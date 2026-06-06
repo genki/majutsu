@@ -621,6 +621,98 @@ fn large_pin_unpin_is_persisted_in_metadata() {
 }
 
 #[test]
+fn large_chunks_can_be_compressed_and_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.log"), vec![b'A'; 64 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 32768");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let manifest = fs::read_to_string(
+        fs::read_dir(state.join("objects/large/manifests"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(manifest.contains("\"compression\": \"zstd\""));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("payload.log")).unwrap(),
+        fs::read(restore.join("sample/payload.log")).unwrap()
+    );
+}
+
+#[test]
 fn missing_root_is_not_snapshotted_as_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

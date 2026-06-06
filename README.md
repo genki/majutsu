@@ -17,6 +17,7 @@ large object handling.
 - Manual snapshots
 - Content-addressed local object store
 - Large file pointer manifests with fixed-size chunks
+- Large chunk zstd compression policy
 - Operation log
 - Operation show and current-ref restore
 - Remote sync of metadata and objects
@@ -111,6 +112,20 @@ mj large unpin --older-than 180d
 
 Pins are stored in metadata and preserved through sync/clone. They are intended
 as lifecycle policy inputs for large objects that should remain hot.
+
+Large chunks are compressed with zstd when compression is enabled, the extension
+is not in the skip list, and the compressed chunk beats `min_gain_ratio`.
+Compression metadata is stored per chunk in the large manifest so restore and
+fsck can verify the original plaintext chunk identity.
+
+```toml
+[large.compression]
+enabled = true
+algorithm = "zstd"
+level = 3
+min_gain_ratio = 0.05
+skip_extensions = ["*.jpg", "*.png", "*.mp4", "*.zip", "*.zst", "*.gz"]
+```
 
 ## Remote Sync
 

@@ -458,6 +458,17 @@ struct LargeConfig {
     chunk_size: usize,
     always: Vec<String>,
     never: Vec<String>,
+    #[serde(default)]
+    compression: LargeCompressionConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LargeCompressionConfig {
+    enabled: bool,
+    algorithm: String,
+    level: i32,
+    min_gain_ratio: f64,
+    skip_extensions: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -550,6 +561,10 @@ struct LargeChunk {
     index: usize,
     offset: u64,
     len: u64,
+    #[serde(default)]
+    stored_len: Option<u64>,
+    #[serde(default = "default_chunk_compression")]
+    compression: String,
     oid: String,
     object_key: String,
 }
@@ -690,6 +705,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                     "*.json".into(),
                     "*.md".into(),
                 ],
+                compression: LargeCompressionConfig::default(),
             },
             security: SecurityConfig {
                 encryption: if args.encrypt {
@@ -1847,6 +1863,36 @@ fn fsck(paths: &Paths) -> Result<()> {
             eprintln!("unreadable chunk {oid} {key}: {err}");
         }
     }
+    let mut stmt = conn.prepare("select oid, manifest_key from large_objects")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (oid, manifest_key) = row?;
+        match read_object(paths, &manifest_key)
+            .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
+        {
+            Ok(manifest) => {
+                for chunk in &manifest.chunks {
+                    match read_large_chunk(paths, chunk) {
+                        Ok(bytes) if blake3_hex(&bytes) == chunk.oid => {}
+                        Ok(_) => {
+                            missing += 1;
+                            eprintln!("large chunk hash mismatch {} {}", oid, chunk.object_key);
+                        }
+                        Err(err) => {
+                            missing += 1;
+                            eprintln!("unreadable large chunk {} {}: {err}", oid, chunk.object_key);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                missing += 1;
+                eprintln!("unreadable large manifest {oid} {manifest_key}: {err}");
+            }
+        }
+    }
     if missing > 0 {
         bail!("fsck found {missing} missing objects");
     }
@@ -2078,7 +2124,7 @@ fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
                 let tmp = dest.with_extension("mjtmp");
                 let mut out = File::create(&tmp)?;
                 for chunk in manifest.chunks {
-                    out.write_all(&read_object(paths, &chunk.object_key)?)?;
+                    out.write_all(&read_large_chunk(paths, &chunk)?)?;
                 }
                 out.sync_all()?;
                 fs::rename(tmp, dest)?;
@@ -2140,7 +2186,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
         let large = classify_large(config, &rel, meta.len(), binary);
         let payload = if large {
             let (oid, manifest_key, chunk_count) =
-                store_large_file(paths, entry.path(), config.large.chunk_size)?;
+                store_large_file(paths, entry.path(), &rel, &config.large)?;
             Payload::Large {
                 oid,
                 manifest_key,
@@ -2188,7 +2234,8 @@ fn build_tree_manifest(root_id: &str, records: Vec<FileRecord>) -> Result<TreeMa
 fn store_large_file(
     paths: &Paths,
     path: &Path,
-    chunk_size: usize,
+    rel: &Path,
+    config: &LargeConfig,
 ) -> Result<(String, String, usize)> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -2196,7 +2243,7 @@ fn store_large_file(
     let mut offset = 0u64;
     let mut index = 0usize;
     loop {
-        let mut buf = vec![0u8; chunk_size];
+        let mut buf = vec![0u8; config.chunk_size];
         let read = file.read(&mut buf)?;
         if read == 0 {
             break;
@@ -2204,11 +2251,14 @@ fn store_large_file(
         buf.truncate(read);
         hasher.update(&buf);
         let chunk_oid = blake3_hex(&buf);
-        let object_key = store_bytes(paths, &paths.large_chunks, &chunk_oid, &buf)?;
+        let stored = compress_large_chunk(config, rel, &buf)?;
+        let object_key = store_bytes(paths, &paths.large_chunks, &chunk_oid, &stored.bytes)?;
         chunks.push(LargeChunk {
             index,
             offset,
             len: read as u64,
+            stored_len: Some(stored.bytes.len() as u64),
+            compression: stored.compression,
             oid: chunk_oid.clone(),
             object_key: object_key.clone(),
         });
@@ -2225,7 +2275,7 @@ fn store_large_file(
         version: 1,
         oid: oid.clone(),
         size: offset,
-        chunk_size,
+        chunk_size: config.chunk_size,
         chunks,
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -2237,6 +2287,58 @@ fn store_large_file(
         params![oid, offset, manifest.chunks.len(), manifest_key],
     )?;
     Ok((oid, manifest_key, manifest.chunks.len()))
+}
+
+struct StoredLargeChunk {
+    bytes: Vec<u8>,
+    compression: String,
+}
+
+fn compress_large_chunk(
+    config: &LargeConfig,
+    rel: &Path,
+    bytes: &[u8],
+) -> Result<StoredLargeChunk> {
+    if !should_compress_large(config, rel) {
+        return Ok(StoredLargeChunk {
+            bytes: bytes.to_vec(),
+            compression: "none".into(),
+        });
+    }
+    let compressed = zstd::stream::encode_all(bytes, config.compression.level)?;
+    let gain = 1.0 - (compressed.len() as f64 / bytes.len().max(1) as f64);
+    if gain >= config.compression.min_gain_ratio {
+        Ok(StoredLargeChunk {
+            bytes: compressed,
+            compression: "zstd".into(),
+        })
+    } else {
+        Ok(StoredLargeChunk {
+            bytes: bytes.to_vec(),
+            compression: "none".into(),
+        })
+    }
+}
+
+fn should_compress_large(config: &LargeConfig, rel: &Path) -> bool {
+    if !config.compression.enabled || config.compression.algorithm != "zstd" {
+        return false;
+    }
+    let name = rel.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    !config
+        .compression
+        .skip_extensions
+        .iter()
+        .any(|pattern| glob_match(pattern, name))
+}
+
+fn read_large_chunk(paths: &Paths, chunk: &LargeChunk) -> Result<Vec<u8>> {
+    let bytes = read_object(paths, &chunk.object_key)?;
+    match chunk.compression.as_str() {
+        "none" => Ok(bytes),
+        "zstd" => Ok(zstd::stream::decode_all(bytes.as_slice())?),
+        other => bail!("unsupported large chunk compression: {other}"),
+    }
 }
 
 fn create_layout(paths: &Paths) -> Result<()> {
@@ -2378,6 +2480,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
                 chunk_size: config.large.chunk_size,
                 always: config.large.always.clone(),
                 never: config.large.never.clone(),
+                compression: config.large.compression.clone(),
             },
             security: config.security.clone(),
         },
@@ -2843,6 +2946,34 @@ fn default_root_status() -> String {
 
 fn default_snapshot_mode() -> String {
     "default".into()
+}
+
+fn default_chunk_compression() -> String {
+    "none".into()
+}
+
+impl Default for LargeCompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            algorithm: "zstd".into(),
+            level: 3,
+            min_gain_ratio: 0.05,
+            skip_extensions: vec![
+                "*.jpg".into(),
+                "*.jpeg".into(),
+                "*.png".into(),
+                "*.heic".into(),
+                "*.mp4".into(),
+                "*.mov".into(),
+                "*.zip".into(),
+                "*.gz".into(),
+                "*.zst".into(),
+                "*.xz".into(),
+                "*.parquet".into(),
+            ],
+        }
+    }
 }
 
 fn read_pid(path: &Path) -> Result<Option<u32>> {
