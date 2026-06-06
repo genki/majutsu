@@ -49,6 +49,7 @@ enum Command {
     Snapshot(SnapshotArgs),
     Status,
     Log(LogArgs),
+    Diff(DiffArgs),
     Restore {
         #[command(subcommand)]
         command: RestoreCommand,
@@ -71,6 +72,8 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    Prune(PruneArgs),
+    Gc,
     Fsck,
 }
 
@@ -116,6 +119,16 @@ struct SnapshotArgs {
 struct LogArgs {
     #[arg(long, default_value_t = 20)]
     limit: usize,
+    #[arg(long)]
+    root: Option<String>,
+}
+
+#[derive(Args)]
+struct DiffArgs {
+    from: Option<String>,
+    to: Option<String>,
+    #[arg(long)]
+    root: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -182,6 +195,16 @@ enum DaemonCommand {
     Status,
 }
 
+#[derive(Args)]
+struct PruneArgs {
+    #[arg(long, default_value_t = true)]
+    dry_run: bool,
+    #[arg(long, default_value_t = 90)]
+    keep_daily: u32,
+    #[arg(long, default_value_t = 36)]
+    keep_monthly: u32,
+}
+
 #[derive(Debug)]
 struct Paths {
     home: PathBuf,
@@ -189,6 +212,7 @@ struct Paths {
     config: PathBuf,
     host: PathBuf,
     objects: PathBuf,
+    trees: PathBuf,
     large_chunks: PathBuf,
     large_manifests: PathBuf,
     logs: PathBuf,
@@ -328,7 +352,26 @@ struct SnapshotManifest {
     parent: Option<String>,
     op_id: String,
     timestamp: DateTime<Utc>,
+    #[serde(default)]
+    root_trees: BTreeMap<String, RootSnapshot>,
+    #[serde(default)]
     roots: BTreeMap<String, Vec<FileRecord>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RootSnapshot {
+    tree_id: String,
+    tree_key: String,
+    file_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TreeManifest {
+    version: u32,
+    tree_id: String,
+    root_id: String,
+    created_at: DateTime<Utc>,
+    entries: BTreeMap<String, FileRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -369,6 +412,7 @@ fn main() -> Result<()> {
         Command::Snapshot(args) => snapshot(&paths, args),
         Command::Status => status(&paths),
         Command::Log(args) => log_ops(&paths, args),
+        Command::Diff(args) => diff_cmd(&paths, args),
         Command::Restore { command } => restore_cmd(&paths, command),
         Command::Large { command } => large_cmd(&paths, command),
         Command::Sync { command } => sync_cmd(&paths, command),
@@ -376,6 +420,8 @@ fn main() -> Result<()> {
         Command::Clone(args) => clone_cmd(&paths, args),
         Command::Watch(args) => watch_cmd(&paths, args),
         Command::Daemon { command } => daemon_cmd(&paths, command),
+        Command::Prune(args) => prune_cmd(&paths, args),
+        Command::Gc => gc_cmd(&paths),
         Command::Fsck => fsck(&paths),
     }
 }
@@ -394,6 +440,7 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         config: home.join("config.toml"),
         host: home.join("host.toml"),
         objects: home.join("objects/blobs"),
+        trees: home.join("objects/trees"),
         large_chunks: home.join("objects/large/chunks/fixed"),
         large_manifests: home.join("objects/large/manifests"),
         logs: home.join("logs"),
@@ -527,6 +574,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let op_id = new_id("op");
     let snapshot_id = new_id("snap");
     let mut by_root = BTreeMap::new();
+    let mut root_trees = BTreeMap::new();
     let mut total_files = 0usize;
     let mut large_files = 0usize;
     for root in roots(&conn)? {
@@ -552,13 +600,26 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .filter(|r| matches!(r.payload, Payload::Large { .. }))
             .count();
         total_files += records.len();
-        by_root.insert(root.id, records);
+        let tree = build_tree_manifest(&root.id, records)?;
+        let tree_json = serde_json::to_vec_pretty(&tree)?;
+        let tree_oid = blake3_hex(&tree_json);
+        let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
+        root_trees.insert(
+            root.id.clone(),
+            RootSnapshot {
+                tree_id: tree.tree_id,
+                tree_key,
+                file_count: tree.entries.len(),
+            },
+        );
+        by_root.insert(root.id, tree.entries.into_values().collect());
     }
     let manifest = SnapshotManifest {
         snapshot_id: snapshot_id.clone(),
         parent: parent.clone(),
         op_id: op_id.clone(),
         timestamp: Utc::now(),
+        root_trees,
         roots: by_root,
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -632,12 +693,72 @@ fn log_ops(paths: &Paths, args: LogArgs) -> Result<()> {
     })?;
     for row in rows {
         let (id, kind, before, after, created, message) = row?;
+        if let Some(root) = &args.root {
+            let matches_root = message.as_deref() == Some(root)
+                || before
+                    .as_deref()
+                    .and_then(|snapshot| snapshot_contains_root(&conn, snapshot, root).ok())
+                    .unwrap_or(false)
+                || after
+                    .as_deref()
+                    .and_then(|snapshot| snapshot_contains_root(&conn, snapshot, root).ok())
+                    .unwrap_or(false);
+            if !matches_root {
+                continue;
+            }
+        }
         println!(
             "{id}\t{created}\t{kind}\t{} -> {}\t{}",
             before.unwrap_or_default(),
             after.unwrap_or_default(),
             message.unwrap_or_default()
         );
+    }
+    Ok(())
+}
+
+fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let to_id = args
+        .to
+        .or_else(|| current_snapshot(&conn).ok().flatten())
+        .ok_or_else(|| anyhow!("no target snapshot"))?;
+    let to = load_snapshot_by_id(&conn, &to_id)?;
+    let from_id = args.from.or_else(|| to.parent.clone());
+    let from = if let Some(from_id) = from_id {
+        Some(load_snapshot_by_id(&conn, &from_id)?)
+    } else {
+        None
+    };
+    let from_files = from
+        .as_ref()
+        .map(snapshot_file_map)
+        .transpose()?
+        .unwrap_or_default();
+    let to_files = snapshot_file_map(&to)?;
+    let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
+    paths_all.extend(
+        to_files
+            .keys()
+            .filter(|key| !from_files.contains_key(*key))
+            .cloned(),
+    );
+    paths_all.sort();
+    for key in paths_all {
+        if let Some(root) = &args.root {
+            if !key.starts_with(&format!("{root}/")) {
+                continue;
+            }
+        }
+        match (from_files.get(&key), to_files.get(&key)) {
+            (None, Some(_)) => println!("A\t{key}"),
+            (Some(_), None) => println!("D\t{key}"),
+            (Some(a), Some(b)) if serde_json::to_value(a)? != serde_json::to_value(b)? => {
+                println!("M\t{key}");
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -915,6 +1036,50 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     Ok(())
 }
 
+fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let total: i64 = conn.query_row("select count(*) from snapshots", [], |row| row.get(0))?;
+    let keep_hint = args.keep_daily as i64 + args.keep_monthly as i64;
+    let candidates = (total - keep_hint).max(0);
+    println!("snapshots {total}");
+    println!("keep_daily {}", args.keep_daily);
+    println!("keep_monthly {}", args.keep_monthly);
+    println!("candidate_snapshots {candidates}");
+    if args.dry_run {
+        println!("dry_run true");
+    } else {
+        bail!("snapshot deletion is not implemented yet; run gc for unreferenced local objects");
+    }
+    Ok(())
+}
+
+fn gc_cmd(paths: &Paths) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let config = read_config(paths)?;
+    let export = export_metadata(&conn, &config)?;
+    let referenced = local_object_keys(&export)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut removed = 0usize;
+    for key in all_local_object_keys(paths)? {
+        if !referenced.contains(&key) {
+            fs::remove_file(paths.home.join(&key))?;
+            removed += 1;
+        }
+    }
+    record_op(
+        &conn,
+        "gc",
+        current_snapshot(&conn)?.as_deref(),
+        current_snapshot(&conn)?.as_deref(),
+        Some(&format!("removed {removed} unreferenced objects")),
+    )?;
+    println!("removed_unreferenced_objects {removed}");
+    Ok(())
+}
+
 fn fsck(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
@@ -1166,6 +1331,21 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
     Ok(records)
 }
 
+fn build_tree_manifest(root_id: &str, records: Vec<FileRecord>) -> Result<TreeManifest> {
+    let mut entries = BTreeMap::new();
+    for record in records {
+        entries.insert(record.path.clone(), record);
+    }
+    let identity = serde_json::to_vec(&entries)?;
+    Ok(TreeManifest {
+        version: 1,
+        tree_id: format!("tree-{}", blake3_hex(&identity)),
+        root_id: root_id.to_string(),
+        created_at: Utc::now(),
+        entries,
+    })
+}
+
 fn store_large_file(
     paths: &Paths,
     path: &Path,
@@ -1223,6 +1403,7 @@ fn store_large_file(
 fn create_layout(paths: &Paths) -> Result<()> {
     fs::create_dir_all(paths.db.parent().unwrap())?;
     fs::create_dir_all(&paths.objects)?;
+    fs::create_dir_all(&paths.trees)?;
     fs::create_dir_all(&paths.large_chunks)?;
     fs::create_dir_all(&paths.large_manifests)?;
     fs::create_dir_all(&paths.logs)?;
@@ -1470,6 +1651,11 @@ fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     let mut keys = Vec::new();
     for snapshot in &export.snapshots {
         keys.push(snapshot.manifest_key.clone());
+        if let Ok(manifest) = serde_json::from_str::<SnapshotManifest>(&snapshot.manifest_json) {
+            for root_tree in manifest.root_trees.values() {
+                keys.push(root_tree.tree_key.clone());
+            }
+        }
     }
     for blob in &export.blobs {
         keys.push(blob.object_key.clone());
@@ -1483,6 +1669,21 @@ fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+fn all_local_object_keys(paths: &Paths) -> Result<Vec<String>> {
+    let root = paths.home.join("objects");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::new();
+    for entry in WalkDir::new(&root).sort_by_file_name() {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            keys.push(path_to_slash(entry.path().strip_prefix(&paths.home)?));
+        }
+    }
+    Ok(keys)
 }
 
 fn roots(conn: &Connection) -> Result<Vec<RootConfig>> {
@@ -1541,6 +1742,31 @@ fn load_snapshot(conn: &Connection, args: &RestoreArgs) -> Result<SnapshotManife
         |row| row.get(0),
     )?;
     Ok(serde_json::from_str(&json)?)
+}
+
+fn load_snapshot_by_id(conn: &Connection, id: &str) -> Result<SnapshotManifest> {
+    let json: String = conn.query_row(
+        "select manifest_json from snapshots where id=?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+fn snapshot_contains_root(conn: &Connection, snapshot_id: &str, root: &str) -> Result<bool> {
+    Ok(load_snapshot_by_id(conn, snapshot_id)?
+        .roots
+        .contains_key(root))
+}
+
+fn snapshot_file_map(snapshot: &SnapshotManifest) -> Result<BTreeMap<String, &FileRecord>> {
+    let mut out = BTreeMap::new();
+    for (root_id, records) in &snapshot.roots {
+        for record in records {
+            out.insert(format!("{}/{}", root_id, record.path), record);
+        }
+    }
+    Ok(out)
 }
 
 fn record_op(

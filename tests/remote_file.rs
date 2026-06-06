@@ -68,6 +68,7 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c.arg("--home").arg(&state).arg("remote").arg("fsck");
         c
     });
+    assert!(remote.join("objects/trees").exists());
     run({
         let mut c = mj();
         c.arg("--home")
@@ -105,6 +106,93 @@ fn file_remote_clone_restores_normal_and_large_files() {
         fs::read(source.join("payload.zip")).unwrap(),
         fs::read(restore.join("sample/payload.zip")).unwrap()
     );
+}
+
+#[test]
+fn diff_reports_added_modified_and_deleted_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+    fs::remove_file(source.join("alpha.txt")).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let output = mj().arg("--home").arg(&state).arg("diff").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("D\tsample/alpha.txt"));
+    assert!(stdout.contains("A\tsample/beta.txt"));
+}
+
+#[test]
+fn prune_dry_run_and_gc_are_safe_entry_points() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("prune");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
 }
 
 #[test]

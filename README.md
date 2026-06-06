@@ -20,6 +20,9 @@ large object handling.
 - Remote sync of metadata and objects
 - S3-compatible remote backend
 - Bootstrap clone from remote metadata
+- Root tree manifests stored as separate content-addressed objects
+- Snapshot diff
+- Safe `prune --dry-run` and local loose-object `gc`
 - Root pause/resume/missing-state handling
 - Foreground periodic watch and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
@@ -83,6 +86,7 @@ metadata/export.json
 config.toml
 host.toml
 hosts/current
+objects/trees/...
 objects/...
 ```
 
@@ -114,6 +118,30 @@ mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 
 The current S3 backend uses path-style requests and AWS Signature V2, which is
 compatible with Google Cloud Storage HMAC keys in the validation environment.
+
+## History And Diff
+
+Show recent operations:
+
+```sh
+mj log
+mj log --root home-notes
+```
+
+Diff the current snapshot against its parent:
+
+```sh
+mj diff
+```
+
+Diff explicit snapshots:
+
+```sh
+mj diff snap-old snap-new --root home-notes
+```
+
+Snapshot manifests keep a compatibility file list and also point each root at a
+separate tree manifest object under `objects/trees/`.
 
 ## Watch And Daemon
 
@@ -152,6 +180,17 @@ mj root resume home-notes
 If an active root path disappears, `mj snapshot` records a `root-missing`
 operation and marks the root `missing`; it does not snapshot the root as empty.
 Use `mj root resume <id>` after the path is available again.
+
+## Prune And GC
+
+Prune is currently a safe planning entry point:
+
+```sh
+mj prune --dry-run --keep-daily 90 --keep-monthly 36
+```
+
+`mj gc` removes unreferenced local loose objects under `$MAJUTSU_HOME/objects`.
+It does not delete referenced history or remote objects.
 
 ## Safety Notes
 
