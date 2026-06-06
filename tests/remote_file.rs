@@ -214,9 +214,12 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     let remote = tmp.path().join("remote");
     let state = tmp.path().join("state");
     let clone = tmp.path().join("clone");
+    let rotated_clone = tmp.path().join("rotated-clone");
     let restore = tmp.path().join("restore");
+    let rotated_restore = tmp.path().join("rotated-restore");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("secret.txt"), b"secret\n").unwrap();
+    fs::write(source.join("payload.zip"), vec![7u8; 32 * 1024]).unwrap();
 
     run({
         let mut c = mj();
@@ -297,6 +300,68 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     assert_eq!(
         fs::read(source.join("secret.txt")).unwrap(),
         fs::read(restore.join("sample/secret.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("payload.zip")).unwrap(),
+        fs::read(restore.join("sample/payload.zip")).unwrap()
+    );
+
+    let new_key = "1111111111111111111111111111111111111111111111111111111111111111";
+    let rotated = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("key")
+            .arg("rotate")
+            .arg("--new-key")
+            .arg(new_key);
+        c
+    });
+    assert!(rotated.contains("rotated master key"));
+    assert!(rotated.contains(new_key));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let rotated_export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let rotated_object_key = rotated_export["blobs"][0]["object_key"].as_str().unwrap();
+    assert_ne!(object_key, rotated_object_key);
+    assert!(!rotated_object_key.contains(&plain_oid));
+
+    let status = mj()
+        .arg("--home")
+        .arg(&rotated_clone)
+        .arg("clone")
+        .arg("--remote")
+        .arg(format!("file://{}", remote.display()))
+        .env("MAJUTSU_MASTER_KEY", new_key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&rotated_clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&rotated_restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("secret.txt")).unwrap(),
+        fs::read(rotated_restore.join("sample/secret.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("payload.zip")).unwrap(),
+        fs::read(rotated_restore.join("sample/payload.zip")).unwrap()
     );
 }
 

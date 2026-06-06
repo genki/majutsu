@@ -224,6 +224,17 @@ Export it and store it separately from the host:
 mj key export
 ```
 
+Rotate the master key and rewrite encrypted object metadata:
+
+```sh
+mj key rotate
+mj key rotate --new-key <64-hex-key>
+mj sync
+```
+
+Rotation currently supports unpacked encrypted objects. Run it before packing
+normal blobs.
+
 To recover from remote storage into a fresh state, provide the key with an
 environment variable or import it first:
 

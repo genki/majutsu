@@ -314,7 +314,13 @@ enum DaemonCommand {
 #[derive(Subcommand)]
 enum KeyCommand {
     Export,
-    Import { hex: String },
+    Import {
+        hex: String,
+    },
+    Rotate {
+        #[arg(long)]
+        new_key: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -2657,6 +2663,184 @@ fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {
             validate_key_hex(&hex)?;
             write_master_key(paths, &hex)?;
             println!("imported master key into {}", paths.master_key.display());
+        }
+        KeyCommand::Rotate { new_key } => {
+            ensure_ready(paths)?;
+            let rotated = rotate_master_key(paths, new_key)?;
+            println!("rotated master key");
+            println!("objects_rewritten {}", rotated.objects);
+            println!("snapshots_rewritten {}", rotated.snapshots);
+            println!("new_key {}", rotated.new_key);
+        }
+    }
+    Ok(())
+}
+
+struct KeyRotationResult {
+    objects: usize,
+    snapshots: usize,
+    new_key: String,
+}
+
+fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotationResult> {
+    let config = read_config(paths)?;
+    if config.security.encryption != "chacha20poly1305" {
+        bail!("key rotation requires encrypted state");
+    }
+    let conn = open_db(paths)?;
+    if !query_packs(&conn)?.is_empty() {
+        bail!("key rotation with pack files is not supported yet; run before packing");
+    }
+    let old_key = read_master_key(paths)?;
+    let new_key = new_key.unwrap_or(random_key_hex()?);
+    validate_key_hex(&new_key)?;
+    if old_key.trim() == new_key.trim() {
+        bail!("new key must differ from current key");
+    }
+
+    let blobs = query_blobs(&conn)?;
+    let chunks = query_chunks(&conn)?;
+    let large_objects = query_large_objects(&conn)?;
+    let mut blob_payloads = BTreeMap::new();
+    for blob in &blobs {
+        blob_payloads.insert(blob.oid.clone(), read_object(paths, &blob.object_key)?);
+    }
+    let mut chunk_payloads = BTreeMap::new();
+    for chunk in &chunks {
+        chunk_payloads.insert(chunk.oid.clone(), read_object(paths, &chunk.object_key)?);
+    }
+    let mut large_manifests = BTreeMap::new();
+    for large in &large_objects {
+        let manifest: LargeManifest =
+            serde_json::from_slice(&read_object(paths, &large.manifest_key)?)?;
+        large_manifests.insert(large.oid.clone(), manifest);
+    }
+    let mut snapshots = Vec::new();
+    let mut stmt = conn.prepare("select id, manifest_json from snapshots order by created_at")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, json) = row?;
+        snapshots.push((id, serde_json::from_str::<SnapshotManifest>(&json)?));
+    }
+
+    write_master_key(paths, &new_key)?;
+    let mut objects = 0usize;
+    let mut blob_keys = BTreeMap::new();
+    for blob in &blobs {
+        let key = store_bytes(paths, &paths.objects, &blob.oid, &blob_payloads[&blob.oid])?;
+        conn.execute(
+            "update blobs set object_key=?2 where oid=?1",
+            params![blob.oid, key],
+        )?;
+        blob_keys.insert(blob.oid.clone(), key);
+        objects += 1;
+    }
+    let mut chunk_keys = BTreeMap::new();
+    for chunk in &chunks {
+        let key = store_bytes(
+            paths,
+            &paths.large_chunks,
+            &chunk.oid,
+            &chunk_payloads[&chunk.oid],
+        )?;
+        conn.execute(
+            "update chunks set object_key=?2 where oid=?1",
+            params![chunk.oid, key],
+        )?;
+        chunk_keys.insert(chunk.oid.clone(), key);
+        objects += 1;
+    }
+    let mut large_manifest_keys = BTreeMap::new();
+    for large in &large_objects {
+        let mut manifest = large_manifests
+            .remove(&large.oid)
+            .ok_or_else(|| anyhow!("missing loaded large manifest {}", large.oid))?;
+        for chunk in &mut manifest.chunks {
+            chunk.object_key = chunk_keys
+                .get(&chunk.oid)
+                .ok_or_else(|| anyhow!("missing rotated chunk key {}", chunk.oid))?
+                .clone();
+        }
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_oid = blake3_hex(&bytes);
+        let key = store_bytes(paths, &paths.large_manifests, &manifest_oid, &bytes)?;
+        conn.execute(
+            "update large_objects set manifest_key=?2 where oid=?1",
+            params![large.oid, key],
+        )?;
+        large_manifest_keys.insert(large.oid.clone(), key);
+        objects += 1;
+    }
+
+    let mut snapshots_rewritten = 0usize;
+    for (snapshot_id, mut manifest) in snapshots {
+        rewrite_manifest_payload_keys(&mut manifest, &blob_keys, &large_manifest_keys)?;
+        manifest.root_trees.clear();
+        for (root_id, records) in &manifest.roots {
+            let tree = build_tree_manifest(root_id, records.clone())?;
+            let tree_json = serde_json::to_vec_pretty(&tree)?;
+            let tree_oid = blake3_hex(&tree_json);
+            let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
+            manifest.root_trees.insert(
+                root_id.clone(),
+                RootSnapshot {
+                    tree_id: tree.tree_id,
+                    tree_key,
+                    file_count: tree.entries.len(),
+                },
+            );
+            objects += 1;
+        }
+        let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_oid = blake3_hex(&manifest_json);
+        let manifest_key = store_bytes(paths, &paths.objects, &manifest_oid, &manifest_json)?;
+        conn.execute(
+            "update snapshots set manifest_key=?2, manifest_json=?3 where id=?1",
+            params![snapshot_id, manifest_key, String::from_utf8(manifest_json)?],
+        )?;
+        snapshots_rewritten += 1;
+        objects += 1;
+    }
+    record_op(
+        &conn,
+        "key-rotation",
+        current_snapshot(&conn)?.as_deref(),
+        current_snapshot(&conn)?.as_deref(),
+        Some(&format!("rewrote {objects} objects")),
+    )?;
+    Ok(KeyRotationResult {
+        objects,
+        snapshots: snapshots_rewritten,
+        new_key,
+    })
+}
+
+fn rewrite_manifest_payload_keys(
+    manifest: &mut SnapshotManifest,
+    blob_keys: &BTreeMap<String, String>,
+    large_manifest_keys: &BTreeMap<String, String>,
+) -> Result<()> {
+    for records in manifest.roots.values_mut() {
+        for record in records {
+            match &mut record.payload {
+                Payload::Blob { oid, object_key } => {
+                    *object_key = blob_keys
+                        .get(oid)
+                        .ok_or_else(|| anyhow!("missing rotated blob key {oid}"))?
+                        .clone();
+                }
+                Payload::Large {
+                    oid, manifest_key, ..
+                } => {
+                    *manifest_key = large_manifest_keys
+                        .get(oid)
+                        .ok_or_else(|| anyhow!("missing rotated large manifest key {oid}"))?
+                        .clone();
+                }
+                Payload::Symlink { .. } => {}
+            }
         }
     }
     Ok(())
