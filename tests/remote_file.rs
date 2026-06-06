@@ -1115,6 +1115,81 @@ fn large_files_can_use_content_defined_chunking() {
 }
 
 #[test]
+fn mount_creates_lazy_view_and_can_hydrate_large_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let lazy_view = tmp.path().join("lazy-view");
+    let hydrated_view = tmp.path().join("hydrated-view");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("payload.bin"), vec![9u8; 64 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 32768");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let lazy = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("mount").arg(&lazy_view);
+        c
+    });
+    assert!(lazy.contains("lazy_large_files 1"));
+    assert_eq!(
+        fs::read(source.join("alpha.txt")).unwrap(),
+        fs::read(lazy_view.join("sample/alpha.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::metadata(lazy_view.join("sample/payload.bin"))
+            .unwrap()
+            .len(),
+        64 * 1024
+    );
+    assert!(
+        lazy_view
+            .join(".majutsu-lazy/sample/payload.bin.json")
+            .exists()
+    );
+
+    let hydrated = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("mount")
+            .arg("--hydrate-large")
+            .arg(&hydrated_view);
+        c
+    });
+    assert!(hydrated.contains("hydrated_large_files 1"));
+    assert_eq!(
+        fs::read(source.join("payload.bin")).unwrap(),
+        fs::read(hydrated_view.join("sample/payload.bin")).unwrap()
+    );
+}
+
+#[test]
 fn missing_root_is_not_snapshotted_as_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

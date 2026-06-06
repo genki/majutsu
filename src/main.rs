@@ -69,6 +69,7 @@ enum Command {
         #[command(subcommand)]
         command: RestoreCommand,
     },
+    Mount(MountArgs),
     Large {
         #[command(subcommand)]
         command: LargeCommand,
@@ -183,6 +184,21 @@ struct RestoreArgs {
     path: Option<PathBuf>,
     #[arg(long)]
     to: PathBuf,
+}
+
+#[derive(Args, Clone)]
+struct MountArgs {
+    #[arg(long)]
+    snapshot: Option<String>,
+    #[arg(long)]
+    at: Option<String>,
+    #[arg(long)]
+    root: Option<String>,
+    #[arg(long)]
+    path: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    hydrate_large: bool,
+    mountpoint: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -407,6 +423,17 @@ struct RestoreQueueItem {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct LazyMountEntry {
+    version: u32,
+    snapshot_id: String,
+    root_id: String,
+    path: String,
+    size: u64,
+    manifest_key: String,
+    chunk_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct SnapshotExport {
     id: String,
     parent_id: Option<String>,
@@ -607,6 +634,7 @@ fn main() -> Result<()> {
         Command::Op { command } => op_cmd(&paths, command),
         Command::Diff(args) => diff_cmd(&paths, args),
         Command::Restore { command } => restore_cmd(&paths, command),
+        Command::Mount(args) => mount_cmd(&paths, args),
         Command::Large { command } => large_cmd(&paths, command),
         Command::Sync { command } => sync_cmd(&paths, command),
         Command::Remote { command } => remote_cmd(&paths, command),
@@ -1208,6 +1236,95 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
             println!("restored to {}", plan.to.display());
         }
     }
+    Ok(())
+}
+
+fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let restore_args = RestoreArgs {
+        snapshot: args.snapshot.clone(),
+        at: args.at.clone(),
+        root: args.root.clone(),
+        path: args.path.clone(),
+        to: args.mountpoint.clone(),
+    };
+    let plan = build_restore_plan(paths, &conn, &restore_args)?;
+    fs::create_dir_all(&plan.to)?;
+    let lazy_root = plan.to.join(".majutsu-lazy");
+    let mut lazy_files = 0usize;
+    let mut hydrated_large = 0usize;
+    for record in &plan.files {
+        let dest = plan.to.join(&record.root_id).join(&record.path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match &record.payload {
+            Payload::Blob { oid, object_key } => {
+                write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
+            }
+            Payload::Large {
+                manifest_key,
+                chunk_count,
+                ..
+            } if args.hydrate_large => {
+                let manifest: LargeManifest =
+                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+                let tmp = dest.with_extension("mjtmp");
+                let mut out = File::create(&tmp)?;
+                for chunk in manifest.chunks {
+                    out.write_all(&read_large_chunk(paths, &chunk)?)?;
+                }
+                out.sync_all()?;
+                fs::rename(tmp, dest)?;
+                hydrated_large += 1;
+                let _ = chunk_count;
+            }
+            Payload::Large {
+                manifest_key,
+                chunk_count,
+                ..
+            } => {
+                let file = File::create(&dest)?;
+                file.set_len(record.size)?;
+                let sidecar = lazy_root
+                    .join(&record.root_id)
+                    .join(format!("{}.json", record.path));
+                if let Some(parent) = sidecar.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let entry = LazyMountEntry {
+                    version: 1,
+                    snapshot_id: plan.snapshot.snapshot_id.clone(),
+                    root_id: record.root_id.clone(),
+                    path: record.path.clone(),
+                    size: record.size,
+                    manifest_key: manifest_key.clone(),
+                    chunk_count: *chunk_count,
+                };
+                fs::write(sidecar, serde_json::to_vec_pretty(&entry)?)?;
+                lazy_files += 1;
+            }
+            Payload::Symlink { target } => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &dest)?;
+                #[cfg(not(unix))]
+                fs::write(&dest, target)?;
+            }
+        }
+    }
+    record_op(
+        &conn,
+        "mount",
+        None,
+        Some(&plan.snapshot.snapshot_id),
+        Some(&format!("at {}", plan.to.display())),
+    )?;
+    println!("mounted snapshot {}", plan.snapshot.snapshot_id);
+    println!("target {}", plan.to.display());
+    println!("files {}", plan.files.len());
+    println!("lazy_large_files {lazy_files}");
+    println!("hydrated_large_files {hydrated_large}");
     Ok(())
 }
 

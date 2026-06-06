@@ -43,7 +43,7 @@ large object handling.
 - Large object pin/unpin metadata
 - Basic object-store fsck
 
-Lazy mount/FUSE and crate splitting are intentionally left for later
+Kernel-backed FUSE and crate splitting are intentionally left for later
 iterations.
 
 ## Install
@@ -363,6 +363,19 @@ If `restore prepare` finds required objects missing from local state and a
 remote is configured, it issues provider-side archive restore requests for
 those object keys. S3 remotes use `POST ?restore` with a 7-day Standard restore
 request; file remotes record the request as a no-op for local validation.
+
+## Mount Views
+
+Create a read-only restore view without overwriting the original roots:
+
+```sh
+mj mount --at 2026-06-06T10:30:00Z /tmp/majutsu-view
+mj mount --hydrate-large /tmp/majutsu-view-full
+```
+
+Without `--hydrate-large`, normal files are materialized and large files are
+represented by sparse placeholders plus metadata under `.majutsu-lazy/`.
+With `--hydrate-large`, large files are fully assembled into the view.
 
 ## Packs
 
