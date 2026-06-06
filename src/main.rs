@@ -54,6 +54,10 @@ enum Command {
     Snapshot(SnapshotArgs),
     Status,
     Log(LogArgs),
+    Op {
+        #[command(subcommand)]
+        command: OpCommand,
+    },
     Diff(DiffArgs),
     Restore {
         #[command(subcommand)]
@@ -70,6 +74,10 @@ enum Command {
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
+    },
+    Lifecycle {
+        #[command(subcommand)]
+        command: LifecycleCommand,
     },
     Clone(CloneArgs),
     Watch(WatchArgs),
@@ -153,6 +161,8 @@ struct DiffArgs {
 enum RestoreCommand {
     Plan(RestoreArgs),
     Apply(RestoreArgs),
+    Prepare(RestoreArgs),
+    Resume { job_id: String },
 }
 
 #[derive(Args, Clone)]
@@ -174,6 +184,8 @@ enum LargeCommand {
     List,
     Stat,
     Verify,
+    Pin(LargePinArgs),
+    Unpin(LargeUnpinArgs),
 }
 
 #[derive(Subcommand)]
@@ -181,10 +193,39 @@ enum SyncCommand {
     Status,
 }
 
+#[derive(Args)]
+struct LargePinArgs {
+    #[arg(long)]
+    root: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+}
+
+#[derive(Args)]
+struct LargeUnpinArgs {
+    #[arg(long)]
+    older_than: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum RemoteCommand {
     Check,
     Fsck,
+}
+
+#[derive(Subcommand)]
+enum OpCommand {
+    Log(LogArgs),
+    Show { op_id: String },
+    Restore { op_id: String },
+}
+
+#[derive(Subcommand)]
+enum LifecycleCommand {
+    Policy {
+        #[arg(long, default_value = "gcs")]
+        provider: String,
+    },
 }
 
 #[derive(Args)]
@@ -292,6 +333,8 @@ struct MetadataExport {
     large_objects: Vec<LargeObjectExport>,
     chunks: Vec<ChunkExport>,
     packs: Vec<PackExport>,
+    #[serde(default)]
+    large_pins: Vec<LargePinExport>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -334,6 +377,19 @@ struct EventJournalRecord {
     kind: String,
     observed_at: DateTime<Utc>,
     detail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RestoreQueueItem {
+    id: String,
+    snapshot_id: String,
+    root: Option<String>,
+    path: Option<String>,
+    target: String,
+    required_objects: Vec<String>,
+    archived_objects: Vec<String>,
+    created_at: DateTime<Utc>,
+    status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -382,6 +438,13 @@ struct ChunkExport {
     oid: String,
     size: u64,
     object_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LargePinExport {
+    oid: String,
+    pinned_at: String,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -508,11 +571,13 @@ fn main() -> Result<()> {
         Command::Snapshot(args) => snapshot(&paths, args),
         Command::Status => status(&paths),
         Command::Log(args) => log_ops(&paths, args),
+        Command::Op { command } => op_cmd(&paths, command),
         Command::Diff(args) => diff_cmd(&paths, args),
         Command::Restore { command } => restore_cmd(&paths, command),
         Command::Large { command } => large_cmd(&paths, command),
         Command::Sync { command } => sync_cmd(&paths, command),
         Command::Remote { command } => remote_cmd(&paths, command),
+        Command::Lifecycle { command } => lifecycle_cmd(&paths, command),
         Command::Clone(args) => clone_cmd(&paths, args),
         Command::Watch(args) => watch_cmd(&paths, args),
         Command::Daemon { command } => daemon_cmd(&paths, command),
@@ -529,6 +594,8 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         home
     } else if let Ok(home) = env::var("MAJUTSU_HOME") {
         PathBuf::from(home)
+    } else if let Some(home) = configured_state_home()? {
+        home
     } else {
         let user_home = env::var("HOME").context("HOME is not set")?;
         PathBuf::from(user_home).join(".majutsu")
@@ -551,6 +618,35 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         master_key: home.join("keys/master.key"),
         home,
     })
+}
+
+fn configured_state_home() -> Result<Option<PathBuf>> {
+    let user_home = env::var("HOME").ok().map(PathBuf::from);
+    let config_home = env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| user_home.as_ref().map(|home| home.join(".config")));
+    let Some(config_home) = config_home else {
+        return Ok(None);
+    };
+    let path = config_home.join("majutsu/config.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let value: toml::Value = toml::from_str(&fs::read_to_string(path)?)?;
+    let Some(home) = value
+        .get("state")
+        .and_then(|state| state.get("home"))
+        .and_then(|home| home.as_str())
+    else {
+        return Ok(None);
+    };
+    if let Some(rest) = home.strip_prefix("~/") {
+        if let Some(user_home) = user_home {
+            return Ok(Some(user_home.join(rest)));
+        }
+    }
+    Ok(Some(PathBuf::from(home)))
 }
 
 fn init(paths: &Paths, args: InitArgs) -> Result<()> {
@@ -814,6 +910,10 @@ fn status(paths: &Paths) -> Result<()> {
 fn log_ops(paths: &Paths, args: LogArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
+    print_op_log(&conn, &args)
+}
+
+fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let mut stmt = conn.prepare(
         "select id, kind, before_snapshot, after_snapshot, created_at, message
          from operations order by rowid desc limit ?1",
@@ -850,6 +950,106 @@ fn log_ops(paths: &Paths, args: LogArgs) -> Result<()> {
             after.unwrap_or_default(),
             message.unwrap_or_default()
         );
+    }
+    Ok(())
+}
+
+fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    match command {
+        OpCommand::Log(args) => print_op_log(&conn, &args),
+        OpCommand::Show { op_id } => {
+            let op = query_operation(&conn, &op_id)?;
+            println!("id {}", op.id);
+            println!("kind {}", op.kind);
+            println!(
+                "before {}",
+                op.before_snapshot.unwrap_or_else(|| "(none)".into())
+            );
+            println!(
+                "after {}",
+                op.after_snapshot.unwrap_or_else(|| "(none)".into())
+            );
+            println!("created_at {}", op.created_at);
+            println!("message {}", op.message.unwrap_or_default());
+            Ok(())
+        }
+        OpCommand::Restore { op_id } => {
+            let op = query_operation(&conn, &op_id)?;
+            let before = current_snapshot(&conn)?;
+            let snapshot = op
+                .after_snapshot
+                .or(op.before_snapshot)
+                .ok_or_else(|| anyhow!("operation has no snapshot to restore: {op_id}"))?;
+            conn.execute(
+                "insert into refs(name, value) values ('current', ?1)
+                 on conflict(name) do update set value=excluded.value",
+                params![snapshot],
+            )?;
+            record_op(
+                &conn,
+                "op-restore",
+                before.as_deref(),
+                Some(&snapshot),
+                Some(&op_id),
+            )?;
+            println!("current {}", snapshot);
+            Ok(())
+        }
+    }
+}
+
+fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
+    ensure_ready(paths)?;
+    match command {
+        LifecycleCommand::Policy { provider } => match provider.as_str() {
+            "gcs" => {
+                let policy = serde_json::json!({
+                    "rule": [
+                        {
+                            "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
+                            "condition": {
+                                "age": 30,
+                                "matchesPrefix": ["objects/packs/normal/"]
+                            }
+                        },
+                        {
+                            "action": { "type": "SetStorageClass", "storageClass": "ARCHIVE" },
+                            "condition": {
+                                "age": 180,
+                                "matchesPrefix": ["objects/large/chunks/fixed/"]
+                            }
+                        }
+                    ]
+                });
+                println!("{}", serde_json::to_string_pretty(&policy)?);
+            }
+            "s3" | "aws" => {
+                let policy = serde_json::json!({
+                    "Rules": [
+                        {
+                            "ID": "majutsu-packs-to-ia",
+                            "Status": "Enabled",
+                            "Filter": { "Prefix": "objects/packs/normal/" },
+                            "Transitions": [
+                                { "Days": 30, "StorageClass": "STANDARD_IA" }
+                            ]
+                        },
+                        {
+                            "ID": "majutsu-large-to-archive",
+                            "Status": "Enabled",
+                            "Filter": { "Prefix": "objects/large/chunks/fixed/" },
+                            "Transitions": [
+                                { "Days": 180, "StorageClass": "DEEP_ARCHIVE" }
+                            ]
+                        }
+                    ]
+                });
+                println!("{}", serde_json::to_string_pretty(&policy)?);
+            }
+            other => bail!("unsupported lifecycle provider: {other}"),
+        },
     }
     Ok(())
 }
@@ -922,6 +1122,51 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
             print_restore_plan(&plan);
             println!("restored to {}", plan.to.display());
         }
+        RestoreCommand::Prepare(args) => {
+            let plan = build_restore_plan(paths, &conn, &args)?;
+            let job = build_restore_job(paths, &plan, &args)?;
+            write_restore_job(paths, &job)?;
+            record_op(
+                &conn,
+                "restore-prepare",
+                None,
+                Some(&plan.snapshot.snapshot_id),
+                Some(&job.id),
+            )?;
+            println!("restore_job {}", job.id);
+            println!("snapshot {}", job.snapshot_id);
+            println!("required_objects {}", job.required_objects.len());
+            println!("archived_objects {}", job.archived_objects.len());
+        }
+        RestoreCommand::Resume { job_id } => {
+            let job = read_restore_job(paths, &job_id)?;
+            if !job.archived_objects.is_empty() {
+                bail!(
+                    "restore job {} still has archived objects pending: {}",
+                    job.id,
+                    job.archived_objects.len()
+                );
+            }
+            let args = RestoreArgs {
+                snapshot: Some(job.snapshot_id.clone()),
+                at: None,
+                root: job.root.clone(),
+                path: job.path.as_ref().map(PathBuf::from),
+                to: PathBuf::from(&job.target),
+            };
+            let plan = build_restore_plan(paths, &conn, &args)?;
+            apply_restore_plan(paths, &plan)?;
+            mark_restore_job_done(paths, &job.id)?;
+            record_op(
+                &conn,
+                "restore-resume",
+                None,
+                Some(&plan.snapshot.snapshot_id),
+                Some(&job.id),
+            )?;
+            println!("resumed {}", job.id);
+            println!("restored to {}", plan.to.display());
+        }
     }
     Ok(())
 }
@@ -931,18 +1176,24 @@ fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
     let conn = open_db(paths)?;
     match command {
         LargeCommand::List => {
-            let mut stmt = conn.prepare("select oid, size, chunk_count, manifest_key from large_objects order by rowid desc")?;
+            let mut stmt = conn.prepare(
+                "select l.oid, l.size, l.chunk_count, l.manifest_key, p.oid is not null
+                 from large_objects l left join large_pins p on p.oid = l.oid
+                 order by l.rowid desc",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
                     row.get::<_, usize>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })?;
             for row in rows {
-                let (oid, size, chunks, key) = row?;
-                println!("{oid}\t{size}\t{chunks}\t{key}");
+                let (oid, size, chunks, key, pinned) = row?;
+                let pin = if pinned { "pinned" } else { "unpinned" };
+                println!("{oid}\t{size}\t{chunks}\t{pin}\t{key}");
             }
         }
         LargeCommand::Stat => {
@@ -951,11 +1202,66 @@ fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
             let bytes: Option<u64> =
                 conn.query_row("select sum(size) from large_objects", [], |r| r.get(0))?;
             let chunks: i64 = conn.query_row("select count(*) from chunks", [], |r| r.get(0))?;
+            let pins: i64 = conn.query_row("select count(*) from large_pins", [], |r| r.get(0))?;
             println!("large_objects {count}");
             println!("logical_bytes {}", bytes.unwrap_or(0));
             println!("chunks {chunks}");
+            println!("pinned {pins}");
         }
         LargeCommand::Verify => fsck(paths)?,
+        LargeCommand::Pin(args) => {
+            let snapshot =
+                current_snapshot(&conn)?.ok_or_else(|| anyhow!("no current snapshot"))?;
+            let manifest = load_snapshot_by_id(&conn, &snapshot)?;
+            let mut pinned = 0usize;
+            for (root_id, records) in manifest.roots {
+                if args.root.as_deref().is_some_and(|filter| filter != root_id) {
+                    continue;
+                }
+                for record in records {
+                    if let Payload::Large { oid, .. } = record.payload {
+                        conn.execute(
+                            "insert or replace into large_pins(oid, pinned_at, reason) values (?1, ?2, ?3)",
+                            params![
+                                oid,
+                                Utc::now().to_rfc3339(),
+                                args.since
+                                    .as_ref()
+                                    .map(|since| format!("pin since {since}"))
+                            ],
+                        )?;
+                        pinned += 1;
+                    }
+                }
+            }
+            record_op(
+                &conn,
+                "large-pin",
+                Some(&snapshot),
+                Some(&snapshot),
+                Some(&format!("pinned {pinned} large objects")),
+            )?;
+            println!("pinned {pinned}");
+        }
+        LargeCommand::Unpin(args) => {
+            let removed = if let Some(older_than) = args.older_than {
+                let cutoff = parse_duration_ago(&older_than)?;
+                conn.execute(
+                    "delete from large_pins where pinned_at <= ?1",
+                    params![cutoff.to_rfc3339()],
+                )?
+            } else {
+                conn.execute("delete from large_pins", [])?
+            };
+            record_op(
+                &conn,
+                "large-unpin",
+                current_snapshot(&conn)?.as_deref(),
+                current_snapshot(&conn)?.as_deref(),
+                Some(&format!("unpinned {removed} large objects")),
+            )?;
+            println!("unpinned {removed}");
+        }
     }
     Ok(())
 }
@@ -1652,6 +1958,104 @@ fn print_restore_plan(plan: &RestorePlan) {
     );
 }
 
+fn build_restore_job(
+    paths: &Paths,
+    plan: &RestorePlan,
+    args: &RestoreArgs,
+) -> Result<RestoreQueueItem> {
+    let conn = open_db(paths)?;
+    let required_objects = required_object_keys_for_plan(paths, &conn, plan)?;
+    let archived_objects = required_objects
+        .iter()
+        .filter(|key| !paths.home.join(key).exists())
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(RestoreQueueItem {
+        id: new_id("restore"),
+        snapshot_id: plan.snapshot.snapshot_id.clone(),
+        root: args.root.clone(),
+        path: args.path.as_ref().map(|path| path_to_slash(path)),
+        target: args.to.display().to_string(),
+        required_objects,
+        archived_objects,
+        created_at: Utc::now(),
+        status: "prepared".into(),
+    })
+}
+
+fn required_object_keys_for_plan(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for record in &plan.files {
+        match &record.payload {
+            Payload::Blob { oid, object_key } => {
+                let blob = query_blobs(conn)?
+                    .into_iter()
+                    .find(|blob| blob.oid == *oid)
+                    .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
+                if let Some(pack_id) = blob.pack_id {
+                    let pack: PackExport = conn.query_row(
+                        "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",
+                        params![pack_id],
+                        |row| {
+                            Ok(PackExport {
+                                pack_id: row.get(0)?,
+                                pack_key: row.get(1)?,
+                                index_key: row.get(2)?,
+                                object_count: row.get(3)?,
+                                size: row.get(4)?,
+                            })
+                        },
+                    )?;
+                    keys.push(pack.pack_key);
+                    keys.push(pack.index_key);
+                } else {
+                    keys.push(object_key.clone());
+                }
+            }
+            Payload::Large { manifest_key, .. } => {
+                keys.push(manifest_key.clone());
+                let manifest: LargeManifest =
+                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+                for chunk in manifest.chunks {
+                    keys.push(chunk.object_key);
+                }
+            }
+            Payload::Symlink { .. } => {}
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn write_restore_job(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
+    let dir = paths.home.join("queue/restores");
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join(format!("{}.json", job.id)),
+        serde_json::to_vec_pretty(job)?,
+    )?;
+    Ok(())
+}
+
+fn read_restore_job(paths: &Paths, job_id: &str) -> Result<RestoreQueueItem> {
+    let path = paths
+        .home
+        .join("queue/restores")
+        .join(format!("{job_id}.json"));
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {
+    let mut job = read_restore_job(paths, job_id)?;
+    job.status = "done".into();
+    write_restore_job(paths, &job)
+}
+
 fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
     let conn = open_db(paths)?;
     for record in &plan.files {
@@ -1895,6 +2299,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         create table if not exists packs(pack_id text primary key, pack_key text not null, index_key text not null, object_count integer not null, size integer not null);
         create table if not exists large_objects(oid text primary key, size integer not null, chunk_count integer not null, manifest_key text not null);
         create table if not exists chunks(oid text primary key, size integer not null, object_key text not null);
+        create table if not exists large_pins(oid text primary key, pinned_at text not null, reason text);
         ",
     )?;
     let _ = conn.execute("alter table blobs add column pack_id text", []);
@@ -1979,6 +2384,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
         large_objects: query_large_objects(conn)?,
         chunks: query_chunks(conn)?,
         packs: query_packs(conn)?,
+        large_pins: query_large_pins(conn)?,
     })
 }
 
@@ -2047,6 +2453,12 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
             params![chunk.oid, chunk.size, chunk.object_key],
         )?;
     }
+    for pin in &export.large_pins {
+        conn.execute(
+            "insert or replace into large_pins(oid, pinned_at, reason) values (?1, ?2, ?3)",
+            params![pin.oid, pin.pinned_at, pin.reason],
+        )?;
+    }
     Ok(())
 }
 
@@ -2107,6 +2519,19 @@ fn query_chunks(conn: &Connection) -> Result<Vec<ChunkExport>> {
             oid: row.get(0)?,
             size: row.get(1)?,
             object_key: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn query_large_pins(conn: &Connection) -> Result<Vec<LargePinExport>> {
+    let mut stmt = conn.prepare("select oid, pinned_at, reason from large_pins order by oid")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(LargePinExport {
+            oid: row.get(0)?,
+            pinned_at: row.get(1)?,
+            reason: row.get(2)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -2267,6 +2692,25 @@ fn record_op_with_id(
         params![id, kind, before, after, Utc::now().to_rfc3339(), message],
     )?;
     Ok(())
+}
+
+fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
+    conn.query_row(
+        "select id, kind, before_snapshot, after_snapshot, created_at, message from operations where id=?1",
+        params![op_id],
+        |row| {
+            Ok(OperationExport {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                before_snapshot: row.get(2)?,
+                after_snapshot: row.get(3)?,
+                created_at: row.get(4)?,
+                message: row.get(5)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("unknown operation: {op_id}"))
 }
 
 fn read_config(paths: &Paths) -> Result<Config> {
@@ -2664,6 +3108,19 @@ fn parse_time(input: &str) -> Result<String> {
         return Ok(Utc::now().to_rfc3339());
     }
     bail!("time must be RFC3339 for now, got: {input}");
+}
+
+fn parse_duration_ago(input: &str) -> Result<DateTime<Utc>> {
+    let (number, unit) = input.split_at(input.len().saturating_sub(1));
+    let value: i64 = number.parse()?;
+    let seconds = match unit {
+        "d" => value * 24 * 60 * 60,
+        "h" => value * 60 * 60,
+        "m" => value * 60,
+        "s" => value,
+        _ => bail!("duration must use s, m, h, or d suffix: {input}"),
+    };
+    Ok(Utc::now() - chrono::Duration::seconds(seconds))
 }
 
 enum RemoteStore {

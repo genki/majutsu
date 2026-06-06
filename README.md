@@ -10,13 +10,15 @@ large object handling.
 
 ## Current MVP
 
-- Host-level state under `$MAJUTSU_HOME` or `$HOME/.majutsu`
+- Host-level state under CLI `--home`, `$MAJUTSU_HOME`, XDG config, or
+  `$HOME/.majutsu`
 - Multiple roots managed from one timeline
 - SQLite metadata database
 - Manual snapshots
 - Content-addressed local object store
 - Large file pointer manifests with fixed-size chunks
 - Operation log
+- Operation show and current-ref restore
 - Remote sync of metadata and objects
 - S3-compatible remote backend
 - Bootstrap clone from remote metadata
@@ -35,10 +37,13 @@ large object handling.
 - OS-native filesystem watch backend with debounce
 - Polling watch fallback and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
+- Restore prepare/resume queue
+- Lifecycle policy generation for GCS and S3
+- Large object pin/unpin metadata
 - Basic object-store fsck
 
-Lifecycle policy generation, archive restore, and advanced pack compaction are
-intentionally left for later iterations.
+Provider-side archive restore requests, range reads, multipart upload, and
+advanced pack compaction are intentionally left for later iterations.
 
 ## Install
 
@@ -47,6 +52,24 @@ cargo install --path .
 ```
 
 This installs `mj`.
+
+## State Home
+
+State home resolution order:
+
+```text
+1. mj --home /path/to/state
+2. MAJUTSU_HOME=/path/to/state
+3. $XDG_CONFIG_HOME/majutsu/config.toml with [state].home
+4. $HOME/.majutsu
+```
+
+Example XDG config:
+
+```toml
+[state]
+home = "/var/lib/majutsu"
+```
 
 ## Quick Start
 
@@ -82,7 +105,12 @@ Use:
 mj large stat
 mj large list
 mj large verify
+mj large pin --root photos --since 30d
+mj large unpin --older-than 180d
 ```
+
+Pins are stored in metadata and preserved through sync/clone. They are intended
+as lifecycle policy inputs for large objects that should remain hot.
 
 ## Remote Sync
 
@@ -197,6 +225,9 @@ Show recent operations:
 ```sh
 mj log
 mj log --root home-notes
+mj op log
+mj op show <op-id>
+mj op restore <op-id>
 ```
 
 Diff the current snapshot against its parent:
@@ -268,6 +299,29 @@ mj prune --dry-run --keep-daily 90 --keep-monthly 36
 
 `mj gc` removes unreferenced local loose objects under `$MAJUTSU_HOME/objects`.
 It does not delete referenced history or remote objects.
+
+Generate provider lifecycle policy templates:
+
+```sh
+mj lifecycle policy --provider gcs
+mj lifecycle policy --provider s3
+```
+
+The generated rules keep metadata hot while transitioning packs and large
+chunks by prefix.
+
+## Restore Jobs
+
+Prepare records the object set needed for a restore:
+
+```sh
+mj restore prepare --snapshot snap-id --to /tmp/restore
+mj restore resume restore-job-id
+```
+
+Prepared jobs are stored under `$MAJUTSU_HOME/queue/restores`. Resume applies
+the prepared snapshot and target once no required objects are pending archive
+hydration.
 
 ## Packs
 

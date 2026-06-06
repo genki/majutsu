@@ -19,6 +19,19 @@ fn run(mut command: Command) {
     }
 }
 
+fn output(mut command: Command) -> String {
+    let output = command.output().expect("run command");
+    if !output.status.success() {
+        panic!(
+            "command failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 #[test]
 fn file_remote_clone_restores_normal_and_large_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -399,6 +412,212 @@ fn pack_gc_and_remote_clone_restore_packed_blobs() {
         fs::read(source.join("beta.txt")).unwrap(),
         fs::read(restore.join("sample/beta.txt")).unwrap()
     );
+}
+
+#[test]
+fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    let snapshot_op = op_log
+        .lines()
+        .find(|line| line.contains("manual-snapshot"))
+        .and_then(|line| line.split('\t').next())
+        .unwrap()
+        .to_string();
+    let op_show = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("show")
+            .arg(&snapshot_op);
+        c
+    });
+    assert!(op_show.contains("kind manual-snapshot"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("restore")
+            .arg(&snapshot_op);
+        c
+    });
+
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(prepare.contains("required_objects "));
+    assert!(prepare.contains("archived_objects 0"));
+    let job_id = prepare
+        .lines()
+        .find_map(|line| line.strip_prefix("restore_job "))
+        .unwrap()
+        .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("alpha.txt")).unwrap(),
+        fs::read(restore.join("sample/alpha.txt")).unwrap()
+    );
+
+    let policy = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("policy")
+            .arg("--provider")
+            .arg("gcs");
+        c
+    });
+    assert!(policy.contains("objects/packs/normal/"));
+    assert!(policy.contains("objects/large/chunks/fixed/"));
+}
+
+#[test]
+fn xdg_config_can_select_state_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_home = tmp.path().join("xdg");
+    let state = tmp.path().join("configured-state");
+    fs::create_dir_all(config_home.join("majutsu")).unwrap();
+    fs::write(
+        config_home.join("majutsu/config.toml"),
+        format!("[state]\nhome = \"{}\"\n", state.display()),
+    )
+    .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("init").env("XDG_CONFIG_HOME", &config_home);
+        c
+    });
+
+    assert!(state.join("config.toml").exists());
+    assert!(state.join("db/majutsu.sqlite").exists());
+}
+
+#[test]
+fn large_pin_unpin_is_persisted_in_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.zip"), vec![7u8; 16 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("pinned 1"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let cloned_stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("large").arg("stat");
+        c
+    });
+    assert!(cloned_stat.contains("pinned 1"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("large").arg("unpin");
+        c
+    });
+    let unpinned = output({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("large").arg("stat");
+        c
+    });
+    assert!(unpinned.contains("pinned 0"));
 }
 
 #[test]
