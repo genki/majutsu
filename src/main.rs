@@ -71,10 +71,7 @@ enum Command {
         command: OpCommand,
     },
     Diff(DiffArgs),
-    Restore {
-        #[command(subcommand)]
-        command: RestoreCommand,
-    },
+    Restore(RestoreTopArgs),
     Mount(MountArgs),
     Unmount(UnmountArgs),
     Hydrate(HydrateArgs),
@@ -196,6 +193,14 @@ enum RestoreCommand {
     Apply(RestoreArgs),
     Prepare(RestoreArgs),
     Resume { job_id: String },
+}
+
+#[derive(Args)]
+struct RestoreTopArgs {
+    #[command(subcommand)]
+    command: Option<RestoreCommand>,
+    #[command(flatten)]
+    args: RestoreArgs,
 }
 
 #[derive(Args, Clone)]
@@ -764,7 +769,7 @@ fn main() -> Result<()> {
         Command::Log(args) => log_ops(&paths, args),
         Command::Op { command } => op_cmd(&paths, command),
         Command::Diff(args) => diff_cmd(&paths, args),
-        Command::Restore { command } => restore_cmd(&paths, command),
+        Command::Restore(args) => restore_cmd(&paths, args),
         Command::Mount(args) => mount_cmd(&paths, args),
         Command::Unmount(args) => unmount_cmd(&paths, args),
         Command::Hydrate(args) => hydrate_cmd(&paths, args),
@@ -1365,9 +1370,12 @@ fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
     Ok(())
 }
 
-fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
+fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
+    let command = top_args
+        .command
+        .unwrap_or_else(|| RestoreCommand::Apply(top_args.args));
     match command {
         RestoreCommand::Plan(args) => {
             let plan = build_restore_plan(paths, &conn, &args)?;

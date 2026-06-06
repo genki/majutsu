@@ -82,12 +82,15 @@ mj sync
 mj sync status
 mj remote fsck
 mj log
+mj restore --at "2026-06-06T10:30:00Z" --root home-notes --to /tmp/majutsu-restore
 mj restore plan --to /tmp/majutsu-restore
 mj restore apply --to /tmp/majutsu-restore
 ```
 
-The restore command writes files below `<target>/<root-id>/...` so the original
-root is not overwritten accidentally when `--to` is provided. If `--to` is
+`mj restore` without a subcommand is an alias for `mj restore apply`, matching
+the direct restore form used in the spec. The restore command writes files
+below `<target>/<root-id>/...` so the original root is not overwritten
+accidentally when `--to` is provided. If `--to` is
 omitted, restore writes back to the configured original root path for the
 selected root. `restore plan` reports existing destination conflicts, and
 `restore apply` refuses to overwrite conflicting files unless `--force` is

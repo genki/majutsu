@@ -812,6 +812,53 @@ fn restore_without_to_can_write_back_to_original_root() {
 }
 
 #[test]
+fn restore_without_subcommand_applies_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+}
+
+#[test]
 fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
