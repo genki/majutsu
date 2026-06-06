@@ -42,8 +42,8 @@ large object handling.
 - Large object pin/unpin metadata
 - Basic object-store fsck
 
-Provider-side archive restore requests, range reads, multipart upload, and
-advanced pack compaction are intentionally left for later iterations.
+Provider-side archive restore requests, multipart upload, and advanced pack
+compaction are intentionally left for later iterations.
 
 ## Install
 
@@ -135,6 +135,7 @@ For S3-compatible storage:
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_ENDPOINT_URL=https://storage.googleapis.com
+export AWS_SIGNATURE_VERSION=s3v4
 
 mj init --remote s3://bucket/prefix
 mj root add sample /path/to/sample
@@ -152,8 +153,10 @@ mj --home /tmp/recovered-majutsu fsck
 mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 ```
 
-The current S3 backend uses path-style requests and AWS Signature V2, which is
-compatible with Google Cloud Storage HMAC keys in the validation environment.
+The S3 backend uses path-style requests. AWS Signature V4 is the default; set
+`AWS_SIGNATURE_VERSION=s3v2` only for legacy S3-compatible services that still
+require the older signature style. `mj remote check` also verifies a small
+range GET against remote metadata.
 
 ## Encryption
 

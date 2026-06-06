@@ -11,15 +11,16 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use rand::RngCore;
 use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, HOST, RANGE};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
@@ -1459,6 +1460,8 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             println!("objects {}", keys.len());
             if remote.exists("metadata/export.json")? {
                 println!("metadata ok");
+                let first = remote.get_range("metadata/export.json", 0, 1)?;
+                println!("range_get {}", first.len());
             } else {
                 bail!("metadata/export.json is missing on remote");
             }
@@ -3136,6 +3139,8 @@ struct S3Remote {
     bucket: String,
     prefix: String,
     endpoint: String,
+    region: String,
+    signature_version: String,
     access_key: String,
     secret_key: String,
     client: Client,
@@ -3159,6 +3164,8 @@ fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
             prefix,
             endpoint: env::var("AWS_ENDPOINT_URL")
                 .unwrap_or_else(|_| "https://storage.googleapis.com".into()),
+            region: env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            signature_version: env::var("AWS_SIGNATURE_VERSION").unwrap_or_else(|_| "s3v4".into()),
             access_key: env::var("AWS_ACCESS_KEY_ID")
                 .context("AWS_ACCESS_KEY_ID is required for s3 remote")?,
             secret_key: env::var("AWS_SECRET_ACCESS_KEY")
@@ -3205,6 +3212,20 @@ impl RemoteStore {
         }
     }
 
+    fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        match self {
+            RemoteStore::File(remote) => {
+                let mut file = File::open(remote.root.join(key))?;
+                file.seek(SeekFrom::Start(start))?;
+                let mut limited = Vec::with_capacity(len as usize);
+                let mut take = file.take(len);
+                take.read_to_end(&mut limited)?;
+                Ok(limited)
+            }
+            RemoteStore::S3(remote) => remote.get_range(key, start, len),
+        }
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         match self {
             RemoteStore::File(remote) => Ok(remote.root.join(key).exists()),
@@ -3223,18 +3244,31 @@ impl RemoteStore {
 impl S3Remote {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
         let remote_key = self.remote_key(key);
-        let date = http_date();
-        let path = format!("/{}/{}", self.bucket, remote_key);
-        let auth = self.auth("PUT", "", "application/octet-stream", &date, &path)?;
         let url = self.object_url(&remote_key);
-        let response = self
-            .client
-            .put(url)
-            .header(DATE, date)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .header(AUTHORIZATION, auth)
-            .body(bytes.to_vec())
-            .send()?;
+        let response = if self.uses_sigv2() {
+            let date = http_date();
+            let path = format!("/{}/{}", self.bucket, remote_key);
+            let auth = self.auth_v2("PUT", "", "application/octet-stream", &date, &path)?;
+            self.client
+                .put(url)
+                .header(DATE, date)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(AUTHORIZATION, auth)
+                .body(bytes.to_vec())
+                .send()?
+        } else {
+            let payload_hash = sha256_hex(bytes);
+            let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &[])?;
+            self.client
+                .put(url)
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(AUTHORIZATION, auth.authorization)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(bytes.to_vec())
+                .send()?
+        };
         if !response.status().is_success() {
             bail!("s3 put failed for {key}: HTTP {}", response.status());
         }
@@ -3242,16 +3276,51 @@ impl S3Remote {
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.get_with_range(key, None)
+    }
+
+    fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let end = start
+            .checked_add(len)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or_else(|| anyhow!("invalid range {start}+{len}"))?;
+        self.get_with_range(key, Some(format!("bytes={start}-{end}")))
+    }
+
+    fn get_with_range(&self, key: &str, range: Option<String>) -> Result<Vec<u8>> {
         let remote_key = self.remote_key(key);
-        let date = http_date();
-        let path = format!("/{}/{}", self.bucket, remote_key);
-        let auth = self.auth("GET", "", "", &date, &path)?;
-        let response = self
-            .client
-            .get(self.object_url(&remote_key))
-            .header(DATE, date)
-            .header(AUTHORIZATION, auth)
-            .send()?;
+        let response = if self.uses_sigv2() {
+            let date = http_date();
+            let path = format!("/{}/{}", self.bucket, remote_key);
+            let auth = self.auth_v2("GET", "", "", &date, &path)?;
+            let mut request = self
+                .client
+                .get(self.object_url(&remote_key))
+                .header(DATE, date)
+                .header(AUTHORIZATION, auth);
+            if let Some(range) = &range {
+                request = request.header(RANGE, range);
+            }
+            request.send()?
+        } else {
+            let payload_hash = sha256_hex(b"");
+            let mut extra = Vec::new();
+            if let Some(range) = &range {
+                extra.push(("range".to_string(), range.clone()));
+            }
+            let auth = self.auth_v4("GET", &remote_key, "", &payload_hash, &extra)?;
+            let mut request = self
+                .client
+                .get(self.object_url(&remote_key))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(AUTHORIZATION, auth.authorization);
+            if let Some(range) = &range {
+                request = request.header(RANGE, range);
+            }
+            request.send()?
+        };
         if !response.status().is_success() {
             bail!("s3 get failed for {key}: HTTP {}", response.status());
         }
@@ -3260,15 +3329,26 @@ impl S3Remote {
 
     fn exists(&self, key: &str) -> Result<bool> {
         let remote_key = self.remote_key(key);
-        let date = http_date();
-        let path = format!("/{}/{}", self.bucket, remote_key);
-        let auth = self.auth("HEAD", "", "", &date, &path)?;
-        let response = self
-            .client
-            .head(self.object_url(&remote_key))
-            .header(DATE, date)
-            .header(AUTHORIZATION, auth)
-            .send()?;
+        let response = if self.uses_sigv2() {
+            let date = http_date();
+            let path = format!("/{}/{}", self.bucket, remote_key);
+            let auth = self.auth_v2("HEAD", "", "", &date, &path)?;
+            self.client
+                .head(self.object_url(&remote_key))
+                .header(DATE, date)
+                .header(AUTHORIZATION, auth)
+                .send()?
+        } else {
+            let payload_hash = sha256_hex(b"");
+            let auth = self.auth_v4("HEAD", &remote_key, "", &payload_hash, &[])?;
+            self.client
+                .head(self.object_url(&remote_key))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(AUTHORIZATION, auth.authorization)
+                .send()?
+        };
         if response.status().is_success() {
             Ok(true)
         } else if response.status().as_u16() == 404 {
@@ -3280,21 +3360,33 @@ impl S3Remote {
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let remote_prefix = self.remote_key(prefix);
-        let date = http_date();
-        let resource = format!("/{}/", self.bucket);
-        let auth = self.auth("GET", "", "", &date, &resource)?;
+        let query = format!("prefix={}", uri_encode(&remote_prefix, true));
         let url = format!(
-            "{}/{}/?prefix={}",
+            "{}/{}/?{}",
             self.endpoint.trim_end_matches('/'),
             self.bucket,
-            remote_prefix
+            query
         );
-        let response = self
-            .client
-            .get(url)
-            .header(DATE, date)
-            .header(AUTHORIZATION, auth)
-            .send()?;
+        let response = if self.uses_sigv2() {
+            let date = http_date();
+            let resource = format!("/{}/", self.bucket);
+            let auth = self.auth_v2("GET", "", "", &date, &resource)?;
+            self.client
+                .get(url)
+                .header(DATE, date)
+                .header(AUTHORIZATION, auth)
+                .send()?
+        } else {
+            let payload_hash = sha256_hex(b"");
+            let auth = self.auth_v4("GET", "", &query, &payload_hash, &[])?;
+            self.client
+                .get(url)
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(AUTHORIZATION, auth.authorization)
+                .send()?
+        };
         if !response.status().is_success() {
             bail!("s3 list failed: HTTP {}", response.status());
         }
@@ -3321,7 +3413,7 @@ impl S3Remote {
         Ok(keys)
     }
 
-    fn auth(
+    fn auth_v2(
         &self,
         method: &str,
         md5: &str,
@@ -3335,6 +3427,79 @@ impl S3Remote {
         let signature =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
         Ok(format!("AWS {}:{}", self.access_key, signature))
+    }
+
+    fn auth_v4(
+        &self,
+        method: &str,
+        remote_key: &str,
+        canonical_query: &str,
+        payload_hash: &str,
+        extra_headers: &[(String, String)],
+    ) -> Result<SigV4Auth> {
+        let now = Utc::now();
+        let datestamp = now.format("%Y%m%d").to_string();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let canonical_uri = if remote_key.is_empty() {
+            format!("/{}/", self.bucket)
+        } else {
+            format!("/{}/{}", self.bucket, uri_encode(remote_key, false))
+        };
+        let mut headers = vec![
+            ("host".to_string(), self.host_header()?),
+            ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
+            ("x-amz-date".to_string(), amz_date.clone()),
+        ];
+        headers.extend(extra_headers.iter().cloned());
+        headers.sort_by(|a, b| a.0.cmp(&b.0));
+        let canonical_headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}:{}\n", value.trim()))
+            .collect::<String>();
+        let signed_headers = headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_request = format!(
+            "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+        );
+        let scope = format!("{}/{}/s3/aws4_request", datestamp, self.region);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signing_key = self.sigv4_signing_key(&datestamp)?;
+        let signature = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes())?;
+        Ok(SigV4Auth {
+            amz_date,
+            authorization: format!(
+                "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+                self.access_key, scope, signed_headers, signature
+            ),
+        })
+    }
+
+    fn sigv4_signing_key(&self, datestamp: &str) -> Result<Vec<u8>> {
+        let k_date = hmac_sha256(
+            format!("AWS4{}", self.secret_key).as_bytes(),
+            datestamp.as_bytes(),
+        )?;
+        let k_region = hmac_sha256(&k_date, self.region.as_bytes())?;
+        let k_service = hmac_sha256(&k_region, b"s3")?;
+        hmac_sha256(&k_service, b"aws4_request")
+    }
+
+    fn uses_sigv2(&self) -> bool {
+        self.signature_version.contains('2')
+    }
+
+    fn host_header(&self) -> Result<String> {
+        let url = Url::parse(&self.endpoint)?;
+        Ok(url
+            .host_str()
+            .ok_or_else(|| anyhow!("endpoint has no host: {}", self.endpoint))?
+            .to_string())
     }
 
     fn object_url(&self, remote_key: &str) -> String {
@@ -3368,6 +3533,11 @@ impl S3Remote {
     }
 }
 
+struct SigV4Auth {
+    amz_date: String,
+    authorization: String,
+}
+
 fn list_file_remote(root: &Path, prefix: &str) -> Result<Vec<String>> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -3387,4 +3557,33 @@ fn list_file_remote(root: &Path, prefix: &str) -> Result<Vec<String>> {
 
 fn http_date() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn hmac_sha256(key: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)?;
+    mac.update(bytes);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn hmac_sha256_hex(key: &[u8], bytes: &[u8]) -> Result<String> {
+    Ok(hex::encode(hmac_sha256(key, bytes)?))
+}
+
+fn uri_encode(input: &str, encode_slash: bool) -> String {
+    let mut out = String::new();
+    for byte in input.as_bytes() {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (*byte == b'/' && !encode_slash);
+        if keep {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
