@@ -164,6 +164,8 @@ remote:
 metadata/export.json
 hosts/index.json
 hosts/<host-id>/metadata/export.json
+hosts/<host-id>/snapshots/<snapshot-id>.json
+hosts/<host-id>/ops/<op-id>.json
 config.toml
 host.toml
 hosts/current
@@ -199,7 +201,7 @@ mj remote fsck
 
 `mj remote fsck` verifies the legacy bootstrap metadata, canonical
 `hosts/index.json`, each host metadata export, canonical `hosts/<host>/refs/*`
-values, and every referenced object key.
+values, per-host snapshot/operation exports, and every referenced object key.
 
 To rebuild an empty state directory from remote:
 

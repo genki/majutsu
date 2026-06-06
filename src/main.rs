@@ -2173,6 +2173,20 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         &host_metadata_key,
         serde_json::to_vec_pretty(&export)?,
     )?;
+    for snapshot in &export.snapshots {
+        enqueue_inline_upload(
+            paths,
+            &host_snapshot_key(&config.host.id, &snapshot.id),
+            serde_json::to_vec_pretty(snapshot)?,
+        )?;
+    }
+    for operation in &export.operations {
+        enqueue_inline_upload(
+            paths,
+            &host_operation_key(&config.host.id, &operation.id),
+            serde_json::to_vec_pretty(operation)?,
+        )?;
+    }
     enqueue_inline_upload(
         paths,
         "config.toml",
@@ -2265,6 +2279,14 @@ fn remote_ref(remote: &RemoteStore, key: &str) -> Result<Option<String>> {
         ));
     }
     Ok(None)
+}
+
+fn host_snapshot_key(host_id: &str, snapshot_id: &str) -> String {
+    format!("hosts/{host_id}/snapshots/{snapshot_id}.json")
+}
+
+fn host_operation_key(host_id: &str, op_id: &str) -> String {
+    format!("hosts/{host_id}/ops/{op_id}.json")
 }
 
 fn update_remote_host_index(
@@ -3515,7 +3537,7 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
     let has_host_index = remote.exists("hosts/index.json")?;
 
     if has_legacy_export {
-        let export = remote_fsck_export(remote, "metadata/export.json", &mut missing)?;
+        let export = remote_fsck_export(remote, "metadata/export.json", None, &mut missing)?;
         if let Some(current) = export.refs.get("current") {
             let legacy_current = remote_ref(remote, "hosts/current")?;
             if legacy_current.as_deref() != Some(current.as_str()) {
@@ -3534,7 +3556,8 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
                 eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
                 continue;
             }
-            let export = remote_fsck_export(remote, &host.metadata_key, &mut missing)?;
+            let export =
+                remote_fsck_export(remote, &host.metadata_key, Some(&host.id), &mut missing)?;
             if export.config.host.id != host.id {
                 missing += 1;
                 eprintln!(
@@ -3622,6 +3645,7 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
 fn remote_fsck_export(
     remote: &RemoteStore,
     metadata_key: &str,
+    host_id: Option<&str>,
     missing: &mut usize,
 ) -> Result<MetadataExport> {
     let export: MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
@@ -3640,6 +3664,42 @@ fn remote_fsck_export(
         if !found {
             *missing += 1;
             eprintln!("remote current ref points to missing snapshot {current}");
+        }
+    }
+    if let Some(host_id) = host_id {
+        for snapshot in &export.snapshots {
+            let key = host_snapshot_key(host_id, &snapshot.id);
+            if !remote.exists(&key)? {
+                *missing += 1;
+                eprintln!("missing host snapshot export {key}");
+                continue;
+            }
+            let remote_snapshot: SnapshotExport = serde_json::from_slice(&remote.get(&key)?)
+                .with_context(|| format!("parse remote snapshot export {key}"))?;
+            if remote_snapshot.id != snapshot.id
+                || remote_snapshot.manifest_key != snapshot.manifest_key
+                || remote_snapshot.op_id != snapshot.op_id
+            {
+                *missing += 1;
+                eprintln!("host snapshot export does not match metadata {key}");
+            }
+        }
+        for operation in &export.operations {
+            let key = host_operation_key(host_id, &operation.id);
+            if !remote.exists(&key)? {
+                *missing += 1;
+                eprintln!("missing host operation export {key}");
+                continue;
+            }
+            let remote_operation: OperationExport = serde_json::from_slice(&remote.get(&key)?)
+                .with_context(|| format!("parse remote operation export {key}"))?;
+            if remote_operation.id != operation.id
+                || remote_operation.kind != operation.kind
+                || remote_operation.after_snapshot != operation.after_snapshot
+            {
+                *missing += 1;
+                eprintln!("host operation export does not match metadata {key}");
+            }
         }
     }
     Ok(export)

@@ -163,6 +163,22 @@ fn file_remote_clone_restores_normal_and_large_files() {
         })
         .collect::<Vec<_>>();
     assert_eq!(host_ref_dirs.len(), 1);
+    assert!(
+        host_ref_dirs[0]
+            .join("snapshots")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(
+        host_ref_dirs[0]
+            .join("ops")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
     run({
         let mut c = mj();
         c.arg("--home")
