@@ -364,6 +364,7 @@ Pack normal blob objects to reduce the number of loose object files:
 
 ```sh
 mj pack
+mj pack --compact
 mj gc
 ```
 
@@ -372,6 +373,10 @@ mj gc
 under `$MAJUTSU_HOME/objects/indexes/pack/*.json`. After packing, the original
 loose blob objects are no longer referenced by metadata, so `mj gc` can remove
 them locally.
+
+`mj pack --compact` rewrites currently referenced packed blobs into one fresh
+pack/index pair and drops older pack metadata, allowing `mj gc` to remove stale
+pack files.
 
 Restore, fsck, sync, remote fsck, and clone understand pack indexes. Large
 chunk objects remain separate content-addressed objects.

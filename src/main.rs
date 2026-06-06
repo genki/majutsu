@@ -92,7 +92,7 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
-    Pack,
+    Pack(PackArgs),
     Prune(PruneArgs),
     Gc,
     Fsck,
@@ -275,6 +275,12 @@ struct PruneArgs {
     keep_daily: u32,
     #[arg(long, default_value_t = 36)]
     keep_monthly: u32,
+}
+
+#[derive(Args)]
+struct PackArgs {
+    #[arg(long, default_value_t = false)]
+    compact: bool,
 }
 
 #[derive(Debug)]
@@ -604,7 +610,7 @@ fn main() -> Result<()> {
         Command::Watch(args) => watch_cmd(&paths, args),
         Command::Daemon { command } => daemon_cmd(&paths, command),
         Command::Key { command } => key_cmd(&paths, command),
-        Command::Pack => pack_cmd(&paths),
+        Command::Pack(args) => pack_cmd(&paths, args),
         Command::Prune(args) => prune_cmd(&paths, args),
         Command::Gc => gc_cmd(&paths),
         Command::Fsck => fsck(&paths),
@@ -1698,7 +1704,14 @@ fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {
     Ok(())
 }
 
-fn pack_cmd(paths: &Paths) -> Result<()> {
+fn pack_cmd(paths: &Paths, args: PackArgs) -> Result<()> {
+    if args.compact {
+        return pack_compact_cmd(paths);
+    }
+    pack_loose_blobs(paths)
+}
+
+fn pack_loose_blobs(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
     let blobs = query_blobs(&conn)?
@@ -1760,6 +1773,70 @@ fn pack_cmd(paths: &Paths) -> Result<()> {
         Some(&format!("packed {} blobs", blobs.len())),
     )?;
     println!("packed {} objects into {}", blobs.len(), index.pack_key);
+    Ok(())
+}
+
+fn pack_compact_cmd(paths: &Paths) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let blobs = query_blobs(&conn)?;
+    let packed = blobs.iter().filter(|blob| blob.pack_id.is_some()).count();
+    if packed == 0 {
+        println!("compacted 0 objects");
+        return Ok(());
+    }
+    let pack_id = new_id("pack");
+    let pack_key = format!("objects/packs/normal/{}.mpack", pack_id);
+    let index_key = format!("objects/indexes/pack/{}.json", pack_id);
+    let mut pack_bytes = Vec::new();
+    let mut entries = Vec::new();
+    for blob in &blobs {
+        let payload = read_blob_payload(paths, &conn, &blob.oid, &blob.object_key)?;
+        let stored = encode_object(paths, &payload)?;
+        let offset = pack_bytes.len() as u64;
+        pack_bytes.extend_from_slice(&(stored.len() as u64).to_le_bytes());
+        pack_bytes.extend_from_slice(&stored);
+        entries.push(PackEntry {
+            oid: blob.oid.clone(),
+            offset,
+            len: 8 + stored.len() as u64,
+        });
+    }
+    let pack_path = paths.home.join(&pack_key);
+    if let Some(parent) = pack_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&pack_path, &pack_bytes)?;
+    let index = PackIndex {
+        version: 1,
+        pack_id: pack_id.clone(),
+        pack_key: pack_key.clone(),
+        entries,
+    };
+    let index_path = paths.home.join(&index_key);
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
+    conn.execute("delete from packs", [])?;
+    conn.execute(
+        "insert into packs(pack_id, pack_key, index_key, object_count, size) values (?1, ?2, ?3, ?4, ?5)",
+        params![pack_id, pack_key, index_key, blobs.len(), pack_bytes.len() as u64],
+    )?;
+    for entry in &index.entries {
+        conn.execute(
+            "update blobs set pack_id=?2, pack_offset=?3, pack_len=?4 where oid=?1",
+            params![entry.oid, index.pack_id, entry.offset, entry.len],
+        )?;
+    }
+    record_op(
+        &conn,
+        "pack-compact",
+        current_snapshot(&conn)?.as_deref(),
+        current_snapshot(&conn)?.as_deref(),
+        Some(&format!("compacted {} blobs", blobs.len())),
+    )?;
+    println!("compacted {} objects into {}", blobs.len(), index.pack_key);
     Ok(())
 }
 
