@@ -2862,6 +2862,59 @@ fn watch_once_creates_snapshot_without_daemonizing() {
     assert!(events.contains("settle_ms=50"));
 }
 
+#[test]
+fn watch_uses_configured_timing_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("debounce = 1500", "debounce = \"25ms\"")
+        .replace("settle = 500", "settle = \"15ms\"")
+        .replace("periodic_rescan = 3600", "periodic_rescan = \"0s\"");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("watch")
+        .arg("--once")
+        .arg("--backend")
+        .arg("notify")
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("debounce_ms=25"));
+    assert!(events.contains("settle_ms=15"));
+    assert!(events.contains("periodic_rescan_secs=0"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_inotify_backend_records_native_events() {

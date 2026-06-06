@@ -380,29 +380,40 @@ struct CloneArgs {
 struct WatchArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     foreground: bool,
-    #[arg(long, default_value_t = 60)]
-    interval_secs: u64,
-    #[arg(long, default_value_t = 1500)]
-    debounce_ms: u64,
-    #[arg(long, default_value_t = 500)]
-    settle_ms: u64,
-    #[arg(long, default_value_t = 3600)]
-    periodic_rescan_secs: u64,
+    #[arg(long)]
+    interval_secs: Option<u64>,
+    #[arg(long)]
+    debounce_ms: Option<u64>,
+    #[arg(long)]
+    settle_ms: Option<u64>,
+    #[arg(long)]
+    periodic_rescan_secs: Option<u64>,
     #[arg(long)]
     backend: Option<String>,
     #[arg(long, default_value_t = false)]
     once: bool,
 }
 
+#[derive(Clone)]
+struct ResolvedWatchArgs {
+    foreground: bool,
+    interval_secs: u64,
+    debounce_ms: u64,
+    settle_ms: u64,
+    periodic_rescan_secs: u64,
+    backend: Option<String>,
+    once: bool,
+}
+
 #[derive(Subcommand)]
 enum DaemonCommand {
     Start {
-        #[arg(long, default_value_t = 60)]
-        interval_secs: u64,
-        #[arg(long, default_value_t = 500)]
-        settle_ms: u64,
-        #[arg(long, default_value_t = 3600)]
-        periodic_rescan_secs: u64,
+        #[arg(long)]
+        interval_secs: Option<u64>,
+        #[arg(long)]
+        settle_ms: Option<u64>,
+        #[arg(long)]
+        periodic_rescan_secs: Option<u64>,
     },
     Stop,
     Status,
@@ -463,6 +474,8 @@ struct Config {
     large: LargeConfig,
     #[serde(default)]
     pack: PackConfig,
+    #[serde(default)]
+    watch: WatchConfig,
     #[serde(default)]
     security: SecurityConfig,
     #[serde(default)]
@@ -789,6 +802,32 @@ struct PackConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct WatchConfig {
+    #[serde(default = "default_watch_mode")]
+    mode: String,
+    #[serde(
+        default = "default_watch_debounce_ms",
+        deserialize_with = "deserialize_millis"
+    )]
+    debounce: u64,
+    #[serde(
+        default = "default_watch_settle_ms",
+        deserialize_with = "deserialize_millis"
+    )]
+    settle: u64,
+    #[serde(
+        default = "default_watch_periodic_rescan_secs",
+        deserialize_with = "deserialize_seconds"
+    )]
+    periodic_rescan: u64,
+    #[serde(
+        default = "default_watch_interval_secs",
+        deserialize_with = "deserialize_seconds"
+    )]
+    interval: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct LargeCompressionConfig {
     enabled: bool,
     algorithm: String,
@@ -1070,6 +1109,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                 compression: LargeCompressionConfig::default(),
             },
             pack: PackConfig::default(),
+            watch: WatchConfig::default(),
             security: SecurityConfig {
                 encryption: if args.encrypt {
                     "chacha20poly1305".into()
@@ -3072,6 +3112,8 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
 
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
+    let config = read_config(paths)?;
+    let args = resolve_watch_args(args, &config.watch);
     let backend =
         normalize_watch_backend(args.backend.as_deref().unwrap_or(default_daemon_backend()))?;
     if !args.foreground {
@@ -3090,7 +3132,7 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     match backend {
         "notify" => watch_notify(paths, args, "notify"),
         "inotify" => watch_notify(paths, args, "inotify"),
-        "poll" => watch_poll(paths, args),
+        "poll" => watch_poll(paths, &args),
         other => bail!("unsupported watch backend: {other}"),
     }
 }
@@ -3110,6 +3152,18 @@ fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
     }
 }
 
+fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> ResolvedWatchArgs {
+    ResolvedWatchArgs {
+        foreground: args.foreground,
+        interval_secs: args.interval_secs.unwrap_or(config.interval),
+        debounce_ms: args.debounce_ms.unwrap_or(config.debounce),
+        settle_ms: args.settle_ms.unwrap_or(config.settle),
+        periodic_rescan_secs: args.periodic_rescan_secs.unwrap_or(config.periodic_rescan),
+        backend: args.backend,
+        once: args.once,
+    }
+}
+
 fn default_daemon_backend() -> &'static str {
     if cfg!(target_os = "linux") {
         "inotify"
@@ -3118,7 +3172,7 @@ fn default_daemon_backend() -> &'static str {
     }
 }
 
-fn watch_poll(paths: &Paths, args: WatchArgs) -> Result<()> {
+fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
     record_event(
         paths,
         "watch-start",
@@ -3140,7 +3194,7 @@ fn watch_poll(paths: &Paths, args: WatchArgs) -> Result<()> {
     Ok(())
 }
 
-fn watch_notify(paths: &Paths, args: WatchArgs, backend_label: &str) -> Result<()> {
+fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> Result<()> {
     let conn = open_db(paths)?;
     let active_roots = roots(&conn)?
         .into_iter()
@@ -3326,6 +3380,7 @@ fn start_watch_daemon(
 
 fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     ensure_ready(paths)?;
+    let config = read_config(paths)?;
     match command {
         DaemonCommand::Start {
             interval_secs,
@@ -3335,10 +3390,10 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             let pid = start_watch_daemon(
                 paths,
                 default_daemon_backend(),
-                interval_secs,
-                1500,
-                settle_ms,
-                periodic_rescan_secs,
+                interval_secs.unwrap_or(config.watch.interval),
+                config.watch.debounce,
+                settle_ms.unwrap_or(config.watch.settle),
+                periodic_rescan_secs.unwrap_or(config.watch.periodic_rescan),
             )?;
             println!("started daemon pid {pid}");
         }
@@ -5425,6 +5480,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
                 compression: config.large.compression.clone(),
             },
             pack: config.pack.clone(),
+            watch: config.watch.clone(),
             security: config.security.clone(),
             tiering: config.tiering.clone(),
         },
@@ -5865,7 +5921,9 @@ fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
 }
 
 fn read_config(paths: &Paths) -> Result<Config> {
-    Ok(toml::from_str(&fs::read_to_string(&paths.config)?)?)
+    let config: Config = toml::from_str(&fs::read_to_string(&paths.config)?)?;
+    validate_watch_mode(&config.watch.mode)?;
+    Ok(config)
 }
 
 fn write_config(paths: &Paths, config: &Config) -> Result<()> {
@@ -5885,6 +5943,13 @@ fn validate_snapshot_mode(mode: &str) -> Result<()> {
     match mode {
         "default" | "strict" | "transactional" => Ok(()),
         _ => bail!("snapshot mode must be default, strict, or transactional"),
+    }
+}
+
+fn validate_watch_mode(mode: &str) -> Result<()> {
+    match mode {
+        "default" | "strict" | "transactional" => Ok(()),
+        _ => bail!("watch mode must be default, strict, or transactional"),
     }
 }
 
@@ -5992,6 +6057,80 @@ fn parse_byte_size(input: &str) -> Result<u64> {
         bail!("size is too large: {input}");
     }
     Ok(bytes.round() as u64)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DurationValue {
+    Integer(u64),
+    String(String),
+}
+
+fn deserialize_millis<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = DurationValue::deserialize(deserializer)?;
+    duration_value_millis(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = DurationValue::deserialize(deserializer)?;
+    duration_value_seconds(value).map_err(serde::de::Error::custom)
+}
+
+fn duration_value_millis(value: DurationValue) -> Result<u64> {
+    match value {
+        DurationValue::Integer(value) => Ok(value),
+        DurationValue::String(value) => parse_duration_millis(&value),
+    }
+}
+
+fn duration_value_seconds(value: DurationValue) -> Result<u64> {
+    match value {
+        DurationValue::Integer(value) => Ok(value),
+        DurationValue::String(value) => Ok(parse_duration_millis(&value)? / 1000),
+    }
+}
+
+fn parse_duration_millis(input: &str) -> Result<u64> {
+    let normalized = input.trim().replace('_', "");
+    if normalized.is_empty() {
+        bail!("duration must not be empty");
+    }
+    if let Ok(value) = normalized.parse::<u64>() {
+        return Ok(value);
+    }
+    let split_at = normalized
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .ok_or_else(|| anyhow!("duration is missing a unit: {input}"))?;
+    let number = normalized[..split_at].trim();
+    let unit = normalized[split_at..]
+        .trim()
+        .replace(' ', "")
+        .to_ascii_lowercase();
+    let value: f64 = number
+        .parse()
+        .with_context(|| format!("invalid duration number: {input}"))?;
+    if !value.is_finite() || value < 0.0 {
+        bail!("invalid duration number: {input}");
+    }
+    let multiplier = match unit.as_str() {
+        "ms" | "millisecond" | "milliseconds" => 1.0,
+        "s" | "sec" | "secs" | "second" | "seconds" => 1000.0,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000.0,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000.0,
+        "d" | "day" | "days" => 86_400_000.0,
+        _ => bail!("unsupported duration unit in {input}"),
+    };
+    let millis = value * multiplier;
+    if millis > u64::MAX as f64 {
+        bail!("duration is too large: {input}");
+    }
+    Ok(millis.round() as u64)
 }
 
 fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
@@ -6233,6 +6372,38 @@ impl Default for PackConfig {
         Self {
             small_pack_target: default_small_pack_target(),
             normal_pack_target: default_normal_pack_target(),
+        }
+    }
+}
+
+fn default_watch_mode() -> String {
+    "default".into()
+}
+
+fn default_watch_debounce_ms() -> u64 {
+    1500
+}
+
+fn default_watch_settle_ms() -> u64 {
+    500
+}
+
+fn default_watch_periodic_rescan_secs() -> u64 {
+    3600
+}
+
+fn default_watch_interval_secs() -> u64 {
+    60
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_watch_mode(),
+            debounce: default_watch_debounce_ms(),
+            settle: default_watch_settle_ms(),
+            periodic_rescan: default_watch_periodic_rescan_secs(),
+            interval: default_watch_interval_secs(),
         }
     }
 }

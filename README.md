@@ -495,6 +495,18 @@ The daemon is a process wrapper around foreground watch. It uses the native
 watch backend by default (`inotify` on Linux), records filesystem events in the
 event journal, and exposes a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock`
 for status IPC.
+When timing flags are omitted, watch and daemon start use `[watch]` from
+`config.toml`:
+
+```toml
+[watch]
+mode = "default"
+debounce = "1500ms"
+settle = "500ms"
+periodic_rescan = "1h"
+interval = "60s"
+```
+
 Notify mode debounces event bursts, then waits for the configured settle window
 before snapshotting. New events during the settle window restart the debounce
 and settle cycle.
