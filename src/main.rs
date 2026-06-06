@@ -462,6 +462,8 @@ struct Paths {
     logs: PathBuf,
     runtime: PathBuf,
     daemon_pid: PathBuf,
+    daemon_lock: PathBuf,
+    snapshot_lock: PathBuf,
     upload_queue: PathBuf,
     event_queue: PathBuf,
     master_key: PathBuf,
@@ -1035,6 +1037,8 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         logs: home.join("logs"),
         runtime: home.join("runtime"),
         daemon_pid: home.join("runtime/daemon.pid"),
+        daemon_lock: home.join("locks/daemon.lock"),
+        snapshot_lock: home.join("locks/snapshot.lock"),
         upload_queue: home.join("queue/uploads"),
         event_queue: home.join("queue/events"),
         master_key: home.join("keys/master.key"),
@@ -1302,6 +1306,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
 
 fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     ensure_ready(paths)?;
+    let _lock = acquire_process_lock(&paths.snapshot_lock, "snapshot")?;
     record_event(
         paths,
         "snapshot-start",
@@ -2060,6 +2065,8 @@ impl MajutsuFuseFs {
                 logs: paths.logs.clone(),
                 runtime: paths.runtime.clone(),
                 daemon_pid: paths.daemon_pid.clone(),
+                daemon_lock: paths.daemon_lock.clone(),
+                snapshot_lock: paths.snapshot_lock.clone(),
                 upload_queue: paths.upload_queue.clone(),
                 event_queue: paths.event_queue.clone(),
                 master_key: paths.master_key.clone(),
@@ -3134,6 +3141,7 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
         println!("started daemon pid {pid}");
         return Ok(());
     }
+    let _lock = acquire_process_lock(&paths.daemon_lock, "daemon")?;
     start_daemon_ipc(paths)?;
     match backend {
         "notify" => watch_notify(paths, args, "notify"),
@@ -6606,10 +6614,59 @@ fn read_pid(path: &Path) -> Result<Option<u32>> {
     Ok(Some(text.trim().parse()?))
 }
 
+struct ProcessLock {
+    path: PathBuf,
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_process_lock(path: &Path, name: &str) -> Result<ProcessLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let pid = std::process::id();
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            writeln!(file, "{pid}")?;
+            Ok(ProcessLock {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read_to_string(path).unwrap_or_default();
+            if let Ok(existing_pid) = existing.trim().parse::<u32>() {
+                if pid_alive(existing_pid) {
+                    bail!("{name} already running with pid {existing_pid}");
+                }
+            }
+            fs::remove_file(path)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            writeln!(file, "{pid}")?;
+            Ok(ProcessLock {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(err) => Err(err).with_context(|| format!("acquire {name} lock")),
+    }
+}
+
 fn pid_alive(pid: u32) -> bool {
     ProcessCommand::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)

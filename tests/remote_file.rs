@@ -814,6 +814,37 @@ fn init_creates_spec_state_layout() {
 }
 
 #[test]
+fn snapshot_lock_blocks_concurrent_snapshot_and_recovers_stale_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+
+    fs::write(
+        state.join("locks/snapshot.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::write(state.join("locks/snapshot.lock"), "999999").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(!state.join("locks/snapshot.lock").exists());
+}
+
+#[test]
 fn diff_reports_added_modified_and_deleted_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
