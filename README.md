@@ -331,7 +331,10 @@ mj root resume home-notes
 
 If an active root path disappears, `mj snapshot` records a `root-missing`
 operation and marks the root `missing`; it does not snapshot the root as empty.
-Use `mj root resume <id>` after the path is available again.
+If a root cannot be scanned because access is denied, it records
+`root-permission-denied` and marks the root `permission-denied` instead of
+turning unreadable files into deletions. Use `mj root resume <id>` after the
+path is available again.
 
 ## Prune And GC
 

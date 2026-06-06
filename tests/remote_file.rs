@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -1301,6 +1303,59 @@ fn missing_root_is_not_snapshotted_as_deletion() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("sample\tmissing"));
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_denied_root_is_skipped_without_mass_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let blocked = source.join("blocked");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(blocked.join("secret.txt"), b"secret\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let original_mode = fs::metadata(&blocked).unwrap().permissions().mode();
+    let mut perms = fs::metadata(&blocked).unwrap().permissions();
+    perms.set_mode(0);
+    fs::set_permissions(&blocked, perms).unwrap();
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let mut restore_perms = fs::metadata(&blocked).unwrap().permissions();
+    restore_perms.set_mode(original_mode);
+    fs::set_permissions(&blocked, restore_perms).unwrap();
+    assert!(snapshot.contains("files 0, large 0"));
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(roots.contains("sample\tpermission-denied"));
+    let ops = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(ops.contains("root-permission-denied"));
 }
 
 #[test]

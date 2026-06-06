@@ -945,7 +945,31 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         run_pre_snapshot_hook(paths, &root)?;
         let records_result = scan_root(paths, &config, &root);
         let post_result = run_post_snapshot_hook(paths, &root);
-        let records = records_result?;
+        let records = match records_result {
+            Ok(records) => records,
+            Err(err) if is_permission_denied_error(&err) => {
+                update_root_status(&conn, &root.id, "permission-denied")?;
+                record_op(
+                    &conn,
+                    "root-permission-denied",
+                    parent.as_deref(),
+                    parent.as_deref(),
+                    Some(&root.id),
+                )?;
+                eprintln!(
+                    "root permission-denied, skipped: {} {}",
+                    root.id,
+                    root.path.display()
+                );
+                record_event(
+                    paths,
+                    "root-permission-denied",
+                    &format!("{} {}", root.id, root.path.display()),
+                )?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         post_result?;
         large_files += records
             .iter()
@@ -3323,6 +3347,25 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
         });
     }
     Ok(records)
+}
+
+fn is_permission_denied_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+        if cause
+            .downcast_ref::<walkdir::Error>()
+            .and_then(|walkdir| walkdir.io_error())
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn build_tree_manifest(root_id: &str, records: Vec<FileRecord>) -> Result<TreeManifest> {
