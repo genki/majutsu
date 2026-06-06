@@ -582,6 +582,7 @@ fn restore_without_to_can_write_back_to_original_root() {
     .unwrap()
     .to_string();
     fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    fs::write(source.join("beta.txt"), b"extra\n").unwrap();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
@@ -601,6 +602,7 @@ fn restore_without_to_can_write_back_to_original_root() {
     });
     assert!(plan.contains("target original-roots"));
     assert!(plan.contains("conflicts 1"));
+    assert!(plan.contains("delete 1 files"));
     fails({
         let mut c = mj();
         c.arg("--home")
@@ -614,6 +616,7 @@ fn restore_without_to_can_write_back_to_original_root() {
         c
     });
     assert_eq!(fs::read(source.join("alpha.txt")).unwrap(), b"two\n");
+    assert_eq!(fs::read(source.join("beta.txt")).unwrap(), b"extra\n");
     run({
         let mut c = mj();
         c.arg("--home")
@@ -628,6 +631,7 @@ fn restore_without_to_can_write_back_to_original_root() {
         c
     });
     assert_eq!(fs::read(source.join("alpha.txt")).unwrap(), b"one\n");
+    assert!(!source.join("beta.txt").exists());
 }
 
 #[test]

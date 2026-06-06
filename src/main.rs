@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -3317,6 +3317,13 @@ struct RestorePlan {
     to: Option<PathBuf>,
     root_paths: BTreeMap<String, PathBuf>,
     files: Vec<FileRecord>,
+    deletes: Vec<RestoreDelete>,
+}
+
+#[derive(Debug)]
+struct RestoreDelete {
+    root_id: String,
+    path: String,
 }
 
 fn build_restore_plan(
@@ -3330,12 +3337,14 @@ fn build_restore_plan(
         .map(|root| (root.id, root.path))
         .collect::<BTreeMap<_, _>>();
     let mut files = Vec::new();
+    let mut plan_roots = Vec::new();
     for (root_id, records) in &snapshot.roots {
         if let Some(filter_root) = &args.root {
             if filter_root != root_id {
                 continue;
             }
         }
+        plan_roots.push(root_id.clone());
         for record in records {
             if let Some(path_filter) = &args.path {
                 if !Path::new(&record.path).starts_with(path_filter) {
@@ -3371,11 +3380,13 @@ fn build_restore_plan(
             });
         }
     }
+    let deletes = build_restore_deletes(args, &root_paths, &plan_roots, &files)?;
     Ok(RestorePlan {
         snapshot,
         to: args.to.clone(),
         root_paths,
         files,
+        deletes,
     })
 }
 
@@ -3392,6 +3403,90 @@ fn restore_destination(plan: &RestorePlan, record: &FileRecord) -> Result<PathBu
     Ok(root.join(&record.path))
 }
 
+fn build_restore_deletes(
+    args: &RestoreArgs,
+    root_paths: &BTreeMap<String, PathBuf>,
+    root_ids: &[String],
+    files: &[FileRecord],
+) -> Result<Vec<RestoreDelete>> {
+    let mut snapshot_paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for record in files {
+        snapshot_paths
+            .entry(record.root_id.clone())
+            .or_default()
+            .insert(record.path.clone());
+    }
+    let mut deletes = Vec::new();
+    for root_id in root_ids {
+        if let Some(filter_root) = &args.root {
+            if filter_root != root_id {
+                continue;
+            }
+        }
+        let base = restore_root_base(args, root_paths, root_id)?;
+        let scan_base = args
+            .path
+            .as_ref()
+            .map(|path| base.join(path))
+            .unwrap_or_else(|| base.clone());
+        if !scan_base.try_exists()? {
+            continue;
+        }
+        for entry in WalkDir::new(&scan_base).follow_links(false) {
+            let entry = entry?;
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(&base)?.to_path_buf();
+            let rel_s = path_to_slash(&rel);
+            if !snapshot_paths
+                .get(root_id)
+                .map(|paths| paths.contains(&rel_s))
+                .unwrap_or(false)
+            {
+                deletes.push(RestoreDelete {
+                    root_id: root_id.clone(),
+                    path: rel_s,
+                });
+            }
+        }
+    }
+    deletes.sort_by(|a, b| {
+        a.root_id
+            .cmp(&b.root_id)
+            .then_with(|| b.path.len().cmp(&a.path.len()))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(deletes)
+}
+
+fn restore_root_base(
+    args: &RestoreArgs,
+    root_paths: &BTreeMap<String, PathBuf>,
+    root_id: &str,
+) -> Result<PathBuf> {
+    if let Some(to) = &args.to {
+        return Ok(to.join(root_id));
+    }
+    root_paths
+        .get(root_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("snapshot root is not configured locally: {root_id}"))
+}
+
+fn restore_delete_destination(plan: &RestorePlan, delete: &RestoreDelete) -> Result<PathBuf> {
+    if let Some(to) = &plan.to {
+        return Ok(to.join(&delete.root_id).join(&delete.path));
+    }
+    let root = plan.root_paths.get(&delete.root_id).ok_or_else(|| {
+        anyhow!(
+            "snapshot root is not configured locally: {}",
+            delete.root_id
+        )
+    })?;
+    Ok(root.join(&delete.path))
+}
+
 fn restore_target_label(plan: &RestorePlan) -> String {
     plan.to
         .as_ref()
@@ -3406,6 +3501,7 @@ fn print_restore_plan(plan: &RestorePlan) {
         .filter(|r| matches!(r.payload, Payload::Large { .. }))
         .count();
     let bytes: u64 = plan.files.iter().map(|r| r.size).sum();
+    let keep = plan.files.len().saturating_sub(plan.deletes.len());
     println!("snapshot {}", plan.snapshot.snapshot_id);
     if let Some(to) = &plan.to {
         println!("target {}", to.display());
@@ -3418,6 +3514,8 @@ fn print_restore_plan(plan: &RestorePlan) {
         bytes,
         large
     );
+    println!("delete {} files", plan.deletes.len());
+    println!("keep {} snapshot files", keep);
 }
 
 fn build_restore_job(
@@ -3560,6 +3658,17 @@ fn apply_restore_plan(
             print_restore_conflicts(&conflicts);
             bail!("restore has conflicts; rerun with --force to overwrite");
         }
+        if !plan.deletes.is_empty() {
+            print_restore_deletes(plan);
+            bail!("restore would delete extra files; rerun with --force to delete them");
+        }
+    }
+    for delete in &plan.deletes {
+        let dest = restore_delete_destination(plan, delete)?;
+        if fs::symlink_metadata(&dest).is_ok() {
+            fs::remove_file(&dest)?;
+            remove_empty_restore_parents(plan, delete, &dest)?;
+        }
     }
     for record in &plan.files {
         let dest = restore_destination(plan, record)?;
@@ -3590,6 +3699,34 @@ fn apply_restore_plan(
                 fs::write(&dest, target)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn remove_empty_restore_parents(
+    plan: &RestorePlan,
+    delete: &RestoreDelete,
+    path: &Path,
+) -> Result<()> {
+    let Some(mut current) = path.parent().map(Path::to_path_buf) else {
+        return Ok(());
+    };
+    let stop = if let Some(to) = &plan.to {
+        to.join(&delete.root_id)
+    } else {
+        plan.root_paths
+            .get(&delete.root_id)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/"))
+    };
+    while current.starts_with(&stop) && current != stop {
+        if fs::remove_dir(&current).is_err() {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
     }
     Ok(())
 }
@@ -3665,6 +3802,16 @@ fn print_restore_conflicts(conflicts: &[String]) {
     }
     if conflicts.len() > 20 {
         println!("conflict\t... {} more", conflicts.len() - 20);
+    }
+}
+
+fn print_restore_deletes(plan: &RestorePlan) {
+    println!("deletes {}", plan.deletes.len());
+    for delete in plan.deletes.iter().take(20) {
+        println!("delete\t{}\t{}", delete.root_id, delete.path);
+    }
+    if plan.deletes.len() > 20 {
+        println!("delete\t... {} more", plan.deletes.len() - 20);
     }
 }
 

@@ -91,7 +91,9 @@ root is not overwritten accidentally when `--to` is provided. If `--to` is
 omitted, restore writes back to the configured original root path for the
 selected root. `restore plan` reports existing destination conflicts, and
 `restore apply` refuses to overwrite conflicting files unless `--force` is
-provided.
+provided. Files that exist in the restore target but not in the selected
+snapshot are reported as deletes; apply requires `--force` before deleting
+those extra files.
 
 ## Large Files
 
