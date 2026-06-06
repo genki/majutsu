@@ -313,6 +313,8 @@ struct WatchArgs {
     debounce_ms: u64,
     #[arg(long, default_value_t = 500)]
     settle_ms: u64,
+    #[arg(long, default_value_t = 3600)]
+    periodic_rescan_secs: u64,
     #[arg(long, default_value = "notify")]
     backend: String,
     #[arg(long, default_value_t = false)]
@@ -326,6 +328,8 @@ enum DaemonCommand {
         interval_secs: u64,
         #[arg(long, default_value_t = 500)]
         settle_ms: u64,
+        #[arg(long, default_value_t = 3600)]
+        periodic_rescan_secs: u64,
     },
     Stop,
     Status,
@@ -2514,6 +2518,7 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
             args.interval_secs,
             args.debounce_ms,
             args.settle_ms,
+            args.periodic_rescan_secs,
         )?;
         println!("started daemon pid {pid}");
         return Ok(());
@@ -2561,8 +2566,8 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
         paths,
         "watch-start",
         &format!(
-            "backend=notify debounce_ms={} settle_ms={}",
-            args.debounce_ms, args.settle_ms
+            "backend=notify debounce_ms={} settle_ms={} periodic_rescan_secs={}",
+            args.debounce_ms, args.settle_ms, args.periodic_rescan_secs
         ),
     )?;
     let (tx, rx) = mpsc::channel();
@@ -2581,7 +2586,26 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
         )?;
     }
     loop {
-        let event = rx.recv()??;
+        let event = match recv_watch_event(&rx, args.periodic_rescan_secs)? {
+            Some(event) => event,
+            None => {
+                record_event(
+                    paths,
+                    "periodic-rescan",
+                    &format!("interval_secs={}", args.periodic_rescan_secs),
+                )?;
+                snapshot(
+                    paths,
+                    SnapshotArgs {
+                        message: Some("watch periodic rescan".into()),
+                    },
+                )?;
+                if args.once {
+                    break;
+                }
+                continue;
+            }
+        };
         let detail = format_notify_event(&event);
         record_event(paths, "fs-event", &detail)?;
         let debounce = std::time::Duration::from_millis(args.debounce_ms.max(1));
@@ -2644,12 +2668,27 @@ fn drain_watch_debounce(
     }
 }
 
+fn recv_watch_event(
+    rx: &mpsc::Receiver<notify::Result<notify::Event>>,
+    periodic_rescan_secs: u64,
+) -> Result<Option<notify::Event>> {
+    if periodic_rescan_secs == 0 {
+        return rx.recv()?.map(Some).map_err(Into::into);
+    }
+    match rx.recv_timeout(Duration::from_secs(periodic_rescan_secs)) {
+        Ok(event) => event.map(Some).map_err(Into::into),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
+    }
+}
+
 fn start_watch_daemon(
     paths: &Paths,
     backend: &str,
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
+    periodic_rescan_secs: u64,
 ) -> Result<u32> {
     if let Some(pid) = read_pid(&paths.daemon_pid)? {
         if pid_alive(pid) {
@@ -2676,6 +2715,8 @@ fn start_watch_daemon(
         .arg(debounce_ms.to_string())
         .arg("--settle-ms")
         .arg(settle_ms.to_string())
+        .arg("--periodic-rescan-secs")
+        .arg(periodic_rescan_secs.to_string())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()?;
@@ -2690,8 +2731,16 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         DaemonCommand::Start {
             interval_secs,
             settle_ms,
+            periodic_rescan_secs,
         } => {
-            let pid = start_watch_daemon(paths, "notify", interval_secs, 1500, settle_ms)?;
+            let pid = start_watch_daemon(
+                paths,
+                "notify",
+                interval_secs,
+                1500,
+                settle_ms,
+                periodic_rescan_secs,
+            )?;
             println!("started daemon pid {pid}");
         }
         DaemonCommand::Stop => {

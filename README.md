@@ -327,7 +327,7 @@ separate tree manifest object under `objects/trees/`.
 Foreground OS-native filesystem watching:
 
 ```sh
-mj watch --foreground --backend notify --debounce-ms 1500 --settle-ms 500
+mj watch --foreground --backend notify --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
 ```
 
 Polling fallback:
@@ -362,6 +362,10 @@ a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock` for status IPC.
 Notify mode debounces event bursts, then waits for the configured settle window
 before snapshotting. New events during the settle window restart the debounce
 and settle cycle.
+The notify backend remains the primary change detector, using the platform's
+native watcher such as inotify on Linux. Periodic rescan is only a low-frequency
+safety net for missed events or long idle periods; set `--periodic-rescan-secs
+0` to disable it.
 
 ## Root State
 

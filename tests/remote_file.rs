@@ -1749,6 +1749,55 @@ fn watch_once_creates_snapshot_without_daemonizing() {
     assert!(events.contains("settle_ms=50"));
 }
 
+#[test]
+fn notify_watch_can_create_periodic_rescan_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("watch")
+            .arg("--once")
+            .arg("--backend")
+            .arg("notify")
+            .arg("--periodic-rescan-secs")
+            .arg("1");
+        c
+    });
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    assert!(status.contains("current snap-"));
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("periodic-rescan"));
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_status_uses_ipc_socket() {
