@@ -483,8 +483,33 @@ mj lifecycle policy --provider gcs
 mj lifecycle policy --provider s3
 ```
 
-The generated rules keep metadata hot while transitioning packs and large
-chunks by prefix.
+The generated rules are derived from `[tiering]` in `config.toml`. Rules without
+`after`, or rules whose storage is `standard`, are treated as keep-hot policy
+inputs and are not emitted as provider transitions. Transition rules map
+portable storage names such as `infrequent`, `archive`, and `deep-archive` to
+provider-specific storage classes.
+
+```toml
+[tiering]
+enabled = true
+
+[[tiering.rules]]
+name = "keep-host-metadata-hot"
+prefix = "hosts/"
+storage = "standard"
+
+[[tiering.rules]]
+name = "packs-to-ia"
+prefix = "objects/packs/normal/"
+after = "30d"
+transition_to = "infrequent"
+
+[[tiering.rules]]
+name = "large-chunks-to-archive"
+prefix = "objects/large/chunks/fixed/"
+after = "180d"
+storage = "archive"
+```
 
 ## Restore Jobs
 

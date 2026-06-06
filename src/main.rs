@@ -457,6 +457,8 @@ struct Config {
     large: LargeConfig,
     #[serde(default)]
     security: SecurityConfig,
+    #[serde(default)]
+    tiering: TieringConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -474,6 +476,24 @@ struct RemoteConfig {
 struct SecurityConfig {
     #[serde(default)]
     encryption: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TieringConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_tiering_rules")]
+    rules: Vec<TieringRule>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TieringRule {
+    name: String,
+    prefix: String,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default, alias = "transition_to", alias = "keep")]
+    storage: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -956,6 +976,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                     "none".into()
                 },
             },
+            tiering: TieringConfig::default(),
         }
     };
     write_config(paths, &config)?;
@@ -1394,56 +1415,150 @@ fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
 
 fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
     ensure_ready(paths)?;
+    let config = read_config(paths)?;
     match command {
         LifecycleCommand::Policy { provider } => match provider.as_str() {
             "gcs" => {
-                let policy = serde_json::json!({
-                    "rule": [
-                        {
-                            "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
-                            "condition": {
-                                "age": 30,
-                                "matchesPrefix": ["objects/packs/normal/"]
-                            }
-                        },
-                        {
-                            "action": { "type": "SetStorageClass", "storageClass": "ARCHIVE" },
-                            "condition": {
-                                "age": 180,
-                                "matchesPrefix": ["objects/large/chunks/fixed/"]
-                            }
-                        }
-                    ]
-                });
+                let policy = gcs_lifecycle_policy(&config.tiering)?;
                 println!("{}", serde_json::to_string_pretty(&policy)?);
             }
             "s3" | "aws" => {
-                let policy = serde_json::json!({
-                    "Rules": [
-                        {
-                            "ID": "majutsu-packs-to-ia",
-                            "Status": "Enabled",
-                            "Filter": { "Prefix": "objects/packs/normal/" },
-                            "Transitions": [
-                                { "Days": 30, "StorageClass": "STANDARD_IA" }
-                            ]
-                        },
-                        {
-                            "ID": "majutsu-large-to-archive",
-                            "Status": "Enabled",
-                            "Filter": { "Prefix": "objects/large/chunks/fixed/" },
-                            "Transitions": [
-                                { "Days": 180, "StorageClass": "DEEP_ARCHIVE" }
-                            ]
-                        }
-                    ]
-                });
+                let policy = s3_lifecycle_policy(&config.tiering)?;
                 println!("{}", serde_json::to_string_pretty(&policy)?);
             }
             other => bail!("unsupported lifecycle provider: {other}"),
         },
     }
     Ok(())
+}
+
+fn gcs_lifecycle_policy(tiering: &TieringConfig) -> Result<serde_json::Value> {
+    let mut rules = Vec::new();
+    if tiering.enabled {
+        for rule in transition_tiering_rules(tiering)? {
+            rules.push(serde_json::json!({
+                "action": {
+                    "type": "SetStorageClass",
+                    "storageClass": gcs_storage_class(&rule.storage)
+                },
+                "condition": {
+                    "age": rule.after_days,
+                    "matchesPrefix": [rule.prefix]
+                }
+            }));
+        }
+    }
+    Ok(serde_json::json!({ "rule": rules }))
+}
+
+fn s3_lifecycle_policy(tiering: &TieringConfig) -> Result<serde_json::Value> {
+    let mut rules = Vec::new();
+    if tiering.enabled {
+        for rule in transition_tiering_rules(tiering)? {
+            rules.push(serde_json::json!({
+                "ID": sanitize_lifecycle_rule_id(&rule.name),
+                "Status": "Enabled",
+                "Filter": { "Prefix": rule.prefix },
+                "Transitions": [
+                    {
+                        "Days": rule.after_days,
+                        "StorageClass": s3_storage_class(&rule.storage)
+                    }
+                ]
+            }));
+        }
+    }
+    Ok(serde_json::json!({ "Rules": rules }))
+}
+
+struct TransitionTieringRule {
+    name: String,
+    prefix: String,
+    after_days: u32,
+    storage: String,
+}
+
+fn transition_tiering_rules(tiering: &TieringConfig) -> Result<Vec<TransitionTieringRule>> {
+    let mut out = Vec::new();
+    for rule in &tiering.rules {
+        let Some(after) = &rule.after else {
+            continue;
+        };
+        let Some(storage) = &rule.storage else {
+            continue;
+        };
+        if is_hot_storage(storage) {
+            continue;
+        }
+        out.push(TransitionTieringRule {
+            name: rule.name.clone(),
+            prefix: rule.prefix.clone(),
+            after_days: parse_days(after)?,
+            storage: storage.clone(),
+        });
+    }
+    Ok(out)
+}
+
+fn parse_days(input: &str) -> Result<u32> {
+    let trimmed = input.trim();
+    if let Some(days) = trimmed.strip_suffix('d') {
+        return days
+            .parse::<u32>()
+            .with_context(|| format!("invalid tiering duration: {input}"));
+    }
+    trimmed
+        .parse::<u32>()
+        .with_context(|| format!("invalid tiering duration: {input}"))
+}
+
+fn is_hot_storage(storage: &str) -> bool {
+    matches!(
+        normalize_storage_name(storage).as_str(),
+        "standard" | "hot" | "keep" | "none"
+    )
+}
+
+fn gcs_storage_class(storage: &str) -> &'static str {
+    match normalize_storage_name(storage).as_str() {
+        "infrequent" | "ia" | "nearline" => "NEARLINE",
+        "coldline" => "COLDLINE",
+        "archive" | "archive-instant" | "deep-archive" => "ARCHIVE",
+        _ => "STANDARD",
+    }
+}
+
+fn s3_storage_class(storage: &str) -> &'static str {
+    match normalize_storage_name(storage).as_str() {
+        "infrequent" | "ia" | "standard-ia" => "STANDARD_IA",
+        "onezone-ia" => "ONEZONE_IA",
+        "archive-instant" | "glacier-ir" => "GLACIER_IR",
+        "archive" | "glacier" => "GLACIER",
+        "deep-archive" => "DEEP_ARCHIVE",
+        _ => "STANDARD",
+    }
+}
+
+fn normalize_storage_name(storage: &str) -> String {
+    storage.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn sanitize_lifecycle_rule_id(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "majutsu-tiering-rule".into()
+    } else {
+        sanitized
+    }
 }
 
 fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
@@ -5130,6 +5245,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
                 compression: config.large.compression.clone(),
             },
             security: config.security.clone(),
+            tiering: config.tiering.clone(),
         },
         roots: roots(conn)?,
         snapshots,
@@ -5692,6 +5808,62 @@ fn default_chunk_compression() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_tiering_rules() -> Vec<TieringRule> {
+    vec![
+        TieringRule {
+            name: "keep-host-metadata-hot".into(),
+            prefix: "hosts/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        TieringRule {
+            name: "keep-bootstrap-metadata-hot".into(),
+            prefix: "metadata/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        TieringRule {
+            name: "keep-trees-hot".into(),
+            prefix: "objects/trees/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        TieringRule {
+            name: "keep-large-manifests-hot".into(),
+            prefix: "objects/large/manifests/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        TieringRule {
+            name: "keep-indexes-hot".into(),
+            prefix: "objects/indexes/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        TieringRule {
+            name: "packs-to-ia".into(),
+            prefix: "objects/packs/normal/".into(),
+            after: Some("30d".into()),
+            storage: Some("infrequent".into()),
+        },
+        TieringRule {
+            name: "large-chunks-to-archive".into(),
+            prefix: "objects/large/chunks/fixed/".into(),
+            after: Some("180d".into()),
+            storage: Some("archive".into()),
+        },
+    ]
+}
+
+impl Default for TieringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: default_tiering_rules(),
+        }
+    }
 }
 
 fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {

@@ -1417,6 +1417,81 @@ fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
 }
 
 #[test]
+fn lifecycle_policy_uses_tiering_config_rules() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let base = config.split("\n[tiering]").next().unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            r#"{base}
+[tiering]
+enabled = true
+
+[[tiering.rules]]
+name = "keep-hosts-hot"
+prefix = "hosts/"
+storage = "standard"
+
+[[tiering.rules]]
+name = "custom-packs-to-ia"
+prefix = "objects/packs/normal/"
+after = "14d"
+transition_to = "infrequent"
+
+[[tiering.rules]]
+name = "custom-large-to-deep-archive"
+prefix = "objects/large/chunks/fixed/"
+after = "365d"
+storage = "deep-archive"
+"#
+        ),
+    )
+    .unwrap();
+
+    let s3_policy = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("policy")
+            .arg("--provider")
+            .arg("s3");
+        c
+    });
+    assert!(s3_policy.contains("\"ID\": \"custom-packs-to-ia\""));
+    assert!(s3_policy.contains("\"Days\": 14"));
+    assert!(s3_policy.contains("\"StorageClass\": \"STANDARD_IA\""));
+    assert!(s3_policy.contains("\"Days\": 365"));
+    assert!(s3_policy.contains("\"StorageClass\": \"DEEP_ARCHIVE\""));
+    assert!(!s3_policy.contains("\"Prefix\": \"hosts/\""));
+
+    let gcs_policy = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("policy")
+            .arg("--provider")
+            .arg("gcs");
+        c
+    });
+    assert!(gcs_policy.contains("\"age\": 14"));
+    assert!(gcs_policy.contains("\"storageClass\": \"NEARLINE\""));
+    assert!(gcs_policy.contains("\"age\": 365"));
+    assert!(gcs_policy.contains("\"storageClass\": \"ARCHIVE\""));
+    assert!(!gcs_policy.contains("\"hosts/\""));
+}
+
+#[test]
 fn restore_prepare_requests_archive_for_missing_local_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
