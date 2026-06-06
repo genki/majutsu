@@ -488,7 +488,8 @@ the configured remote. Objects that exist remotely are tracked as
 missing both locally and remotely are tracked as `missing_objects` and block
 `restore resume` until the data is repaired. S3 remotes use `POST ?restore`
 with a 7-day Standard restore request; file remotes record the request as a
-no-op for local validation.
+no-op for local validation. On resume, majutsu tries to download pending remote
+objects into the local object store before applying the prepared restore.
 
 ## Mount Views
 

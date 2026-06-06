@@ -1344,6 +1344,35 @@ fn restore_prepare_requests_archive_for_missing_local_objects() {
     )
     .unwrap();
     assert!(job.contains("\"status\": \"archive-requested\""));
+    let job_id = prepare
+        .lines()
+        .find_map(|line| line.strip_prefix("restore_job "))
+        .unwrap()
+        .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+    let job = fs::read_to_string(
+        fs::read_dir(state.join("queue/restores"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(job.contains("\"status\": \"done\""));
+    assert!(job.contains("\"archived_objects\": []"));
 }
 
 #[test]

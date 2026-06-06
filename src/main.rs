@@ -1424,7 +1424,7 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
             );
         }
         RestoreCommand::Resume { job_id } => {
-            let job = read_restore_job(paths, &job_id)?;
+            let mut job = read_restore_job(paths, &job_id)?;
             if !job.missing_objects.is_empty() {
                 bail!(
                     "restore job {} has missing objects: {}",
@@ -1432,6 +1432,7 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
                     job.missing_objects.len()
                 );
             }
+            hydrate_restore_job_objects(paths, &mut job)?;
             if !job.archived_objects.is_empty() {
                 bail!(
                     "restore job {} still has archived objects pending: {}",
@@ -4211,6 +4212,55 @@ fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) ->
     if !requested.is_empty() {
         job.status = "archive-requested".into();
         job.archive_requested_objects = requested;
+    }
+    Ok(())
+}
+
+fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Result<()> {
+    if job.archived_objects.is_empty() {
+        return Ok(());
+    }
+    let config = read_config(paths)?;
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(());
+    };
+    let remote = open_remote(remote_config)?;
+    let mut still_pending = Vec::new();
+    let mut hydrated = Vec::new();
+    for key in &job.archived_objects {
+        let dest = paths.home.join(key);
+        if dest.exists() {
+            hydrated.push(key.clone());
+            continue;
+        }
+        if !remote.exists(key)? {
+            still_pending.push(key.clone());
+            continue;
+        }
+        match remote.get(key) {
+            Ok(bytes) => {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&dest, bytes).with_context(|| format!("hydrate restore object {key}"))?;
+                hydrated.push(key.clone());
+            }
+            Err(_) => still_pending.push(key.clone()),
+        }
+    }
+    job.archived_objects = still_pending;
+    job.archive_requested_objects
+        .retain(|key| job.archived_objects.contains(key));
+    if job.archived_objects.is_empty() {
+        job.status = "ready".into();
+    }
+    write_restore_job(paths, job)?;
+    if !hydrated.is_empty() {
+        record_event(
+            paths,
+            "restore-hydrate",
+            &format!("{} hydrated_objects={}", job.id, hydrated.len()),
+        )?;
     }
     Ok(())
 }
