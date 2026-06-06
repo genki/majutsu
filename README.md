@@ -20,7 +20,7 @@ large object handling.
 - Operation log
 - Operation show and current-ref restore
 - Remote sync of metadata and objects
-- S3-compatible remote backend
+- S3-compatible remote backend with Signature V4, range GET, and multipart upload
 - Bootstrap clone from remote metadata
 - Root tree manifests stored as separate content-addressed objects
 - Normal blob pack files and pack indexes
@@ -42,8 +42,8 @@ large object handling.
 - Large object pin/unpin metadata
 - Basic object-store fsck
 
-Provider-side archive restore requests, multipart upload, and advanced pack
-compaction are intentionally left for later iterations.
+Provider-side archive restore requests and advanced pack compaction are
+intentionally left for later iterations.
 
 ## Install
 
@@ -136,6 +136,7 @@ export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_ENDPOINT_URL=https://storage.googleapis.com
 export AWS_SIGNATURE_VERSION=s3v4
+export MAJUTSU_S3_MULTIPART_THRESHOLD=$((64 * 1024 * 1024))
 
 mj init --remote s3://bucket/prefix
 mj root add sample /path/to/sample
@@ -156,7 +157,9 @@ mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 The S3 backend uses path-style requests. AWS Signature V4 is the default; set
 `AWS_SIGNATURE_VERSION=s3v2` only for legacy S3-compatible services that still
 require the older signature style. `mj remote check` also verifies a small
-range GET against remote metadata.
+range GET against remote metadata. Signature V4 uploads at or above
+`MAJUTSU_S3_MULTIPART_THRESHOLD` use S3 multipart upload; the minimum effective
+threshold is 5 MiB because S3 requires non-final parts to be at least that size.
 
 ## Encryption
 

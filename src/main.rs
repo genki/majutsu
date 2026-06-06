@@ -11,7 +11,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use rand::RngCore;
 use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, HOST, RANGE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -31,6 +31,8 @@ use walkdir::WalkDir;
 const DEFAULT_LARGE_MIN_SIZE: u64 = 64 * 1024 * 1024;
 const DEFAULT_LARGE_BINARY_MIN_SIZE: u64 = 16 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -3243,6 +3245,9 @@ impl RemoteStore {
 
 impl S3Remote {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if !self.uses_sigv2() && bytes.len() >= self.multipart_threshold() {
+            return self.put_multipart(key, bytes);
+        }
         let remote_key = self.remote_key(key);
         let url = self.object_url(&remote_key);
         let response = if self.uses_sigv2() {
@@ -3273,6 +3278,144 @@ impl S3Remote {
             bail!("s3 put failed for {key}: HTTP {}", response.status());
         }
         Ok(())
+    }
+
+    fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let remote_key = self.remote_key(key);
+        let upload_id = self.initiate_multipart(&remote_key)?;
+        let result = (|| {
+            let mut parts = Vec::new();
+            for (idx, chunk) in bytes.chunks(MIN_MULTIPART_PART_SIZE).enumerate() {
+                let part_number = idx + 1;
+                let etag = self.upload_part(&remote_key, &upload_id, part_number, chunk)?;
+                parts.push(CompletedPart { part_number, etag });
+            }
+            self.complete_multipart(&remote_key, &upload_id, &parts)
+        })();
+        if result.is_err() {
+            let _ = self.abort_multipart(&remote_key, &upload_id);
+        }
+        result.with_context(|| format!("multipart upload failed for {key}"))
+    }
+
+    fn initiate_multipart(&self, remote_key: &str) -> Result<String> {
+        let query = "uploads=".to_string();
+        let payload_hash = sha256_hex(b"");
+        let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &[])?;
+        let response = self
+            .client
+            .post(self.object_url_query(remote_key, &query))
+            .header(HOST, self.host_header()?)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(AUTHORIZATION, auth.authorization)
+            .body(Vec::new())
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "s3 initiate multipart failed: HTTP {} {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            );
+        }
+        parse_xml_text(&response.text()?, "UploadId")?
+            .ok_or_else(|| anyhow!("missing multipart UploadId"))
+    }
+
+    fn upload_part(
+        &self,
+        remote_key: &str,
+        upload_id: &str,
+        part_number: usize,
+        bytes: &[u8],
+    ) -> Result<String> {
+        let query = canonical_query(&[
+            ("partNumber", part_number.to_string()),
+            ("uploadId", upload_id.to_string()),
+        ]);
+        let payload_hash = sha256_hex(bytes);
+        let auth = self.auth_v4("PUT", remote_key, &query, &payload_hash, &[])?;
+        let response = self
+            .client
+            .put(self.object_url_query(remote_key, &query))
+            .header(HOST, self.host_header()?)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(AUTHORIZATION, auth.authorization)
+            .body(bytes.to_vec())
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "s3 upload part {part_number} failed: HTTP {} {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            );
+        }
+        response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow!("s3 upload part {part_number} response had no ETag"))
+    }
+
+    fn complete_multipart(
+        &self,
+        remote_key: &str,
+        upload_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<()> {
+        let query = canonical_query(&[("uploadId", upload_id.to_string())]);
+        let mut body = String::from("<CompleteMultipartUpload>");
+        for part in parts {
+            body.push_str("<Part>");
+            body.push_str(&format!("<PartNumber>{}</PartNumber>", part.part_number));
+            body.push_str("<ETag>");
+            body.push_str(&xml_escape(&part.etag));
+            body.push_str("</ETag>");
+            body.push_str("</Part>");
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        let payload_hash = sha256_hex(body.as_bytes());
+        let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &[])?;
+        let response = self
+            .client
+            .post(self.object_url_query(remote_key, &query))
+            .header(HOST, self.host_header()?)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(AUTHORIZATION, auth.authorization)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(body)
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "s3 complete multipart failed: HTTP {} {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    fn abort_multipart(&self, remote_key: &str, upload_id: &str) -> Result<()> {
+        let query = canonical_query(&[("uploadId", upload_id.to_string())]);
+        let payload_hash = sha256_hex(b"");
+        let auth = self.auth_v4("DELETE", remote_key, &query, &payload_hash, &[])?;
+        let response = self
+            .client
+            .delete(self.object_url_query(remote_key, &query))
+            .header(HOST, self.host_header()?)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(AUTHORIZATION, auth.authorization)
+            .body(Vec::new())
+            .send()?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            bail!("s3 abort multipart failed: HTTP {}", response.status())
+        }
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
@@ -3511,6 +3654,18 @@ impl S3Remote {
         )
     }
 
+    fn object_url_query(&self, remote_key: &str, query: &str) -> String {
+        format!("{}?{}", self.object_url(remote_key), query)
+    }
+
+    fn multipart_threshold(&self) -> usize {
+        env::var("MAJUTSU_S3_MULTIPART_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MULTIPART_THRESHOLD)
+            .max(MIN_MULTIPART_PART_SIZE)
+    }
+
     fn remote_key(&self, key: &str) -> String {
         let clean = key.trim_start_matches('/');
         if self.prefix.is_empty() {
@@ -3536,6 +3691,11 @@ impl S3Remote {
 struct SigV4Auth {
     amz_date: String,
     authorization: String,
+}
+
+struct CompletedPart {
+    part_number: usize,
+    etag: String,
 }
 
 fn list_file_remote(root: &Path, prefix: &str) -> Result<Vec<String>> {
@@ -3573,6 +3733,19 @@ fn hmac_sha256_hex(key: &[u8], bytes: &[u8]) -> Result<String> {
     Ok(hex::encode(hmac_sha256(key, bytes)?))
 }
 
+fn canonical_query(params: &[(&str, String)]) -> String {
+    let mut pairs = params
+        .iter()
+        .map(|(key, value)| (uri_encode(key, true), uri_encode(value, true)))
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 fn uri_encode(input: &str, encode_slash: bool) -> String {
     let mut out = String::new();
     for byte in input.as_bytes() {
@@ -3586,4 +3759,27 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
         }
     }
     out
+}
+
+fn parse_xml_text(xml: &str, tag: &str) -> Result<Option<String>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut in_tag = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().as_ref() == tag.as_bytes() => in_tag = true,
+            Ok(Event::End(e)) if e.name().as_ref() == tag.as_bytes() => in_tag = false,
+            Ok(Event::Text(e)) if in_tag => return Ok(Some(e.unescape()?.into_owned())),
+            Ok(Event::Eof) => return Ok(None),
+            Err(err) => return Err(err.into()),
+            _ => {}
+        }
+    }
+}
+
+fn xml_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
