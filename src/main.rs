@@ -2121,6 +2121,12 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         return sync_status(paths, &conn, &remote);
     }
     let current = current_snapshot(&conn)?;
+    let synced_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "insert into refs(name, value) values ('last-synced', ?1)
+         on conflict(name) do update set value=excluded.value",
+        params![synced_at],
+    )?;
     record_op(
         &conn,
         "remote-sync",
@@ -2154,6 +2160,18 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
             &format!("hosts/{}/current", config.host.id),
             current.as_bytes().to_vec(),
         )?;
+        enqueue_inline_upload(
+            paths,
+            &format!("hosts/{}/refs/current", config.host.id),
+            current.as_bytes().to_vec(),
+        )?;
+    }
+    if let Some(last_synced) = export.refs.get("last-synced") {
+        enqueue_inline_upload(
+            paths,
+            &format!("hosts/{}/refs/last-synced", config.host.id),
+            last_synced.as_bytes().to_vec(),
+        )?;
     }
     let host_index = update_remote_host_index(&remote, &config, &export, &host_metadata_key)?;
     enqueue_inline_upload(
@@ -2175,15 +2193,14 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
 
 fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {
     let local_current = current_snapshot(conn)?;
-    let remote_current = if remote.exists("hosts/current")? {
-        Some(
-            String::from_utf8(remote.get("hosts/current")?)?
-                .trim()
-                .to_string(),
-        )
-    } else {
-        None
-    };
+    let config = read_config(paths)?;
+    let canonical_current = format!("hosts/{}/refs/current", config.host.id);
+    let canonical_last_synced = format!("hosts/{}/refs/last-synced", config.host.id);
+    let mut remote_current = remote_ref(remote, &canonical_current)?;
+    if remote_current.is_none() {
+        remote_current = remote_ref(remote, "hosts/current")?;
+    }
+    let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
     let export = export_metadata(conn, &read_config(paths)?)?;
     let local_keys = local_object_keys(&export);
     let mut missing_remote = 0usize;
@@ -2201,10 +2218,23 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
         "remote_current {}",
         remote_current.unwrap_or_else(|| "(none)".into())
     );
+    println!(
+        "remote_last_synced {}",
+        remote_last_synced.unwrap_or_else(|| "(none)".into())
+    );
     println!("local_objects {}", local_keys.len());
     println!("missing_remote_objects {}", missing_remote);
     println!("queued_uploads {}", upload_queue_items(paths)?.len());
     Ok(())
+}
+
+fn remote_ref(remote: &RemoteStore, key: &str) -> Result<Option<String>> {
+    if remote.exists(key)? {
+        return Ok(Some(
+            String::from_utf8(remote.get(key)?)?.trim().to_string(),
+        ));
+    }
+    Ok(None)
 }
 
 fn update_remote_host_index(

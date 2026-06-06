@@ -94,6 +94,12 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
+    let sync_status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("status");
+        c
+    });
+    assert!(sync_status.contains("remote_last_synced "));
     assert!(
         state
             .join("queue/uploads")
@@ -145,6 +151,18 @@ fn file_remote_clone_restores_normal_and_large_files() {
     assert!(host.contains("roots 1"));
     assert!(host.contains("snapshots 1"));
     assert!(remote.join("objects/trees").exists());
+    let host_ref_dirs = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            if path.join("refs/current").exists() && path.join("refs/last-synced").exists() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(host_ref_dirs.len(), 1);
     run({
         let mut c = mj();
         c.arg("--home")

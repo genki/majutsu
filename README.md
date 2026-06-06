@@ -165,6 +165,8 @@ config.toml
 host.toml
 hosts/current
 hosts/<host-id>/current
+hosts/<host-id>/refs/current
+hosts/<host-id>/refs/last-synced
 objects/trees/...
 objects/...
 ```
