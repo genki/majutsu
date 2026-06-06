@@ -216,6 +216,13 @@ require the older signature style. `mj remote check` also verifies a small
 range GET against remote metadata. Signature V4 uploads at or above
 `MAJUTSU_S3_MULTIPART_THRESHOLD` use S3 multipart upload; the minimum effective
 threshold is 5 MiB because S3 requires non-final parts to be at least that size.
+For providers that support them, `MAJUTSU_S3_STORAGE_CLASS` adds
+`x-amz-storage-class` on object creation and `MAJUTSU_S3_OBJECT_TAGS` adds
+`x-amz-tagging` in `key=value&key=value` form. Majutsu also tags configured S3
+uploads with `majutsu-class` so lifecycle policies can distinguish metadata,
+refs, trees, packs, large chunks, and generic objects. Leave these variables
+unset for S3-compatible providers that reject S3 storage-class or object-tagging
+headers.
 
 ## Encryption
 

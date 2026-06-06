@@ -5559,6 +5559,8 @@ struct S3Remote {
     signature_version: String,
     access_key: String,
     secret_key: String,
+    storage_class: Option<String>,
+    object_tags: Vec<(String, String)>,
     client: Client,
 }
 
@@ -5586,6 +5588,8 @@ fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
                 .context("AWS_ACCESS_KEY_ID is required for s3 remote")?,
             secret_key: env::var("AWS_SECRET_ACCESS_KEY")
                 .context("AWS_SECRET_ACCESS_KEY is required for s3 remote")?,
+            storage_class: optional_env("MAJUTSU_S3_STORAGE_CLASS")?,
+            object_tags: parse_s3_object_tags_env()?,
             client: Client::new(),
         }));
     }
@@ -5676,8 +5680,8 @@ impl RemoteStore {
             },
             RemoteStore::S3(remote) => RemoteCapabilities {
                 lifecycle_rules: true,
-                object_tags: false,
-                storage_class_on_put: false,
+                object_tags: !remote.uses_sigv2(),
+                storage_class_on_put: !remote.uses_sigv2(),
                 restore_archived_object: true,
                 multipart_upload: !remote.uses_sigv2(),
                 range_get: true,
@@ -5707,16 +5711,20 @@ impl S3Remote {
                 .send()?
         } else {
             let payload_hash = sha256_hex(bytes);
-            let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &[])?;
-            self.client
+            let extra_headers = self.put_object_headers(key)?;
+            let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &extra_headers)?;
+            let mut request = self
+                .client
                 .put(url)
                 .header(HOST, self.host_header()?)
                 .header("x-amz-date", auth.amz_date)
                 .header("x-amz-content-sha256", payload_hash)
                 .header(AUTHORIZATION, auth.authorization)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .body(bytes.to_vec())
-                .send()?
+                .header(CONTENT_TYPE, "application/octet-stream");
+            for (name, value) in extra_headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            request.body(bytes.to_vec()).send()?
         };
         if !response.status().is_success() {
             bail!("s3 put failed for {key}: HTTP {}", response.status());
@@ -5745,16 +5753,19 @@ impl S3Remote {
     fn initiate_multipart(&self, remote_key: &str) -> Result<String> {
         let query = "uploads=".to_string();
         let payload_hash = sha256_hex(b"");
-        let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &[])?;
-        let response = self
+        let extra_headers = self.put_object_headers(remote_key)?;
+        let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &extra_headers)?;
+        let mut request = self
             .client
             .post(self.object_url_query(remote_key, &query))
             .header(HOST, self.host_header()?)
             .header("x-amz-date", auth.amz_date)
             .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization)
-            .body(Vec::new())
-            .send()?;
+            .header(AUTHORIZATION, auth.authorization);
+        for (name, value) in extra_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = request.body(Vec::new()).send()?;
         if !response.status().is_success() {
             bail!(
                 "s3 initiate multipart failed: HTTP {} {}",
@@ -6113,6 +6124,22 @@ impl S3Remote {
         hmac_sha256(&k_service, b"aws4_request")
     }
 
+    fn put_object_headers(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let mut headers = Vec::new();
+        if let Some(storage_class) = &self.storage_class {
+            headers.push(("x-amz-storage-class".to_string(), storage_class.clone()));
+        }
+        if !self.object_tags.is_empty() {
+            let mut tags = vec![(
+                "majutsu-class".to_string(),
+                s3_object_class(key).to_string(),
+            )];
+            tags.extend(self.object_tags.iter().cloned());
+            headers.push(("x-amz-tagging".to_string(), encode_s3_object_tags(&tags)?));
+        }
+        Ok(headers)
+    }
+
     fn uses_sigv2(&self) -> bool {
         self.signature_version.contains('2')
     }
@@ -6226,6 +6253,92 @@ fn canonical_query(params: &[(&str, String)]) -> String {
         .join("&")
 }
 
+fn optional_env(name: &str) -> Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                Ok(None)
+            } else if value.contains('\n') || value.contains('\r') {
+                bail!("{name} must not contain newlines")
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn parse_s3_object_tags_env() -> Result<Vec<(String, String)>> {
+    let Some(value) = optional_env("MAJUTSU_S3_OBJECT_TAGS")? else {
+        return Ok(Vec::new());
+    };
+    parse_s3_object_tags(&value)
+}
+
+fn parse_s3_object_tags(input: &str) -> Result<Vec<(String, String)>> {
+    input
+        .split('&')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let (key, value) = part
+                .split_once('=')
+                .ok_or_else(|| anyhow!("S3 object tag must be key=value: {part}"))?;
+            let key = key.trim();
+            let value = value.trim();
+            validate_s3_tag_part("S3 object tag key", key)?;
+            validate_s3_tag_part("S3 object tag value", value)?;
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn validate_s3_tag_part(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{label} must not be empty");
+    }
+    if value.contains('\n') || value.contains('\r') {
+        bail!("{label} must not contain newlines");
+    }
+    Ok(())
+}
+
+fn encode_s3_object_tags(tags: &[(String, String)]) -> Result<String> {
+    tags.iter()
+        .map(|(key, value)| {
+            validate_s3_tag_part("S3 object tag key", key)?;
+            validate_s3_tag_part("S3 object tag value", value)?;
+            Ok(format!(
+                "{}={}",
+                uri_encode(key, true),
+                uri_encode(value, true)
+            ))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("&"))
+}
+
+fn s3_object_class(key: &str) -> &'static str {
+    let key = key.trim_start_matches('/');
+    if key.starts_with("hosts/")
+        || key.starts_with("metadata/")
+        || key.ends_with("/metadata/export.json")
+    {
+        "metadata"
+    } else if key.starts_with("refs/") || key.contains("/refs/") || key.ends_with("current") {
+        "ref"
+    } else if key.starts_with("objects/trees/") {
+        "tree"
+    } else if key.starts_with("objects/packs/") {
+        "pack"
+    } else if key.starts_with("objects/large/") {
+        "large"
+    } else {
+        "object"
+    }
+}
+
 fn uri_encode(input: &str, encode_slash: bool) -> String {
     let mut out = String::new();
     for byte in input.as_bytes() {
@@ -6275,6 +6388,54 @@ fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_s3_remote() -> S3Remote {
+        S3Remote {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            endpoint: "https://storage.googleapis.com".to_string(),
+            region: "auto".to_string(),
+            signature_version: "s3v4".to_string(),
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            storage_class: Some("STANDARD_IA".to_string()),
+            object_tags: vec![("purpose".to_string(), "backup data".to_string())],
+            client: Client::new(),
+        }
+    }
+
+    #[test]
+    fn s3_put_headers_include_storage_class_and_encoded_tags() {
+        let remote = test_s3_remote();
+        let headers = remote
+            .put_object_headers("objects/large/chunks/fixed/chunk-1")
+            .unwrap();
+        assert!(headers.contains(&("x-amz-storage-class".to_string(), "STANDARD_IA".to_string())));
+        assert!(headers.contains(&(
+            "x-amz-tagging".to_string(),
+            "majutsu-class=large&purpose=backup%20data".to_string()
+        )));
+    }
+
+    #[test]
+    fn s3_sigv4_signs_put_attribute_headers() {
+        let remote = test_s3_remote();
+        let headers = remote
+            .put_object_headers("objects/packs/normal/pack-1")
+            .unwrap();
+        let auth = remote
+            .auth_v4(
+                "PUT",
+                "prefix/objects/packs/normal/pack-1",
+                "",
+                "hash",
+                &headers,
+            )
+            .unwrap();
+        assert!(auth.authorization.contains(
+            "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-storage-class;x-amz-tagging"
+        ));
+    }
 
     #[cfg(unix)]
     #[test]
