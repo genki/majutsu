@@ -642,6 +642,14 @@ mj pack --compact
 mj gc
 ```
 
+Pack target sizes are configurable:
+
+```toml
+[pack]
+small_pack_target = "64 MiB"
+normal_pack_target = "256 MiB"
+```
+
 `mj pack` stores unpacked normal blobs under
 `$MAJUTSU_HOME/objects/packs/normal/*.mpack` and writes matching pack indexes
 under `$MAJUTSU_HOME/objects/indexes/pack/*.json`. After packing, the original

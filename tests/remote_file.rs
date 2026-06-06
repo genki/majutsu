@@ -1473,6 +1473,80 @@ fn pack_compaction_rewrites_existing_packs() {
 }
 
 #[test]
+fn pack_respects_configured_normal_pack_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    for idx in 0..4 {
+        fs::write(
+            source.join(format!("file-{idx}.txt")),
+            format!("payload-{idx}-abcdefghijklmnopqrstuvwxyz\n"),
+        )
+        .unwrap();
+    }
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace(
+            "small_pack_target = 67108864",
+            "small_pack_target = \"64 B\"",
+        )
+        .replace(
+            "normal_pack_target = 268435456",
+            "normal_pack_target = \"64 B\"",
+        );
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let pack_output = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    assert!(pack_output.contains("pack(s)"));
+    let pack_count = fs::read_dir(state.join("objects/packs/normal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("mpack"))
+        .count();
+    assert!(pack_count > 1);
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/file-3.txt")).unwrap(),
+        "payload-3-abcdefghijklmnopqrstuvwxyz\n"
+    );
+}
+
+#[test]
 fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
