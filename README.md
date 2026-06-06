@@ -280,6 +280,10 @@ Strict mode retries stable reads more aggressively:
 mj root add config /etc/myapp --snapshot-mode strict
 ```
 
+Stable reads compare file size, modified time, and Unix inode where available
+before and after reading. If a file changes or is replaced during the read,
+majutsu retries before storing it.
+
 Transactional mode runs hooks before and after scanning the root. This is the
 intended path for application state, database dumps, VM images, and other data
 that needs an application-consistent checkpoint:

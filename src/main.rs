@@ -5152,13 +5152,31 @@ fn stable_read(path: &Path, mode: &str) -> Result<Vec<u8>> {
         let before = fs::metadata(path)?;
         let bytes = fs::read(path)?;
         let after = fs::metadata(path)?;
-        if before.len() == after.len() && before.modified().ok() == after.modified().ok() {
+        if stable_metadata_matches(&before, &after) {
             return Ok(bytes);
         }
         last_error = Some(anyhow!("file changed while reading: {}", path.display()));
         std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1) as u64));
     }
     Err(last_error.unwrap_or_else(|| anyhow!("file did not become stable: {}", path.display())))
+}
+
+fn stable_metadata_matches(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return false;
+    }
+    stable_file_id(before) == stable_file_id(after)
+}
+
+#[cfg(unix)]
+fn stable_file_id(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.ino())
+}
+
+#[cfg(not(unix))]
+fn stable_file_id(_: &fs::Metadata) -> Option<u64> {
+    None
 }
 
 fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<String> {
@@ -6217,5 +6235,32 @@ fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
         200 | 202 | 204 | 409 => Ok(true),
         404 => Ok(false),
         _ => bail!("archive restore request failed for {key}: HTTP {status}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_metadata_detects_same_size_file_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("data.txt");
+        let replacement = tmp.path().join("replacement.txt");
+        fs::write(&path, b"same-size-a").unwrap();
+        fs::write(&replacement, b"same-size-b").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_system_time(before.modified().unwrap()),
+        )
+        .unwrap();
+        let after = fs::metadata(&path).unwrap();
+
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert!(!stable_metadata_matches(&before, &after));
     }
 }
