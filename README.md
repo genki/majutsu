@@ -20,11 +20,14 @@ large object handling.
 - Remote sync of metadata and objects
 - S3-compatible remote backend
 - Bootstrap clone from remote metadata
+- Root pause/resume/missing-state handling
+- Foreground periodic watch and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
 - Basic object-store fsck
 
-Daemon watching, encryption, lifecycle policy generation, archive restore, and
-pack compaction are intentionally left for later iterations.
+OS-native file event journaling, encryption, lifecycle policy generation,
+archive restore, and pack compaction are intentionally left for later
+iterations.
 
 ## Install
 
@@ -41,6 +44,8 @@ mj init
 mj root add home-notes ~/notes --exclude '**/.git/**'
 mj snapshot --message 'first snapshot'
 mj sync
+mj sync status
+mj remote fsck
 mj log
 mj restore plan --to /tmp/majutsu-restore
 mj restore apply --to /tmp/majutsu-restore
@@ -96,6 +101,7 @@ mj root add sample /path/to/sample
 mj snapshot --message 'first remote snapshot'
 mj sync
 mj remote check
+mj remote fsck
 ```
 
 To rebuild an empty state directory from remote:
@@ -108,6 +114,44 @@ mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 
 The current S3 backend uses path-style requests and AWS Signature V2, which is
 compatible with Google Cloud Storage HMAC keys in the validation environment.
+
+## Watch And Daemon
+
+Foreground periodic snapshots:
+
+```sh
+mj watch --foreground --interval-secs 60
+```
+
+One-shot watch, useful for tests:
+
+```sh
+mj watch --once --interval-secs 1
+```
+
+Minimal background daemon management:
+
+```sh
+mj daemon start --interval-secs 60
+mj daemon status
+mj daemon stop
+```
+
+The current daemon is a small process wrapper around foreground watch. It does
+not yet use OS-native file event APIs or a persistent event journal.
+
+## Root State
+
+Roots can be paused and resumed:
+
+```sh
+mj root pause home-notes
+mj root resume home-notes
+```
+
+If an active root path disappears, `mj snapshot` records a `root-missing`
+operation and marks the root `missing`; it does not snapshot the root as empty.
+Use `mj root resume <id>` after the path is available again.
 
 ## Safety Notes
 

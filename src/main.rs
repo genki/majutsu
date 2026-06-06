@@ -17,6 +17,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -56,12 +57,20 @@ enum Command {
         #[command(subcommand)]
         command: LargeCommand,
     },
-    Sync,
+    Sync {
+        #[command(subcommand)]
+        command: Option<SyncCommand>,
+    },
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
     },
     Clone(CloneArgs),
+    Watch(WatchArgs),
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     Fsck,
 }
 
@@ -78,6 +87,9 @@ enum RootCommand {
     Add(RootAddArgs),
     List,
     Remove { id: String },
+    Pause { id: String },
+    Resume { id: String },
+    MarkDeleted { id: String },
 }
 
 #[derive(Args)]
@@ -88,6 +100,8 @@ struct RootAddArgs {
     name: Option<String>,
     #[arg(long = "exclude")]
     exclude: Vec<String>,
+    #[arg(long = "include")]
+    include: Vec<String>,
     #[arg(long, default_value_t = false)]
     follow_symlinks: bool,
 }
@@ -132,14 +146,40 @@ enum LargeCommand {
 }
 
 #[derive(Subcommand)]
+enum SyncCommand {
+    Status,
+}
+
+#[derive(Subcommand)]
 enum RemoteCommand {
     Check,
+    Fsck,
 }
 
 #[derive(Args)]
 struct CloneArgs {
     #[arg(long)]
     remote: String,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    #[arg(long, default_value_t = true)]
+    foreground: bool,
+    #[arg(long, default_value_t = 60)]
+    interval_secs: u64,
+    #[arg(long, default_value_t = false)]
+    once: bool,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    Start {
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+    },
+    Stop,
+    Status,
 }
 
 #[derive(Debug)]
@@ -152,6 +192,8 @@ struct Paths {
     large_chunks: PathBuf,
     large_manifests: PathBuf,
     logs: PathBuf,
+    runtime: PathBuf,
+    daemon_pid: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,8 +285,12 @@ struct RootConfig {
     id: String,
     name: String,
     path: PathBuf,
+    #[serde(default = "default_include")]
+    include: Vec<String>,
+    #[serde(default)]
     exclude: Vec<String>,
     follow_symlinks: bool,
+    #[serde(default = "default_root_status")]
     status: String,
 }
 
@@ -325,9 +371,11 @@ fn main() -> Result<()> {
         Command::Log(args) => log_ops(&paths, args),
         Command::Restore { command } => restore_cmd(&paths, command),
         Command::Large { command } => large_cmd(&paths, command),
-        Command::Sync => sync_cmd(&paths),
+        Command::Sync { command } => sync_cmd(&paths, command),
         Command::Remote { command } => remote_cmd(&paths, command),
         Command::Clone(args) => clone_cmd(&paths, args),
+        Command::Watch(args) => watch_cmd(&paths, args),
+        Command::Daemon { command } => daemon_cmd(&paths, command),
         Command::Fsck => fsck(&paths),
     }
 }
@@ -349,6 +397,8 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         large_chunks: home.join("objects/large/chunks/fixed"),
         large_manifests: home.join("objects/large/manifests"),
         logs: home.join("logs"),
+        runtime: home.join("runtime"),
+        daemon_pid: home.join("runtime/daemon.pid"),
         home,
     })
 }
@@ -417,6 +467,11 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 name: args.name.unwrap_or_else(|| args.id.clone()),
                 id: args.id,
                 path,
+                include: if args.include.is_empty() {
+                    default_include()
+                } else {
+                    args.include
+                },
                 exclude: args.exclude,
                 follow_symlinks: args.follow_symlinks,
                 status: "active".into(),
@@ -445,6 +500,21 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             record_op(&conn, "root-removed", None, None, Some(&id))?;
             println!("removed root {id}");
         }
+        RootCommand::Pause { id } => {
+            update_root_status(&conn, &id, "paused")?;
+            record_op(&conn, "root-paused", None, None, Some(&id))?;
+            println!("paused root {id}");
+        }
+        RootCommand::Resume { id } => {
+            update_root_status(&conn, &id, "active")?;
+            record_op(&conn, "root-resumed", None, None, Some(&id))?;
+            println!("resumed root {id}");
+        }
+        RootCommand::MarkDeleted { id } => {
+            update_root_status(&conn, &id, "deleted")?;
+            record_op(&conn, "root-mark-deleted", None, None, Some(&id))?;
+            println!("marked root {id} deleted");
+        }
     }
     Ok(())
 }
@@ -460,7 +530,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let mut total_files = 0usize;
     let mut large_files = 0usize;
     for root in roots(&conn)? {
+        if root.status != "active" {
+            eprintln!("root {}, skipped: status={}", root.id, root.status);
+            continue;
+        }
         if !root.path.exists() {
+            update_root_status(&conn, &root.id, "missing")?;
             record_op(
                 &conn,
                 "root-missing",
@@ -627,7 +702,7 @@ fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
     Ok(())
 }
 
-fn sync_cmd(paths: &Paths) -> Result<()> {
+fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
     let remote = open_remote(
@@ -637,6 +712,9 @@ fn sync_cmd(paths: &Paths) -> Result<()> {
             .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?,
     )?;
     let conn = open_db(paths)?;
+    if let Some(SyncCommand::Status) = command {
+        return sync_status(paths, &conn, &remote);
+    }
     let current = current_snapshot(&conn)?;
     record_op(
         &conn,
@@ -672,6 +750,39 @@ fn sync_cmd(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {
+    let local_current = current_snapshot(conn)?;
+    let remote_current = if remote.exists("hosts/current")? {
+        Some(
+            String::from_utf8(remote.get("hosts/current")?)?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let export = export_metadata(conn, &read_config(paths)?)?;
+    let local_keys = local_object_keys(&export);
+    let mut missing_remote = 0usize;
+    for key in &local_keys {
+        if !remote.exists(key)? {
+            missing_remote += 1;
+        }
+    }
+    println!("remote {}", remote.describe());
+    println!(
+        "local_current {}",
+        local_current.unwrap_or_else(|| "(none)".into())
+    );
+    println!(
+        "remote_current {}",
+        remote_current.unwrap_or_else(|| "(none)".into())
+    );
+    println!("local_objects {}", local_keys.len());
+    println!("missing_remote_objects {}", missing_remote);
+    Ok(())
+}
+
 fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
@@ -691,6 +802,9 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             } else {
                 bail!("metadata/export.json is missing on remote");
             }
+        }
+        RemoteCommand::Fsck => {
+            remote_fsck(&remote)?;
         }
     }
     Ok(())
@@ -727,6 +841,80 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     Ok(())
 }
 
+fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
+    ensure_ready(paths)?;
+    if !args.foreground {
+        bail!("daemonized watch is not implemented yet; use --foreground");
+    }
+    loop {
+        snapshot(
+            paths,
+            SnapshotArgs {
+                message: Some("watch snapshot".into()),
+            },
+        )?;
+        if args.once {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(args.interval_secs.max(1)));
+    }
+    Ok(())
+}
+
+fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
+    ensure_ready(paths)?;
+    match command {
+        DaemonCommand::Start { interval_secs } => {
+            if let Some(pid) = read_pid(&paths.daemon_pid)? {
+                if pid_alive(pid) {
+                    bail!("daemon already running with pid {pid}");
+                }
+            }
+            fs::create_dir_all(&paths.runtime)?;
+            fs::create_dir_all(&paths.logs)?;
+            let log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(paths.logs.join("majutsu.log"))?;
+            let child = ProcessCommand::new(env::current_exe()?)
+                .arg("--home")
+                .arg(&paths.home)
+                .arg("watch")
+                .arg("--interval-secs")
+                .arg(interval_secs.to_string())
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log))
+                .spawn()?;
+            fs::write(&paths.daemon_pid, child.id().to_string())?;
+            println!("started daemon pid {}", child.id());
+        }
+        DaemonCommand::Stop => {
+            let pid =
+                read_pid(&paths.daemon_pid)?.ok_or_else(|| anyhow!("daemon pid file not found"))?;
+            if pid_alive(pid) {
+                let status = ProcessCommand::new("kill").arg(pid.to_string()).status()?;
+                if !status.success() {
+                    bail!("failed to stop daemon pid {pid}");
+                }
+            }
+            let _ = fs::remove_file(&paths.daemon_pid);
+            println!("stopped daemon pid {pid}");
+        }
+        DaemonCommand::Status => {
+            if let Some(pid) = read_pid(&paths.daemon_pid)? {
+                if pid_alive(pid) {
+                    println!("running pid {pid}");
+                } else {
+                    println!("stale pid {pid}");
+                }
+            } else {
+                println!("stopped");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn fsck(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
@@ -757,6 +945,37 @@ fn fsck(paths: &Paths) -> Result<()> {
         bail!("fsck found {missing} missing objects");
     }
     println!("fsck ok");
+    Ok(())
+}
+
+fn remote_fsck(remote: &RemoteStore) -> Result<()> {
+    if !remote.exists("metadata/export.json")? {
+        bail!("metadata/export.json is missing on remote");
+    }
+    let export: MetadataExport = serde_json::from_slice(&remote.get("metadata/export.json")?)?;
+    let mut missing = 0usize;
+    for key in local_object_keys(&export) {
+        if !remote.exists(&key)? {
+            missing += 1;
+            eprintln!("missing remote object {key}");
+        }
+    }
+    if let Some(current) = export.refs.get("current") {
+        let found = export
+            .snapshots
+            .iter()
+            .any(|snapshot| &snapshot.id == current);
+        if !found {
+            missing += 1;
+            eprintln!("remote current ref points to missing snapshot {current}");
+        }
+    }
+    if missing > 0 {
+        bail!("remote fsck found {missing} issue(s)");
+    }
+    println!("remote fsck ok");
+    println!("snapshots {}", export.snapshots.len());
+    println!("objects {}", local_object_keys(&export).len());
     Ok(())
 }
 
@@ -883,10 +1102,14 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
             continue;
         }
         let rel = entry.path().strip_prefix(&root.path)?.to_path_buf();
+        if !is_included(&root.include, &rel) {
+            continue;
+        }
         if is_ignored(&ignore, &rel, entry.file_type().is_dir()) {
             if entry.file_type().is_dir() {
                 continue;
             }
+            continue;
         }
         let rel_s = path_to_slash(&rel);
         if entry.file_type().is_dir() {
@@ -1272,6 +1495,24 @@ fn roots(conn: &Connection) -> Result<Vec<RootConfig>> {
     Ok(out)
 }
 
+fn update_root_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
+    let data: String = conn
+        .query_row(
+            "select data_json from roots where id=?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("unknown root: {id}"))?;
+    let mut root: RootConfig = serde_json::from_str(&data)?;
+    root.status = status.to_string();
+    conn.execute(
+        "update roots set data_json=?2 where id=?1",
+        params![id, serde_json::to_string(&root)?],
+    )?;
+    Ok(())
+}
+
 fn current_snapshot(conn: &Connection) -> Result<Option<String>> {
     conn.query_row("select value from refs where name='current'", [], |row| {
         row.get(0)
@@ -1347,6 +1588,16 @@ fn build_ignore(root: &RootConfig) -> Result<Gitignore> {
     Ok(builder.build()?)
 }
 
+fn is_included(patterns: &[String], rel: &Path) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let rel = path_to_slash(rel);
+    patterns
+        .iter()
+        .any(|pattern| path_pattern_match(pattern, &rel))
+}
+
 fn is_ignored(ignore: &Gitignore, rel: &Path, is_dir: bool) -> bool {
     ignore.matched_path_or_any_parents(rel, is_dir).is_ignore()
 }
@@ -1373,6 +1624,52 @@ fn glob_match(pattern: &str, name: &str) -> bool {
             .unwrap_or(false);
     }
     pattern == name
+}
+
+fn path_pattern_match(pattern: &str, rel: &str) -> bool {
+    if pattern == "**" || pattern == "*" {
+        return true;
+    }
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        return rel
+            .rsplit_once('.')
+            .map(|(_, e)| e.eq_ignore_ascii_case(ext))
+            .unwrap_or(false);
+    }
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        if let Some(middle) = suffix.strip_suffix("/**") {
+            return rel == middle
+                || rel.starts_with(&format!("{middle}/"))
+                || rel.contains(&format!("/{middle}/"));
+        }
+        return rel == suffix || rel.ends_with(&format!("/{suffix}"));
+    }
+    rel == pattern || rel.starts_with(&format!("{pattern}/"))
+}
+
+fn default_include() -> Vec<String> {
+    vec!["**".into()]
+}
+
+fn default_root_status() -> String {
+    "active".into()
+}
+
+fn read_pid(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(Some(text.trim().parse()?))
+}
+
+fn pid_alive(pid: u32) -> bool {
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn looks_binary(path: &Path) -> Result<bool> {
