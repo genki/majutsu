@@ -151,6 +151,8 @@ struct RootAddArgs {
     #[arg(long)]
     snapshot_source: Option<PathBuf>,
     #[arg(long)]
+    application_plugin: Option<String>,
+    #[arg(long)]
     large_min_size: Option<u64>,
     #[arg(long)]
     large_binary_min_size: Option<u64>,
@@ -201,6 +203,10 @@ struct RootSetArgs {
     snapshot_source: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     clear_snapshot_source: bool,
+    #[arg(long)]
+    application_plugin: Option<String>,
+    #[arg(long, default_value_t = false)]
+    clear_application_plugin: bool,
     #[arg(long)]
     large_min_size: Option<u64>,
     #[arg(long)]
@@ -726,6 +732,8 @@ struct RootConfig {
     #[serde(default)]
     snapshot_source: Option<PathBuf>,
     #[serde(default)]
+    application_plugin: Option<String>,
+    #[serde(default)]
     large: Option<RootLargeConfig>,
 }
 
@@ -1031,6 +1039,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 pre_snapshot: args.pre_snapshot,
                 post_snapshot: args.post_snapshot,
                 snapshot_source,
+                application_plugin: args.application_plugin,
                 large,
             };
             conn.execute(
@@ -1102,6 +1111,12 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             }
             if let Some(snapshot_source) = &args.snapshot_source {
                 root.snapshot_source = Some(absolutize(snapshot_source)?);
+            }
+            if args.clear_application_plugin {
+                root.application_plugin = None;
+            }
+            if let Some(application_plugin) = &args.application_plugin {
+                root.application_plugin = Some(application_plugin.clone());
             }
             if root.snapshot_source.is_some() && root.snapshot_mode != "transactional" {
                 bail!("--snapshot-source requires snapshot_mode transactional");
@@ -5629,6 +5644,7 @@ fn validate_large_chunking(chunking: &str) -> Result<()> {
 
 fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
     if root.snapshot_mode == "transactional" {
+        run_application_plugin(paths, root, "pre")?;
         if let Some(command) = &root.pre_snapshot {
             record_event(paths, "pre-snapshot", &format!("{} {}", root.id, command))?;
             run_hook(command, &root.path)?;
@@ -5643,6 +5659,36 @@ fn run_post_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
             record_event(paths, "post-snapshot", &format!("{} {}", root.id, command))?;
             run_hook(command, &root.path)?;
         }
+        run_application_plugin(paths, root, "post")?;
+    }
+    Ok(())
+}
+
+fn run_application_plugin(paths: &Paths, root: &RootConfig, phase: &str) -> Result<()> {
+    let Some(command) = &root.application_plugin else {
+        return Ok(());
+    };
+    record_event(
+        paths,
+        &format!("application-plugin-{phase}"),
+        &format!("{} {}", root.id, command),
+    )?;
+    let mut process = ProcessCommand::new("sh");
+    process
+        .arg("-c")
+        .arg(command)
+        .current_dir(&root.path)
+        .env("MAJUTSU_HOME", &paths.home)
+        .env("MAJUTSU_PLUGIN_PHASE", phase)
+        .env("MAJUTSU_ROOT_ID", &root.id)
+        .env("MAJUTSU_ROOT_NAME", &root.name)
+        .env("MAJUTSU_ROOT_PATH", &root.path);
+    if let Some(source) = &root.snapshot_source {
+        process.env("MAJUTSU_SNAPSHOT_SOURCE", source);
+    }
+    let status = process.status()?;
+    if !status.success() {
+        bail!("application plugin failed during {phase}: {command}");
     }
     Ok(())
 }

@@ -355,6 +355,21 @@ mj root add app-data /srv/app/data \
 If a hook exits non-zero, the snapshot fails. Hook execution is recorded in the
 event journal.
 
+Transactional roots can also run an application plugin command for both phases:
+
+```sh
+mj root add sqlite-app /srv/app/data \
+  --snapshot-mode transactional \
+  --snapshot-source /tmp/sqlite-app-checkpoint \
+  --application-plugin '/usr/local/lib/majutsu/plugins/sqlite-checkpoint'
+```
+
+Majutsu runs the plugin with `MAJUTSU_PLUGIN_PHASE=pre` before scanning and
+`MAJUTSU_PLUGIN_PHASE=post` after the post hook. It also provides
+`MAJUTSU_HOME`, `MAJUTSU_ROOT_ID`, `MAJUTSU_ROOT_NAME`, `MAJUTSU_ROOT_PATH`, and
+`MAJUTSU_SNAPSHOT_SOURCE` when configured. A non-zero plugin exit fails the
+snapshot, and each phase is recorded in the event journal.
+
 ## History And Diff
 
 Show recent operations:

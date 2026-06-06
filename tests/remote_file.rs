@@ -2979,3 +2979,72 @@ fn transactional_snapshot_can_scan_snapshot_source() {
     );
     assert!(!restore.join("sample/post.txt").exists());
 }
+
+#[test]
+fn transactional_snapshot_runs_application_plugin_phases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let snapshot_source = tmp.path().join("plugin-source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("live.txt"), b"live\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let plugin = "if [ \"$MAJUTSU_PLUGIN_PHASE\" = pre ]; then \
+         mkdir -p \"$MAJUTSU_SNAPSHOT_SOURCE\" && \
+         cp live.txt \"$MAJUTSU_SNAPSHOT_SOURCE/live.txt\" && \
+         printf plugin > \"$MAJUTSU_SNAPSHOT_SOURCE/plugin.txt\"; \
+         else printf cleaned > plugin-cleaned.txt; fi";
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--snapshot-mode")
+            .arg("transactional")
+            .arg("--snapshot-source")
+            .arg(&snapshot_source)
+            .arg("--application-plugin")
+            .arg(plugin);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(source.join("plugin-cleaned.txt")).unwrap(),
+        "cleaned"
+    );
+    let restore = tmp.path().join("restore");
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/plugin.txt")).unwrap(),
+        "plugin"
+    );
+    assert!(!restore.join("sample/plugin-cleaned.txt").exists());
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("application-plugin-pre"));
+    assert!(events.contains("application-plugin-post"));
+}
