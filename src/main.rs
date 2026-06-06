@@ -218,6 +218,8 @@ struct Paths {
     logs: PathBuf,
     runtime: PathBuf,
     daemon_pid: PathBuf,
+    upload_queue: PathBuf,
+    event_queue: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,6 +252,24 @@ struct MetadataExport {
     blobs: Vec<BlobExport>,
     large_objects: Vec<LargeObjectExport>,
     chunks: Vec<ChunkExport>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UploadQueueItem {
+    id: String,
+    key: String,
+    source: Option<String>,
+    inline: Option<Vec<u8>>,
+    created_at: DateTime<Utc>,
+    attempts: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EventJournalRecord {
+    event_id: String,
+    kind: String,
+    observed_at: DateTime<Utc>,
+    detail: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -446,6 +466,8 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         logs: home.join("logs"),
         runtime: home.join("runtime"),
         daemon_pid: home.join("runtime/daemon.pid"),
+        upload_queue: home.join("queue/uploads"),
+        event_queue: home.join("queue/events"),
         home,
     })
 }
@@ -568,6 +590,11 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
 
 fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     ensure_ready(paths)?;
+    record_event(
+        paths,
+        "snapshot-start",
+        args.message.as_deref().unwrap_or("manual"),
+    )?;
     let config = read_config(paths)?;
     let conn = open_db(paths)?;
     let parent = current_snapshot(&conn)?;
@@ -580,6 +607,11 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     for root in roots(&conn)? {
         if root.status != "active" {
             eprintln!("root {}, skipped: status={}", root.id, root.status);
+            record_event(
+                paths,
+                "root-skipped",
+                &format!("{} status={}", root.id, root.status),
+            )?;
             continue;
         }
         if !root.path.exists() {
@@ -592,6 +624,11 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 Some(&root.id),
             )?;
             eprintln!("root missing, skipped: {} {}", root.id, root.path.display());
+            record_event(
+                paths,
+                "root-missing",
+                &format!("{} {}", root.id, root.path.display()),
+            )?;
             continue;
         }
         let records = scan_root(paths, &config, &root)?;
@@ -652,6 +689,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     )?;
     println!("snapshot {}", manifest.snapshot_id);
     println!("files {total_files}, large {large_files}");
+    record_event(paths, "snapshot-finish", &manifest.snapshot_id)?;
     Ok(())
 }
 
@@ -846,27 +884,28 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     )?;
     let export = export_metadata(&conn, &config)?;
     let export_json = serde_json::to_vec_pretty(&export)?;
-    remote.put("metadata/export.json", &export_json)?;
-    remote.put("config.toml", toml::to_string_pretty(&config)?.as_bytes())?;
-    remote.put(
+    enqueue_inline_upload(paths, "metadata/export.json", export_json)?;
+    enqueue_inline_upload(
+        paths,
+        "config.toml",
+        toml::to_string_pretty(&config)?.into_bytes(),
+    )?;
+    enqueue_inline_upload(
+        paths,
         "host.toml",
-        toml::to_string_pretty(&config.host)?.as_bytes(),
+        toml::to_string_pretty(&config.host)?.into_bytes(),
     )?;
     if let Some(current) = export.refs.get("current") {
-        remote.put("hosts/current", current.as_bytes())?;
+        enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
     }
 
-    let mut uploaded = 3usize;
     for key in local_object_keys(&export) {
         let local = paths.home.join(&key);
         if local.exists() {
-            remote.put(
-                &key,
-                &fs::read(&local).with_context(|| format!("read {}", local.display()))?,
-            )?;
-            uploaded += 1;
+            enqueue_file_upload(paths, &key, &local)?;
         }
     }
+    let uploaded = drain_upload_queue(paths, &remote)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     Ok(())
 }
@@ -901,6 +940,101 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
     );
     println!("local_objects {}", local_keys.len());
     println!("missing_remote_objects {}", missing_remote);
+    println!("queued_uploads {}", upload_queue_items(paths)?.len());
+    Ok(())
+}
+
+fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()> {
+    write_upload_item(
+        paths,
+        UploadQueueItem {
+            id: format!("upload-{}", blake3_hex(key.as_bytes())),
+            key: key.to_string(),
+            source: None,
+            inline: Some(bytes),
+            created_at: Utc::now(),
+            attempts: 0,
+        },
+    )
+}
+
+fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Result<()> {
+    write_upload_item(
+        paths,
+        UploadQueueItem {
+            id: format!("upload-{}", blake3_hex(key.as_bytes())),
+            key: key.to_string(),
+            source: Some(path_to_slash(source)),
+            inline: None,
+            created_at: Utc::now(),
+            attempts: 0,
+        },
+    )
+}
+
+fn write_upload_item(paths: &Paths, item: UploadQueueItem) -> Result<()> {
+    fs::create_dir_all(&paths.upload_queue)?;
+    let path = paths.upload_queue.join(format!("{}.json", item.id));
+    fs::write(path, serde_json::to_vec_pretty(&item)?)?;
+    Ok(())
+}
+
+fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQueueItem)>> {
+    if !paths.upload_queue.exists() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::new();
+    for entry in fs::read_dir(&paths.upload_queue)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry.path().extension().and_then(OsStr::to_str) == Some("json")
+        {
+            let item: UploadQueueItem = serde_json::from_slice(&fs::read(entry.path())?)?;
+            items.push((entry.path(), item));
+        }
+    }
+    items.sort_by(|a, b| a.1.key.cmp(&b.1.key));
+    Ok(items)
+}
+
+fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
+    let mut uploaded = 0usize;
+    for (path, mut item) in upload_queue_items(paths)? {
+        let bytes = if let Some(bytes) = item.inline.take() {
+            bytes
+        } else if let Some(source) = &item.source {
+            fs::read(source).with_context(|| format!("read queued upload source {source}"))?
+        } else {
+            bail!(
+                "queued upload has neither inline payload nor source: {}",
+                item.key
+            );
+        };
+        match remote.put(&item.key, &bytes) {
+            Ok(()) => {
+                fs::remove_file(path)?;
+                uploaded += 1;
+            }
+            Err(err) => {
+                item.attempts += 1;
+                fs::write(&path, serde_json::to_vec_pretty(&item)?)?;
+                return Err(err).with_context(|| format!("upload failed for {}", item.key));
+            }
+        }
+    }
+    Ok(uploaded)
+}
+
+fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {
+    fs::create_dir_all(&paths.event_queue)?;
+    let event = EventJournalRecord {
+        event_id: new_id("event"),
+        kind: kind.to_string(),
+        observed_at: Utc::now(),
+        detail: detail.to_string(),
+    };
+    let path = paths.event_queue.join(format!("{}.json", event.event_id));
+    fs::write(path, serde_json::to_vec_pretty(&event)?)?;
     Ok(())
 }
 
@@ -967,6 +1101,11 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     if !args.foreground {
         bail!("daemonized watch is not implemented yet; use --foreground");
     }
+    record_event(
+        paths,
+        "watch-start",
+        &format!("interval_secs={}", args.interval_secs),
+    )?;
     loop {
         snapshot(
             paths,
@@ -979,6 +1118,7 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_secs(args.interval_secs.max(1)));
     }
+    record_event(paths, "watch-stop", "foreground watch stopped")?;
     Ok(())
 }
 

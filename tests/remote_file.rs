@@ -63,6 +63,22 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
+    assert!(
+        state
+            .join("queue/uploads")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(
+        state
+            .join("queue/events")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("remote").arg("fsck");

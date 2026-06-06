@@ -23,6 +23,8 @@ large object handling.
 - Root tree manifests stored as separate content-addressed objects
 - Snapshot diff
 - Safe `prune --dry-run` and local loose-object `gc`
+- Persistent upload queue with retry on the next `mj sync`
+- Event journal records for snapshot/watch/root availability observations
 - Root pause/resume/missing-state handling
 - Foreground periodic watch and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
@@ -191,6 +193,27 @@ mj prune --dry-run --keep-daily 90 --keep-monthly 36
 
 `mj gc` removes unreferenced local loose objects under `$MAJUTSU_HOME/objects`.
 It does not delete referenced history or remote objects.
+
+## Queues
+
+`mj sync` first writes upload tasks under:
+
+```text
+$MAJUTSU_HOME/queue/uploads
+```
+
+Each successful remote write removes its queue item. If an upload fails, the
+item remains with an incremented attempt count and the next `mj sync` retries
+it.
+
+Snapshot and watch observations are recorded under:
+
+```text
+$MAJUTSU_HOME/queue/events
+```
+
+This is the initial event journal used to preserve observed work across process
+crashes. OS-native filesystem events are still a future extension.
 
 ## Safety Notes
 
