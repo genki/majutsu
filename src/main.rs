@@ -556,6 +556,10 @@ impl RemoteConfig {
 struct SecurityConfig {
     #[serde(default)]
     encryption: String,
+    #[serde(default = "default_security_key_id")]
+    key_id: String,
+    #[serde(default = "default_security_hash")]
+    hash: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1112,17 +1116,19 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
             watch: WatchConfig::default(),
             security: SecurityConfig {
                 encryption: if args.encrypt {
-                    "chacha20poly1305".into()
+                    "age".into()
                 } else {
                     "none".into()
                 },
+                key_id: default_security_key_id(),
+                hash: default_security_hash(),
             },
             tiering: TieringConfig::default(),
         }
     };
     write_config(paths, &config)?;
     fs::write(&paths.host, toml::to_string_pretty(&config.host)?)?;
-    if config.security.encryption != "none" && !paths.master_key.exists() {
+    if encryption_enabled(&config.security)? && !paths.master_key.exists() {
         write_master_key(paths, &random_key_hex()?)?;
     }
     let conn = open_db(paths)?;
@@ -3526,7 +3532,7 @@ struct KeyRotationResult {
 
 fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotationResult> {
     let config = read_config(paths)?;
-    if config.security.encryption != "chacha20poly1305" {
+    if !encryption_enabled(&config.security)? {
         bail!("key rotation requires encrypted state");
     }
     let conn = open_db(paths)?;
@@ -3892,6 +3898,8 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             encryption: "none".into(),
+            key_id: default_security_key_id(),
+            hash: default_security_hash(),
         }
     }
 }
@@ -5354,11 +5362,19 @@ fn create_layout(paths: &Paths) -> Result<()> {
         "queue/uploads",
         "queue/restores",
         "cache",
+        "cache/blobs",
+        "cache/large",
+        "cache/packs",
+        "cache/indexes",
         "keys",
         "locks",
         "runtime",
     ] {
         fs::create_dir_all(paths.home.join(dir))?;
+    }
+    let recipients = paths.home.join("keys/recipients.toml");
+    if !recipients.exists() {
+        fs::write(recipients, "recipients = []\n")?;
     }
     Ok(())
 }
@@ -5923,6 +5939,7 @@ fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
 fn read_config(paths: &Paths) -> Result<Config> {
     let config: Config = toml::from_str(&fs::read_to_string(&paths.config)?)?;
     validate_watch_mode(&config.watch.mode)?;
+    validate_security_config(&config.security)?;
     Ok(config)
 }
 
@@ -5950,6 +5967,22 @@ fn validate_watch_mode(mode: &str) -> Result<()> {
     match mode {
         "default" | "strict" | "transactional" => Ok(()),
         _ => bail!("watch mode must be default, strict, or transactional"),
+    }
+}
+
+fn validate_security_config(security: &SecurityConfig) -> Result<()> {
+    encryption_enabled(security)?;
+    match security.hash.as_str() {
+        "blake3-keyed" | "blake3" | "sha256" => Ok(()),
+        _ => bail!("security hash must be blake3-keyed, blake3, or sha256"),
+    }
+}
+
+fn encryption_enabled(security: &SecurityConfig) -> Result<bool> {
+    match security.encryption.as_str() {
+        "" | "none" => Ok(false),
+        "age" | "chacha20poly1305" => Ok(true),
+        _ => bail!("security encryption must be none, age, or chacha20poly1305"),
     }
 }
 
@@ -6396,6 +6429,14 @@ fn default_watch_interval_secs() -> u64 {
     60
 }
 
+fn default_security_key_id() -> String {
+    "default".into()
+}
+
+fn default_security_hash() -> String {
+    "blake3-keyed".into()
+}
+
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
@@ -6666,7 +6707,7 @@ fn object_keys_are_hmac(paths: &Paths) -> Result<bool> {
     if !paths.config.exists() {
         return Ok(false);
     }
-    Ok(read_config(paths)?.security.encryption == "chacha20poly1305")
+    encryption_enabled(&read_config(paths)?.security)
 }
 
 fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
@@ -6688,7 +6729,8 @@ fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
     };
     if config
         .as_ref()
-        .map(|config| config.security.encryption.as_str() == "chacha20poly1305")
+        .map(|config| encryption_enabled(&config.security))
+        .transpose()?
         .unwrap_or(false)
     {
         let key_hex = read_master_key(paths)?;

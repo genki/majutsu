@@ -641,6 +641,10 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
             .arg(format!("file://{}", remote.display()));
         c
     });
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    assert!(config.contains("encryption = \"age\""));
+    assert!(config.contains("key_id = \"default\""));
+    assert!(config.contains("hash = \"blake3-keyed\""));
     run({
         let mut c = mj();
         c.arg("--home")
@@ -772,6 +776,40 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     assert_eq!(
         fs::read(source.join("payload.zip")).unwrap(),
         fs::read(rotated_restore.join("sample/payload.zip")).unwrap()
+    );
+}
+
+#[test]
+fn init_creates_spec_state_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+
+    for path in [
+        "db",
+        "ops",
+        "queue/events",
+        "queue/uploads",
+        "queue/restores",
+        "cache/blobs",
+        "cache/large",
+        "cache/packs",
+        "cache/indexes",
+        "keys",
+        "locks",
+        "runtime",
+        "logs",
+    ] {
+        assert!(state.join(path).is_dir(), "missing directory {path}");
+    }
+    assert_eq!(
+        fs::read_to_string(state.join("keys/recipients.toml")).unwrap(),
+        "recipients = []\n"
     );
 }
 
