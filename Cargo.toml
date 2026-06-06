@@ -10,9 +10,11 @@ blake3 = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+fuser = { version = "0.15", default-features = false }
 hex = "0.4"
 hmac = "0.12"
 ignore = "0.4"
+libc = "0.2"
 notify = "8"
 quick-xml = "0.37"
 rand = "0.8"

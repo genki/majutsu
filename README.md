@@ -39,13 +39,12 @@ large object handling.
 - Polling watch fallback and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
 - Restore prepare/resume queue
-- Mount restore views with lazy large-file hydration and unmount markers
+- Materialized and kernel-backed FUSE mount restore views
 - Lifecycle policy generation for GCS and S3
 - Large object pin/unpin metadata
 - Basic object-store fsck
 
-Kernel-backed FUSE remains a future backend; current mount views are materialized
-directories with lazy large-file metadata.
+FUSE mounts run in the foreground and hydrate large-file chunks on read.
 
 ## Install
 
@@ -384,13 +383,20 @@ mj mount --at 2026-06-06T10:30:00Z /tmp/majutsu-view
 mj hydrate /tmp/majutsu-view --root sample --path large.bin
 mj unmount /tmp/majutsu-view
 mj mount --hydrate-large /tmp/majutsu-view-full
+mj mount --backend fuse --at 2026-06-06T10:30:00Z /tmp/majutsu-fuse
 ```
 
-Without `--hydrate-large`, normal files are materialized and large files are
-represented by sparse placeholders plus metadata under `.majutsu-lazy/`.
+The default `materialized` backend writes a restore view directory. Without
+`--hydrate-large`, normal files are materialized and large files are represented
+by sparse placeholders plus metadata under `.majutsu-lazy/`.
 Use `mj hydrate` to assemble selected lazy large files into an existing view.
 With `--hydrate-large`, large files are fully assembled while creating the view.
 `mj unmount` removes views that contain a majutsu mount marker.
+
+The `fuse` backend is a kernel-backed read-only mount. It serves normal files
+from the object store and reads only the large-file chunks overlapping each read
+request. The mount command stays in the foreground; unmount it from another
+terminal with `mj unmount /tmp/majutsu-fuse`.
 
 ## Packs
 

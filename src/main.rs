@@ -4,8 +4,13 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use fuser::{
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request,
+};
 use hmac::{Hmac, Mac};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use libc::{EIO, EISDIR, ENOENT, EROFS};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -18,12 +23,13 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -200,6 +206,8 @@ struct MountArgs {
     path: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     hydrate_large: bool,
+    #[arg(long, default_value = "materialized")]
+    backend: String,
     mountpoint: PathBuf,
 }
 
@@ -578,7 +586,7 @@ struct RootConfig {
     post_snapshot: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct FileRecord {
     root_id: String,
     path: String,
@@ -589,7 +597,7 @@ struct FileRecord {
     payload: Payload,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Payload {
     Blob {
@@ -1299,6 +1307,12 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         to: args.mountpoint.clone(),
     };
     let plan = build_restore_plan(paths, &conn, &restore_args)?;
+    if args.backend == "fuse" {
+        return mount_fuse_cmd(paths, &conn, &plan);
+    }
+    if args.backend != "materialized" {
+        bail!("mount backend must be materialized or fuse");
+    }
     fs::create_dir_all(&plan.to)?;
     let lazy_root = plan.to.join(".majutsu-lazy");
     let mut lazy_files = 0usize;
@@ -1394,6 +1408,18 @@ fn unmount_cmd(paths: &Paths, args: UnmountArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
     let marker = args.mountpoint.join(".majutsu-mount.json");
+    if !marker.exists() && is_mountpoint(&args.mountpoint)? {
+        unmount_fuse(&args.mountpoint)?;
+        record_op(
+            &conn,
+            "unmount-fuse",
+            None,
+            None,
+            Some(&format!("from {}", args.mountpoint.display())),
+        )?;
+        println!("unmounted {}", args.mountpoint.display());
+        return Ok(());
+    }
     if !marker.exists() {
         bail!(
             "{} is not a majutsu mount view; missing .majutsu-mount.json",
@@ -1413,6 +1439,389 @@ fn unmount_cmd(paths: &Paths, args: UnmountArgs) -> Result<()> {
     )?;
     println!("unmounted {}", args.mountpoint.display());
     println!("snapshot {}", metadata.snapshot_id);
+    Ok(())
+}
+
+const FUSE_TTL: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+enum FuseNodeKind {
+    Directory { children: BTreeMap<OsString, u64> },
+    File { record: FileRecord },
+    Symlink { target: String },
+}
+
+#[derive(Clone)]
+struct FuseNode {
+    parent: u64,
+    attr: FileAttr,
+    kind: FuseNodeKind,
+}
+
+struct MajutsuFuseFs {
+    paths: Paths,
+    nodes: BTreeMap<u64, FuseNode>,
+}
+
+impl MajutsuFuseFs {
+    fn from_plan(paths: &Paths, plan: &RestorePlan) -> Result<Self> {
+        let mut fs = Self {
+            paths: Paths {
+                home: paths.home.clone(),
+                db: paths.db.clone(),
+                config: paths.config.clone(),
+                host: paths.host.clone(),
+                objects: paths.objects.clone(),
+                trees: paths.trees.clone(),
+                large_chunks: paths.large_chunks.clone(),
+                large_manifests: paths.large_manifests.clone(),
+                packs: paths.packs.clone(),
+                pack_indexes: paths.pack_indexes.clone(),
+                logs: paths.logs.clone(),
+                runtime: paths.runtime.clone(),
+                daemon_pid: paths.daemon_pid.clone(),
+                upload_queue: paths.upload_queue.clone(),
+                event_queue: paths.event_queue.clone(),
+                master_key: paths.master_key.clone(),
+            },
+            nodes: BTreeMap::new(),
+        };
+        fs.nodes.insert(
+            1,
+            FuseNode {
+                parent: 1,
+                attr: fuse_attr(1, FileType::Directory, 0, 0o755, None),
+                kind: FuseNodeKind::Directory {
+                    children: BTreeMap::new(),
+                },
+            },
+        );
+        for record in &plan.files {
+            let parent = fs.ensure_dir_path(1, Path::new(&record.root_id))?;
+            let rel = Path::new(&record.path);
+            let file_parent = if let Some(parent_path) = rel.parent() {
+                if parent_path.as_os_str().is_empty() {
+                    parent
+                } else {
+                    fs.ensure_dir_path(parent, parent_path)?
+                }
+            } else {
+                parent
+            };
+            let name = rel
+                .file_name()
+                .ok_or_else(|| anyhow!("invalid snapshot path: {}", record.path))?
+                .to_os_string();
+            let ino = fs.next_ino();
+            let kind = match &record.payload {
+                Payload::Symlink { target } => FuseNodeKind::Symlink {
+                    target: target.clone(),
+                },
+                _ => FuseNodeKind::File {
+                    record: record.clone(),
+                },
+            };
+            let file_type = match kind {
+                FuseNodeKind::Symlink { .. } => FileType::Symlink,
+                _ => FileType::RegularFile,
+            };
+            fs.nodes.insert(
+                ino,
+                FuseNode {
+                    parent: file_parent,
+                    attr: fuse_attr(
+                        ino,
+                        file_type,
+                        record.size,
+                        fuse_file_perm(record.mode, file_type),
+                        record.modified,
+                    ),
+                    kind,
+                },
+            );
+            fs.add_child(file_parent, name, ino)?;
+        }
+        Ok(fs)
+    }
+
+    fn next_ino(&self) -> u64 {
+        self.nodes.keys().next_back().copied().unwrap_or(1) + 1
+    }
+
+    fn ensure_dir_path(&mut self, start: u64, path: &Path) -> Result<u64> {
+        let mut current = start;
+        for component in path.components() {
+            let name = component.as_os_str().to_os_string();
+            if name.is_empty() {
+                continue;
+            }
+            let existing = self.nodes.get(&current).and_then(|node| match &node.kind {
+                FuseNodeKind::Directory { children } => children.get(&name).copied(),
+                _ => None,
+            });
+            if let Some(ino) = existing {
+                current = ino;
+                continue;
+            }
+            let ino = self.next_ino();
+            self.nodes.insert(
+                ino,
+                FuseNode {
+                    parent: current,
+                    attr: fuse_attr(ino, FileType::Directory, 0, 0o755, None),
+                    kind: FuseNodeKind::Directory {
+                        children: BTreeMap::new(),
+                    },
+                },
+            );
+            self.add_child(current, name, ino)?;
+            current = ino;
+        }
+        Ok(current)
+    }
+
+    fn add_child(&mut self, parent: u64, name: OsString, ino: u64) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(&parent)
+            .ok_or_else(|| anyhow!("missing parent inode {parent}"))?;
+        if let FuseNodeKind::Directory { children } = &mut node.kind {
+            children.insert(name, ino);
+            Ok(())
+        } else {
+            bail!("parent inode {parent} is not a directory")
+        }
+    }
+
+    fn read_file(&self, record: &FileRecord, offset: i64, size: u32) -> Result<Vec<u8>> {
+        if offset < 0 {
+            return Ok(Vec::new());
+        }
+        let start = offset as u64;
+        if start >= record.size {
+            return Ok(Vec::new());
+        }
+        let end = (start + size as u64).min(record.size);
+        match &record.payload {
+            Payload::Blob { object_key, .. } => {
+                let data = read_object(&self.paths, object_key)?;
+                Ok(data[start as usize..end as usize].to_vec())
+            }
+            Payload::Large { manifest_key, .. } => {
+                let manifest: LargeManifest =
+                    serde_json::from_slice(&read_object(&self.paths, manifest_key)?)?;
+                let mut out = Vec::with_capacity((end - start) as usize);
+                for chunk in manifest.chunks {
+                    let chunk_start = chunk.offset;
+                    let chunk_end = chunk.offset + chunk.len;
+                    if chunk_end <= start || chunk_start >= end {
+                        continue;
+                    }
+                    let data = read_large_chunk(&self.paths, &chunk)?;
+                    let slice_start = start.saturating_sub(chunk_start) as usize;
+                    let slice_end = (end.min(chunk_end) - chunk_start) as usize;
+                    out.extend_from_slice(&data[slice_start..slice_end]);
+                }
+                Ok(out)
+            }
+            Payload::Symlink { .. } => Ok(Vec::new()),
+        }
+    }
+}
+
+impl Filesystem for MajutsuFuseFs {
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let Some(parent_node) = self.nodes.get(&parent) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if let FuseNodeKind::Directory { children } = &parent_node.kind {
+            if let Some(ino) = children.get(name).and_then(|ino| self.nodes.get(ino)) {
+                reply.entry(&FUSE_TTL, &ino.attr, 0);
+                return;
+            }
+        }
+        reply.error(ENOENT);
+    }
+
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        if let Some(node) = self.nodes.get(&ino) {
+            reply.attr(&FUSE_TTL, &node.attr);
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            reply.error(EROFS);
+            return;
+        }
+        match self.nodes.get(&ino).map(|node| &node.kind) {
+            Some(FuseNodeKind::File { .. }) => reply.opened(0, 0),
+            Some(FuseNodeKind::Directory { .. }) => reply.error(EISDIR),
+            _ => reply.error(ENOENT),
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        match self.nodes.get(&ino).map(|node| &node.kind) {
+            Some(FuseNodeKind::File { record }) => match self.read_file(record, offset, size) {
+                Ok(data) => reply.data(&data),
+                Err(_) => reply.error(EIO),
+            },
+            Some(FuseNodeKind::Directory { .. }) => reply.error(EISDIR),
+            _ => reply.error(ENOENT),
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        match self.nodes.get(&ino).map(|node| &node.kind) {
+            Some(FuseNodeKind::Symlink { target }) => reply.data(target.as_bytes()),
+            _ => reply.error(ENOENT),
+        }
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let Some(node) = self.nodes.get(&ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let FuseNodeKind::Directory { children } = &node.kind else {
+            reply.error(ENOENT);
+            return;
+        };
+        let mut entries = Vec::with_capacity(children.len() + 2);
+        entries.push((ino, FileType::Directory, OsString::from(".")));
+        entries.push((node.parent, FileType::Directory, OsString::from("..")));
+        for (name, child_ino) in children {
+            if let Some(child) = self.nodes.get(child_ino) {
+                entries.push((*child_ino, child.attr.kind, name.clone()));
+            }
+        }
+        for (i, (entry_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(entry_ino, (i + 1) as i64, kind, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _offset: i64,
+        _data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        reply.error(EROFS);
+    }
+}
+
+fn mount_fuse_cmd(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<()> {
+    fs::create_dir_all(&plan.to)?;
+    let fs = MajutsuFuseFs::from_plan(paths, plan)?;
+    record_op(
+        conn,
+        "mount-fuse",
+        None,
+        Some(&plan.snapshot.snapshot_id),
+        Some(&format!("at {}", plan.to.display())),
+    )?;
+    println!("mounted snapshot {}", plan.snapshot.snapshot_id);
+    println!("target {}", plan.to.display());
+    println!("backend fuse");
+    println!("files {}", plan.files.len());
+    fuser::mount2(
+        fs,
+        &plan.to,
+        &[
+            MountOption::RO,
+            MountOption::FSName("majutsu".into()),
+            MountOption::Subtype("majutsu".into()),
+            MountOption::DefaultPermissions,
+        ],
+    )
+    .with_context(|| format!("mount fuse view {}", plan.to.display()))?;
+    Ok(())
+}
+
+fn fuse_attr(ino: u64, kind: FileType, size: u64, perm: u16, modified: Option<i64>) -> FileAttr {
+    let time = modified
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    FileAttr {
+        ino,
+        size,
+        blocks: size.div_ceil(512),
+        atime: time,
+        mtime: time,
+        ctime: time,
+        crtime: time,
+        kind,
+        perm,
+        nlink: if kind == FileType::Directory { 2 } else { 1 },
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        rdev: 0,
+        flags: 0,
+        blksize: 512,
+    }
+}
+
+fn fuse_file_perm(mode: u32, kind: FileType) -> u16 {
+    if kind == FileType::Symlink {
+        return 0o777;
+    }
+    let perm = (mode & 0o777) as u16;
+    if perm == 0 { 0o644 } else { perm }
+}
+
+fn is_mountpoint(path: &Path) -> Result<bool> {
+    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let needle = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    Ok(mounts
+        .lines()
+        .any(|line| line.split_whitespace().nth(4).map(Path::new) == Some(needle.as_path())))
+}
+
+fn unmount_fuse(path: &Path) -> Result<()> {
+    let status = ProcessCommand::new("fusermount3")
+        .arg("-u")
+        .arg(path)
+        .status()
+        .or_else(|_| {
+            ProcessCommand::new("fusermount")
+                .arg("-u")
+                .arg(path)
+                .status()
+        })?;
+    if !status.success() {
+        bail!("failed to unmount {}", path.display());
+    }
     Ok(())
 }
 
