@@ -125,6 +125,101 @@ fn file_remote_clone_restores_normal_and_large_files() {
 }
 
 #[test]
+fn encrypted_file_remote_clone_restores_with_exported_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("secret.txt"), b"secret\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--encrypt")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let key_output = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("key")
+        .arg("export")
+        .output()
+        .unwrap();
+    assert!(key_output.status.success());
+    let key = String::from_utf8_lossy(&key_output.stdout)
+        .trim()
+        .to_string();
+    let object = fs::read(
+        fs::read_dir(remote.join("objects/blobs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(object.starts_with(b"MJENC1\n"));
+
+    let status = mj()
+        .arg("--home")
+        .arg(&clone)
+        .arg("clone")
+        .arg("--remote")
+        .arg(format!("file://{}", remote.display()))
+        .env("MAJUTSU_MASTER_KEY", &key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("secret.txt")).unwrap(),
+        fs::read(restore.join("sample/secret.txt")).unwrap()
+    );
+}
+
+#[test]
 fn diff_reports_added_modified_and_deleted_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

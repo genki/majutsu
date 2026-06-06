@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use hmac::{Hmac, Mac};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use rand::RngCore;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -72,6 +75,10 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
     Prune(PruneArgs),
     Gc,
     Fsck,
@@ -83,6 +90,8 @@ struct InitArgs {
     remote: Option<String>,
     #[arg(long)]
     host_name: Option<String>,
+    #[arg(long, default_value_t = false)]
+    encrypt: bool,
 }
 
 #[derive(Subcommand)]
@@ -195,6 +204,12 @@ enum DaemonCommand {
     Status,
 }
 
+#[derive(Subcommand)]
+enum KeyCommand {
+    Export,
+    Import { hex: String },
+}
+
 #[derive(Args)]
 struct PruneArgs {
     #[arg(long, default_value_t = true)]
@@ -220,6 +235,7 @@ struct Paths {
     daemon_pid: PathBuf,
     upload_queue: PathBuf,
     event_queue: PathBuf,
+    master_key: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -227,6 +243,8 @@ struct Config {
     host: HostConfig,
     remote: Option<RemoteConfig>,
     large: LargeConfig,
+    #[serde(default)]
+    security: SecurityConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -238,6 +256,12 @@ struct HostConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct RemoteConfig {
     url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SecurityConfig {
+    #[serde(default)]
+    encryption: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -440,6 +464,7 @@ fn main() -> Result<()> {
         Command::Clone(args) => clone_cmd(&paths, args),
         Command::Watch(args) => watch_cmd(&paths, args),
         Command::Daemon { command } => daemon_cmd(&paths, command),
+        Command::Key { command } => key_cmd(&paths, command),
         Command::Prune(args) => prune_cmd(&paths, args),
         Command::Gc => gc_cmd(&paths),
         Command::Fsck => fsck(&paths),
@@ -468,6 +493,7 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         daemon_pid: home.join("runtime/daemon.pid"),
         upload_queue: home.join("queue/uploads"),
         event_queue: home.join("queue/events"),
+        master_key: home.join("keys/master.key"),
         home,
     })
 }
@@ -511,10 +537,20 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                     "*.md".into(),
                 ],
             },
+            security: SecurityConfig {
+                encryption: if args.encrypt {
+                    "chacha20poly1305".into()
+                } else {
+                    "none".into()
+                },
+            },
         }
     };
     write_config(paths, &config)?;
     fs::write(&paths.host, toml::to_string_pretty(&config.host)?)?;
+    if config.security.encryption != "none" && !paths.master_key.exists() {
+        write_master_key(paths, &random_key_hex()?)?;
+    }
     let conn = open_db(paths)?;
     migrate(&conn)?;
     record_op(&conn, "init", None, None, Some("initialized majutsu home"))?;
@@ -1077,6 +1113,11 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     export.config.remote = Some(remote_config);
     write_config(paths, &export.config)?;
     fs::write(&paths.host, toml::to_string_pretty(&export.config.host)?)?;
+    if export.config.security.encryption != "none" {
+        if let Ok(key) = env::var("MAJUTSU_MASTER_KEY") {
+            write_master_key(paths, &key)?;
+        }
+    }
     for key in local_object_keys(&export) {
         let dest = paths.home.join(&key);
         if let Some(parent) = dest.parent() {
@@ -1176,6 +1217,31 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     Ok(())
 }
 
+fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {
+    match command {
+        KeyCommand::Export => {
+            ensure_ready(paths)?;
+            let key = read_master_key(paths)?;
+            println!("{key}");
+        }
+        KeyCommand::Import { hex } => {
+            create_layout(paths)?;
+            validate_key_hex(&hex)?;
+            write_master_key(paths, &hex)?;
+            println!("imported master key into {}", paths.master_key.display());
+        }
+    }
+    Ok(())
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            encryption: "none".into(),
+        }
+    }
+}
+
 fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
@@ -1224,6 +1290,18 @@ fn fsck(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
     let mut missing = 0usize;
+    let config = read_config(paths)?;
+    let export = export_metadata(&conn, &config)?;
+    for key in local_object_keys(&export) {
+        let full = paths.home.join(&key);
+        if !full.exists() {
+            missing += 1;
+            eprintln!("missing object {key}");
+        } else if let Err(err) = read_object(paths, &key) {
+            missing += 1;
+            eprintln!("unreadable object {key}: {err}");
+        }
+    }
     let mut stmt = conn.prepare("select oid, object_key from blobs")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1233,6 +1311,9 @@ fn fsck(paths: &Paths) -> Result<()> {
         if !paths.home.join(&key).exists() {
             missing += 1;
             eprintln!("missing blob {oid} {key}");
+        } else if let Err(err) = read_object(paths, &key) {
+            missing += 1;
+            eprintln!("unreadable blob {oid} {key}: {err}");
         }
     }
     let mut stmt = conn.prepare("select oid, object_key from chunks")?;
@@ -1244,6 +1325,9 @@ fn fsck(paths: &Paths) -> Result<()> {
         if !paths.home.join(&key).exists() {
             missing += 1;
             eprintln!("missing chunk {oid} {key}");
+        } else if let Err(err) = read_object(paths, &key) {
+            missing += 1;
+            eprintln!("unreadable chunk {oid} {key}: {err}");
         }
     }
     if missing > 0 {
@@ -1370,16 +1454,15 @@ fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
         }
         match &record.payload {
             Payload::Blob { object_key, .. } => {
-                copy_atomic(&paths.home.join(object_key), &dest)?;
+                write_atomic(&dest, &read_object(paths, object_key)?)?;
             }
             Payload::Large { manifest_key, .. } => {
                 let manifest: LargeManifest =
-                    serde_json::from_slice(&fs::read(paths.home.join(manifest_key))?)?;
+                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
                 let tmp = dest.with_extension("mjtmp");
                 let mut out = File::create(&tmp)?;
                 for chunk in manifest.chunks {
-                    let mut input = File::open(paths.home.join(chunk.object_key))?;
-                    std::io::copy(&mut input, &mut out)?;
+                    out.write_all(&read_object(paths, &chunk.object_key)?)?;
                 }
                 out.sync_all()?;
                 fs::rename(tmp, dest)?;
@@ -1673,6 +1756,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
                 always: config.large.always.clone(),
                 never: config.large.never.clone(),
             },
+            security: config.security.clone(),
         },
         roots: roots(conn)?,
         snapshots,
@@ -2063,7 +2147,7 @@ fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<St
     if !path.exists() {
         let tmp = path.with_extension("tmp");
         let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
+        f.write_all(&encode_object(paths, bytes)?)?;
         f.sync_all()?;
         fs::rename(tmp, &path)?;
     }
@@ -2071,11 +2155,101 @@ fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<St
     Ok(path_to_slash(rel))
 }
 
-fn copy_atomic(src: &Path, dest: &Path) -> Result<()> {
+fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = dest.with_extension("mjtmp");
-    fs::copy(src, &tmp)?;
-    File::open(&tmp)?.sync_all()?;
+    let mut f = File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     fs::rename(tmp, dest)?;
+    Ok(())
+}
+
+const ENC_MAGIC: &[u8] = b"MJENC1\n";
+
+fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
+    let config = if paths.config.exists() {
+        Some(read_config(paths)?)
+    } else {
+        None
+    };
+    if config
+        .as_ref()
+        .map(|config| config.security.encryption.as_str() == "chacha20poly1305")
+        .unwrap_or(false)
+    {
+        let key_hex = read_master_key(paths)?;
+        let key_bytes = hex::decode(key_hex.trim())?;
+        let key = Key::from_slice(&key_bytes);
+        let cipher = ChaCha20Poly1305::new(key);
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), bytes)
+            .map_err(|_| anyhow!("object encryption failed"))?;
+        let mut out = Vec::with_capacity(ENC_MAGIC.len() + nonce_bytes.len() + ciphertext.len());
+        out.extend_from_slice(ENC_MAGIC);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
+    let bytes = fs::read(paths.home.join(key))?;
+    decode_object(paths, &bytes)
+}
+
+fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
+    if !bytes.starts_with(ENC_MAGIC) {
+        return Ok(bytes.to_vec());
+    }
+    let start = ENC_MAGIC.len();
+    if bytes.len() < start + 12 {
+        bail!("encrypted object is truncated");
+    }
+    let nonce = &bytes[start..start + 12];
+    let ciphertext = &bytes[start + 12..];
+    let key_hex = read_master_key(paths)?;
+    let key_bytes = hex::decode(key_hex.trim())?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| anyhow!("object decryption failed"))
+}
+
+fn random_key_hex() -> Result<String> {
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    Ok(hex::encode(key))
+}
+
+fn validate_key_hex(hex_key: &str) -> Result<()> {
+    let bytes = hex::decode(hex_key.trim())?;
+    if bytes.len() != 32 {
+        bail!("master key must be 32 bytes encoded as 64 hex characters");
+    }
+    Ok(())
+}
+
+fn read_master_key(paths: &Paths) -> Result<String> {
+    if let Ok(key) = env::var("MAJUTSU_MASTER_KEY") {
+        validate_key_hex(&key)?;
+        return Ok(key);
+    }
+    let key = fs::read_to_string(&paths.master_key)
+        .with_context(|| format!("missing master key: {}", paths.master_key.display()))?;
+    validate_key_hex(key.trim())?;
+    Ok(key.trim().to_string())
+}
+
+fn write_master_key(paths: &Paths, hex_key: &str) -> Result<()> {
+    validate_key_hex(hex_key)?;
+    if let Some(parent) = paths.master_key.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&paths.master_key, format!("{}\n", hex_key.trim()))?;
     Ok(())
 }
 
@@ -2335,7 +2509,7 @@ impl S3Remote {
         resource: &str,
     ) -> Result<String> {
         let canonical = format!("{method}\n{md5}\n{content_type}\n{date}\n{resource}");
-        let mut mac = Hmac::<Sha1>::new_from_slice(self.secret_key.as_bytes())?;
+        let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(self.secret_key.as_bytes())?;
         mac.update(canonical.as_bytes());
         let signature =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());

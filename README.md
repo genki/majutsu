@@ -25,6 +25,8 @@ large object handling.
 - Safe `prune --dry-run` and local loose-object `gc`
 - Persistent upload queue with retry on the next `mj sync`
 - Event journal records for snapshot/watch/root availability observations
+- Optional ChaCha20-Poly1305 object encryption
+- Master key export/import for remote disaster recovery
 - Root pause/resume/missing-state handling
 - Foreground periodic watch and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
@@ -120,6 +122,41 @@ mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 
 The current S3 backend uses path-style requests and AWS Signature V2, which is
 compatible with Google Cloud Storage HMAC keys in the validation environment.
+
+## Encryption
+
+New state can encrypt local and remote object payloads:
+
+```sh
+mj init --encrypt --remote s3://bucket/prefix
+```
+
+Encrypted objects are written with a `MJENC1` header and ChaCha20-Poly1305
+ciphertext. Existing plaintext objects remain readable for compatibility.
+
+The master key is stored locally at:
+
+```text
+$MAJUTSU_HOME/keys/master.key
+```
+
+Export it and store it separately from the host:
+
+```sh
+mj key export
+```
+
+To recover from remote storage into a fresh state, provide the key with an
+environment variable or import it first:
+
+```sh
+MAJUTSU_MASTER_KEY=<64-hex-key> mj --home /tmp/recovered clone --remote s3://bucket/prefix
+
+mj --home /tmp/recovered key import <64-hex-key>
+```
+
+Without the master key, encrypted objects can be downloaded but cannot be
+verified or restored.
 
 ## History And Diff
 

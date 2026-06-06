@@ -7,12 +7,14 @@ edition = "2024"
 anyhow = "1"
 base64 = "0.22"
 blake3 = "1"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 hmac = "0.12"
 ignore = "0.4"
 quick-xml = "0.37"
+rand = "0.8"
 reqwest = { version = "0.12", features = ["blocking"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
