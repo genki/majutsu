@@ -487,6 +487,8 @@ struct RestoreQueueItem {
     required_objects: Vec<String>,
     archived_objects: Vec<String>,
     #[serde(default)]
+    missing_objects: Vec<String>,
+    #[serde(default)]
     archive_requested_objects: Vec<String>,
     #[serde(default)]
     force: bool,
@@ -1415,6 +1417,7 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
             println!("snapshot {}", job.snapshot_id);
             println!("required_objects {}", job.required_objects.len());
             println!("archived_objects {}", job.archived_objects.len());
+            println!("missing_objects {}", job.missing_objects.len());
             println!(
                 "archive_requested_objects {}",
                 job.archive_requested_objects.len()
@@ -1422,6 +1425,13 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
         }
         RestoreCommand::Resume { job_id } => {
             let job = read_restore_job(paths, &job_id)?;
+            if !job.missing_objects.is_empty() {
+                bail!(
+                    "restore job {} has missing objects: {}",
+                    job.id,
+                    job.missing_objects.len()
+                );
+            }
             if !job.archived_objects.is_empty() {
                 bail!(
                     "restore job {} still has archived objects pending: {}",
@@ -4143,11 +4153,25 @@ fn build_restore_job(
 ) -> Result<RestoreQueueItem> {
     let conn = open_db(paths)?;
     let required_objects = required_object_keys_for_plan(paths, &conn, plan)?;
-    let archived_objects = required_objects
-        .iter()
-        .filter(|key| !paths.home.join(key).exists())
-        .cloned()
-        .collect::<Vec<_>>();
+    let remote = read_config(paths)
+        .ok()
+        .and_then(|config| config.remote.and_then(|remote| open_remote(&remote).ok()));
+    let mut archived_objects = Vec::new();
+    let mut missing_objects = Vec::new();
+    for key in &required_objects {
+        if paths.home.join(key).exists() {
+            continue;
+        }
+        if remote
+            .as_ref()
+            .and_then(|remote| remote.exists(key).ok())
+            .unwrap_or(false)
+        {
+            archived_objects.push(key.clone());
+        } else {
+            missing_objects.push(key.clone());
+        }
+    }
     Ok(RestoreQueueItem {
         id: new_id("restore"),
         snapshot_id: plan.snapshot.snapshot_id.clone(),
@@ -4160,6 +4184,7 @@ fn build_restore_job(
             .unwrap_or_else(|| "original-roots".into()),
         required_objects,
         archived_objects,
+        missing_objects,
         archive_requested_objects: Vec::new(),
         force: args.force,
         check_conflicts: args.check_conflicts,

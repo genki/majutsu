@@ -482,10 +482,13 @@ Restored regular and large files preserve stored Unix mode bits, extended
 attributes, and modified time. Symlink metadata is left unchanged so restore
 does not mutate the link target.
 
-If `restore prepare` finds required objects missing from local state and a
-remote is configured, it issues provider-side archive restore requests for
-those object keys. S3 remotes use `POST ?restore` with a 7-day Standard restore
-request; file remotes record the request as a no-op for local validation.
+If `restore prepare` finds required objects missing from local state, it checks
+the configured remote. Objects that exist remotely are tracked as
+`archived_objects` and receive provider-side archive restore requests; objects
+missing both locally and remotely are tracked as `missing_objects` and block
+`restore resume` until the data is repaired. S3 remotes use `POST ?restore`
+with a 7-day Standard restore request; file remotes record the request as a
+no-op for local validation.
 
 ## Mount Views
 
