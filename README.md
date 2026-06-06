@@ -82,7 +82,7 @@ mj sync
 mj sync status
 mj remote fsck
 mj log
-mj restore --at "2026-06-06T10:30:00Z" --root home-notes --to /tmp/majutsu-restore
+mj restore --at "2026-06-06 10:30:00" --root home-notes --to /tmp/majutsu-restore
 mj restore plan --to /tmp/majutsu-restore
 mj restore apply --to /tmp/majutsu-restore
 ```
@@ -102,6 +102,9 @@ with the target.
 Plans also summarize the object set needed for restore, including large-file
 chunk count, local availability, remote availability, and objects that are
 missing or likely need archive hydration.
+Time arguments such as `--at` accept RFC3339 timestamps, `YYYY-MM-DD HH:MM:SS`
+as UTC, `YYYY-MM-DD` as midnight UTC, `now`, and relative values such as
+`10 minutes ago`.
 
 ## Large Files
 
@@ -368,14 +371,14 @@ separate tree manifest object under `objects/trees/`.
 
 ## Watch And Daemon
 
-Foreground OS-native filesystem watching. On Linux, `inotify` can be selected
-explicitly:
+Foreground OS-native filesystem watching. On Linux, `inotify` is the default:
 
 ```sh
-mj watch --foreground --backend inotify --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
+mj watch --foreground --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
 ```
 
-`--backend notify` is kept as the cross-platform native watcher alias.
+`--backend inotify` can be specified explicitly on Linux. `--backend notify` is
+kept as the cross-platform native watcher alias.
 
 Polling fallback:
 
@@ -392,7 +395,7 @@ mj watch --once --backend notify --debounce-ms 100
 Daemonized watch can also be started through `watch`:
 
 ```sh
-mj watch --foreground=false --backend poll --interval-secs 60
+mj watch --foreground=false --interval-secs 60
 ```
 
 Minimal background daemon management:

@@ -863,6 +863,73 @@ fn restore_without_subcommand_applies_plan() {
 }
 
 #[test]
+fn restore_at_accepts_spec_datetime_formats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore_datetime = tmp.path().join("restore-datetime");
+    let restore_date = tmp.path().join("restore-date");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--at")
+            .arg("2999-01-01 00:00:00")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore_datetime);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--at")
+            .arg("2999-01-01")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore_date);
+        c
+    });
+
+    assert_eq!(
+        fs::read(restore_datetime.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+    assert_eq!(
+        fs::read(restore_date.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+}
+
+#[test]
 fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -2324,6 +2391,54 @@ fn linux_inotify_backend_records_native_events() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("current snap-"));
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("backend=inotify"));
+    assert!(events.contains("fs-event"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_watch_defaults_to_inotify_backend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("watch")
+        .arg("--once")
+        .arg("--debounce-ms")
+        .arg("100")
+        .arg("--settle-ms")
+        .arg("50")
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
     let events = fs::read_dir(state.join("queue/events"))
         .unwrap()
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
@@ -324,8 +324,8 @@ struct WatchArgs {
     settle_ms: u64,
     #[arg(long, default_value_t = 3600)]
     periodic_rescan_secs: u64,
-    #[arg(long, default_value = "notify")]
-    backend: String,
+    #[arg(long)]
+    backend: Option<String>,
     #[arg(long, default_value_t = false)]
     once: bool,
 }
@@ -2717,7 +2717,8 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
 
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
-    let backend = normalize_watch_backend(&args.backend)?;
+    let backend =
+        normalize_watch_backend(args.backend.as_deref().unwrap_or(default_daemon_backend()))?;
     if !args.foreground {
         let pid = start_watch_daemon(
             paths,
@@ -5956,13 +5957,25 @@ fn parse_time(input: &str) -> Result<String> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(input) {
         return Ok(dt.with_timezone(&Utc).to_rfc3339());
     }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
+        return Ok(dt.and_utc().to_rfc3339());
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
+        return Ok(date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow!("invalid date: {input}"))?
+            .and_utc()
+            .to_rfc3339());
+    }
     if input == "now" {
         return Ok(Utc::now().to_rfc3339());
     }
     if let Some(dt) = parse_relative_ago(input)? {
         return Ok(dt.to_rfc3339());
     }
-    bail!("time must be RFC3339 for now, got: {input}");
+    bail!(
+        "time must be RFC3339, YYYY-MM-DD HH:MM:SS, YYYY-MM-DD, relative ago, or now, got: {input}"
+    );
 }
 
 fn parse_relative_ago(input: &str) -> Result<Option<DateTime<Utc>>> {
