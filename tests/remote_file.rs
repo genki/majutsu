@@ -32,6 +32,16 @@ fn output(mut command: Command) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn fails(mut command: Command) {
+    let output = command.output().expect("run command");
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn file_remote_clone_restores_normal_and_large_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -319,6 +329,102 @@ fn prune_dry_run_and_gc_are_safe_entry_points() {
         c.arg("--home").arg(&state).arg("fsck");
         c
     });
+}
+
+#[test]
+fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let first = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    let second = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+
+    let prune = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("1")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    assert!(prune.contains("deleted_snapshots 1"));
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--snapshot")
+            .arg(&second)
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"two\n"
+    );
 }
 
 #[test]

@@ -312,11 +312,16 @@ Use `mj root resume <id>` after the path is available again.
 
 ## Prune And GC
 
-Prune is currently a safe planning entry point:
+Prune plans or deletes snapshots according to daily/monthly retention buckets:
 
 ```sh
 mj prune --dry-run --keep-daily 90 --keep-monthly 36
+mj prune --dry-run=false --keep-daily 90 --keep-monthly 36
 ```
+
+The current snapshot is always kept. Non-dry-run prune removes unkept snapshot
+metadata and drops blob/large/chunk metadata no longer referenced by remaining
+snapshots.
 
 `mj gc` removes unreferenced local loose objects under `$MAJUTSU_HOME/objects`.
 It does not delete referenced history or remote objects.

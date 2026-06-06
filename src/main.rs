@@ -269,7 +269,7 @@ enum KeyCommand {
 
 #[derive(Args)]
 struct PruneArgs {
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
     #[arg(long, default_value_t = 90)]
     keep_daily: u32,
@@ -1769,19 +1769,154 @@ impl Default for SecurityConfig {
 fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
-    let total: i64 = conn.query_row("select count(*) from snapshots", [], |row| row.get(0))?;
-    let keep_hint = args.keep_daily as i64 + args.keep_monthly as i64;
-    let candidates = (total - keep_hint).max(0);
+    let plan = build_prune_plan(&conn, &args)?;
+    let total = plan.keep.len() + plan.delete.len();
     println!("snapshots {total}");
     println!("keep_daily {}", args.keep_daily);
     println!("keep_monthly {}", args.keep_monthly);
-    println!("candidate_snapshots {candidates}");
+    println!("keep_snapshots {}", plan.keep.len());
+    println!("candidate_snapshots {}", plan.delete.len());
     if args.dry_run {
         println!("dry_run true");
     } else {
-        bail!("snapshot deletion is not implemented yet; run gc for unreferenced local objects");
+        let before = current_snapshot(&conn)?;
+        for snapshot in &plan.delete {
+            conn.execute("delete from snapshots where id=?1", params![snapshot])?;
+        }
+        let removed = prune_unreferenced_metadata(paths, &conn)?;
+        record_op(
+            &conn,
+            "prune",
+            before.as_deref(),
+            before.as_deref(),
+            Some(&format!("deleted {} snapshots", plan.delete.len())),
+        )?;
+        println!("dry_run false");
+        println!("deleted_snapshots {}", plan.delete.len());
+        println!("removed_blob_metadata {}", removed.blobs);
+        println!("removed_large_metadata {}", removed.large_objects);
+        println!("removed_chunk_metadata {}", removed.chunks);
     }
     Ok(())
+}
+
+struct PrunePlan {
+    keep: Vec<String>,
+    delete: Vec<String>,
+}
+
+struct SnapshotPruneRow {
+    id: String,
+    created_at: DateTime<Utc>,
+}
+
+struct PrunedMetadata {
+    blobs: usize,
+    large_objects: usize,
+    chunks: usize,
+}
+
+fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<PrunePlan> {
+    let current = current_snapshot(conn)?;
+    let mut stmt = conn.prepare("select id, created_at from snapshots order by created_at desc")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let snapshots = rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(id, created)| {
+            Ok(SnapshotPruneRow {
+                id,
+                created_at: parse_db_time(&created)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut keep = std::collections::BTreeSet::new();
+    if let Some(current) = current {
+        keep.insert(current);
+    }
+    let mut daily = std::collections::BTreeSet::new();
+    let mut monthly = std::collections::BTreeSet::new();
+    for snapshot in &snapshots {
+        let day = snapshot.created_at.format("%Y-%m-%d").to_string();
+        if daily.len() < args.keep_daily as usize && daily.insert(day) {
+            keep.insert(snapshot.id.clone());
+        }
+        let month = snapshot.created_at.format("%Y-%m").to_string();
+        if monthly.len() < args.keep_monthly as usize && monthly.insert(month) {
+            keep.insert(snapshot.id.clone());
+        }
+    }
+    let mut keep = keep.into_iter().collect::<Vec<_>>();
+    keep.sort();
+    let delete = snapshots
+        .into_iter()
+        .map(|snapshot| snapshot.id)
+        .filter(|id| !keep.binary_search(id).is_ok())
+        .collect::<Vec<_>>();
+    Ok(PrunePlan { keep, delete })
+}
+
+fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<PrunedMetadata> {
+    let mut live_blobs = std::collections::BTreeSet::new();
+    let mut live_large = std::collections::BTreeSet::new();
+    let mut live_chunks = std::collections::BTreeSet::new();
+    let mut stmt = conn.prepare("select manifest_json from snapshots")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let manifest: SnapshotManifest = serde_json::from_str(&row?)?;
+        for records in manifest.roots.values() {
+            for record in records {
+                match &record.payload {
+                    Payload::Blob { oid, .. } => {
+                        live_blobs.insert(oid.clone());
+                    }
+                    Payload::Large {
+                        oid, manifest_key, ..
+                    } => {
+                        live_large.insert(oid.clone());
+                        let large_manifest: LargeManifest =
+                            serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+                        for chunk in large_manifest.chunks {
+                            live_chunks.insert(chunk.oid);
+                        }
+                    }
+                    Payload::Symlink { .. } => {}
+                }
+            }
+        }
+    }
+    let blobs = delete_rows_not_in(conn, "blobs", "oid", &live_blobs)?;
+    let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live_large)?;
+    let chunks = delete_rows_not_in(conn, "chunks", "oid", &live_chunks)?;
+    Ok(PrunedMetadata {
+        blobs,
+        large_objects,
+        chunks,
+    })
+}
+
+fn delete_rows_not_in(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    live: &std::collections::BTreeSet<String>,
+) -> Result<usize> {
+    let mut stmt = conn.prepare(&format!("select {column} from {table}"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut removed = 0usize;
+    for row in rows {
+        let id = row?;
+        if !live.contains(&id) {
+            conn.execute(
+                &format!("delete from {table} where {column}=?1"),
+                params![id],
+            )?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn gc_cmd(paths: &Paths) -> Result<()> {
@@ -3244,6 +3379,10 @@ fn parse_time(input: &str) -> Result<String> {
         return Ok(Utc::now().to_rfc3339());
     }
     bail!("time must be RFC3339 for now, got: {input}");
+}
+
+fn parse_db_time(input: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(input)?.with_timezone(&Utc))
 }
 
 fn parse_duration_ago(input: &str) -> Result<DateTime<Utc>> {
