@@ -193,7 +193,7 @@ struct RestoreArgs {
     #[arg(long)]
     path: Option<PathBuf>,
     #[arg(long)]
-    to: PathBuf,
+    to: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -1283,10 +1283,10 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
                 "restore",
                 None,
                 Some(after),
-                Some(&format!("to {}", plan.to.display())),
+                Some(&format!("to {}", restore_target_label(&plan))),
             )?;
             print_restore_plan(&plan);
-            println!("restored to {}", plan.to.display());
+            println!("restored to {}", restore_target_label(&plan));
         }
         RestoreCommand::Prepare(args) => {
             let plan = build_restore_plan(paths, &conn, &args)?;
@@ -1323,7 +1323,11 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
                 at: None,
                 root: job.root.clone(),
                 path: job.path.as_ref().map(PathBuf::from),
-                to: PathBuf::from(&job.target),
+                to: if job.target == "original-roots" {
+                    None
+                } else {
+                    Some(PathBuf::from(&job.target))
+                },
             };
             let plan = build_restore_plan(paths, &conn, &args)?;
             apply_restore_plan(paths, &plan)?;
@@ -1336,7 +1340,7 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
                 Some(&job.id),
             )?;
             println!("resumed {}", job.id);
-            println!("restored to {}", plan.to.display());
+            println!("restored to {}", restore_target_label(&plan));
         }
     }
     Ok(())
@@ -1350,7 +1354,7 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         at: args.at.clone(),
         root: args.root.clone(),
         path: args.path.clone(),
-        to: args.mountpoint.clone(),
+        to: Some(args.mountpoint.clone()),
     };
     let plan = build_restore_plan(paths, &conn, &restore_args)?;
     if args.backend == "fuse" {
@@ -1359,12 +1363,16 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
     if args.backend != "materialized" {
         bail!("mount backend must be materialized or fuse");
     }
-    fs::create_dir_all(&plan.to)?;
-    let lazy_root = plan.to.join(".majutsu-lazy");
+    let mountpoint = plan
+        .to
+        .as_ref()
+        .ok_or_else(|| anyhow!("mount requires a target directory"))?;
+    fs::create_dir_all(mountpoint)?;
+    let lazy_root = mountpoint.join(".majutsu-lazy");
     let mut lazy_files = 0usize;
     let mut hydrated_large = 0usize;
     for record in &plan.files {
-        let dest = plan.to.join(&record.root_id).join(&record.path);
+        let dest = mountpoint.join(&record.root_id).join(&record.path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1427,7 +1435,7 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         "mount",
         None,
         Some(&plan.snapshot.snapshot_id),
-        Some(&format!("at {}", plan.to.display())),
+        Some(&format!("at {}", mountpoint.display())),
     )?;
     let mount_metadata = MountViewMetadata {
         version: 1,
@@ -1439,11 +1447,11 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         hydrated_large_files: hydrated_large,
     };
     fs::write(
-        plan.to.join(".majutsu-mount.json"),
+        mountpoint.join(".majutsu-mount.json"),
         serde_json::to_vec_pretty(&mount_metadata)?,
     )?;
     println!("mounted snapshot {}", plan.snapshot.snapshot_id);
-    println!("target {}", plan.to.display());
+    println!("target {}", mountpoint.display());
     println!("files {}", plan.files.len());
     println!("lazy_large_files {lazy_files}");
     println!("hydrated_large_files {hydrated_large}");
@@ -1787,22 +1795,26 @@ impl Filesystem for MajutsuFuseFs {
 }
 
 fn mount_fuse_cmd(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<()> {
-    fs::create_dir_all(&plan.to)?;
+    let mountpoint = plan
+        .to
+        .as_ref()
+        .ok_or_else(|| anyhow!("fuse mount requires a target directory"))?;
+    fs::create_dir_all(mountpoint)?;
     let fs = MajutsuFuseFs::from_plan(paths, plan)?;
     record_op(
         conn,
         "mount-fuse",
         None,
         Some(&plan.snapshot.snapshot_id),
-        Some(&format!("at {}", plan.to.display())),
+        Some(&format!("at {}", mountpoint.display())),
     )?;
     println!("mounted snapshot {}", plan.snapshot.snapshot_id);
-    println!("target {}", plan.to.display());
+    println!("target {}", mountpoint.display());
     println!("backend fuse");
     println!("files {}", plan.files.len());
     fuser::mount2(
         fs,
-        &plan.to,
+        mountpoint,
         &[
             MountOption::RO,
             MountOption::FSName("majutsu".into()),
@@ -1810,7 +1822,7 @@ fn mount_fuse_cmd(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Resul
             MountOption::DefaultPermissions,
         ],
     )
-    .with_context(|| format!("mount fuse view {}", plan.to.display()))?;
+    .with_context(|| format!("mount fuse view {}", mountpoint.display()))?;
     Ok(())
 }
 
@@ -3097,7 +3109,8 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
 #[derive(Debug)]
 struct RestorePlan {
     snapshot: SnapshotManifest,
-    to: PathBuf,
+    to: Option<PathBuf>,
+    root_paths: BTreeMap<String, PathBuf>,
     files: Vec<FileRecord>,
 }
 
@@ -3107,6 +3120,10 @@ fn build_restore_plan(
     args: &RestoreArgs,
 ) -> Result<RestorePlan> {
     let snapshot = load_snapshot(conn, args)?;
+    let root_paths = roots(conn)?
+        .into_iter()
+        .map(|root| (root.id, root.path))
+        .collect::<BTreeMap<_, _>>();
     let mut files = Vec::new();
     for (root_id, records) in &snapshot.roots {
         if let Some(filter_root) = &args.root {
@@ -3151,8 +3168,29 @@ fn build_restore_plan(
     Ok(RestorePlan {
         snapshot,
         to: args.to.clone(),
+        root_paths,
         files,
     })
+}
+
+fn restore_destination(plan: &RestorePlan, record: &FileRecord) -> Result<PathBuf> {
+    if let Some(to) = &plan.to {
+        return Ok(to.join(&record.root_id).join(&record.path));
+    }
+    let root = plan.root_paths.get(&record.root_id).ok_or_else(|| {
+        anyhow!(
+            "snapshot root is not configured locally: {}",
+            record.root_id
+        )
+    })?;
+    Ok(root.join(&record.path))
+}
+
+fn restore_target_label(plan: &RestorePlan) -> String {
+    plan.to
+        .as_ref()
+        .map(|to| to.display().to_string())
+        .unwrap_or_else(|| "original-roots".into())
 }
 
 fn print_restore_plan(plan: &RestorePlan) {
@@ -3163,7 +3201,11 @@ fn print_restore_plan(plan: &RestorePlan) {
         .count();
     let bytes: u64 = plan.files.iter().map(|r| r.size).sum();
     println!("snapshot {}", plan.snapshot.snapshot_id);
-    println!("target {}", plan.to.display());
+    if let Some(to) = &plan.to {
+        println!("target {}", to.display());
+    } else {
+        println!("target original-roots");
+    }
     println!(
         "restore {} files, {} bytes, {} large files",
         plan.files.len(),
@@ -3189,7 +3231,11 @@ fn build_restore_job(
         snapshot_id: plan.snapshot.snapshot_id.clone(),
         root: args.root.clone(),
         path: args.path.as_ref().map(|path| path_to_slash(path)),
-        target: args.to.display().to_string(),
+        target: args
+            .to
+            .as_ref()
+            .map(|to| to.display().to_string())
+            .unwrap_or_else(|| "original-roots".into()),
         required_objects,
         archived_objects,
         archive_requested_objects: Vec::new(),
@@ -3296,7 +3342,7 @@ fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {
 fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
     let conn = open_db(paths)?;
     for record in &plan.files {
-        let dest = plan.to.join(&record.root_id).join(&record.path);
+        let dest = restore_destination(plan, record)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }

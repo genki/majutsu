@@ -87,7 +87,9 @@ mj restore apply --to /tmp/majutsu-restore
 ```
 
 The restore command writes files below `<target>/<root-id>/...` so the original
-root is not overwritten accidentally.
+root is not overwritten accidentally when `--to` is provided. If `--to` is
+omitted, restore writes back to the configured original root path for the
+selected root.
 
 ## Large Files
 
@@ -461,6 +463,6 @@ debounced snapshots are created.
 
 - Missing roots are skipped and logged as `root-missing`; they are not treated
   as mass deletion.
-- Restore writes to an alternate directory only in this MVP.
+- Prefer `restore plan` before writing back to original roots.
 - Database directories, VM images, and live application state still require an
   application-consistent dump or filesystem snapshot before being watched.

@@ -414,6 +414,72 @@ fn prune_dry_run_and_gc_are_safe_entry_points() {
 }
 
 #[test]
+fn restore_without_to_can_write_back_to_original_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let first = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let plan = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--root")
+            .arg("sample");
+        c
+    });
+    assert!(plan.contains("target original-roots"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--root")
+            .arg("sample");
+        c
+    });
+    assert_eq!(fs::read(source.join("alpha.txt")).unwrap(), b"one\n");
+}
+
+#[test]
 fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
