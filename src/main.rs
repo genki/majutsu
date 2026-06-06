@@ -1327,7 +1327,7 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
     match command {
         RestoreCommand::Plan(args) => {
             let plan = build_restore_plan(paths, &conn, &args)?;
-            print_restore_plan(&plan);
+            print_restore_plan(paths, &conn, &plan)?;
             if args.check_conflicts {
                 let conflicts = restore_conflicts(paths, &conn, &plan)?;
                 print_restore_conflicts(&conflicts);
@@ -1344,7 +1344,7 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
                 Some(after),
                 Some(&format!("to {}", restore_target_label(&plan))),
             )?;
-            print_restore_plan(&plan);
+            print_restore_plan(paths, &conn, &plan)?;
             println!("restored to {}", restore_target_label(&plan));
         }
         RestoreCommand::Prepare(args) => {
@@ -3444,6 +3444,14 @@ struct RestoreDelete {
     path: String,
 }
 
+struct RestoreObjectStats {
+    required_objects: usize,
+    required_chunks: usize,
+    local_objects: usize,
+    remote_objects: usize,
+    archive_or_missing_objects: usize,
+}
+
 fn build_restore_plan(
     _paths: &Paths,
     conn: &Connection,
@@ -3612,7 +3620,7 @@ fn restore_target_label(plan: &RestorePlan) -> String {
         .unwrap_or_else(|| "original-roots".into())
 }
 
-fn print_restore_plan(plan: &RestorePlan) {
+fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<()> {
     let large = plan
         .files
         .iter()
@@ -3634,6 +3642,72 @@ fn print_restore_plan(plan: &RestorePlan) {
     );
     println!("delete {} files", plan.deletes.len());
     println!("keep {} snapshot files", keep);
+    let stats = restore_object_stats(paths, conn, plan)?;
+    println!("large_files {large}");
+    println!("required_objects {}", stats.required_objects);
+    println!("required_chunks {}", stats.required_chunks);
+    println!("local_objects {}", stats.local_objects);
+    println!("remote_objects {}", stats.remote_objects);
+    println!(
+        "archive_or_missing_objects {}",
+        stats.archive_or_missing_objects
+    );
+    Ok(())
+}
+
+fn restore_object_stats(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+) -> Result<RestoreObjectStats> {
+    let required_objects = required_object_keys_for_plan(paths, conn, plan)?;
+    let required_chunks = required_chunk_count_for_plan(paths, plan)?;
+    let local_objects = required_objects
+        .iter()
+        .filter(|key| paths.home.join(key).exists())
+        .count();
+    let remote = read_config(paths)
+        .ok()
+        .and_then(|config| config.remote.and_then(|remote| open_remote(&remote).ok()));
+    let mut remote_objects = 0usize;
+    if let Some(remote) = remote.as_ref() {
+        for key in &required_objects {
+            if remote.exists(key)? {
+                remote_objects += 1;
+            }
+        }
+    }
+    let archive_or_missing_objects = required_objects.len().saturating_sub(
+        required_objects
+            .iter()
+            .filter(|key| {
+                paths.home.join(key).exists()
+                    || remote
+                        .as_ref()
+                        .and_then(|remote| remote.exists(key).ok())
+                        .unwrap_or(false)
+            })
+            .count(),
+    );
+    Ok(RestoreObjectStats {
+        required_objects: required_objects.len(),
+        required_chunks,
+        local_objects,
+        remote_objects,
+        archive_or_missing_objects,
+    })
+}
+
+fn required_chunk_count_for_plan(paths: &Paths, plan: &RestorePlan) -> Result<usize> {
+    let mut chunks = 0usize;
+    for record in &plan.files {
+        if let Payload::Large { manifest_key, .. } = &record.payload {
+            let manifest: LargeManifest =
+                serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+            chunks += manifest.chunks.len();
+        }
+    }
+    Ok(chunks)
 }
 
 fn build_restore_job(

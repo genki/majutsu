@@ -1354,6 +1354,22 @@ fn large_chunks_can_be_compressed_and_restored() {
             .arg(format!("file://{}", remote.display()));
         c
     });
+    let plan = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("plan")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(plan.contains("large_files 1"));
+    assert!(plan.contains("required_chunks 2"));
+    assert!(plan.contains("required_objects "));
+    assert!(plan.contains("local_objects "));
+    assert!(plan.contains("remote_objects "));
+    assert!(plan.contains("archive_or_missing_objects 0"));
     run({
         let mut c = mj();
         c.arg("--home")
