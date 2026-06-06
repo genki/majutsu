@@ -3786,6 +3786,13 @@ struct RestoreObjectStats {
     archive_or_missing_objects: usize,
 }
 
+struct RestoreChangeStats {
+    restore_files: usize,
+    modify_files: usize,
+    keep_files: usize,
+    delete_files: usize,
+}
+
 fn build_restore_plan(
     _paths: &Paths,
     conn: &Connection,
@@ -3961,7 +3968,7 @@ fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> R
         .filter(|r| matches!(r.payload, Payload::Large { .. }))
         .count();
     let bytes: u64 = plan.files.iter().map(|r| r.size).sum();
-    let keep = plan.files.len().saturating_sub(plan.deletes.len());
+    let changes = restore_change_stats(paths, conn, plan)?;
     println!("snapshot {}", plan.snapshot.snapshot_id);
     if let Some(to) = &plan.to {
         println!("target {}", to.display());
@@ -3975,7 +3982,10 @@ fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> R
         large
     );
     println!("delete {} files", plan.deletes.len());
-    println!("keep {} snapshot files", keep);
+    println!("restore_files {}", changes.restore_files);
+    println!("modify_files {}", changes.modify_files);
+    println!("keep_files {}", changes.keep_files);
+    println!("delete_files {}", changes.delete_files);
     let stats = restore_object_stats(paths, conn, plan)?;
     println!("large_files {large}");
     println!("required_objects {}", stats.required_objects);
@@ -3987,6 +3997,30 @@ fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> R
         stats.archive_or_missing_objects
     );
     Ok(())
+}
+
+fn restore_change_stats(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+) -> Result<RestoreChangeStats> {
+    let mut stats = RestoreChangeStats {
+        restore_files: 0,
+        modify_files: 0,
+        keep_files: 0,
+        delete_files: plan.deletes.len(),
+    };
+    for record in &plan.files {
+        let dest = restore_destination(plan, record)?;
+        if !dest.try_exists()? {
+            stats.restore_files += 1;
+        } else if restore_record_matches_path(paths, conn, record, &dest).unwrap_or(false) {
+            stats.keep_files += 1;
+        } else {
+            stats.modify_files += 1;
+        }
+    }
+    Ok(stats)
 }
 
 fn restore_object_stats(

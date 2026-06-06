@@ -96,7 +96,9 @@ selected root. `restore plan` reports existing destination conflicts, and
 `restore apply` refuses to overwrite conflicting files unless `--force` is
 provided. Files that exist in the restore target but not in the selected
 snapshot are reported as deletes; apply requires `--force` before deleting
-those extra files.
+those extra files. Plans also include `restore_files`, `modify_files`,
+`keep_files`, and `delete_files` counts after comparing the selected snapshot
+with the target.
 Plans also summarize the object set needed for restore, including large-file
 chunk count, local availability, remote availability, and objects that are
 missing or likely need archive hydration.

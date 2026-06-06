@@ -780,6 +780,10 @@ fn restore_without_to_can_write_back_to_original_root() {
     assert!(plan.contains("target original-roots"));
     assert!(plan.contains("conflicts 1"));
     assert!(plan.contains("delete 1 files"));
+    assert!(plan.contains("restore_files 0"));
+    assert!(plan.contains("modify_files 1"));
+    assert!(plan.contains("keep_files 0"));
+    assert!(plan.contains("delete_files 1"));
     fails({
         let mut c = mj();
         c.arg("--home")
