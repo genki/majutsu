@@ -257,6 +257,7 @@ struct LargeUnpinArgs {
 enum RemoteCommand {
     Check,
     Fsck,
+    Capabilities,
     Hosts,
     Host { id: String },
 }
@@ -486,6 +487,17 @@ struct RemoteHostIndex {
     version: u32,
     updated_at: DateTime<Utc>,
     hosts: Vec<RemoteHostSummary>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoteCapabilities {
+    lifecycle_rules: bool,
+    object_tags: bool,
+    storage_class_on_put: bool,
+    restore_archived_object: bool,
+    multipart_upload: bool,
+    range_get: bool,
+    conditional_put: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2274,6 +2286,20 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         }
         RemoteCommand::Fsck => {
             remote_fsck(&remote)?;
+        }
+        RemoteCommand::Capabilities => {
+            let capabilities = remote.capabilities();
+            println!("remote {}", remote.describe());
+            println!("lifecycle_rules {}", capabilities.lifecycle_rules);
+            println!("object_tags {}", capabilities.object_tags);
+            println!("storage_class_on_put {}", capabilities.storage_class_on_put);
+            println!(
+                "restore_archived_object {}",
+                capabilities.restore_archived_object
+            );
+            println!("multipart_upload {}", capabilities.multipart_upload);
+            println!("range_get {}", capabilities.range_get);
+            println!("conditional_put {}", capabilities.conditional_put);
         }
         RemoteCommand::Hosts => {
             let index = remote_host_index_with_legacy(&remote)?;
@@ -4602,6 +4628,29 @@ impl RemoteStore {
         match self {
             RemoteStore::File(_) => Ok(true),
             RemoteStore::S3(remote) => remote.restore_archive(key, days, tier),
+        }
+    }
+
+    fn capabilities(&self) -> RemoteCapabilities {
+        match self {
+            RemoteStore::File(_) => RemoteCapabilities {
+                lifecycle_rules: false,
+                object_tags: false,
+                storage_class_on_put: false,
+                restore_archived_object: true,
+                multipart_upload: false,
+                range_get: true,
+                conditional_put: false,
+            },
+            RemoteStore::S3(remote) => RemoteCapabilities {
+                lifecycle_rules: true,
+                object_tags: false,
+                storage_class_on_put: false,
+                restore_archived_object: true,
+                multipart_upload: !remote.uses_sigv2(),
+                range_get: true,
+                conditional_put: false,
+            },
         }
     }
 }

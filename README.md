@@ -170,6 +170,7 @@ mj root add sample /path/to/sample
 mj snapshot --message 'first remote snapshot'
 mj sync
 mj remote check
+mj remote capabilities
 mj remote hosts
 mj remote host test-host
 mj remote fsck

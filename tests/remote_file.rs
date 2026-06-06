@@ -113,6 +113,16 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c.arg("--home").arg(&state).arg("remote").arg("fsck");
         c
     });
+    let capabilities = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("capabilities");
+        c
+    });
+    assert!(capabilities.contains("range_get true"));
+    assert!(capabilities.contains("multipart_upload false"));
     let hosts = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("remote").arg("hosts");
