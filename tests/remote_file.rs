@@ -593,7 +593,8 @@ fn restore_without_to_can_write_back_to_original_root() {
         c
     });
     assert!(plan.contains("target original-roots"));
-    run({
+    assert!(plan.contains("conflicts 1"));
+    fails({
         let mut c = mj();
         c.arg("--home")
             .arg(&state)
@@ -603,6 +604,20 @@ fn restore_without_to_can_write_back_to_original_root() {
             .arg(&first)
             .arg("--root")
             .arg("sample");
+        c
+    });
+    assert_eq!(fs::read(source.join("alpha.txt")).unwrap(), b"two\n");
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--root")
+            .arg("sample")
+            .arg("--force");
         c
     });
     assert_eq!(fs::read(source.join("alpha.txt")).unwrap(), b"one\n");

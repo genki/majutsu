@@ -89,7 +89,9 @@ mj restore apply --to /tmp/majutsu-restore
 The restore command writes files below `<target>/<root-id>/...` so the original
 root is not overwritten accidentally when `--to` is provided. If `--to` is
 omitted, restore writes back to the configured original root path for the
-selected root.
+selected root. `restore plan` reports existing destination conflicts, and
+`restore apply` refuses to overwrite conflicting files unless `--force` is
+provided.
 
 ## Large Files
 

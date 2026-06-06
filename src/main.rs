@@ -194,6 +194,10 @@ struct RestoreArgs {
     path: Option<PathBuf>,
     #[arg(long)]
     to: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    force: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    check_conflicts: bool,
 }
 
 #[derive(Args, Clone)]
@@ -455,6 +459,10 @@ struct RestoreQueueItem {
     archived_objects: Vec<String>,
     #[serde(default)]
     archive_requested_objects: Vec<String>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default = "default_true")]
+    check_conflicts: bool,
     created_at: DateTime<Utc>,
     status: String,
 }
@@ -1279,10 +1287,14 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
         RestoreCommand::Plan(args) => {
             let plan = build_restore_plan(paths, &conn, &args)?;
             print_restore_plan(&plan);
+            if args.check_conflicts {
+                let conflicts = restore_conflicts(paths, &conn, &plan)?;
+                print_restore_conflicts(&conflicts);
+            }
         }
         RestoreCommand::Apply(args) => {
             let plan = build_restore_plan(paths, &conn, &args)?;
-            apply_restore_plan(paths, &plan)?;
+            apply_restore_plan(paths, &plan, args.force, args.check_conflicts)?;
             let after = plan.snapshot.snapshot_id.as_str();
             record_op(
                 &conn,
@@ -1334,9 +1346,11 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
                 } else {
                     Some(PathBuf::from(&job.target))
                 },
+                force: job.force,
+                check_conflicts: job.check_conflicts,
             };
             let plan = build_restore_plan(paths, &conn, &args)?;
-            apply_restore_plan(paths, &plan)?;
+            apply_restore_plan(paths, &plan, job.force, job.check_conflicts)?;
             mark_restore_job_done(paths, &job.id)?;
             record_op(
                 &conn,
@@ -1361,6 +1375,8 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         root: args.root.clone(),
         path: args.path.clone(),
         to: Some(args.mountpoint.clone()),
+        force: true,
+        check_conflicts: false,
     };
     let plan = build_restore_plan(paths, &conn, &restore_args)?;
     if args.backend == "fuse" {
@@ -3426,6 +3442,8 @@ fn build_restore_job(
         required_objects,
         archived_objects,
         archive_requested_objects: Vec::new(),
+        force: args.force,
+        check_conflicts: args.check_conflicts,
         created_at: Utc::now(),
         status: "prepared".into(),
     })
@@ -3526,8 +3544,20 @@ fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {
     write_restore_job(paths, &job)
 }
 
-fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
+fn apply_restore_plan(
+    paths: &Paths,
+    plan: &RestorePlan,
+    force: bool,
+    check_conflicts: bool,
+) -> Result<()> {
     let conn = open_db(paths)?;
+    if check_conflicts && !force {
+        let conflicts = restore_conflicts(paths, &conn, plan)?;
+        if !conflicts.is_empty() {
+            print_restore_conflicts(&conflicts);
+            bail!("restore has conflicts; rerun with --force to overwrite");
+        }
+    }
     for record in &plan.files {
         let dest = restore_destination(plan, record)?;
         if let Some(parent) = dest.parent() {
@@ -3559,6 +3589,80 @@ fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn restore_conflicts(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<Vec<String>> {
+    let mut conflicts = Vec::new();
+    for record in &plan.files {
+        let dest = restore_destination(plan, record)?;
+        if !dest.try_exists()? {
+            continue;
+        }
+        if !restore_record_matches_path(paths, conn, record, &dest)? {
+            conflicts.push(format!("{}\t{}", record.root_id, record.path));
+        }
+    }
+    Ok(conflicts)
+}
+
+fn restore_record_matches_path(
+    paths: &Paths,
+    conn: &Connection,
+    record: &FileRecord,
+    dest: &Path,
+) -> Result<bool> {
+    let meta = fs::symlink_metadata(dest)?;
+    match &record.payload {
+        Payload::Blob { oid, object_key } => {
+            if !meta.file_type().is_file() {
+                return Ok(false);
+            }
+            Ok(fs::read(dest)? == read_blob_payload(paths, conn, oid, object_key)?)
+        }
+        Payload::Large { manifest_key, .. } => {
+            if !meta.file_type().is_file() || meta.len() != record.size {
+                return Ok(false);
+            }
+            let manifest: LargeManifest =
+                serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+            let mut current = File::open(dest)?;
+            for chunk in manifest.chunks {
+                let expected = read_large_chunk(paths, &chunk)?;
+                let mut actual = vec![0u8; expected.len()];
+                current.read_exact(&mut actual)?;
+                if actual != expected {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Payload::Symlink { target } => {
+            #[cfg(unix)]
+            {
+                if !meta.file_type().is_symlink() {
+                    return Ok(false);
+                }
+                Ok(fs::read_link(dest)?.as_os_str() == OsStr::new(target))
+            }
+            #[cfg(not(unix))]
+            {
+                if !meta.file_type().is_file() {
+                    return Ok(false);
+                }
+                Ok(fs::read_to_string(dest)? == *target)
+            }
+        }
+    }
+}
+
+fn print_restore_conflicts(conflicts: &[String]) {
+    println!("conflicts {}", conflicts.len());
+    for conflict in conflicts.iter().take(20) {
+        println!("conflict\t{conflict}");
+    }
+    if conflicts.len() > 20 {
+        println!("conflict\t... {} more", conflicts.len() - 20);
+    }
 }
 
 fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
@@ -4457,6 +4561,10 @@ fn default_large_chunking() -> String {
 
 fn default_chunk_compression() -> String {
     "none".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for LargeCompressionConfig {
