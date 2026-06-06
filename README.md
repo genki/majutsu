@@ -27,6 +27,9 @@ large object handling.
 - Event journal records for snapshot/watch/root availability observations
 - Optional ChaCha20-Poly1305 object encryption
 - Master key export/import for remote disaster recovery
+- Root snapshot modes: `default`, `strict`, and `transactional`
+- Transactional pre/post snapshot hooks
+- Stable read retry/backoff
 - Root pause/resume/missing-state handling
 - Foreground periodic watch and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
@@ -157,6 +160,34 @@ mj --home /tmp/recovered key import <64-hex-key>
 
 Without the master key, encrypted objects can be downloaded but cannot be
 verified or restored.
+
+## Snapshot Modes
+
+Roots default to coalesced snapshot behavior:
+
+```sh
+mj root add docs ~/Documents --snapshot-mode default
+```
+
+Strict mode retries stable reads more aggressively:
+
+```sh
+mj root add config /etc/myapp --snapshot-mode strict
+```
+
+Transactional mode runs hooks before and after scanning the root. This is the
+intended path for application state, database dumps, VM images, and other data
+that needs an application-consistent checkpoint:
+
+```sh
+mj root add app-data /srv/app/data \
+  --snapshot-mode transactional \
+  --pre-snapshot '/usr/local/bin/app-checkpoint begin' \
+  --post-snapshot '/usr/local/bin/app-checkpoint end'
+```
+
+If a hook exits non-zero, the snapshot fails. Hook execution is recorded in the
+event journal.
 
 ## History And Diff
 

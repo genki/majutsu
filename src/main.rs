@@ -116,6 +116,12 @@ struct RootAddArgs {
     include: Vec<String>,
     #[arg(long, default_value_t = false)]
     follow_symlinks: bool,
+    #[arg(long, default_value = "default")]
+    snapshot_mode: String,
+    #[arg(long)]
+    pre_snapshot: Option<String>,
+    #[arg(long)]
+    post_snapshot: Option<String>,
 }
 
 #[derive(Args)]
@@ -360,6 +366,12 @@ struct RootConfig {
     follow_symlinks: bool,
     #[serde(default = "default_root_status")]
     status: String,
+    #[serde(default = "default_snapshot_mode")]
+    snapshot_mode: String,
+    #[serde(default)]
+    pre_snapshot: Option<String>,
+    #[serde(default)]
+    post_snapshot: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -568,6 +580,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             if !path.exists() {
                 bail!("root path does not exist: {}", path.display());
             }
+            validate_snapshot_mode(&args.snapshot_mode)?;
             let root = RootConfig {
                 name: args.name.unwrap_or_else(|| args.id.clone()),
                 id: args.id,
@@ -580,6 +593,9 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 exclude: args.exclude,
                 follow_symlinks: args.follow_symlinks,
                 status: "active".into(),
+                snapshot_mode: args.snapshot_mode,
+                pre_snapshot: args.pre_snapshot,
+                post_snapshot: args.post_snapshot,
             };
             conn.execute(
                 "insert into roots(id, data_json) values (?1, ?2)
@@ -667,7 +683,11 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             )?;
             continue;
         }
-        let records = scan_root(paths, &config, &root)?;
+        run_pre_snapshot_hook(paths, &root)?;
+        let records_result = scan_root(paths, &config, &root);
+        let post_result = run_post_snapshot_hook(paths, &root);
+        let records = records_result?;
+        post_result?;
         large_files += records
             .iter()
             .filter(|r| matches!(r.payload, Payload::Large { .. }))
@@ -1531,7 +1551,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 chunk_count,
             }
         } else {
-            let bytes = stable_read(entry.path())?;
+            let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
             let oid = blake3_hex(&bytes);
             let object_key = store_bytes(paths, &paths.objects, &oid, &bytes)?;
             let conn = open_db(paths)?;
@@ -2038,6 +2058,45 @@ fn build_ignore(root: &RootConfig) -> Result<Gitignore> {
     Ok(builder.build()?)
 }
 
+fn validate_snapshot_mode(mode: &str) -> Result<()> {
+    match mode {
+        "default" | "strict" | "transactional" => Ok(()),
+        _ => bail!("snapshot mode must be default, strict, or transactional"),
+    }
+}
+
+fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
+    if root.snapshot_mode == "transactional" {
+        if let Some(command) = &root.pre_snapshot {
+            record_event(paths, "pre-snapshot", &format!("{} {}", root.id, command))?;
+            run_hook(command, &root.path)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_post_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
+    if root.snapshot_mode == "transactional" {
+        if let Some(command) = &root.post_snapshot {
+            record_event(paths, "post-snapshot", &format!("{} {}", root.id, command))?;
+            run_hook(command, &root.path)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_hook(command: &str, cwd: &Path) -> Result<()> {
+    let status = ProcessCommand::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .status()?;
+    if !status.success() {
+        bail!("snapshot hook failed: {command}");
+    }
+    Ok(())
+}
+
 fn is_included(patterns: &[String], rel: &Path) -> bool {
     if patterns.is_empty() {
         return true;
@@ -2105,6 +2164,10 @@ fn default_root_status() -> String {
     "active".into()
 }
 
+fn default_snapshot_mode() -> String {
+    "default".into()
+}
+
 fn read_pid(path: &Path) -> Result<Option<u32>> {
     if !path.exists() {
         return Ok(None);
@@ -2129,14 +2192,20 @@ fn looks_binary(path: &Path) -> Result<bool> {
     Ok(buf[..n].contains(&0))
 }
 
-fn stable_read(path: &Path) -> Result<Vec<u8>> {
-    let before = fs::metadata(path)?;
-    let bytes = fs::read(path)?;
-    let after = fs::metadata(path)?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-        bail!("file changed while reading: {}", path.display());
+fn stable_read(path: &Path, mode: &str) -> Result<Vec<u8>> {
+    let attempts = if mode == "strict" { 8 } else { 3 };
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        let before = fs::metadata(path)?;
+        let bytes = fs::read(path)?;
+        let after = fs::metadata(path)?;
+        if before.len() == after.len() && before.modified().ok() == after.modified().ok() {
+            return Ok(bytes);
+        }
+        last_error = Some(anyhow!("file changed while reading: {}", path.display()));
+        std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1) as u64));
     }
-    Ok(bytes)
+    Err(last_error.unwrap_or_else(|| anyhow!("file did not become stable: {}", path.display())))
 }
 
 fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<String> {

@@ -394,3 +394,55 @@ fn watch_once_creates_snapshot_without_daemonizing() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("current snap-"));
 }
+
+#[test]
+fn transactional_snapshot_runs_pre_and_post_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--snapshot-mode")
+            .arg("transactional")
+            .arg("--pre-snapshot")
+            .arg("printf pre > pre.txt")
+            .arg("--post-snapshot")
+            .arg("printf post > post.txt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert_eq!(fs::read_to_string(source.join("pre.txt")).unwrap(), "pre");
+    assert_eq!(fs::read_to_string(source.join("post.txt")).unwrap(), "post");
+    let restore = tmp.path().join("restore");
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/pre.txt")).unwrap(),
+        "pre"
+    );
+}
