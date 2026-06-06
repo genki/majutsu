@@ -2537,10 +2537,11 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
 
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
+    let backend = normalize_watch_backend(&args.backend)?;
     if !args.foreground {
         let pid = start_watch_daemon(
             paths,
-            &args.backend,
+            backend,
             args.interval_secs,
             args.debounce_ms,
             args.settle_ms,
@@ -2550,10 +2551,34 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
         return Ok(());
     }
     start_daemon_ipc(paths)?;
-    match args.backend.as_str() {
-        "notify" => watch_notify(paths, args),
+    match backend {
+        "notify" => watch_notify(paths, args, "notify"),
+        "inotify" => watch_notify(paths, args, "inotify"),
         "poll" => watch_poll(paths, args),
         other => bail!("unsupported watch backend: {other}"),
+    }
+}
+
+fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
+    match backend {
+        "notify" | "native" => Ok("notify"),
+        "poll" => Ok("poll"),
+        "inotify" => {
+            if cfg!(target_os = "linux") {
+                Ok("inotify")
+            } else {
+                bail!("inotify backend is only available on Linux")
+            }
+        }
+        other => bail!("unsupported watch backend: {other}"),
+    }
+}
+
+fn default_daemon_backend() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "inotify"
+    } else {
+        "notify"
     }
 }
 
@@ -2579,7 +2604,7 @@ fn watch_poll(paths: &Paths, args: WatchArgs) -> Result<()> {
     Ok(())
 }
 
-fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
+fn watch_notify(paths: &Paths, args: WatchArgs, backend_label: &str) -> Result<()> {
     let conn = open_db(paths)?;
     let active_roots = roots(&conn)?
         .into_iter()
@@ -2592,8 +2617,8 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
         paths,
         "watch-start",
         &format!(
-            "backend=notify debounce_ms={} settle_ms={} periodic_rescan_secs={}",
-            args.debounce_ms, args.settle_ms, args.periodic_rescan_secs
+            "backend={} debounce_ms={} settle_ms={} periodic_rescan_secs={}",
+            backend_label, args.debounce_ms, args.settle_ms, args.periodic_rescan_secs
         ),
     )?;
     let (tx, rx) = mpsc::channel();
@@ -2673,7 +2698,11 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
             break;
         }
     }
-    record_event(paths, "watch-stop", "foreground notify watch stopped")?;
+    record_event(
+        paths,
+        "watch-stop",
+        &format!("foreground {backend_label} watch stopped"),
+    )?;
     Ok(())
 }
 
@@ -2761,7 +2790,7 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         } => {
             let pid = start_watch_daemon(
                 paths,
-                "notify",
+                default_daemon_backend(),
                 interval_secs,
                 1500,
                 settle_ms,

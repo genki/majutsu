@@ -328,11 +328,14 @@ separate tree manifest object under `objects/trees/`.
 
 ## Watch And Daemon
 
-Foreground OS-native filesystem watching:
+Foreground OS-native filesystem watching. On Linux, `inotify` can be selected
+explicitly:
 
 ```sh
-mj watch --foreground --backend notify --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
+mj watch --foreground --backend inotify --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
 ```
+
+`--backend notify` is kept as the cross-platform native watcher alias.
 
 Polling fallback:
 
@@ -360,16 +363,16 @@ mj daemon status
 mj daemon stop
 ```
 
-The daemon is a process wrapper around foreground watch. It uses the notify
-backend by default, records filesystem events in the event journal, and exposes
-a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock` for status IPC.
+The daemon is a process wrapper around foreground watch. It uses the native
+watch backend by default (`inotify` on Linux), records filesystem events in the
+event journal, and exposes a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock`
+for status IPC.
 Notify mode debounces event bursts, then waits for the configured settle window
 before snapshotting. New events during the settle window restart the debounce
 and settle cycle.
-The notify backend remains the primary change detector, using the platform's
-native watcher such as inotify on Linux. Periodic rescan is only a low-frequency
-safety net for missed events or long idle periods; set `--periodic-rescan-secs
-0` to disable it.
+The native backend remains the primary change detector. Periodic rescan is only
+a low-frequency safety net for missed events or long idle periods; set
+`--periodic-rescan-secs 0` to disable it.
 
 ## Root State
 

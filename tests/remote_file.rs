@@ -1881,6 +1881,64 @@ fn watch_once_creates_snapshot_without_daemonizing() {
     assert!(events.contains("settle_ms=50"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_inotify_backend_records_native_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("watch")
+        .arg("--once")
+        .arg("--backend")
+        .arg("inotify")
+        .arg("--debounce-ms")
+        .arg("100")
+        .arg("--settle-ms")
+        .arg("50")
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let output = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("current snap-"));
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("backend=inotify"));
+    assert!(events.contains("fs-event"));
+}
+
 #[test]
 fn notify_watch_can_create_periodic_rescan_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
