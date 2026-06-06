@@ -455,6 +455,8 @@ struct LargeConfig {
     enabled: bool,
     min_size: u64,
     binary_min_size: u64,
+    #[serde(default = "default_large_chunking")]
+    default_chunking: String,
     chunk_size: usize,
     always: Vec<String>,
     never: Vec<String>,
@@ -552,6 +554,8 @@ struct LargeManifest {
     version: u32,
     oid: String,
     size: u64,
+    #[serde(default = "default_large_chunking")]
+    chunking: String,
     chunk_size: usize,
     chunks: Vec<LargeChunk>,
 }
@@ -686,6 +690,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                 enabled: true,
                 min_size: DEFAULT_LARGE_MIN_SIZE,
                 binary_min_size: DEFAULT_LARGE_BINARY_MIN_SIZE,
+                default_chunking: "fixed".into(),
                 chunk_size: DEFAULT_CHUNK_SIZE,
                 always: vec![
                     "*.mp4".into(),
@@ -2372,26 +2377,20 @@ fn store_large_file(
     rel: &Path,
     config: &LargeConfig,
 ) -> Result<(String, String, usize)> {
-    let mut file = File::open(path)?;
+    let bytes = stable_read(path, "strict")?;
     let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes);
     let mut chunks = Vec::new();
-    let mut offset = 0u64;
-    let mut index = 0usize;
-    loop {
-        let mut buf = vec![0u8; config.chunk_size];
-        let read = file.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        buf.truncate(read);
-        hasher.update(&buf);
-        let chunk_oid = blake3_hex(&buf);
-        let stored = compress_large_chunk(config, rel, &buf)?;
+    let ranges = large_chunk_ranges_for_bytes(config, &bytes);
+    for (index, (start, end)) in ranges.into_iter().enumerate() {
+        let chunk = &bytes[start..end];
+        let chunk_oid = blake3_hex(chunk);
+        let stored = compress_large_chunk(config, rel, chunk)?;
         let object_key = store_bytes(paths, &paths.large_chunks, &chunk_oid, &stored.bytes)?;
         chunks.push(LargeChunk {
             index,
-            offset,
-            len: read as u64,
+            offset: start as u64,
+            len: chunk.len() as u64,
             stored_len: Some(stored.bytes.len() as u64),
             compression: stored.compression,
             oid: chunk_oid.clone(),
@@ -2400,16 +2399,15 @@ fn store_large_file(
         let conn = open_db(paths)?;
         conn.execute(
             "insert or ignore into chunks(oid, size, object_key) values (?1, ?2, ?3)",
-            params![chunk_oid, read as u64, object_key],
+            params![chunk_oid, chunk.len() as u64, object_key],
         )?;
-        offset += read as u64;
-        index += 1;
     }
     let oid = hasher.finalize().to_hex().to_string();
     let manifest = LargeManifest {
         version: 1,
         oid: oid.clone(),
-        size: offset,
+        size: bytes.len() as u64,
+        chunking: config.default_chunking.clone(),
         chunk_size: config.chunk_size,
         chunks,
     };
@@ -2419,9 +2417,60 @@ fn store_large_file(
     let conn = open_db(paths)?;
     conn.execute(
         "insert or ignore into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
-        params![oid, offset, manifest.chunks.len(), manifest_key],
+        params![oid, bytes.len() as u64, manifest.chunks.len(), manifest_key],
     )?;
     Ok((oid, manifest_key, manifest.chunks.len()))
+}
+
+fn large_chunk_ranges_for_bytes(config: &LargeConfig, bytes: &[u8]) -> Vec<(usize, usize)> {
+    if config.default_chunking == "fastcdc" {
+        content_defined_ranges(bytes, config.chunk_size)
+    } else {
+        fixed_ranges(bytes.len(), config.chunk_size)
+    }
+}
+
+fn fixed_ranges(len: usize, chunk_size: usize) -> Vec<(usize, usize)> {
+    let chunk_size = chunk_size.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < len {
+        let end = (start + chunk_size).min(len);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
+fn content_defined_ranges(bytes: &[u8], target: usize) -> Vec<(usize, usize)> {
+    let len = bytes.len();
+    let target = target.max(1024);
+    let min = (target / 4).max(1024).min(target);
+    let max = (target * 4).max(min + 1);
+    let mask = target.next_power_of_two().saturating_sub(1).max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut rolling = 0u64;
+    while start < len {
+        let hard_end = (start + max).min(len);
+        let mut end = hard_end;
+        let mut i = start;
+        while i < hard_end {
+            rolling = rolling
+                .rotate_left(1)
+                .wrapping_add(bytes[i] as u64)
+                .wrapping_mul(0x9E37_79B1_85EB_CA87);
+            let current_len = i + 1 - start;
+            if current_len >= min && ((rolling as usize) & mask) == 0 {
+                end = i + 1;
+                break;
+            }
+            i += 1;
+        }
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
 }
 
 struct StoredLargeChunk {
@@ -2612,6 +2661,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
                 enabled: config.large.enabled,
                 min_size: config.large.min_size,
                 binary_min_size: config.large.binary_min_size,
+                default_chunking: config.large.default_chunking.clone(),
                 chunk_size: config.large.chunk_size,
                 always: config.large.always.clone(),
                 never: config.large.never.clone(),
@@ -3081,6 +3131,10 @@ fn default_root_status() -> String {
 
 fn default_snapshot_mode() -> String {
     "default".into()
+}
+
+fn default_large_chunking() -> String {
+    "fixed".into()
 }
 
 fn default_chunk_compression() -> String {

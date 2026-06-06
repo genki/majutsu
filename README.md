@@ -16,7 +16,7 @@ large object handling.
 - SQLite metadata database
 - Manual snapshots
 - Content-addressed local object store
-- Large file pointer manifests with fixed-size chunks
+- Large file pointer manifests with fixed-size or content-defined chunks
 - Large chunk zstd compression policy
 - Operation log
 - Operation show and current-ref restore
@@ -125,6 +125,15 @@ algorithm = "zstd"
 level = 3
 min_gain_ratio = 0.05
 skip_extensions = ["*.jpg", "*.png", "*.mp4", "*.zip", "*.zst", "*.gz"]
+```
+
+Chunking defaults to fixed-size chunks. Set `large.default_chunking` to
+`fastcdc` to use content-defined chunk boundaries around `large.chunk_size`:
+
+```toml
+[large]
+default_chunking = "fastcdc"
+chunk_size = 8388608
 ```
 
 ## Remote Sync
