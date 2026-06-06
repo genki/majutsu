@@ -4193,7 +4193,8 @@ fn stable_read(path: &Path, mode: &str) -> Result<Vec<u8>> {
 }
 
 fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<String> {
-    let (a, b) = oid.split_at(2);
+    let storage_id = object_storage_id(paths, oid)?;
+    let (a, b) = storage_id.split_at(2);
     let dir = base.join(a);
     fs::create_dir_all(&dir)?;
     let path = dir.join(b);
@@ -4206,6 +4207,25 @@ fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<St
     }
     let rel = path.strip_prefix(&paths.home).unwrap_or(&path);
     Ok(path_to_slash(rel))
+}
+
+fn object_storage_id(paths: &Paths, oid: &str) -> Result<String> {
+    if !object_keys_are_hmac(paths)? {
+        return Ok(oid.to_string());
+    }
+    let key_hex = read_master_key(paths)?;
+    let key_bytes = hex::decode(key_hex.trim())?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key_bytes)?;
+    mac.update(b"majutsu-object-key-v1\0");
+    mac.update(oid.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn object_keys_are_hmac(paths: &Paths) -> Result<bool> {
+    if !paths.config.exists() {
+        return Ok(false);
+    }
+    Ok(read_config(paths)?.security.encryption == "chacha20poly1305")
 }
 
 fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {

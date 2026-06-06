@@ -204,7 +204,10 @@ mj init --encrypt --remote s3://bucket/prefix
 ```
 
 Encrypted objects are written with a `MJENC1` header and ChaCha20-Poly1305
-ciphertext. Existing plaintext objects remain readable for compatibility.
+ciphertext. For encrypted state, content object paths are derived with
+HMAC-SHA256 from the master key and the internal content id, so remote object
+keys do not expose raw plaintext hashes. Existing plaintext objects remain
+readable for compatibility.
 
 The master key is stored locally at:
 

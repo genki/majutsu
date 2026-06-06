@@ -247,21 +247,19 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     let key = String::from_utf8_lossy(&key_output.stdout)
         .trim()
         .to_string();
-    let object = fs::read(
-        fs::read_dir(remote.join("objects/blobs"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path()
-            .read_dir()
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path(),
-    )
-    .unwrap();
+    let plain_oid = blake3::hash(b"secret\n").to_hex().to_string();
+    assert!(
+        !remote
+            .join("objects/blobs")
+            .join(&plain_oid[..2])
+            .join(&plain_oid[2..])
+            .exists()
+    );
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let object_key = export["blobs"][0]["object_key"].as_str().unwrap();
+    assert!(!object_key.contains(&plain_oid));
+    let object = fs::read(remote.join(object_key)).unwrap();
     assert!(object.starts_with(b"MJENC1\n"));
 
     let status = mj()
