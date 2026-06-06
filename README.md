@@ -383,6 +383,16 @@ If a root cannot be scanned because access is denied, it records
 turning unreadable files into deletions. Use `mj root resume <id>` after the
 path is available again.
 
+For roots that must be backed by a mounted filesystem, use `--require-mount`:
+
+```sh
+mj root add photos /mnt/photos --require-mount
+```
+
+If that path exists but is not a mount point, `mj snapshot` records
+`root-unmounted`, marks the root `unmounted`, and skips it instead of recording
+mass deletion.
+
 ## Prune And GC
 
 Prune plans or deletes snapshots according to daily/monthly retention buckets:

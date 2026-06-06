@@ -142,6 +142,8 @@ struct RootAddArgs {
     include: Vec<String>,
     #[arg(long, default_value_t = false)]
     follow_symlinks: bool,
+    #[arg(long, default_value_t = false)]
+    require_mount: bool,
     #[arg(long, default_value = "default")]
     snapshot_mode: String,
     #[arg(long)]
@@ -624,6 +626,8 @@ struct RootConfig {
     #[serde(default)]
     exclude: Vec<String>,
     follow_symlinks: bool,
+    #[serde(default)]
+    require_mount: bool,
     #[serde(default = "default_root_status")]
     status: String,
     #[serde(default = "default_snapshot_mode")]
@@ -923,6 +927,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 },
                 exclude: args.exclude,
                 follow_symlinks: args.follow_symlinks,
+                require_mount: args.require_mount,
                 status: "active".into(),
                 snapshot_mode: args.snapshot_mode,
                 pre_snapshot: args.pre_snapshot,
@@ -1011,6 +1016,27 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             record_event(
                 paths,
                 "root-missing",
+                &format!("{} {}", root.id, root.path.display()),
+            )?;
+            continue;
+        }
+        if root.require_mount && !is_mount_point(&root.path) {
+            update_root_status(&conn, &root.id, "unmounted")?;
+            record_op(
+                &conn,
+                "root-unmounted",
+                parent.as_deref(),
+                parent.as_deref(),
+                Some(&root.id),
+            )?;
+            eprintln!(
+                "root unmounted, skipped: {} {}",
+                root.id,
+                root.path.display()
+            );
+            record_event(
+                paths,
+                "root-unmounted",
                 &format!("{} {}", root.id, root.path.display()),
             )?;
             continue;
@@ -5341,6 +5367,59 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(env::current_dir()?.join(path))
     }
+}
+
+fn is_mount_point(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(target) = fs::canonicalize(path) else {
+            return false;
+        };
+        let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+            return false;
+        };
+        for line in mountinfo.lines() {
+            let Some(before_sep) = line.split(" - ").next() else {
+                continue;
+            };
+            let mut fields = before_sep.split_whitespace();
+            let mount_point = fields.nth(4);
+            if let Some(mount_point) = mount_point {
+                if PathBuf::from(unescape_mountinfo_path(mount_point)) == target {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn unescape_mountinfo_path(input: &str) -> String {
+    let mut out = String::new();
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+        {
+            if let Ok(value) = u8::from_str_radix(&input[i + 1..i + 4], 8) {
+                out.push(value as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn path_to_slash(path: &Path) -> String {
