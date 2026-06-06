@@ -2984,6 +2984,72 @@ fn watch_uses_configured_timing_defaults() {
     assert!(events.contains("periodic_rescan_secs=0"));
 }
 
+#[test]
+fn watch_strict_mode_snapshots_each_observed_event_without_debounce() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("mode = \"default\"", "mode = \"strict\"")
+        .replace("debounce = 1500", "debounce = \"2000ms\"")
+        .replace("settle = 500", "settle = \"2000ms\"")
+        .replace("periodic_rescan = 3600", "periodic_rescan = \"0s\"");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+
+    let start = std::time::Instant::now();
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("watch")
+        .arg("--once")
+        .arg("--backend")
+        .arg("notify")
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "strict watch waited for debounce/settle"
+    );
+
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("mode=strict"));
+    assert!(!events.contains("watch-settle"));
+    let ops = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(ops.contains("watch strict event snapshot"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_inotify_backend_records_native_events() {

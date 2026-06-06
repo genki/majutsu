@@ -397,6 +397,7 @@ struct WatchArgs {
 #[derive(Clone)]
 struct ResolvedWatchArgs {
     foreground: bool,
+    mode: String,
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
@@ -3169,6 +3170,7 @@ fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
 fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> ResolvedWatchArgs {
     ResolvedWatchArgs {
         foreground: args.foreground,
+        mode: config.mode.clone(),
         interval_secs: args.interval_secs.unwrap_or(config.interval),
         debounce_ms: args.debounce_ms.unwrap_or(config.debounce),
         settle_ms: args.settle_ms.unwrap_or(config.settle),
@@ -3190,7 +3192,10 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
     record_event(
         paths,
         "watch-start",
-        &format!("backend=poll interval_secs={}", args.interval_secs),
+        &format!(
+            "backend=poll mode={} interval_secs={}",
+            args.mode, args.interval_secs
+        ),
     )?;
     loop {
         snapshot(
@@ -3221,8 +3226,8 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
         paths,
         "watch-start",
         &format!(
-            "backend={} debounce_ms={} settle_ms={} periodic_rescan_secs={}",
-            backend_label, args.debounce_ms, args.settle_ms, args.periodic_rescan_secs
+            "backend={} mode={} debounce_ms={} settle_ms={} periodic_rescan_secs={}",
+            backend_label, args.mode, args.debounce_ms, args.settle_ms, args.periodic_rescan_secs
         ),
     )?;
     let (tx, rx) = mpsc::channel();
@@ -3271,6 +3276,18 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
         };
         let detail = format_notify_event(&event);
         record_event(paths, "fs-event", &detail)?;
+        if args.mode == "strict" {
+            snapshot(
+                paths,
+                SnapshotArgs {
+                    message: Some("watch strict event snapshot".into()),
+                },
+            )?;
+            if args.once {
+                break;
+            }
+            continue;
+        }
         let debounce = std::time::Duration::from_millis(args.debounce_ms.max(1));
         let settle = std::time::Duration::from_millis(args.settle_ms);
         drain_watch_debounce(paths, &rx, debounce)?;
