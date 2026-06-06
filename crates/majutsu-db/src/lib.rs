@@ -1,0 +1,9 @@
+pub const ROOTS_TABLE: &str = "roots";
+pub const SNAPSHOTS_TABLE: &str = "snapshots";
+pub const OPERATIONS_TABLE: &str = "operations";
+pub const BLOBS_TABLE: &str = "blobs";
+pub const LARGE_OBJECTS_TABLE: &str = "large_objects";
+pub const CHUNKS_TABLE: &str = "chunks";
+pub const UPLOAD_QUEUE_TABLE: &str = "upload_queue";
+pub const RESTORE_QUEUE_TABLE: &str = "restore_queue";
+pub const REFS_TABLE: &str = "refs";

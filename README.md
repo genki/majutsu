@@ -54,6 +54,28 @@ cargo install --path .
 
 This installs `mj`.
 
+## Workspace
+
+The repository is a Cargo workspace. The current `mj` binary remains in the
+root package while domain boundaries are represented by these crates:
+
+```text
+crates/majutsu-cli
+crates/majutsu-daemon
+crates/majutsu-core
+crates/majutsu-db
+crates/majutsu-watch
+crates/majutsu-store
+crates/majutsu-large
+crates/majutsu-pack
+crates/majutsu-crypto
+crates/majutsu-restore
+crates/majutsu-policy
+```
+
+They provide the stable model, policy, and trait surfaces used as extraction
+targets while the production CLI continues to preserve compatibility.
+
 ## State Home
 
 State home resolution order:

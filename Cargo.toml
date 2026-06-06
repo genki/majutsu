@@ -3,6 +3,22 @@ name = "majutsu"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    ".",
+    "crates/majutsu-cli",
+    "crates/majutsu-core",
+    "crates/majutsu-crypto",
+    "crates/majutsu-daemon",
+    "crates/majutsu-db",
+    "crates/majutsu-large",
+    "crates/majutsu-pack",
+    "crates/majutsu-policy",
+    "crates/majutsu-restore",
+    "crates/majutsu-store",
+    "crates/majutsu-watch",
+]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

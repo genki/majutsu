@@ -1148,6 +1148,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "majutsu-cli"
+version = "0.1.0"
+
+[[package]]
+name = "majutsu-core"
+version = "0.1.0"
+
+[[package]]
+name = "majutsu-crypto"
+version = "0.1.0"
+
+[[package]]
+name = "majutsu-daemon"
+version = "0.1.0"
+
+[[package]]
+name = "majutsu-db"
+version = "0.1.0"
+
+[[package]]
+name = "majutsu-large"
+version = "0.1.0"
+dependencies = [
+ "majutsu-core",
+]
+
+[[package]]
+name = "majutsu-pack"
+version = "0.1.0"
+dependencies = [
+ "majutsu-core",
+]
+
+[[package]]
+name = "majutsu-policy"
+version = "0.1.0"
+
+[[package]]
+name = "majutsu-restore"
+version = "0.1.0"
+dependencies = [
+ "majutsu-core",
+]
+
+[[package]]
+name = "majutsu-store"
+version = "0.1.0"
+dependencies = [
+ "majutsu-core",
+]
+
+[[package]]
+name = "majutsu-watch"
+version = "0.1.0"
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
