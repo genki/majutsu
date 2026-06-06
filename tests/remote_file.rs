@@ -2377,12 +2377,17 @@ fn large_config_accepts_spec_size_strings() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("tiny.dat"), b"tiny-large-policy\n").unwrap();
 
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("init");
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
         c
     });
     let config_path = state.join("config.toml");
@@ -2390,7 +2395,9 @@ fn large_config_accepts_spec_size_strings() {
         .unwrap()
         .replace("min_size = 67108864", "min_size = \"4 B\"")
         .replace("binary_min_size = 16777216", "binary_min_size = \"16 MiB\"")
-        .replace("chunk_size = 8388608", "target_chunk_size = \"4 B\"");
+        .replace("chunk_size = 8388608", "target_chunk_size = \"4 B\"")
+        .replace("max_parallel_uploads = 8", "max_parallel_uploads = 3")
+        .replace("multipart = true", "multipart = false");
     fs::write(&config_path, config).unwrap();
     run({
         let mut c = mj();
@@ -2414,6 +2421,16 @@ fn large_config_accepts_spec_size_strings() {
     });
     assert!(stat.contains("large_objects 1"));
     assert!(stat.contains("chunks 5"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    assert_eq!(export["config"]["large"]["chunk_size"], 4);
+    assert_eq!(export["config"]["large"]["max_parallel_uploads"], 3);
+    assert_eq!(export["config"]["large"]["multipart"], false);
 }
 
 #[test]

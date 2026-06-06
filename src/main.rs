@@ -788,6 +788,10 @@ struct LargeConfig {
         deserialize_with = "deserialize_usize_bytes"
     )]
     chunk_size: usize,
+    #[serde(default = "default_large_max_parallel_uploads")]
+    max_parallel_uploads: usize,
+    #[serde(default = "default_true")]
+    multipart: bool,
     always: Vec<String>,
     never: Vec<String>,
     #[serde(default)]
@@ -1097,6 +1101,8 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                 binary_min_size: DEFAULT_LARGE_BINARY_MIN_SIZE,
                 default_chunking: "fixed".into(),
                 chunk_size: DEFAULT_CHUNK_SIZE,
+                max_parallel_uploads: default_large_max_parallel_uploads(),
+                multipart: true,
                 always: vec![
                     "*.mp4".into(),
                     "*.mov".into(),
@@ -5516,6 +5522,8 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
                 binary_min_size: config.large.binary_min_size,
                 default_chunking: config.large.default_chunking.clone(),
                 chunk_size: config.large.chunk_size,
+                max_parallel_uploads: config.large.max_parallel_uploads,
+                multipart: config.large.multipart,
                 always: config.large.always.clone(),
                 never: config.large.never.clone(),
                 compression: config.large.compression.clone(),
@@ -6309,6 +6317,8 @@ fn effective_large_config(config: &Config, root: &RootConfig) -> LargeConfig {
         binary_min_size: config.large.binary_min_size,
         default_chunking: config.large.default_chunking.clone(),
         chunk_size: config.large.chunk_size,
+        max_parallel_uploads: config.large.max_parallel_uploads,
+        multipart: config.large.multipart,
         always: config.large.always.clone(),
         never: config.large.never.clone(),
         compression: config.large.compression.clone(),
@@ -6407,6 +6417,10 @@ fn default_true() -> bool {
 
 fn default_large_min_size() -> u64 {
     DEFAULT_LARGE_MIN_SIZE
+}
+
+fn default_large_max_parallel_uploads() -> usize {
+    8
 }
 
 fn default_large_binary_min_size() -> u64 {
