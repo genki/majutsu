@@ -554,7 +554,9 @@ $MAJUTSU_HOME/queue/events
 
 This is the initial event journal used to preserve observed work across process
 crashes. The notify watch backend records filesystem events here before
-debounced snapshots are created.
+debounced snapshots are created. On watch startup, majutsu scans the journal for
+filesystem events newer than the last `snapshot-finish` record and creates a
+replay snapshot before waiting for new events.
 
 ## Safety Notes
 

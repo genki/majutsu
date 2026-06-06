@@ -2496,6 +2496,56 @@ fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {
     Ok(())
 }
 
+fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRecord>> {
+    if !paths.event_queue.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records: Vec<EventJournalRecord> = Vec::new();
+    for entry in fs::read_dir(&paths.event_queue)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry.path().extension().and_then(OsStr::to_str) == Some("json")
+        {
+            records.push(serde_json::from_slice(&fs::read(entry.path())?)?);
+        }
+    }
+    records.sort_by(|a, b| a.observed_at.cmp(&b.observed_at));
+    Ok(records)
+}
+
+fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
+    let records = event_journal_records(paths)?;
+    let last_snapshot_finish = records
+        .iter()
+        .filter(|event| event.kind == "snapshot-finish")
+        .map(|event| event.observed_at)
+        .max();
+    Ok(records.iter().any(|event| {
+        matches!(event.kind.as_str(), "fs-event" | "periodic-rescan")
+            && last_snapshot_finish
+                .map(|finished_at| event.observed_at > finished_at)
+                .unwrap_or(true)
+    }))
+}
+
+fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
+    if !has_pending_journal_events(paths)? {
+        return Ok(false);
+    }
+    record_event(
+        paths,
+        "event-journal-replay",
+        "pending filesystem events after last snapshot-finish",
+    )?;
+    snapshot(
+        paths,
+        SnapshotArgs {
+            message: Some("watch journal replay snapshot".into()),
+        },
+    )?;
+    Ok(true)
+}
+
 fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
@@ -2721,6 +2771,14 @@ fn watch_notify(paths: &Paths, args: WatchArgs, backend_label: &str) -> Result<(
             "watch-root",
             &format!("{} {}", root.id, root.path.display()),
         )?;
+    }
+    if replay_pending_journal_events(paths)? && args.once {
+        record_event(
+            paths,
+            "watch-stop",
+            &format!("foreground {backend_label} watch stopped after journal replay"),
+        )?;
+        return Ok(());
     }
     loop {
         let event = match recv_watch_event(&rx, args.periodic_rescan_secs)? {
