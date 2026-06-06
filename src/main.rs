@@ -1385,6 +1385,7 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         match &record.payload {
             Payload::Blob { oid, object_key } => {
                 write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
+                apply_file_metadata(&dest, record)?;
             }
             Payload::Large {
                 manifest_key,
@@ -1399,7 +1400,8 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
                     out.write_all(&read_large_chunk(paths, &chunk)?)?;
                 }
                 out.sync_all()?;
-                fs::rename(tmp, dest)?;
+                fs::rename(tmp, &dest)?;
+                apply_file_metadata(&dest, record)?;
                 hydrated_large += 1;
                 let _ = chunk_count;
             }
@@ -1410,6 +1412,7 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
             } => {
                 let file = File::create(&dest)?;
                 file.set_len(record.size)?;
+                apply_file_metadata(&dest, record)?;
                 let sidecar = lazy_root
                     .join(&record.root_id)
                     .join(format!("{}.json", record.path));
@@ -3533,6 +3536,7 @@ fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
         match &record.payload {
             Payload::Blob { oid, object_key } => {
                 write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
+                apply_file_metadata(&dest, record)?;
             }
             Payload::Large { manifest_key, .. } => {
                 let manifest: LargeManifest =
@@ -3543,7 +3547,8 @@ fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
                     out.write_all(&read_large_chunk(paths, &chunk)?)?;
                 }
                 out.sync_all()?;
-                fs::rename(tmp, dest)?;
+                fs::rename(tmp, &dest)?;
+                apply_file_metadata(&dest, record)?;
             }
             Payload::Symlink { target } => {
                 #[cfg(unix)]
@@ -3552,6 +3557,20 @@ fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
                 fs::write(&dest, target)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if record.mode != 0 {
+            fs::set_permissions(dest, fs::Permissions::from_mode(record.mode & 0o7777))?;
+        }
+    }
+    if let Some(seconds) = record.modified {
+        filetime::set_file_mtime(dest, filetime::FileTime::from_unix_time(seconds, 0))?;
     }
     Ok(())
 }

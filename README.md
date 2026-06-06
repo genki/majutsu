@@ -396,6 +396,10 @@ Prepared jobs are stored under `$MAJUTSU_HOME/queue/restores`. Resume applies
 the prepared snapshot and target once no required objects are pending archive
 hydration.
 
+Restored regular and large files preserve the stored Unix mode bits and
+modified time. Symlink metadata is left unchanged so restore does not mutate the
+link target.
+
 If `restore prepare` finds required objects missing from local state and a
 remote is configured, it issues provider-side archive restore requests for
 those object keys. S3 remotes use `POST ?restore` with a 7-day Standard restore

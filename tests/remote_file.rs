@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::UNIX_EPOCH;
 
 fn mj() -> Command {
     Command::new(env!("CARGO_BIN_EXE_mj"))
@@ -204,6 +206,68 @@ fn file_remote_clone_restores_normal_and_large_files() {
     assert_eq!(
         fs::read(source.join("payload.zip")).unwrap(),
         fs::read(host_restore.join("sample/payload.zip")).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_preserves_file_mode_and_mtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    let file = source.join("mode.txt");
+    fs::write(&file, b"mode and mtime\n").unwrap();
+
+    let mut perms = fs::metadata(&file).unwrap().permissions();
+    perms.set_mode(0o640);
+    fs::set_permissions(&file, perms).unwrap();
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    let restored = restore.join("sample/mode.txt");
+    let metadata = fs::metadata(&restored).unwrap();
+    assert_eq!(fs::read(&restored).unwrap(), b"mode and mtime\n");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+    assert_eq!(
+        metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        1_700_000_000
     );
 }
 
