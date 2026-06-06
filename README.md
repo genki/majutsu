@@ -284,6 +284,7 @@ Diff explicit snapshots:
 
 ```sh
 mj diff snap-old snap-new --root home-notes
+mj diff --at "10 minutes ago"
 ```
 
 Snapshot manifests keep a compatibility file list and also point each root at a

@@ -169,6 +169,8 @@ struct DiffArgs {
     from: Option<String>,
     to: Option<String>,
     #[arg(long)]
+    at: Option<String>,
+    #[arg(long)]
     root: Option<String>,
 }
 
@@ -1213,12 +1215,20 @@ fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
 fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
+    if args.at.is_some() && args.from.is_some() {
+        bail!("use either a positional from snapshot or --at, not both");
+    }
     let to_id = args
         .to
+        .clone()
         .or_else(|| current_snapshot(&conn).ok().flatten())
         .ok_or_else(|| anyhow!("no target snapshot"))?;
     let to = load_snapshot_by_id(&conn, &to_id)?;
-    let from_id = args.from.or_else(|| to.parent.clone());
+    let from_id = if let Some(at) = &args.at {
+        Some(snapshot_id_at(&conn, at)?)
+    } else {
+        args.from.or_else(|| to.parent.clone())
+    };
     let from = if let Some(from_id) = from_id {
         Some(load_snapshot_by_id(&conn, &from_id)?)
     } else {
@@ -3971,13 +3981,7 @@ fn load_snapshot(conn: &Connection, args: &RestoreArgs) -> Result<SnapshotManife
     let id = if let Some(id) = &args.snapshot {
         id.clone()
     } else if let Some(at) = &args.at {
-        conn.query_row(
-            "select id from snapshots where created_at <= ?1 order by created_at desc limit 1",
-            params![parse_time(at)?],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| anyhow!("no snapshot at or before {at}"))?
+        snapshot_id_at(conn, at)?
     } else {
         current_snapshot(conn)?.ok_or_else(|| anyhow!("no current snapshot"))?
     };
@@ -3987,6 +3991,16 @@ fn load_snapshot(conn: &Connection, args: &RestoreArgs) -> Result<SnapshotManife
         |row| row.get(0),
     )?;
     Ok(serde_json::from_str(&json)?)
+}
+
+fn snapshot_id_at(conn: &Connection, at: &str) -> Result<String> {
+    conn.query_row(
+        "select id from snapshots where created_at <= ?1 order by created_at desc limit 1",
+        params![parse_time(at)?],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("no snapshot at or before {at}"))
 }
 
 fn load_snapshot_by_id(conn: &Connection, id: &str) -> Result<SnapshotManifest> {
@@ -4507,7 +4521,34 @@ fn parse_time(input: &str) -> Result<String> {
     if input == "now" {
         return Ok(Utc::now().to_rfc3339());
     }
+    if let Some(dt) = parse_relative_ago(input)? {
+        return Ok(dt.to_rfc3339());
+    }
     bail!("time must be RFC3339 for now, got: {input}");
+}
+
+fn parse_relative_ago(input: &str) -> Result<Option<DateTime<Utc>>> {
+    let normalized = input.trim().to_ascii_lowercase();
+    let Some(value) = normalized.strip_suffix(" ago") else {
+        return Ok(None);
+    };
+    let compact = value.trim();
+    if let Ok(dt) = parse_duration_ago(compact) {
+        return Ok(Some(dt));
+    }
+    let parts = compact.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Ok(None);
+    }
+    let number: i64 = parts[0].parse()?;
+    let seconds = match parts[1] {
+        "second" | "seconds" | "sec" | "secs" => number,
+        "minute" | "minutes" | "min" | "mins" => number * 60,
+        "hour" | "hours" => number * 60 * 60,
+        "day" | "days" => number * 24 * 60 * 60,
+        _ => return Ok(None),
+    };
+    Ok(Some(Utc::now() - chrono::Duration::seconds(seconds)))
 }
 
 fn parse_db_time(input: &str) -> Result<DateTime<Utc>> {

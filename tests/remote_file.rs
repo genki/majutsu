@@ -328,6 +328,21 @@ fn diff_reports_added_modified_and_deleted_paths() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    let first_at = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("1");
+        c
+    })
+    .lines()
+    .next()
+    .and_then(|line| line.split('\t').nth(1))
+    .unwrap()
+    .to_string();
+    thread::sleep(Duration::from_millis(20));
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
     fs::write(source.join("beta.txt"), b"beta\n").unwrap();
     fs::remove_file(source.join("alpha.txt")).unwrap();
@@ -336,11 +351,22 @@ fn diff_reports_added_modified_and_deleted_paths() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
-    let output = mj().arg("--home").arg(&state).arg("diff").output().unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diff_output = mj().arg("--home").arg(&state).arg("diff").output().unwrap();
+    assert!(diff_output.status.success());
+    let stdout = String::from_utf8_lossy(&diff_output.stdout);
     assert!(stdout.contains("D\tsample/alpha.txt"));
     assert!(stdout.contains("A\tsample/beta.txt"));
+    let at_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("diff")
+            .arg("--at")
+            .arg(first_at);
+        c
+    });
+    assert!(at_output.contains("D\tsample/alpha.txt"));
+    assert!(at_output.contains("A\tsample/beta.txt"));
 }
 
 #[test]
