@@ -1218,6 +1218,49 @@ fn large_pin_unpin_is_persisted_in_metadata() {
 }
 
 #[test]
+fn root_large_policy_override_can_route_small_files_to_large_pipeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("tiny.dat"), b"tiny-large-policy\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--large-min-size")
+            .arg("4")
+            .arg("--large-chunking")
+            .arg("fixed")
+            .arg("--large-chunk-size")
+            .arg("4");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("large_objects 1"));
+    assert!(stat.contains("chunks 5"));
+}
+
+#[test]
 fn large_chunks_can_be_compressed_and_restored() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

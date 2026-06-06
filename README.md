@@ -142,6 +142,16 @@ default_chunking = "fastcdc"
 chunk_size = 8388608
 ```
 
+Root-specific large-file policy can override the global thresholds and
+patterns:
+
+```sh
+mj root add photos /mnt/photos \
+  --large-min-size 8388608 \
+  --large-always '*.raw' \
+  --large-never '*.json'
+```
+
 ## Remote Sync
 
 `mj sync` writes hot metadata and all referenced local objects to the configured

@@ -148,6 +148,18 @@ struct RootAddArgs {
     pre_snapshot: Option<String>,
     #[arg(long)]
     post_snapshot: Option<String>,
+    #[arg(long)]
+    large_min_size: Option<u64>,
+    #[arg(long)]
+    large_binary_min_size: Option<u64>,
+    #[arg(long)]
+    large_chunk_size: Option<usize>,
+    #[arg(long)]
+    large_chunking: Option<String>,
+    #[arg(long = "large-always")]
+    large_always: Vec<String>,
+    #[arg(long = "large-never")]
+    large_never: Vec<String>,
 }
 
 #[derive(Args)]
@@ -612,6 +624,24 @@ struct RootConfig {
     pre_snapshot: Option<String>,
     #[serde(default)]
     post_snapshot: Option<String>,
+    #[serde(default)]
+    large: Option<RootLargeConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RootLargeConfig {
+    #[serde(default)]
+    min_size: Option<u64>,
+    #[serde(default)]
+    binary_min_size: Option<u64>,
+    #[serde(default)]
+    default_chunking: Option<String>,
+    #[serde(default)]
+    chunk_size: Option<usize>,
+    #[serde(default)]
+    always: Vec<String>,
+    #[serde(default)]
+    never: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -870,6 +900,10 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 bail!("root path does not exist: {}", path.display());
             }
             validate_snapshot_mode(&args.snapshot_mode)?;
+            if let Some(chunking) = &args.large_chunking {
+                validate_large_chunking(chunking)?;
+            }
+            let large = root_large_override(&args);
             let root = RootConfig {
                 name: args.name.unwrap_or_else(|| args.id.clone()),
                 id: args.id,
@@ -885,6 +919,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 snapshot_mode: args.snapshot_mode,
                 pre_snapshot: args.pre_snapshot,
                 post_snapshot: args.post_snapshot,
+                large,
             };
             conn.execute(
                 "insert into roots(id, data_json) values (?1, ?2)
@@ -3903,11 +3938,12 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
         if !meta.is_file() {
             continue;
         }
+        let large_config = effective_large_config(config, root);
         let binary = looks_binary(entry.path()).unwrap_or(false);
-        let large = classify_large(config, &rel, meta.len(), binary);
+        let large = classify_large(&large_config, &rel, meta.len(), binary);
         let payload = if large {
             let (oid, manifest_key, chunk_count) =
-                store_large_file(paths, entry.path(), &rel, &config.large)?;
+                store_large_file(paths, entry.path(), &rel, &large_config)?;
             Payload::Large {
                 oid,
                 manifest_key,
@@ -4635,6 +4671,13 @@ fn validate_snapshot_mode(mode: &str) -> Result<()> {
     }
 }
 
+fn validate_large_chunking(chunking: &str) -> Result<()> {
+    match chunking {
+        "fixed" | "fastcdc" => Ok(()),
+        _ => bail!("large chunking must be fixed or fastcdc"),
+    }
+}
+
 fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
     if root.snapshot_mode == "transactional" {
         if let Some(command) = &root.pre_snapshot {
@@ -4681,18 +4724,52 @@ fn is_ignored(ignore: &Gitignore, rel: &Path, is_dir: bool) -> bool {
     ignore.matched_path_or_any_parents(rel, is_dir).is_ignore()
 }
 
-fn classify_large(config: &Config, rel: &Path, size: u64, binary: bool) -> bool {
-    if !config.large.enabled {
+fn effective_large_config(config: &Config, root: &RootConfig) -> LargeConfig {
+    let mut large = LargeConfig {
+        enabled: config.large.enabled,
+        min_size: config.large.min_size,
+        binary_min_size: config.large.binary_min_size,
+        default_chunking: config.large.default_chunking.clone(),
+        chunk_size: config.large.chunk_size,
+        always: config.large.always.clone(),
+        never: config.large.never.clone(),
+        compression: config.large.compression.clone(),
+    };
+    if let Some(root_large) = &root.large {
+        if let Some(min_size) = root_large.min_size {
+            large.min_size = min_size;
+        }
+        if let Some(binary_min_size) = root_large.binary_min_size {
+            large.binary_min_size = binary_min_size;
+        }
+        if let Some(default_chunking) = &root_large.default_chunking {
+            large.default_chunking = default_chunking.clone();
+        }
+        if let Some(chunk_size) = root_large.chunk_size {
+            large.chunk_size = chunk_size;
+        }
+        if !root_large.always.is_empty() {
+            large.always = root_large.always.clone();
+        }
+        if !root_large.never.is_empty() {
+            large.never = root_large.never.clone();
+        }
+    }
+    large
+}
+
+fn classify_large(config: &LargeConfig, rel: &Path, size: u64, binary: bool) -> bool {
+    if !config.enabled {
         return false;
     }
     let name = rel.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    if config.large.never.iter().any(|p| glob_match(p, name)) {
+    if config.never.iter().any(|p| glob_match(p, name)) {
         return false;
     }
-    if config.large.always.iter().any(|p| glob_match(p, name)) {
+    if config.always.iter().any(|p| glob_match(p, name)) {
         return true;
     }
-    size >= config.large.min_size || (binary && size >= config.large.binary_min_size)
+    size >= config.min_size || (binary && size >= config.binary_min_size)
 }
 
 fn glob_match(pattern: &str, name: &str) -> bool {
@@ -4748,6 +4825,26 @@ fn default_chunk_compression() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {
+    if args.large_min_size.is_none()
+        && args.large_binary_min_size.is_none()
+        && args.large_chunk_size.is_none()
+        && args.large_chunking.is_none()
+        && args.large_always.is_empty()
+        && args.large_never.is_empty()
+    {
+        return None;
+    }
+    Some(RootLargeConfig {
+        min_size: args.large_min_size,
+        binary_min_size: args.large_binary_min_size,
+        default_chunking: args.large_chunking.clone(),
+        chunk_size: args.large_chunk_size,
+        always: args.large_always.clone(),
+        never: args.large_never.clone(),
+    })
 }
 
 impl Default for LargeCompressionConfig {
