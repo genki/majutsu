@@ -1690,6 +1690,8 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         .arg("notify")
         .arg("--debounce-ms")
         .arg("100")
+        .arg("--settle-ms")
+        .arg("50")
         .spawn()
         .unwrap();
     thread::sleep(Duration::from_millis(300));
@@ -1704,6 +1706,13 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("current snap-"));
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("watch-settle"));
+    assert!(events.contains("settle_ms=50"));
 }
 
 #[cfg(unix)]

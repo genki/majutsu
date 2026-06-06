@@ -311,6 +311,8 @@ struct WatchArgs {
     interval_secs: u64,
     #[arg(long, default_value_t = 1500)]
     debounce_ms: u64,
+    #[arg(long, default_value_t = 500)]
+    settle_ms: u64,
     #[arg(long, default_value = "notify")]
     backend: String,
     #[arg(long, default_value_t = false)]
@@ -322,6 +324,8 @@ enum DaemonCommand {
     Start {
         #[arg(long, default_value_t = 60)]
         interval_secs: u64,
+        #[arg(long, default_value_t = 500)]
+        settle_ms: u64,
     },
     Stop,
     Status,
@@ -2474,7 +2478,13 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
     if !args.foreground {
-        let pid = start_watch_daemon(paths, &args.backend, args.interval_secs, args.debounce_ms)?;
+        let pid = start_watch_daemon(
+            paths,
+            &args.backend,
+            args.interval_secs,
+            args.debounce_ms,
+            args.settle_ms,
+        )?;
         println!("started daemon pid {pid}");
         return Ok(());
     }
@@ -2520,7 +2530,10 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
     record_event(
         paths,
         "watch-start",
-        &format!("backend=notify debounce_ms={}", args.debounce_ms),
+        &format!(
+            "backend=notify debounce_ms={} settle_ms={}",
+            args.debounce_ms, args.settle_ms
+        ),
     )?;
     let (tx, rx) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(
@@ -2542,15 +2555,32 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
         let detail = format_notify_event(&event);
         record_event(paths, "fs-event", &detail)?;
         let debounce = std::time::Duration::from_millis(args.debounce_ms.max(1));
-        loop {
-            match rx.recv_timeout(debounce) {
-                Ok(Ok(next)) => {
-                    record_event(paths, "fs-event", &format_notify_event(&next))?;
-                    continue;
+        let settle = std::time::Duration::from_millis(args.settle_ms);
+        drain_watch_debounce(paths, &rx, debounce)?;
+        if !settle.is_zero() {
+            record_event(
+                paths,
+                "watch-settle",
+                &format!("settle_ms={}", args.settle_ms),
+            )?;
+            loop {
+                match rx.recv_timeout(settle) {
+                    Ok(Ok(next)) => {
+                        record_event(paths, "fs-event", &format_notify_event(&next))?;
+                        drain_watch_debounce(paths, &rx, debounce)?;
+                        record_event(
+                            paths,
+                            "watch-settle",
+                            &format!("settle_ms={}", args.settle_ms),
+                        )?;
+                        continue;
+                    }
+                    Ok(Err(err)) => return Err(err.into()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("watch channel disconnected")
+                    }
                 }
-                Ok(Err(err)) => return Err(err.into()),
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
             }
         }
         snapshot(
@@ -2567,11 +2597,29 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
     Ok(())
 }
 
+fn drain_watch_debounce(
+    paths: &Paths,
+    rx: &mpsc::Receiver<notify::Result<notify::Event>>,
+    debounce: Duration,
+) -> Result<()> {
+    loop {
+        match rx.recv_timeout(debounce) {
+            Ok(Ok(next)) => {
+                record_event(paths, "fs-event", &format_notify_event(&next))?;
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
+        }
+    }
+}
+
 fn start_watch_daemon(
     paths: &Paths,
     backend: &str,
     interval_secs: u64,
     debounce_ms: u64,
+    settle_ms: u64,
 ) -> Result<u32> {
     if let Some(pid) = read_pid(&paths.daemon_pid)? {
         if pid_alive(pid) {
@@ -2596,6 +2644,8 @@ fn start_watch_daemon(
         .arg(interval_secs.to_string())
         .arg("--debounce-ms")
         .arg(debounce_ms.to_string())
+        .arg("--settle-ms")
+        .arg(settle_ms.to_string())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .spawn()?;
@@ -2607,8 +2657,11 @@ fn start_watch_daemon(
 fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     ensure_ready(paths)?;
     match command {
-        DaemonCommand::Start { interval_secs } => {
-            let pid = start_watch_daemon(paths, "notify", interval_secs, 1500)?;
+        DaemonCommand::Start {
+            interval_secs,
+            settle_ms,
+        } => {
+            let pid = start_watch_daemon(paths, "notify", interval_secs, 1500, settle_ms)?;
             println!("started daemon pid {pid}");
         }
         DaemonCommand::Stop => {
