@@ -224,6 +224,7 @@ fn restore_preserves_file_mode_and_mtime() {
     perms.set_mode(0o640);
     fs::set_permissions(&file, perms).unwrap();
     filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+    let xattr_supported = xattr::set(&file, "user.majutsu_test", b"xattr-value").is_ok();
 
     run({
         let mut c = mj();
@@ -260,6 +261,12 @@ fn restore_preserves_file_mode_and_mtime() {
     let metadata = fs::metadata(&restored).unwrap();
     assert_eq!(fs::read(&restored).unwrap(), b"mode and mtime\n");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+    if xattr_supported {
+        assert_eq!(
+            xattr::get(&restored, "user.majutsu_test").unwrap(),
+            Some(b"xattr-value".to_vec())
+        );
+    }
     assert_eq!(
         metadata
             .modified()

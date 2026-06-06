@@ -622,6 +622,8 @@ struct FileRecord {
     size: u64,
     mode: u32,
     modified: Option<i64>,
+    #[serde(default)]
+    xattrs: BTreeMap<String, String>,
     payload: Payload,
 }
 
@@ -3347,6 +3349,7 @@ fn build_restore_plan(
                 size: record.size,
                 mode: record.mode,
                 modified: record.modified,
+                xattrs: record.xattrs.clone(),
                 payload: match &record.payload {
                     Payload::Blob { oid, object_key } => Payload::Blob {
                         oid: oid.clone(),
@@ -3666,6 +3669,7 @@ fn print_restore_conflicts(conflicts: &[String]) {
 }
 
 fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
+    apply_xattrs(dest, &record.xattrs)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3675,6 +3679,36 @@ fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
     }
     if let Some(seconds) = record.modified {
         filetime::set_file_mtime(dest, filetime::FileTime::from_unix_time(seconds, 0))?;
+    }
+    Ok(())
+}
+
+fn read_xattrs(path: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Ok(names) = xattr::list(path) else {
+        return out;
+    };
+    for name in names {
+        let name_s = name.to_string_lossy().to_string();
+        let Ok(Some(value)) = xattr::get(path, &name) else {
+            continue;
+        };
+        out.insert(
+            name_s,
+            base64::engine::general_purpose::STANDARD.encode(value),
+        );
+    }
+    out
+}
+
+fn apply_xattrs(path: &Path, xattrs: &BTreeMap<String, String>) -> Result<()> {
+    for (name, encoded) in xattrs {
+        let value = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| format!("decode xattr {name}"))?;
+        if xattr::set(path, name, &value).is_err() {
+            continue;
+        }
     }
     Ok(())
 }
@@ -3714,6 +3748,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 size: 0,
                 mode: file_mode(&meta),
                 modified: modified_secs(&meta),
+                xattrs: BTreeMap::new(),
                 payload: Payload::Symlink { target },
             });
             continue;
@@ -3749,6 +3784,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
             size: meta.len(),
             mode: file_mode(&meta),
             modified: modified_secs(&meta),
+            xattrs: read_xattrs(entry.path()),
             payload,
         });
     }

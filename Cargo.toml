@@ -31,6 +31,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 zstd = "0.13"
+xattr = "1"
 
 [[bin]]
 name = "mj"
