@@ -840,10 +840,15 @@ struct WatchConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct LargeCompressionConfig {
+    #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default = "default_large_compression_algorithm")]
     algorithm: String,
+    #[serde(default = "default_large_compression_level")]
     level: i32,
+    #[serde(default = "default_large_compression_min_gain_ratio")]
     min_gain_ratio: f64,
+    #[serde(default = "default_large_compression_skip_extensions")]
     skip_extensions: Vec<String>,
 }
 
@@ -6431,6 +6436,34 @@ fn default_chunk_size() -> usize {
     DEFAULT_CHUNK_SIZE
 }
 
+fn default_large_compression_algorithm() -> String {
+    "zstd".into()
+}
+
+fn default_large_compression_level() -> i32 {
+    3
+}
+
+fn default_large_compression_min_gain_ratio() -> f64 {
+    0.05
+}
+
+fn default_large_compression_skip_extensions() -> Vec<String> {
+    vec![
+        "*.jpg".into(),
+        "*.jpeg".into(),
+        "*.png".into(),
+        "*.heic".into(),
+        "*.mp4".into(),
+        "*.mov".into(),
+        "*.zip".into(),
+        "*.gz".into(),
+        "*.zst".into(),
+        "*.xz".into(),
+        "*.parquet".into(),
+    ]
+}
+
 fn default_small_pack_target() -> u64 {
     64 * 1024 * 1024
 }
@@ -6617,22 +6650,10 @@ impl Default for LargeCompressionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            algorithm: "zstd".into(),
-            level: 3,
-            min_gain_ratio: 0.05,
-            skip_extensions: vec![
-                "*.jpg".into(),
-                "*.jpeg".into(),
-                "*.png".into(),
-                "*.heic".into(),
-                "*.mp4".into(),
-                "*.mov".into(),
-                "*.zip".into(),
-                "*.gz".into(),
-                "*.zst".into(),
-                "*.xz".into(),
-                "*.parquet".into(),
-            ],
+            algorithm: default_large_compression_algorithm(),
+            level: default_large_compression_level(),
+            min_gain_ratio: default_large_compression_min_gain_ratio(),
+            skip_extensions: default_large_compression_skip_extensions(),
         }
     }
 }

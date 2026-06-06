@@ -2457,7 +2457,11 @@ fn large_chunks_can_be_compressed_and_restored() {
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("min_size = 67108864", "min_size = 1024")
-        .replace("chunk_size = 8388608", "chunk_size = 32768");
+        .replace("chunk_size = 8388608", "chunk_size = 32768")
+        .replace(
+            "[large.compression]\nenabled = true\nalgorithm = \"zstd\"\nlevel = 3\nmin_gain_ratio = 0.05",
+            "[large.compression]\nalgorithm = \"zstd\"\nlevel = 3",
+        );
     fs::write(&config_path, config).unwrap();
     run({
         let mut c = mj();
