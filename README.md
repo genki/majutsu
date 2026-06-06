@@ -223,6 +223,10 @@ mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 `metadata/export.json` remains the legacy/current-host bootstrap path.
 `hosts/index.json` and `hosts/<host-id>/metadata/export.json` allow browsing and
 recovering a specific host timeline from a shared remote prefix.
+After local prune removes snapshot metadata, the next `mj sync` removes stale
+per-host snapshot/operation export JSON files for the current host. It does not
+delete referenced object payloads; lifecycle tiering remains the storage
+provider's job.
 
 The S3 backend uses path-style requests. AWS Signature V4 is the default; set
 `AWS_SIGNATURE_VERSION=s3v2` only for legacy S3-compatible services that still

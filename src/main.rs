@@ -2300,7 +2300,9 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         }
     }
     let uploaded = drain_upload_queue(paths, &remote)?;
+    let pruned_remote_exports = prune_remote_host_exports(&remote, &config.host.id, &export)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
+    println!("pruned_remote_exports {}", pruned_remote_exports);
     Ok(())
 }
 
@@ -2377,6 +2379,37 @@ fn update_remote_host_index(
     index.hosts.sort_by(|a, b| a.id.cmp(&b.id));
     index.updated_at = Utc::now();
     Ok(index)
+}
+
+fn prune_remote_host_exports(
+    remote: &RemoteStore,
+    host_id: &str,
+    export: &MetadataExport,
+) -> Result<usize> {
+    let live_snapshots = export
+        .snapshots
+        .iter()
+        .map(|snapshot| host_snapshot_key(host_id, &snapshot.id))
+        .collect::<BTreeSet<_>>();
+    let live_ops = export
+        .operations
+        .iter()
+        .map(|operation| host_operation_key(host_id, &operation.id))
+        .collect::<BTreeSet<_>>();
+    let mut removed = 0usize;
+    for key in remote.list(&format!("hosts/{host_id}/snapshots/"))? {
+        if key.ends_with(".json") && !live_snapshots.contains(&key) {
+            remote.delete(&key)?;
+            removed += 1;
+        }
+    }
+    for key in remote.list(&format!("hosts/{host_id}/ops/"))? {
+        if key.ends_with(".json") && !live_ops.contains(&key) {
+            remote.delete(&key)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
@@ -6088,6 +6121,19 @@ impl RemoteStore {
         }
     }
 
+    fn delete(&self, key: &str) -> Result<()> {
+        match self {
+            RemoteStore::File(remote) => {
+                let path = remote.root.join(key);
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+                Ok(())
+            }
+            RemoteStore::S3(remote) => remote.delete(key),
+        }
+    }
+
     fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Vec<u8>> {
         match self {
             RemoteStore::File(remote) => {
@@ -6388,6 +6434,35 @@ impl S3Remote {
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
         self.get_with_range(key, None)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let remote_key = self.remote_key(key);
+        let response = if self.uses_sigv2() {
+            let date = http_date();
+            let path = format!("/{}/{}", self.bucket, remote_key);
+            let auth = self.auth_v2("DELETE", "", "", &date, &path)?;
+            self.client
+                .delete(self.object_url(&remote_key))
+                .header(DATE, date)
+                .header(AUTHORIZATION, auth)
+                .send()?
+        } else {
+            let payload_hash = sha256_hex(b"");
+            let auth = self.auth_v4("DELETE", &remote_key, "", &payload_hash, &[])?;
+            self.client
+                .delete(self.object_url(&remote_key))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(AUTHORIZATION, auth.authorization)
+                .send()?
+        };
+        if response.status().is_success() || response.status().as_u16() == 404 {
+            Ok(())
+        } else {
+            bail!("s3 delete failed for {key}: HTTP {}", response.status())
+        }
     }
 
     fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Vec<u8>> {

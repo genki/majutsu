@@ -959,6 +959,80 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
 }
 
 #[test]
+fn sync_prunes_stale_remote_host_exports_after_prune() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let host_dir = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("metadata/export.json").exists())
+        .unwrap();
+    let before = fs::read_dir(host_dir.join("snapshots")).unwrap().count();
+    assert!(before >= 2);
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("0")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("pruned_remote_exports "));
+    let after = fs::read_dir(host_dir.join("snapshots")).unwrap().count();
+    assert_eq!(after, 1);
+}
+
+#[test]
 fn pack_gc_and_remote_clone_restore_packed_blobs() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
