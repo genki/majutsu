@@ -1468,6 +1468,61 @@ fn daemon_status_uses_ipc_socket() {
     let _ = child.wait();
 }
 
+#[cfg(unix)]
+#[test]
+fn watch_can_start_daemon_when_not_foreground() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let started = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("watch")
+            .arg("--foreground=false")
+            .arg("--backend")
+            .arg("poll")
+            .arg("--interval-secs")
+            .arg("60");
+        c
+    });
+    assert!(started.contains("started daemon pid"));
+    for _ in 0..50 {
+        if state.join("runtime/daemon.sock").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("status");
+        c
+    });
+    assert!(status.contains("ipc ok") || status.contains("running pid"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
+}
+
 #[test]
 fn transactional_snapshot_runs_pre_and_post_hooks() {
     let tmp = tempfile::tempdir().unwrap();

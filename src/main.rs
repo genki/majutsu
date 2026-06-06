@@ -287,7 +287,7 @@ struct CloneArgs {
 
 #[derive(Args)]
 struct WatchArgs {
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     foreground: bool,
     #[arg(long, default_value_t = 60)]
     interval_secs: u64,
@@ -2390,7 +2390,9 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
     if !args.foreground {
-        bail!("daemonized watch is not implemented yet; use --foreground");
+        let pid = start_watch_daemon(paths, &args.backend, args.interval_secs, args.debounce_ms)?;
+        println!("started daemon pid {pid}");
+        return Ok(());
     }
     start_daemon_ipc(paths)?;
     match args.backend.as_str() {
@@ -2481,34 +2483,49 @@ fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
     Ok(())
 }
 
+fn start_watch_daemon(
+    paths: &Paths,
+    backend: &str,
+    interval_secs: u64,
+    debounce_ms: u64,
+) -> Result<u32> {
+    if let Some(pid) = read_pid(&paths.daemon_pid)? {
+        if pid_alive(pid) {
+            bail!("daemon already running with pid {pid}");
+        }
+    }
+    fs::create_dir_all(&paths.runtime)?;
+    fs::create_dir_all(&paths.logs)?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.logs.join("majutsu.log"))?;
+    let child = ProcessCommand::new(env::current_exe()?)
+        .arg("--home")
+        .arg(&paths.home)
+        .arg("watch")
+        .arg("--foreground")
+        .arg("true")
+        .arg("--backend")
+        .arg(backend)
+        .arg("--interval-secs")
+        .arg(interval_secs.to_string())
+        .arg("--debounce-ms")
+        .arg(debounce_ms.to_string())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()?;
+    let pid = child.id();
+    fs::write(&paths.daemon_pid, pid.to_string())?;
+    Ok(pid)
+}
+
 fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     ensure_ready(paths)?;
     match command {
         DaemonCommand::Start { interval_secs } => {
-            if let Some(pid) = read_pid(&paths.daemon_pid)? {
-                if pid_alive(pid) {
-                    bail!("daemon already running with pid {pid}");
-                }
-            }
-            fs::create_dir_all(&paths.runtime)?;
-            fs::create_dir_all(&paths.logs)?;
-            let log = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(paths.logs.join("majutsu.log"))?;
-            let child = ProcessCommand::new(env::current_exe()?)
-                .arg("--home")
-                .arg(&paths.home)
-                .arg("watch")
-                .arg("--backend")
-                .arg("notify")
-                .arg("--interval-secs")
-                .arg(interval_secs.to_string())
-                .stdout(Stdio::from(log.try_clone()?))
-                .stderr(Stdio::from(log))
-                .spawn()?;
-            fs::write(&paths.daemon_pid, child.id().to_string())?;
-            println!("started daemon pid {}", child.id());
+            let pid = start_watch_daemon(paths, "notify", interval_secs, 1500)?;
+            println!("started daemon pid {pid}");
         }
         DaemonCommand::Stop => {
             let pid =

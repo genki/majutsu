@@ -309,6 +309,12 @@ One-shot notify watch, useful for tests:
 mj watch --once --backend notify --debounce-ms 100
 ```
 
+Daemonized watch can also be started through `watch`:
+
+```sh
+mj watch --foreground=false --backend poll --interval-secs 60
+```
+
 Minimal background daemon management:
 
 ```sh
