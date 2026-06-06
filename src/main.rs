@@ -70,6 +70,7 @@ enum Command {
         command: RestoreCommand,
     },
     Mount(MountArgs),
+    Hydrate(HydrateArgs),
     Large {
         #[command(subcommand)]
         command: LargeCommand,
@@ -199,6 +200,15 @@ struct MountArgs {
     #[arg(long, default_value_t = false)]
     hydrate_large: bool,
     mountpoint: PathBuf,
+}
+
+#[derive(Args)]
+struct HydrateArgs {
+    view: PathBuf,
+    #[arg(long)]
+    root: Option<String>,
+    #[arg(long)]
+    path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -635,6 +645,7 @@ fn main() -> Result<()> {
         Command::Diff(args) => diff_cmd(&paths, args),
         Command::Restore { command } => restore_cmd(&paths, command),
         Command::Mount(args) => mount_cmd(&paths, args),
+        Command::Hydrate(args) => hydrate_cmd(&paths, args),
         Command::Large { command } => large_cmd(&paths, command),
         Command::Sync { command } => sync_cmd(&paths, command),
         Command::Remote { command } => remote_cmd(&paths, command),
@@ -1325,6 +1336,69 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
     println!("files {}", plan.files.len());
     println!("lazy_large_files {lazy_files}");
     println!("hydrated_large_files {hydrated_large}");
+    Ok(())
+}
+
+fn hydrate_cmd(paths: &Paths, args: HydrateArgs) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let lazy_root = args.view.join(".majutsu-lazy");
+    if !lazy_root.exists() {
+        bail!("lazy metadata not found: {}", lazy_root.display());
+    }
+    let requested_path = args.path.as_ref().map(|path| path_to_slash(path));
+    let mut sidecars = Vec::new();
+    for entry in WalkDir::new(&lazy_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() || entry.path().extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let lazy: LazyMountEntry = serde_json::from_slice(&fs::read(entry.path())?)
+            .with_context(|| format!("read lazy metadata {}", entry.path().display()))?;
+        if args
+            .root
+            .as_deref()
+            .is_some_and(|root| root != lazy.root_id)
+        {
+            continue;
+        }
+        if requested_path
+            .as_deref()
+            .is_some_and(|path| path != lazy.path)
+        {
+            continue;
+        }
+        sidecars.push((entry.path().to_path_buf(), lazy));
+    }
+    if sidecars.is_empty() {
+        bail!("no lazy large files matched");
+    }
+    let mut hydrated = 0usize;
+    for (sidecar, lazy) in sidecars {
+        let manifest: LargeManifest =
+            serde_json::from_slice(&read_object(paths, &lazy.manifest_key)?)
+                .with_context(|| format!("read large manifest {}", lazy.manifest_key))?;
+        let dest = args.view.join(&lazy.root_id).join(&lazy.path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = dest.with_extension("mjtmp");
+        let mut out = File::create(&tmp)?;
+        for chunk in manifest.chunks {
+            out.write_all(&read_large_chunk(paths, &chunk)?)?;
+        }
+        out.sync_all()?;
+        fs::rename(tmp, &dest)?;
+        fs::remove_file(sidecar)?;
+        hydrated += 1;
+    }
+    record_op(
+        &conn,
+        "hydrate",
+        None,
+        None,
+        Some(&format!("view {}", args.view.display())),
+    )?;
+    println!("hydrated_large_files {hydrated}");
     Ok(())
 }
 

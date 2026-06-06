@@ -370,12 +370,14 @@ Create a read-only restore view without overwriting the original roots:
 
 ```sh
 mj mount --at 2026-06-06T10:30:00Z /tmp/majutsu-view
+mj hydrate /tmp/majutsu-view --root sample --path large.bin
 mj mount --hydrate-large /tmp/majutsu-view-full
 ```
 
 Without `--hydrate-large`, normal files are materialized and large files are
 represented by sparse placeholders plus metadata under `.majutsu-lazy/`.
-With `--hydrate-large`, large files are fully assembled into the view.
+Use `mj hydrate` to assemble selected lazy large files into an existing view.
+With `--hydrate-large`, large files are fully assembled while creating the view.
 
 ## Packs
 
