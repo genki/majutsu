@@ -2217,3 +2217,65 @@ fn transactional_snapshot_runs_pre_and_post_hooks() {
         "pre"
     );
 }
+
+#[test]
+fn transactional_snapshot_can_scan_snapshot_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let snapshot_source = tmp.path().join("snapshot-source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("live.txt"), b"live\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let pre = format!(
+        "mkdir -p '{}' && cp live.txt '{}/live.txt' && printf dump > '{}/dump.txt'",
+        snapshot_source.display(),
+        snapshot_source.display(),
+        snapshot_source.display()
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--snapshot-mode")
+            .arg("transactional")
+            .arg("--snapshot-source")
+            .arg(&snapshot_source)
+            .arg("--pre-snapshot")
+            .arg(pre)
+            .arg("--post-snapshot")
+            .arg("printf post > post.txt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert_eq!(fs::read_to_string(source.join("post.txt")).unwrap(), "post");
+    let restore = tmp.path().join("restore");
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/dump.txt")).unwrap(),
+        "dump"
+    );
+    assert!(!restore.join("sample/post.txt").exists());
+}

@@ -151,6 +151,8 @@ struct RootAddArgs {
     #[arg(long)]
     post_snapshot: Option<String>,
     #[arg(long)]
+    snapshot_source: Option<PathBuf>,
+    #[arg(long)]
     large_min_size: Option<u64>,
     #[arg(long)]
     large_binary_min_size: Option<u64>,
@@ -616,7 +618,7 @@ struct LargeCompressionConfig {
     skip_extensions: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RootConfig {
     id: String,
     name: String,
@@ -636,6 +638,8 @@ struct RootConfig {
     pre_snapshot: Option<String>,
     #[serde(default)]
     post_snapshot: Option<String>,
+    #[serde(default)]
+    snapshot_source: Option<PathBuf>,
     #[serde(default)]
     large: Option<RootLargeConfig>,
 }
@@ -915,6 +919,14 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             if let Some(chunking) = &args.large_chunking {
                 validate_large_chunking(chunking)?;
             }
+            let snapshot_source = args
+                .snapshot_source
+                .as_deref()
+                .map(absolutize)
+                .transpose()?;
+            if snapshot_source.is_some() && args.snapshot_mode != "transactional" {
+                bail!("--snapshot-source requires --snapshot-mode transactional");
+            }
             let large = root_large_override(&args);
             let root = RootConfig {
                 name: args.name.unwrap_or_else(|| args.id.clone()),
@@ -932,6 +944,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 snapshot_mode: args.snapshot_mode,
                 pre_snapshot: args.pre_snapshot,
                 post_snapshot: args.post_snapshot,
+                snapshot_source,
                 large,
             };
             conn.execute(
@@ -1042,7 +1055,8 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             continue;
         }
         run_pre_snapshot_hook(paths, &root)?;
-        let records_result = scan_root(paths, &config, &root);
+        let scan_root_config = snapshot_scan_root(paths, &root)?;
+        let records_result = scan_root(paths, &config, &scan_root_config);
         let post_result = run_post_snapshot_hook(paths, &root);
         let records = match records_result {
             Ok(records) => records,
@@ -5134,6 +5148,40 @@ fn run_post_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn snapshot_scan_root(paths: &Paths, root: &RootConfig) -> Result<RootConfig> {
+    let Some(source) = &root.snapshot_source else {
+        return Ok(root.clone());
+    };
+    if root.snapshot_mode != "transactional" {
+        bail!(
+            "snapshot source requires transactional snapshot mode for root {}",
+            root.id
+        );
+    }
+    if !source.exists() {
+        bail!(
+            "snapshot source does not exist for root {}: {}",
+            root.id,
+            source.display()
+        );
+    }
+    if !source.is_dir() {
+        bail!(
+            "snapshot source is not a directory for root {}: {}",
+            root.id,
+            source.display()
+        );
+    }
+    record_event(
+        paths,
+        "snapshot-source",
+        &format!("{} {}", root.id, source.display()),
+    )?;
+    let mut scan_root = root.clone();
+    scan_root.path = source.clone();
+    Ok(scan_root)
 }
 
 fn run_hook(command: &str, cwd: &Path) -> Result<()> {

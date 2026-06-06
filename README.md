@@ -312,6 +312,17 @@ mj root add app-data /srv/app/data \
   --post-snapshot '/usr/local/bin/app-checkpoint end'
 ```
 
+If the pre-hook creates a filesystem snapshot or dump directory, keep the root
+path as the restore destination identity and read from that snapshot source:
+
+```sh
+mj root add app-data /srv/app/data \
+  --snapshot-mode transactional \
+  --snapshot-source /mnt/app-data-snapshot \
+  --pre-snapshot '/usr/local/bin/create-app-snapshot /mnt/app-data-snapshot' \
+  --post-snapshot '/usr/local/bin/remove-app-snapshot /mnt/app-data-snapshot'
+```
+
 If a hook exits non-zero, the snapshot fails. Hook execution is recorded in the
 event journal.
 
