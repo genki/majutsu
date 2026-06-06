@@ -70,6 +70,7 @@ enum Command {
         command: RestoreCommand,
     },
     Mount(MountArgs),
+    Unmount(UnmountArgs),
     Hydrate(HydrateArgs),
     Large {
         #[command(subcommand)]
@@ -199,6 +200,11 @@ struct MountArgs {
     path: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     hydrate_large: bool,
+    mountpoint: PathBuf,
+}
+
+#[derive(Args)]
+struct UnmountArgs {
     mountpoint: PathBuf,
 }
 
@@ -444,6 +450,17 @@ struct LazyMountEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct MountViewMetadata {
+    version: u32,
+    snapshot_id: String,
+    created_at: DateTime<Utc>,
+    hydrate_large: bool,
+    files: usize,
+    lazy_large_files: usize,
+    hydrated_large_files: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct SnapshotExport {
     id: String,
     parent_id: Option<String>,
@@ -645,6 +662,7 @@ fn main() -> Result<()> {
         Command::Diff(args) => diff_cmd(&paths, args),
         Command::Restore { command } => restore_cmd(&paths, command),
         Command::Mount(args) => mount_cmd(&paths, args),
+        Command::Unmount(args) => unmount_cmd(&paths, args),
         Command::Hydrate(args) => hydrate_cmd(&paths, args),
         Command::Large { command } => large_cmd(&paths, command),
         Command::Sync { command } => sync_cmd(&paths, command),
@@ -1331,11 +1349,50 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         Some(&plan.snapshot.snapshot_id),
         Some(&format!("at {}", plan.to.display())),
     )?;
+    let mount_metadata = MountViewMetadata {
+        version: 1,
+        snapshot_id: plan.snapshot.snapshot_id.clone(),
+        created_at: Utc::now(),
+        hydrate_large: args.hydrate_large,
+        files: plan.files.len(),
+        lazy_large_files: lazy_files,
+        hydrated_large_files: hydrated_large,
+    };
+    fs::write(
+        plan.to.join(".majutsu-mount.json"),
+        serde_json::to_vec_pretty(&mount_metadata)?,
+    )?;
     println!("mounted snapshot {}", plan.snapshot.snapshot_id);
     println!("target {}", plan.to.display());
     println!("files {}", plan.files.len());
     println!("lazy_large_files {lazy_files}");
     println!("hydrated_large_files {hydrated_large}");
+    Ok(())
+}
+
+fn unmount_cmd(paths: &Paths, args: UnmountArgs) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let marker = args.mountpoint.join(".majutsu-mount.json");
+    if !marker.exists() {
+        bail!(
+            "{} is not a majutsu mount view; missing .majutsu-mount.json",
+            args.mountpoint.display()
+        );
+    }
+    let metadata: MountViewMetadata = serde_json::from_slice(&fs::read(&marker)?)
+        .with_context(|| format!("read mount metadata {}", marker.display()))?;
+    fs::remove_dir_all(&args.mountpoint)
+        .with_context(|| format!("remove mount view {}", args.mountpoint.display()))?;
+    record_op(
+        &conn,
+        "unmount",
+        Some(&metadata.snapshot_id),
+        None,
+        Some(&format!("from {}", args.mountpoint.display())),
+    )?;
+    println!("unmounted {}", args.mountpoint.display());
+    println!("snapshot {}", metadata.snapshot_id);
     Ok(())
 }
 

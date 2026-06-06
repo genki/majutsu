@@ -1172,6 +1172,7 @@ fn mount_creates_lazy_view_and_can_hydrate_large_files() {
             .join(".majutsu-lazy/sample/payload.bin.json")
             .exists()
     );
+    assert!(lazy_view.join(".majutsu-mount.json").exists());
     let hydrated_lazy = output({
         let mut c = mj();
         c.arg("--home")
@@ -1209,6 +1210,14 @@ fn mount_creates_lazy_view_and_can_hydrate_large_files() {
         fs::read(source.join("payload.bin")).unwrap(),
         fs::read(hydrated_view.join("sample/payload.bin")).unwrap()
     );
+
+    let unmounted = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("unmount").arg(&lazy_view);
+        c
+    });
+    assert!(unmounted.contains("unmounted"));
+    assert!(!lazy_view.exists());
 }
 
 #[test]
