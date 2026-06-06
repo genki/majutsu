@@ -3509,14 +3509,126 @@ fn fsck(paths: &Paths) -> Result<()> {
 }
 
 fn remote_fsck(remote: &RemoteStore) -> Result<()> {
-    if !remote.exists("metadata/export.json")? {
-        bail!("metadata/export.json is missing on remote");
-    }
-    let export: MetadataExport = serde_json::from_slice(&remote.get("metadata/export.json")?)?;
     let mut missing = 0usize;
+    let mut verified_hosts = 0usize;
+    let has_legacy_export = remote.exists("metadata/export.json")?;
+    let has_host_index = remote.exists("hosts/index.json")?;
+
+    if has_legacy_export {
+        let export = remote_fsck_export(remote, "metadata/export.json", &mut missing)?;
+        if let Some(current) = export.refs.get("current") {
+            let legacy_current = remote_ref(remote, "hosts/current")?;
+            if legacy_current.as_deref() != Some(current.as_str()) {
+                missing += 1;
+                eprintln!("legacy hosts/current does not match metadata current ref");
+            }
+        }
+    }
+
+    if has_host_index {
+        let index = read_remote_host_index(remote)?;
+        for host in &index.hosts {
+            verified_hosts += 1;
+            if !remote.exists(&host.metadata_key)? {
+                missing += 1;
+                eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
+                continue;
+            }
+            let export = remote_fsck_export(remote, &host.metadata_key, &mut missing)?;
+            if export.config.host.id != host.id {
+                missing += 1;
+                eprintln!(
+                    "host index id {} does not match metadata host id {}",
+                    host.id, export.config.host.id
+                );
+            }
+            if export.config.host.name != host.name {
+                missing += 1;
+                eprintln!(
+                    "host index name {} does not match metadata host name {}",
+                    host.name, export.config.host.name
+                );
+            }
+            let current = export.refs.get("current");
+            if host.current_snapshot.as_ref() != current {
+                missing += 1;
+                eprintln!(
+                    "host index current snapshot does not match metadata for {}",
+                    host.id
+                );
+            }
+            let current_ref_key = format!("hosts/{}/refs/current", host.id);
+            if let Some(current) = current {
+                match remote_ref(remote, &current_ref_key)? {
+                    Some(remote_current) if remote_current == *current => {}
+                    Some(remote_current) => {
+                        missing += 1;
+                        eprintln!(
+                            "{current_ref_key} points to {remote_current}, expected {current}"
+                        );
+                    }
+                    None => {
+                        missing += 1;
+                        eprintln!("missing remote ref {current_ref_key}");
+                    }
+                }
+                let legacy_current_key = format!("hosts/{}/current", host.id);
+                if let Some(legacy_current) = remote_ref(remote, &legacy_current_key)? {
+                    if legacy_current != *current {
+                        missing += 1;
+                        eprintln!(
+                            "{legacy_current_key} points to {legacy_current}, expected {current}"
+                        );
+                    }
+                }
+            }
+            if let Some(last_synced) = export.refs.get("last-synced") {
+                let last_synced_ref_key = format!("hosts/{}/refs/last-synced", host.id);
+                match remote_ref(remote, &last_synced_ref_key)? {
+                    Some(remote_last_synced) if remote_last_synced == *last_synced => {}
+                    Some(remote_last_synced) => {
+                        missing += 1;
+                        eprintln!(
+                            "{last_synced_ref_key} points to {remote_last_synced}, expected {last_synced}"
+                        );
+                    }
+                    None => {
+                        missing += 1;
+                        eprintln!("missing remote ref {last_synced_ref_key}");
+                    }
+                }
+            }
+        }
+    }
+
+    if !has_legacy_export && !has_host_index {
+        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    }
+    if has_host_index && verified_hosts == 0 {
+        missing += 1;
+        eprintln!("hosts/index.json contains no hosts");
+    }
+    if missing > 0 {
+        bail!("remote fsck found {missing} issue(s)");
+    }
+    println!("remote fsck ok");
+    println!("hosts {}", verified_hosts);
+    if has_legacy_export {
+        println!("legacy_metadata ok");
+    }
+    Ok(())
+}
+
+fn remote_fsck_export(
+    remote: &RemoteStore,
+    metadata_key: &str,
+    missing: &mut usize,
+) -> Result<MetadataExport> {
+    let export: MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
+        .with_context(|| format!("parse remote metadata {metadata_key}"))?;
     for key in local_object_keys(&export) {
         if !remote.exists(&key)? {
-            missing += 1;
+            *missing += 1;
             eprintln!("missing remote object {key}");
         }
     }
@@ -3526,17 +3638,11 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
             .iter()
             .any(|snapshot| &snapshot.id == current);
         if !found {
-            missing += 1;
+            *missing += 1;
             eprintln!("remote current ref points to missing snapshot {current}");
         }
     }
-    if missing > 0 {
-        bail!("remote fsck found {missing} issue(s)");
-    }
-    println!("remote fsck ok");
-    println!("snapshots {}", export.snapshots.len());
-    println!("objects {}", local_object_keys(&export).len());
-    Ok(())
+    Ok(export)
 }
 
 #[derive(Debug)]

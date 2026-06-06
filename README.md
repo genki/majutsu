@@ -197,6 +197,10 @@ mj remote host test-host
 mj remote fsck
 ```
 
+`mj remote fsck` verifies the legacy bootstrap metadata, canonical
+`hosts/index.json`, each host metadata export, canonical `hosts/<host>/refs/*`
+values, and every referenced object key.
+
 To rebuild an empty state directory from remote:
 
 ```sh

@@ -227,6 +227,61 @@ fn file_remote_clone_restores_normal_and_large_files() {
     );
 }
 
+#[test]
+fn remote_fsck_detects_missing_canonical_host_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--host-name")
+            .arg("test-host")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let host_ref = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("refs/current").exists())
+        .unwrap()
+        .join("refs/current");
+    fs::remove_file(host_ref).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn restore_preserves_file_mode_and_mtime() {
