@@ -1,5 +1,7 @@
 use std::fs;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 fn mj() -> Command {
     Command::new(env!("CARGO_BIN_EXE_mj"))
@@ -375,16 +377,21 @@ fn watch_once_creates_snapshot_without_daemonizing() {
             .arg(&source);
         c
     });
-    run({
-        let mut c = mj();
-        c.arg("--home")
-            .arg(&state)
-            .arg("watch")
-            .arg("--once")
-            .arg("--interval-secs")
-            .arg("1");
-        c
-    });
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("watch")
+        .arg("--once")
+        .arg("--backend")
+        .arg("notify")
+        .arg("--debounce-ms")
+        .arg("100")
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
     let output = mj()
         .arg("--home")
         .arg(&state)

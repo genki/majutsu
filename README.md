@@ -31,13 +31,13 @@ large object handling.
 - Transactional pre/post snapshot hooks
 - Stable read retry/backoff
 - Root pause/resume/missing-state handling
-- Foreground periodic watch and minimal daemon start/stop/status
+- OS-native filesystem watch backend with debounce
+- Polling watch fallback and minimal daemon start/stop/status
 - Restore planning and restore to an alternate directory
 - Basic object-store fsck
 
-OS-native file event journaling, encryption, lifecycle policy generation,
-archive restore, and pack compaction are intentionally left for later
-iterations.
+Lifecycle policy generation, archive restore, and pack compaction are
+intentionally left for later iterations.
 
 ## Install
 
@@ -215,16 +215,22 @@ separate tree manifest object under `objects/trees/`.
 
 ## Watch And Daemon
 
-Foreground periodic snapshots:
+Foreground OS-native filesystem watching:
 
 ```sh
-mj watch --foreground --interval-secs 60
+mj watch --foreground --backend notify --debounce-ms 1500
 ```
 
-One-shot watch, useful for tests:
+Polling fallback:
 
 ```sh
-mj watch --once --interval-secs 1
+mj watch --foreground --backend poll --interval-secs 60
+```
+
+One-shot notify watch, useful for tests:
+
+```sh
+mj watch --once --backend notify --debounce-ms 100
 ```
 
 Minimal background daemon management:
@@ -236,7 +242,7 @@ mj daemon stop
 ```
 
 The current daemon is a small process wrapper around foreground watch. It does
-not yet use OS-native file event APIs or a persistent event journal.
+use the notify backend and records filesystem events in the event journal.
 
 ## Root State
 
@@ -281,7 +287,8 @@ $MAJUTSU_HOME/queue/events
 ```
 
 This is the initial event journal used to preserve observed work across process
-crashes. OS-native filesystem events are still a future extension.
+crashes. The notify watch backend records filesystem events here before
+debounced snapshots are created.
 
 ## Safety Notes
 

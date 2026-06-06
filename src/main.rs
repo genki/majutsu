@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use hmac::{Hmac, Mac};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rand::RngCore;
@@ -21,6 +22,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::mpsc;
 use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -196,6 +198,10 @@ struct WatchArgs {
     foreground: bool,
     #[arg(long, default_value_t = 60)]
     interval_secs: u64,
+    #[arg(long, default_value_t = 1500)]
+    debounce_ms: u64,
+    #[arg(long, default_value = "notify")]
+    backend: String,
     #[arg(long, default_value_t = false)]
     once: bool,
 }
@@ -1162,10 +1168,18 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     if !args.foreground {
         bail!("daemonized watch is not implemented yet; use --foreground");
     }
+    match args.backend.as_str() {
+        "notify" => watch_notify(paths, args),
+        "poll" => watch_poll(paths, args),
+        other => bail!("unsupported watch backend: {other}"),
+    }
+}
+
+fn watch_poll(paths: &Paths, args: WatchArgs) -> Result<()> {
     record_event(
         paths,
         "watch-start",
-        &format!("interval_secs={}", args.interval_secs),
+        &format!("backend=poll interval_secs={}", args.interval_secs),
     )?;
     loop {
         snapshot(
@@ -1180,6 +1194,65 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(args.interval_secs.max(1)));
     }
     record_event(paths, "watch-stop", "foreground watch stopped")?;
+    Ok(())
+}
+
+fn watch_notify(paths: &Paths, args: WatchArgs) -> Result<()> {
+    let conn = open_db(paths)?;
+    let active_roots = roots(&conn)?
+        .into_iter()
+        .filter(|root| root.status == "active" && root.path.exists())
+        .collect::<Vec<_>>();
+    if active_roots.is_empty() {
+        bail!("no active roots are available to watch");
+    }
+    record_event(
+        paths,
+        "watch-start",
+        &format!("backend=notify debounce_ms={}", args.debounce_ms),
+    )?;
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        NotifyConfig::default(),
+    )?;
+    for root in &active_roots {
+        watcher.watch(&root.path, RecursiveMode::Recursive)?;
+        record_event(
+            paths,
+            "watch-root",
+            &format!("{} {}", root.id, root.path.display()),
+        )?;
+    }
+    loop {
+        let event = rx.recv()??;
+        let detail = format_notify_event(&event);
+        record_event(paths, "fs-event", &detail)?;
+        let debounce = std::time::Duration::from_millis(args.debounce_ms.max(1));
+        loop {
+            match rx.recv_timeout(debounce) {
+                Ok(Ok(next)) => {
+                    record_event(paths, "fs-event", &format_notify_event(&next))?;
+                    continue;
+                }
+                Ok(Err(err)) => return Err(err.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
+            }
+        }
+        snapshot(
+            paths,
+            SnapshotArgs {
+                message: Some("watch event snapshot".into()),
+            },
+        )?;
+        if args.once {
+            break;
+        }
+    }
+    record_event(paths, "watch-stop", "foreground notify watch stopped")?;
     Ok(())
 }
 
@@ -1202,6 +1275,8 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 .arg("--home")
                 .arg(&paths.home)
                 .arg("watch")
+                .arg("--backend")
+                .arg("notify")
                 .arg("--interval-secs")
                 .arg(interval_secs.to_string())
                 .stdout(Stdio::from(log.try_clone()?))
@@ -2183,6 +2258,24 @@ fn pid_alive(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn format_notify_event(event: &notify::Event) -> String {
+    let kind = match &event.kind {
+        EventKind::Create(_) => "create",
+        EventKind::Modify(_) => "modify",
+        EventKind::Remove(_) => "remove",
+        EventKind::Access(_) => "access",
+        EventKind::Other => "other",
+        _ => "unknown",
+    };
+    let paths = event
+        .paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{kind} {paths}")
 }
 
 fn looks_binary(path: &Path) -> Result<bool> {
