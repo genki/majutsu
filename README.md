@@ -223,6 +223,10 @@ uploads with `majutsu-class` so lifecycle policies can distinguish metadata,
 refs, trees, packs, large chunks, and generic objects. Leave these variables
 unset for S3-compatible providers that reject S3 storage-class or object-tagging
 headers.
+File remotes and S3 Signature V4 remotes support conditional put for queued CAS
+objects. S3 uses `If-None-Match: *` for regular PutObject requests; multipart
+uploads fall back to a preflight existence check because S3 multipart completion
+does not provide the same simple create-only PutObject primitive.
 
 ## Encryption
 

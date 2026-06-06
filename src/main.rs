@@ -2382,7 +2382,13 @@ fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
                 item.key
             );
         };
-        match remote.put(&item.key, &bytes) {
+        let upload_result =
+            if item.key.starts_with("objects/") && remote.capabilities().conditional_put {
+                remote.put_if_absent(&item.key, &bytes).map(|_| ())
+            } else {
+                remote.put(&item.key, &bytes)
+            };
+        match upload_result {
             Ok(()) => {
                 fs::remove_file(path)?;
                 uploaded += 1;
@@ -5625,6 +5631,31 @@ impl RemoteStore {
         }
     }
 
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        match self {
+            RemoteStore::File(remote) => {
+                let path = remote.root.join(key);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(mut file) => {
+                        file.write_all(bytes)?;
+                        file.sync_all()?;
+                        Ok(true)
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                    Err(err) => Err(err.into()),
+                }
+            }
+            RemoteStore::S3(remote) => remote.put_if_absent(key, bytes),
+        }
+    }
+
     fn get(&self, key: &str) -> Result<Vec<u8>> {
         match self {
             RemoteStore::File(remote) => Ok(fs::read(remote.root.join(key))?),
@@ -5676,7 +5707,7 @@ impl RemoteStore {
                 restore_archived_object: true,
                 multipart_upload: false,
                 range_get: true,
-                conditional_put: false,
+                conditional_put: true,
             },
             RemoteStore::S3(remote) => RemoteCapabilities {
                 lifecycle_rules: true,
@@ -5685,7 +5716,7 @@ impl RemoteStore {
                 restore_archived_object: true,
                 multipart_upload: !remote.uses_sigv2(),
                 range_get: true,
-                conditional_put: false,
+                conditional_put: !remote.uses_sigv2(),
             },
         }
     }
@@ -5693,8 +5724,23 @@ impl RemoteStore {
 
 impl S3Remote {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.put_object(key, bytes, false).map(|_| ())
+    }
+
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        if self.uses_sigv2() {
+            bail!("conditional put requires S3 Signature V4");
+        }
+        self.put_object(key, bytes, true)
+    }
+
+    fn put_object(&self, key: &str, bytes: &[u8], if_absent: bool) -> Result<bool> {
         if !self.uses_sigv2() && bytes.len() >= self.multipart_threshold() {
-            return self.put_multipart(key, bytes);
+            if if_absent && self.exists(key)? {
+                return Ok(false);
+            }
+            self.put_multipart(key, bytes)?;
+            return Ok(true);
         }
         let remote_key = self.remote_key(key);
         let url = self.object_url(&remote_key);
@@ -5711,7 +5757,10 @@ impl S3Remote {
                 .send()?
         } else {
             let payload_hash = sha256_hex(bytes);
-            let extra_headers = self.put_object_headers(key)?;
+            let mut extra_headers = self.put_object_headers(key)?;
+            if if_absent {
+                extra_headers.push(("if-none-match".to_string(), "*".to_string()));
+            }
             let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &extra_headers)?;
             let mut request = self
                 .client
@@ -5726,10 +5775,13 @@ impl S3Remote {
             }
             request.body(bytes.to_vec()).send()?
         };
+        if if_absent && matches!(response.status().as_u16(), 409 | 412) {
+            return Ok(false);
+        }
         if !response.status().is_success() {
             bail!("s3 put failed for {key}: HTTP {}", response.status());
         }
-        Ok(())
+        Ok(true)
     }
 
     fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -6435,6 +6487,37 @@ mod tests {
         assert!(auth.authorization.contains(
             "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-storage-class;x-amz-tagging"
         ));
+    }
+
+    #[test]
+    fn s3_sigv4_signs_conditional_put_header() {
+        let remote = test_s3_remote();
+        let mut headers = remote
+            .put_object_headers("objects/blobs/loose/blob-1")
+            .unwrap();
+        headers.push(("if-none-match".to_string(), "*".to_string()));
+        let auth = remote
+            .auth_v4(
+                "PUT",
+                "prefix/objects/blobs/loose/blob-1",
+                "",
+                "hash",
+                &headers,
+            )
+            .unwrap();
+        assert!(auth.authorization.contains("SignedHeaders=host;if-none-match;x-amz-content-sha256;x-amz-date;x-amz-storage-class;x-amz-tagging"));
+    }
+
+    #[test]
+    fn file_remote_put_if_absent_does_not_overwrite_existing_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = RemoteStore::File(FileRemote {
+            root: tmp.path().to_path_buf(),
+        });
+
+        assert!(remote.put_if_absent("objects/test", b"first").unwrap());
+        assert!(!remote.put_if_absent("objects/test", b"second").unwrap());
+        assert_eq!(remote.get("objects/test").unwrap(), b"first");
     }
 
     #[cfg(unix)]
