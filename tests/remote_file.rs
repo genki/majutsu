@@ -1395,6 +1395,102 @@ fn large_pin_unpin_is_persisted_in_metadata() {
 }
 
 #[test]
+fn large_pin_filters_by_root_and_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let photos = tmp.path().join("photos");
+    let docs = tmp.path().join("docs");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&photos).unwrap();
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(photos.join("photo.bin"), b"photo-large").unwrap();
+    fs::write(docs.join("doc.bin"), b"doc-large").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("photos")
+            .arg(&photos)
+            .arg("--large-always")
+            .arg("*.bin");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("docs")
+            .arg(&docs)
+            .arg("--large-always")
+            .arg("*.bin");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("large")
+            .arg("pin")
+            .arg("--root")
+            .arg("photos")
+            .arg("--since")
+            .arg("1d");
+        c
+    });
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("pinned 1"));
+    let list = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("list");
+        c
+    });
+    assert!(list.contains("pinned"));
+    assert!(list.contains("unpinned"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("unpin");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("large")
+            .arg("pin")
+            .arg("--root")
+            .arg("photos")
+            .arg("--since")
+            .arg("0s");
+        c
+    });
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("pinned 0"));
+}
+
+#[test]
 fn root_large_policy_override_can_route_small_files_to_large_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

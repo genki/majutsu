@@ -2097,25 +2097,30 @@ fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
         LargeCommand::Pin(args) => {
             let snapshot =
                 current_snapshot(&conn)?.ok_or_else(|| anyhow!("no current snapshot"))?;
-            let manifest = load_snapshot_by_id(&conn, &snapshot)?;
+            let manifests = large_pin_snapshots(&conn, args.since.as_deref(), &snapshot)?;
             let mut pinned = 0usize;
-            for (root_id, records) in manifest.roots {
-                if args.root.as_deref().is_some_and(|filter| filter != root_id) {
-                    continue;
-                }
-                for record in records {
-                    if let Payload::Large { oid, .. } = record.payload {
-                        conn.execute(
-                            "insert or replace into large_pins(oid, pinned_at, reason) values (?1, ?2, ?3)",
-                            params![
-                                oid,
-                                Utc::now().to_rfc3339(),
-                                args.since
-                                    .as_ref()
-                                    .map(|since| format!("pin since {since}"))
-                            ],
-                        )?;
-                        pinned += 1;
+            let mut seen = BTreeSet::new();
+            for manifest in manifests {
+                for (root_id, records) in manifest.roots {
+                    if args.root.as_deref().is_some_and(|filter| filter != root_id) {
+                        continue;
+                    }
+                    for record in records {
+                        if let Payload::Large { oid, .. } = record.payload {
+                            if seen.insert(oid.clone()) {
+                                conn.execute(
+                                    "insert or replace into large_pins(oid, pinned_at, reason) values (?1, ?2, ?3)",
+                                    params![
+                                        oid,
+                                        Utc::now().to_rfc3339(),
+                                        args.since
+                                            .as_ref()
+                                            .map(|since| format!("pin since {since}"))
+                                    ],
+                                )?;
+                                pinned += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -2149,6 +2154,37 @@ fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn large_pin_snapshots(
+    conn: &Connection,
+    since: Option<&str>,
+    current_snapshot_id: &str,
+) -> Result<Vec<SnapshotManifest>> {
+    let Some(since) = since else {
+        return Ok(vec![load_snapshot_by_id(conn, current_snapshot_id)?]);
+    };
+    let cutoff = parse_pin_since(since)?;
+    let mut stmt =
+        conn.prepare("select manifest_json, created_at from snapshots order by created_at")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut manifests = Vec::new();
+    for row in rows {
+        let (json, created_at) = row?;
+        if parse_db_time(&created_at)? >= cutoff {
+            manifests.push(serde_json::from_str(&json)?);
+        }
+    }
+    Ok(manifests)
+}
+
+fn parse_pin_since(input: &str) -> Result<DateTime<Utc>> {
+    parse_duration_ago(input).or_else(|_| {
+        let parsed = parse_time(input)?;
+        parse_db_time(&parsed)
+    })
 }
 
 fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {

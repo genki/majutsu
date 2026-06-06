@@ -121,6 +121,9 @@ mj large unpin --older-than 180d
 
 Pins are stored in metadata and preserved through sync/clone. They are intended
 as lifecycle policy inputs for large objects that should remain hot.
+Without `--since`, `large pin` considers the current snapshot. With `--since`,
+it considers snapshots at or after the cutoff, accepting duration values such as
+`30d`, `12h`, `10m`, and `30s`, or an RFC3339 timestamp.
 
 Large chunks are compressed with zstd when compression is enabled, the extension
 is not in the skip list, and the compressed chunk beats `min_gain_ratio`.
