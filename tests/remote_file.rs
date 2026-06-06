@@ -309,6 +309,99 @@ fn prune_dry_run_and_gc_are_safe_entry_points() {
 }
 
 #[test]
+fn pack_gc_and_remote_clone_restore_packed_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    assert!(
+        state
+            .join("objects/packs/normal")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("alpha.txt")).unwrap(),
+        fs::read(restore.join("sample/alpha.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("beta.txt")).unwrap(),
+        fs::read(restore.join("sample/beta.txt")).unwrap()
+    );
+}
+
+#[test]
 fn missing_root_is_not_snapshotted_as_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

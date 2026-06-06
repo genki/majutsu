@@ -21,6 +21,7 @@ large object handling.
 - S3-compatible remote backend
 - Bootstrap clone from remote metadata
 - Root tree manifests stored as separate content-addressed objects
+- Normal blob pack files and pack indexes
 - Snapshot diff
 - Safe `prune --dry-run` and local loose-object `gc`
 - Persistent upload queue with retry on the next `mj sync`
@@ -36,7 +37,7 @@ large object handling.
 - Restore planning and restore to an alternate directory
 - Basic object-store fsck
 
-Lifecycle policy generation, archive restore, and pack compaction are
+Lifecycle policy generation, archive restore, and advanced pack compaction are
 intentionally left for later iterations.
 
 ## Install
@@ -267,6 +268,24 @@ mj prune --dry-run --keep-daily 90 --keep-monthly 36
 
 `mj gc` removes unreferenced local loose objects under `$MAJUTSU_HOME/objects`.
 It does not delete referenced history or remote objects.
+
+## Packs
+
+Pack normal blob objects to reduce the number of loose object files:
+
+```sh
+mj pack
+mj gc
+```
+
+`mj pack` stores unpacked normal blobs under
+`$MAJUTSU_HOME/objects/packs/normal/*.mpack` and writes matching pack indexes
+under `$MAJUTSU_HOME/objects/indexes/pack/*.json`. After packing, the original
+loose blob objects are no longer referenced by metadata, so `mj gc` can remove
+them locally.
+
+Restore, fsck, sync, remote fsck, and clone understand pack indexes. Large
+chunk objects remain separate content-addressed objects.
 
 ## Queues
 

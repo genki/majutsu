@@ -81,6 +81,7 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    Pack,
     Prune(PruneArgs),
     Gc,
     Fsck,
@@ -242,6 +243,8 @@ struct Paths {
     trees: PathBuf,
     large_chunks: PathBuf,
     large_manifests: PathBuf,
+    packs: PathBuf,
+    pack_indexes: PathBuf,
     logs: PathBuf,
     runtime: PathBuf,
     daemon_pid: PathBuf,
@@ -288,6 +291,31 @@ struct MetadataExport {
     blobs: Vec<BlobExport>,
     large_objects: Vec<LargeObjectExport>,
     chunks: Vec<ChunkExport>,
+    packs: Vec<PackExport>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackExport {
+    pack_id: String,
+    pack_key: String,
+    index_key: String,
+    object_count: usize,
+    size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackIndex {
+    version: u32,
+    pack_id: String,
+    pack_key: String,
+    entries: Vec<PackEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackEntry {
+    oid: String,
+    offset: u64,
+    len: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -333,6 +361,12 @@ struct BlobExport {
     oid: String,
     size: u64,
     object_key: String,
+    #[serde(default)]
+    pack_id: Option<String>,
+    #[serde(default)]
+    pack_offset: Option<u64>,
+    #[serde(default)]
+    pack_len: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -483,6 +517,7 @@ fn main() -> Result<()> {
         Command::Watch(args) => watch_cmd(&paths, args),
         Command::Daemon { command } => daemon_cmd(&paths, command),
         Command::Key { command } => key_cmd(&paths, command),
+        Command::Pack => pack_cmd(&paths),
         Command::Prune(args) => prune_cmd(&paths, args),
         Command::Gc => gc_cmd(&paths),
         Command::Fsck => fsck(&paths),
@@ -506,6 +541,8 @@ fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
         trees: home.join("objects/trees"),
         large_chunks: home.join("objects/large/chunks/fixed"),
         large_manifests: home.join("objects/large/manifests"),
+        packs: home.join("objects/packs/normal"),
+        pack_indexes: home.join("objects/indexes/pack"),
         logs: home.join("logs"),
         runtime: home.join("runtime"),
         daemon_pid: home.join("runtime/daemon.pid"),
@@ -1329,6 +1366,71 @@ fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {
     Ok(())
 }
 
+fn pack_cmd(paths: &Paths) -> Result<()> {
+    ensure_ready(paths)?;
+    let conn = open_db(paths)?;
+    let blobs = query_blobs(&conn)?
+        .into_iter()
+        .filter(|blob| blob.pack_id.is_none())
+        .collect::<Vec<_>>();
+    if blobs.is_empty() {
+        println!("packed 0 objects");
+        return Ok(());
+    }
+    let pack_id = new_id("pack");
+    let pack_key = format!("objects/packs/normal/{}.mpack", pack_id);
+    let index_key = format!("objects/indexes/pack/{}.json", pack_id);
+    let mut pack_bytes = Vec::new();
+    let mut entries = Vec::new();
+    for blob in &blobs {
+        let payload = read_object(paths, &blob.object_key)?;
+        let stored = encode_object(paths, &payload)?;
+        let offset = pack_bytes.len() as u64;
+        pack_bytes.extend_from_slice(&(stored.len() as u64).to_le_bytes());
+        pack_bytes.extend_from_slice(&stored);
+        entries.push(PackEntry {
+            oid: blob.oid.clone(),
+            offset,
+            len: 8 + stored.len() as u64,
+        });
+    }
+    let pack_path = paths.home.join(&pack_key);
+    if let Some(parent) = pack_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&pack_path, &pack_bytes)?;
+    let index = PackIndex {
+        version: 1,
+        pack_id: pack_id.clone(),
+        pack_key: pack_key.clone(),
+        entries,
+    };
+    let index_path = paths.home.join(&index_key);
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
+    conn.execute(
+        "insert or replace into packs(pack_id, pack_key, index_key, object_count, size) values (?1, ?2, ?3, ?4, ?5)",
+        params![pack_id, pack_key, index_key, blobs.len(), pack_bytes.len() as u64],
+    )?;
+    for entry in &index.entries {
+        conn.execute(
+            "update blobs set pack_id=?2, pack_offset=?3, pack_len=?4 where oid=?1",
+            params![entry.oid, index.pack_id, entry.offset, entry.len],
+        )?;
+    }
+    record_op(
+        &conn,
+        "pack",
+        current_snapshot(&conn)?.as_deref(),
+        current_snapshot(&conn)?.as_deref(),
+        Some(&format!("packed {} blobs", blobs.len())),
+    )?;
+    println!("packed {} objects into {}", blobs.len(), index.pack_key);
+    Ok(())
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -1397,13 +1499,22 @@ fn fsck(paths: &Paths) -> Result<()> {
             eprintln!("unreadable object {key}: {err}");
         }
     }
-    let mut stmt = conn.prepare("select oid, object_key from blobs")?;
+    let mut stmt = conn.prepare("select oid, object_key, pack_id from blobs")?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?;
     for row in rows {
-        let (oid, key) = row?;
-        if !paths.home.join(&key).exists() {
+        let (oid, key, pack_id) = row?;
+        if pack_id.is_some() {
+            if let Err(err) = read_blob_payload(paths, &conn, &oid, &key) {
+                missing += 1;
+                eprintln!("unreadable packed blob {oid}: {err}");
+            }
+        } else if !paths.home.join(&key).exists() {
             missing += 1;
             eprintln!("missing blob {oid} {key}");
         } else if let Err(err) = read_object(paths, &key) {
@@ -1542,14 +1653,15 @@ fn print_restore_plan(plan: &RestorePlan) {
 }
 
 fn apply_restore_plan(paths: &Paths, plan: &RestorePlan) -> Result<()> {
+    let conn = open_db(paths)?;
     for record in &plan.files {
         let dest = plan.to.join(&record.root_id).join(&record.path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
         match &record.payload {
-            Payload::Blob { object_key, .. } => {
-                write_atomic(&dest, &read_object(paths, object_key)?)?;
+            Payload::Blob { oid, object_key } => {
+                write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
             }
             Payload::Large { manifest_key, .. } => {
                 let manifest: LargeManifest =
@@ -1724,6 +1836,8 @@ fn create_layout(paths: &Paths) -> Result<()> {
     fs::create_dir_all(&paths.trees)?;
     fs::create_dir_all(&paths.large_chunks)?;
     fs::create_dir_all(&paths.large_manifests)?;
+    fs::create_dir_all(&paths.packs)?;
+    fs::create_dir_all(&paths.pack_indexes)?;
     fs::create_dir_all(&paths.logs)?;
     for dir in [
         "ops",
@@ -1778,10 +1892,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         create table if not exists refs(name text primary key, value text not null);
         create table if not exists blobs(oid text primary key, size integer not null, object_key text not null);
+        create table if not exists packs(pack_id text primary key, pack_key text not null, index_key text not null, object_count integer not null, size integer not null);
         create table if not exists large_objects(oid text primary key, size integer not null, chunk_count integer not null, manifest_key text not null);
         create table if not exists chunks(oid text primary key, size integer not null, object_key text not null);
         ",
     )?;
+    let _ = conn.execute("alter table blobs add column pack_id text", []);
+    let _ = conn.execute("alter table blobs add column pack_offset integer", []);
+    let _ = conn.execute("alter table blobs add column pack_len integer", []);
     Ok(())
 }
 
@@ -1860,6 +1978,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
         blobs: query_blobs(conn)?,
         large_objects: query_large_objects(conn)?,
         chunks: query_chunks(conn)?,
+        packs: query_packs(conn)?,
     })
 }
 
@@ -1906,8 +2025,14 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
     }
     for blob in &export.blobs {
         conn.execute(
-            "insert or replace into blobs(oid, size, object_key) values (?1, ?2, ?3)",
-            params![blob.oid, blob.size, blob.object_key],
+            "insert or replace into blobs(oid, size, object_key, pack_id, pack_offset, pack_len) values (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![blob.oid, blob.size, blob.object_key, blob.pack_id, blob.pack_offset, blob.pack_len],
+        )?;
+    }
+    for pack in &export.packs {
+        conn.execute(
+            "insert or replace into packs(pack_id, pack_key, index_key, object_count, size) values (?1, ?2, ?3, ?4, ?5)",
+            params![pack.pack_id, pack.pack_key, pack.index_key, pack.object_count, pack.size],
         )?;
     }
     for large in &export.large_objects {
@@ -1926,12 +2051,34 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
 }
 
 fn query_blobs(conn: &Connection) -> Result<Vec<BlobExport>> {
-    let mut stmt = conn.prepare("select oid, size, object_key from blobs order by oid")?;
+    let mut stmt = conn.prepare(
+        "select oid, size, object_key, pack_id, pack_offset, pack_len from blobs order by oid",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok(BlobExport {
             oid: row.get(0)?,
             size: row.get(1)?,
             object_key: row.get(2)?,
+            pack_id: row.get(3)?,
+            pack_offset: row.get(4)?,
+            pack_len: row.get(5)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn query_packs(conn: &Connection) -> Result<Vec<PackExport>> {
+    let mut stmt = conn.prepare(
+        "select pack_id, pack_key, index_key, object_count, size from packs order by pack_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PackExport {
+            pack_id: row.get(0)?,
+            pack_key: row.get(1)?,
+            index_key: row.get(2)?,
+            object_count: row.get(3)?,
+            size: row.get(4)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1977,7 +2124,13 @@ fn local_object_keys(export: &MetadataExport) -> Vec<String> {
         }
     }
     for blob in &export.blobs {
-        keys.push(blob.object_key.clone());
+        if blob.pack_id.is_none() {
+            keys.push(blob.object_key.clone());
+        }
+    }
+    for pack in &export.packs {
+        keys.push(pack.pack_key.clone());
+        keys.push(pack.index_key.clone());
     }
     for large in &export.large_objects {
         keys.push(large.manifest_key.clone());
@@ -2361,6 +2514,55 @@ fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
 fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
     let bytes = fs::read(paths.home.join(key))?;
     decode_object(paths, &bytes)
+}
+
+fn read_blob_payload(
+    paths: &Paths,
+    conn: &Connection,
+    oid: &str,
+    fallback_key: &str,
+) -> Result<Vec<u8>> {
+    let blob = query_blobs(conn)?
+        .into_iter()
+        .find(|blob| blob.oid == oid)
+        .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
+    if let Some(pack_id) = blob.pack_id {
+        let pack: PackExport = conn.query_row(
+            "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",
+            params![pack_id],
+            |row| {
+                Ok(PackExport {
+                    pack_id: row.get(0)?,
+                    pack_key: row.get(1)?,
+                    index_key: row.get(2)?,
+                    object_count: row.get(3)?,
+                    size: row.get(4)?,
+                })
+            },
+        )?;
+        let offset = blob
+            .pack_offset
+            .ok_or_else(|| anyhow!("missing pack offset for {oid}"))? as usize;
+        let len = blob
+            .pack_len
+            .ok_or_else(|| anyhow!("missing pack len for {oid}"))? as usize;
+        let bytes = fs::read(paths.home.join(pack.pack_key))?;
+        let slice = bytes
+            .get(offset..offset + len)
+            .ok_or_else(|| anyhow!("pack entry out of range for {oid}"))?;
+        if slice.len() < 8 {
+            bail!("pack entry too short for {oid}");
+        }
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&slice[..8]);
+        let stored_len = u64::from_le_bytes(len_bytes) as usize;
+        if stored_len != slice.len() - 8 {
+            bail!("pack entry length mismatch for {oid}");
+        }
+        decode_object(paths, &slice[8..])
+    } else {
+        read_object(paths, fallback_key)
+    }
 }
 
 fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
