@@ -257,6 +257,26 @@ mj remote host test-host
 mj remote fsck
 ```
 
+`[remote]` also accepts the split config form used in the spec:
+
+```toml
+[remote]
+type = "s3"
+bucket = "my-majutsu-backup"
+prefix = "majutsu/v1/workstation"
+endpoint = "https://storage.googleapis.com"
+region = "us-east-1"
+signature_version = "s3v4"
+```
+
+For local validation:
+
+```toml
+[remote]
+type = "file"
+path = "/tmp/majutsu-remote"
+```
+
 `mj remote fsck` verifies the legacy bootstrap metadata, canonical
 `hosts/index.json`, each host metadata export, canonical `hosts/<host>/refs/*`
 values, per-host snapshot/operation exports, and every referenced object key.

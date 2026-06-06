@@ -359,6 +359,107 @@ fn remote_fsck_detects_missing_canonical_object_alias() {
     });
 }
 
+#[test]
+fn split_remote_config_supports_file_and_s3_forms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let base = config.split("\n[large]").next().unwrap();
+    let large_and_after = config.split("\n[large]").nth(1).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            r#"{base}
+[remote]
+type = "file"
+path = "{}"
+
+[large]{large_and_after}"#,
+            remote.display()
+        ),
+    )
+    .unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+
+    let s3_state = tmp.path().join("s3-state");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&s3_state).arg("init");
+        c
+    });
+    let s3_config = fs::read_to_string(s3_state.join("config.toml")).unwrap();
+    let s3_base = s3_config.split("\n[large]").next().unwrap();
+    let s3_large_and_after = s3_config.split("\n[large]").nth(1).unwrap();
+    fs::write(
+        s3_state.join("config.toml"),
+        format!(
+            r#"{s3_base}
+[remote]
+type = "s3"
+bucket = "split-bucket"
+prefix = "majutsu/v1"
+endpoint = "https://example.invalid"
+region = "us-test-1"
+signature_version = "s3v4"
+
+[large]{s3_large_and_after}"#
+        ),
+    )
+    .unwrap();
+    let capabilities = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&s3_state)
+            .arg("remote")
+            .arg("capabilities")
+            .env("AWS_ACCESS_KEY_ID", "dummy")
+            .env("AWS_SECRET_ACCESS_KEY", "dummy");
+        c
+    });
+    assert!(capabilities.contains("remote s3://split-bucket/majutsu/v1"));
+    assert!(capabilities.contains("lifecycle_rules true"));
+}
+
 #[cfg(unix)]
 #[test]
 fn restore_preserves_file_mode_and_mtime() {

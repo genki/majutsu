@@ -473,9 +473,68 @@ struct HostConfig {
     name: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RemoteConfig {
-    url: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, rename = "type")]
+    remote_type: Option<String>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    signature_version: Option<String>,
+}
+
+impl RemoteConfig {
+    fn from_url(url: String) -> Self {
+        Self {
+            url: Some(url),
+            remote_type: None,
+            path: None,
+            bucket: None,
+            prefix: None,
+            endpoint: None,
+            region: None,
+            signature_version: None,
+        }
+    }
+
+    fn url(&self) -> Result<String> {
+        if let Some(url) = &self.url {
+            return Ok(url.clone());
+        }
+        match self.remote_type.as_deref() {
+            Some("file") => {
+                let path = self
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("file remote requires [remote].path"))?;
+                Ok(format!("file://{}", path.display()))
+            }
+            Some("s3") | None if self.bucket.is_some() => {
+                let bucket = self
+                    .bucket
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("s3 remote requires [remote].bucket"))?;
+                let prefix = self.prefix.as_deref().unwrap_or_default().trim_matches('/');
+                if prefix.is_empty() {
+                    Ok(format!("s3://{bucket}"))
+                } else {
+                    Ok(format!("s3://{bucket}/{prefix}"))
+                }
+            }
+            Some(other) => bail!("unsupported remote type: {other}"),
+            None => bail!("remote requires url, or type plus path/bucket"),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -950,7 +1009,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                 id: Uuid::new_v4().to_string(),
                 name: host_name,
             },
-            remote: args.remote.map(|url| RemoteConfig { url }),
+            remote: args.remote.map(RemoteConfig::from_url),
             large: LargeConfig {
                 enabled: true,
                 min_size: DEFAULT_LARGE_MIN_SIZE,
@@ -2935,7 +2994,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         bail!("target majutsu home is not empty: {}", paths.home.display());
     }
     create_layout(paths)?;
-    let remote_config = RemoteConfig { url: args.remote };
+    let remote_config = RemoteConfig::from_url(args.remote);
     let remote = open_remote(&remote_config)?;
     let metadata_key = if let Some(host_id) = args.host.as_ref() {
         let index = remote_host_index_with_legacy(&remote)?;
@@ -5256,9 +5315,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
                 id: config.host.id.clone(),
                 name: config.host.name.clone(),
             },
-            remote: config.remote.as_ref().map(|remote| RemoteConfig {
-                url: remote.url.clone(),
-            }),
+            remote: config.remote.clone(),
             large: LargeConfig {
                 enabled: config.large.enabled,
                 min_size: config.large.min_size,
@@ -6542,25 +6599,37 @@ struct S3Remote {
 }
 
 fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
-    if let Some(path) = config.url.strip_prefix("file://") {
+    let remote_url = config.url()?;
+    if let Some(path) = remote_url.strip_prefix("file://") {
         return Ok(RemoteStore::File(FileRemote {
             root: PathBuf::from(path),
         }));
     }
-    if config.url.starts_with("s3://") {
-        let url = Url::parse(&config.url)?;
+    if remote_url.starts_with("s3://") {
+        let url = Url::parse(&remote_url)?;
         let bucket = url
             .host_str()
-            .ok_or_else(|| anyhow!("s3 remote is missing bucket: {}", config.url))?
+            .ok_or_else(|| anyhow!("s3 remote is missing bucket: {remote_url}"))?
             .to_string();
         let prefix = url.path().trim_matches('/').to_string();
         return Ok(RemoteStore::S3(S3Remote {
             bucket,
             prefix,
-            endpoint: env::var("AWS_ENDPOINT_URL")
-                .unwrap_or_else(|_| "https://storage.googleapis.com".into()),
-            region: env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            signature_version: env::var("AWS_SIGNATURE_VERSION").unwrap_or_else(|_| "s3v4".into()),
+            endpoint: config
+                .endpoint
+                .clone()
+                .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
+                .unwrap_or_else(|| "https://storage.googleapis.com".into()),
+            region: config
+                .region
+                .clone()
+                .or_else(|| env::var("AWS_DEFAULT_REGION").ok())
+                .unwrap_or_else(|| "us-east-1".into()),
+            signature_version: config
+                .signature_version
+                .clone()
+                .or_else(|| env::var("AWS_SIGNATURE_VERSION").ok())
+                .unwrap_or_else(|| "s3v4".into()),
             access_key: env::var("AWS_ACCESS_KEY_ID")
                 .context("AWS_ACCESS_KEY_ID is required for s3 remote")?,
             secret_key: env::var("AWS_SECRET_ACCESS_KEY")
@@ -6570,7 +6639,7 @@ fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
             client: Client::new(),
         }));
     }
-    bail!("unsupported remote URL: {}", config.url);
+    bail!("unsupported remote URL: {remote_url}");
 }
 
 impl RemoteStore {
