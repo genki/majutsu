@@ -120,6 +120,7 @@ struct InitArgs {
 #[derive(Subcommand)]
 enum RootCommand {
     Add(RootAddArgs),
+    Set(RootSetArgs),
     List,
     Remove { id: String },
     Pause { id: String },
@@ -161,6 +162,63 @@ struct RootAddArgs {
     large_always: Vec<String>,
     #[arg(long = "large-never")]
     large_never: Vec<String>,
+}
+
+#[derive(Args)]
+struct RootSetArgs {
+    id: String,
+    #[arg(long)]
+    path: Option<PathBuf>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long = "include")]
+    include: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    clear_include: bool,
+    #[arg(long = "exclude")]
+    exclude: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    clear_exclude: bool,
+    #[arg(long, default_value_t = false)]
+    follow_symlinks: bool,
+    #[arg(long, default_value_t = false)]
+    no_follow_symlinks: bool,
+    #[arg(long, default_value_t = false)]
+    require_mount: bool,
+    #[arg(long, default_value_t = false)]
+    no_require_mount: bool,
+    #[arg(long)]
+    snapshot_mode: Option<String>,
+    #[arg(long)]
+    pre_snapshot: Option<String>,
+    #[arg(long, default_value_t = false)]
+    clear_pre_snapshot: bool,
+    #[arg(long)]
+    post_snapshot: Option<String>,
+    #[arg(long, default_value_t = false)]
+    clear_post_snapshot: bool,
+    #[arg(long)]
+    snapshot_source: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    clear_snapshot_source: bool,
+    #[arg(long)]
+    large_min_size: Option<u64>,
+    #[arg(long)]
+    large_binary_min_size: Option<u64>,
+    #[arg(long)]
+    large_chunk_size: Option<usize>,
+    #[arg(long)]
+    large_chunking: Option<String>,
+    #[arg(long = "large-always")]
+    large_always: Vec<String>,
+    #[arg(long = "large-never")]
+    large_never: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    clear_large_policy: bool,
+    #[arg(long, default_value_t = false)]
+    clear_large_always: bool,
+    #[arg(long, default_value_t = false)]
+    clear_large_never: bool,
 }
 
 #[derive(Args)]
@@ -961,6 +1019,76 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             )?;
             record_op(&conn, "root-added", None, None, Some(&root.id))?;
             println!("added root {} -> {}", root.id, root.path.display());
+        }
+        RootCommand::Set(args) => {
+            let mut root = root_by_id(&conn, &args.id)?;
+            if let Some(path) = &args.path {
+                let path = absolutize(path)?;
+                if !path.exists() {
+                    bail!("root path does not exist: {}", path.display());
+                }
+                root.path = path;
+            }
+            if let Some(name) = &args.name {
+                root.name = name.clone();
+            }
+            if args.clear_include {
+                root.include = default_include();
+            }
+            if !args.include.is_empty() {
+                root.include = args.include.clone();
+            }
+            if args.clear_exclude {
+                root.exclude.clear();
+            }
+            root.exclude.extend(args.exclude.clone());
+            if args.follow_symlinks && args.no_follow_symlinks {
+                bail!("use either --follow-symlinks or --no-follow-symlinks, not both");
+            }
+            if args.follow_symlinks {
+                root.follow_symlinks = true;
+            }
+            if args.no_follow_symlinks {
+                root.follow_symlinks = false;
+            }
+            if args.require_mount && args.no_require_mount {
+                bail!("use either --require-mount or --no-require-mount, not both");
+            }
+            if args.require_mount {
+                root.require_mount = true;
+            }
+            if args.no_require_mount {
+                root.require_mount = false;
+            }
+            if let Some(mode) = &args.snapshot_mode {
+                validate_snapshot_mode(&mode)?;
+                root.snapshot_mode = mode.clone();
+            }
+            if args.clear_pre_snapshot {
+                root.pre_snapshot = None;
+            }
+            if let Some(pre_snapshot) = &args.pre_snapshot {
+                root.pre_snapshot = Some(pre_snapshot.clone());
+            }
+            if args.clear_post_snapshot {
+                root.post_snapshot = None;
+            }
+            if let Some(post_snapshot) = &args.post_snapshot {
+                root.post_snapshot = Some(post_snapshot.clone());
+            }
+            if args.clear_snapshot_source {
+                root.snapshot_source = None;
+            }
+            if let Some(snapshot_source) = &args.snapshot_source {
+                root.snapshot_source = Some(absolutize(snapshot_source)?);
+            }
+            if root.snapshot_source.is_some() && root.snapshot_mode != "transactional" {
+                bail!("--snapshot-source requires snapshot_mode transactional");
+            }
+            apply_root_large_set(&mut root, &args)?;
+            save_root(&conn, &root)?;
+            record_op(&conn, "config-change", None, None, Some(&root.id))?;
+            println!("updated root {} -> {}", root.id, root.path.display());
         }
         RootCommand::List => {
             for root in roots(&conn)? {
@@ -5220,7 +5348,7 @@ fn roots(conn: &Connection) -> Result<Vec<RootConfig>> {
     Ok(out)
 }
 
-fn update_root_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
+fn root_by_id(conn: &Connection, id: &str) -> Result<RootConfig> {
     let data: String = conn
         .query_row(
             "select data_json from roots where id=?1",
@@ -5229,13 +5357,21 @@ fn update_root_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
         )
         .optional()?
         .ok_or_else(|| anyhow!("unknown root: {id}"))?;
-    let mut root: RootConfig = serde_json::from_str(&data)?;
-    root.status = status.to_string();
+    serde_json::from_str(&data).map_err(Into::into)
+}
+
+fn save_root(conn: &Connection, root: &RootConfig) -> Result<()> {
     conn.execute(
         "update roots set data_json=?2 where id=?1",
-        params![id, serde_json::to_string(&root)?],
+        params![root.id, serde_json::to_string(root)?],
     )?;
     Ok(())
+}
+
+fn update_root_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
+    let mut root = root_by_id(conn, id)?;
+    root.status = status.to_string();
+    save_root(conn, &root)
 }
 
 fn current_snapshot(conn: &Connection) -> Result<Option<String>> {
@@ -5576,6 +5712,55 @@ fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {
         always: args.large_always.clone(),
         never: args.large_never.clone(),
     })
+}
+
+fn apply_root_large_set(root: &mut RootConfig, args: &RootSetArgs) -> Result<()> {
+    if let Some(chunking) = &args.large_chunking {
+        validate_large_chunking(chunking)?;
+    }
+    if args.clear_large_policy {
+        root.large = None;
+    }
+    let wants_large = args.large_min_size.is_some()
+        || args.large_binary_min_size.is_some()
+        || args.large_chunk_size.is_some()
+        || args.large_chunking.is_some()
+        || !args.large_always.is_empty()
+        || !args.large_never.is_empty()
+        || args.clear_large_always
+        || args.clear_large_never;
+    if !wants_large {
+        return Ok(());
+    }
+    let large = root.large.get_or_insert_with(|| RootLargeConfig {
+        min_size: None,
+        binary_min_size: None,
+        default_chunking: None,
+        chunk_size: None,
+        always: Vec::new(),
+        never: Vec::new(),
+    });
+    if let Some(min_size) = args.large_min_size {
+        large.min_size = Some(min_size);
+    }
+    if let Some(binary_min_size) = args.large_binary_min_size {
+        large.binary_min_size = Some(binary_min_size);
+    }
+    if let Some(chunk_size) = args.large_chunk_size {
+        large.chunk_size = Some(chunk_size);
+    }
+    if let Some(chunking) = &args.large_chunking {
+        large.default_chunking = Some(chunking.clone());
+    }
+    if args.clear_large_always {
+        large.always.clear();
+    }
+    large.always.extend(args.large_always.clone());
+    if args.clear_large_never {
+        large.never.clear();
+    }
+    large.never.extend(args.large_never.clone());
+    Ok(())
 }
 
 impl Default for LargeCompressionConfig {

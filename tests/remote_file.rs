@@ -1828,6 +1828,132 @@ fn root_large_policy_override_can_route_small_files_to_large_pipeline() {
 }
 
 #[test]
+fn root_set_updates_filters_and_records_config_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(source.join("skip.tmp"), b"skip\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
+            .arg("--name")
+            .arg("Sample Docs")
+            .arg("--exclude")
+            .arg("*.tmp");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(restore.join("sample/keep.txt")).unwrap(),
+        b"keep\n"
+    );
+    assert!(!restore.join("sample/skip.tmp").exists());
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(roots.contains("Sample Docs"));
+    let ops = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(ops.contains("config-change"));
+}
+
+#[test]
+fn root_set_updates_large_policy_for_existing_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("tiny.dat"), b"tiny-large-policy\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
+            .arg("--large-min-size")
+            .arg("4")
+            .arg("--large-chunking")
+            .arg("fixed")
+            .arg("--large-chunk-size")
+            .arg("4");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("large_objects 1"));
+    assert!(stat.contains("chunks 5"));
+}
+
+#[test]
 fn large_chunks_can_be_compressed_and_restored() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

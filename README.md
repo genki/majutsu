@@ -166,6 +166,20 @@ mj root add photos /mnt/photos \
   --large-never '*.json'
 ```
 
+Existing root settings can be changed without removing the root:
+
+```sh
+mj root set photos --exclude '**/.cache/**'
+mj root set photos --clear-exclude --exclude '**/.DS_Store'
+mj root set photos --large-min-size 8388608 --large-always '*.heic'
+mj root set app-data --snapshot-mode transactional \
+  --pre-snapshot '/usr/local/bin/app-checkpoint begin' \
+  --post-snapshot '/usr/local/bin/app-checkpoint end'
+```
+
+`root set` records a `config-change` operation so root policy changes are
+visible in the operation log.
+
 ## Remote Sync
 
 `mj sync` writes hot metadata and all referenced local objects to the configured
