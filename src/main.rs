@@ -5631,12 +5631,62 @@ fn record_op_with_id(
     after: Option<&str>,
     message: Option<&str>,
 ) -> Result<()> {
+    let created_at = Utc::now().to_rfc3339();
     conn.execute(
         "insert into operations(id, kind, before_snapshot, after_snapshot, created_at, message)
          values (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, kind, before, after, Utc::now().to_rfc3339(), message],
+        params![id, kind, before, after, created_at, message],
+    )?;
+    append_local_oplog(
+        conn,
+        &OperationExport {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            before_snapshot: before.map(str::to_string),
+            after_snapshot: after.map(str::to_string),
+            created_at,
+            message: message.map(str::to_string),
+        },
     )?;
     Ok(())
+}
+
+fn append_local_oplog(conn: &Connection, op: &OperationExport) -> Result<()> {
+    let Some(path) = local_oplog_path(conn)? else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let bytes = serde_cbor::to_vec(op)?;
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+fn local_oplog_path(conn: &Connection) -> Result<Option<PathBuf>> {
+    let db_path = conn
+        .query_row(
+            "select file from pragma_database_list where name='main'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(db_path) = db_path.filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let db_path = PathBuf::from(db_path);
+    let Some(home) = db_path
+        .parent()
+        .and_then(|parent| parent.parent())
+        .map(Path::to_path_buf)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(home.join("ops/local-oplog.cborl")))
 }
 
 fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {

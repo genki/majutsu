@@ -14,6 +14,7 @@ large object handling.
   `$HOME/.majutsu`
 - Multiple roots managed from one timeline
 - SQLite metadata database
+- Append-only local operation log under `ops/local-oplog.cborl`
 - Manual snapshots
 - Content-addressed local object store
 - Large file pointer manifests with fixed-size or content-defined chunks

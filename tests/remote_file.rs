@@ -1747,6 +1747,45 @@ fn xdg_config_can_select_state_home() {
 }
 
 #[test]
+fn operations_are_appended_to_local_oplog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let oplog = state.join("ops/local-oplog.cborl");
+    assert!(oplog.exists());
+    let init_len = fs::metadata(&oplog).unwrap().len();
+    assert!(init_len > 0);
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let root_add_len = fs::metadata(&oplog).unwrap().len();
+    assert!(root_add_len > init_len);
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(fs::metadata(&oplog).unwrap().len() > root_add_len);
+}
+
+#[test]
 fn large_pin_unpin_is_persisted_in_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
