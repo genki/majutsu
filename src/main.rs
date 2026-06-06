@@ -4152,21 +4152,26 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
         if entry.file_type().is_dir() {
             continue;
         }
-        let meta = fs::symlink_metadata(entry.path())?;
-        if meta.file_type().is_symlink() {
+        let link_meta = fs::symlink_metadata(entry.path())?;
+        if link_meta.file_type().is_symlink() && !root.follow_symlinks {
             let target = fs::read_link(entry.path())?.to_string_lossy().to_string();
             records.push(FileRecord {
                 root_id: root.id.clone(),
                 path: rel_s,
                 kind: "symlink".into(),
                 size: 0,
-                mode: file_mode(&meta),
-                modified: modified_secs(&meta),
+                mode: file_mode(&link_meta),
+                modified: modified_secs(&link_meta),
                 xattrs: BTreeMap::new(),
                 payload: Payload::Symlink { target },
             });
             continue;
         }
+        let meta = if link_meta.file_type().is_symlink() {
+            fs::metadata(entry.path())?
+        } else {
+            link_meta
+        };
         if !meta.is_file() {
             continue;
         }

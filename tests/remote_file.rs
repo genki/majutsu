@@ -296,6 +296,94 @@ fn restore_preserves_file_mode_and_mtime() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn follow_symlinks_controls_snapshot_payload_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let plain_state = tmp.path().join("plain-state");
+    let follow_state = tmp.path().join("follow-state");
+    let plain_restore = tmp.path().join("plain-restore");
+    let follow_restore = tmp.path().join("follow-restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("target.txt"), b"target\n").unwrap();
+    std::os::unix::fs::symlink("target.txt", source.join("link.txt")).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&plain_state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&plain_state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--include")
+            .arg("link.txt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&plain_state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&plain_state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&plain_restore);
+        c
+    });
+    assert_eq!(
+        fs::read_link(plain_restore.join("sample/link.txt")).unwrap(),
+        std::path::PathBuf::from("target.txt")
+    );
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&follow_state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&follow_state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--include")
+            .arg("link.txt")
+            .arg("--follow-symlinks");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&follow_state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&follow_state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&follow_restore);
+        c
+    });
+    let restored = follow_restore.join("sample/link.txt");
+    assert!(fs::symlink_metadata(&restored).unwrap().is_file());
+    assert_eq!(fs::read(&restored).unwrap(), b"target\n");
+}
+
 #[test]
 fn encrypted_file_remote_clone_restores_with_exported_key() {
     let tmp = tempfile::tempdir().unwrap();

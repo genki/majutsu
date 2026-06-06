@@ -397,6 +397,9 @@ If that path exists but is not a mount point, `mj snapshot` records
 `root-unmounted`, marks the root `unmounted`, and skips it instead of recording
 mass deletion.
 
+Symlinks are stored as symlink entries by default. Use `--follow-symlinks` when
+the root should snapshot the linked file contents instead.
+
 ## Prune And GC
 
 Prune plans or deletes snapshots according to daily/monthly retention buckets:
