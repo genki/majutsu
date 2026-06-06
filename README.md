@@ -144,9 +144,12 @@ remote:
 
 ```text
 metadata/export.json
+hosts/index.json
+hosts/<host-id>/metadata/export.json
 config.toml
 host.toml
 hosts/current
+hosts/<host-id>/current
 objects/trees/...
 objects/...
 ```
@@ -168,6 +171,8 @@ mj root add sample /path/to/sample
 mj snapshot --message 'first remote snapshot'
 mj sync
 mj remote check
+mj remote hosts
+mj remote host test-host
 mj remote fsck
 ```
 
@@ -175,9 +180,14 @@ To rebuild an empty state directory from remote:
 
 ```sh
 mj --home /tmp/recovered-majutsu clone --remote s3://bucket/prefix
+mj --home /tmp/recovered-other clone --remote s3://bucket/prefix --host test-host
 mj --home /tmp/recovered-majutsu fsck
 mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 ```
+
+`metadata/export.json` remains the legacy/current-host bootstrap path.
+`hosts/index.json` and `hosts/<host-id>/metadata/export.json` allow browsing and
+recovering a specific host timeline from a shared remote prefix.
 
 The S3 backend uses path-style requests. AWS Signature V4 is the default; set
 `AWS_SIGNATURE_VERSION=s3v2` only for legacy S3-compatible services that still

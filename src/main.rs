@@ -249,6 +249,8 @@ struct LargeUnpinArgs {
 enum RemoteCommand {
     Check,
     Fsck,
+    Hosts,
+    Host { id: String },
 }
 
 #[derive(Subcommand)]
@@ -270,6 +272,8 @@ enum LifecycleCommand {
 struct CloneArgs {
     #[arg(long)]
     remote: String,
+    #[arg(long)]
+    host: Option<String>,
 }
 
 #[derive(Args)]
@@ -458,6 +462,22 @@ struct MountViewMetadata {
     files: usize,
     lazy_large_files: usize,
     hydrated_large_files: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RemoteHostSummary {
+    id: String,
+    name: String,
+    last_synced_at: DateTime<Utc>,
+    current_snapshot: Option<String>,
+    metadata_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoteHostIndex {
+    version: u32,
+    updated_at: DateTime<Utc>,
+    hosts: Vec<RemoteHostSummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1578,6 +1598,12 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     let export = export_metadata(&conn, &config)?;
     let export_json = serde_json::to_vec_pretty(&export)?;
     enqueue_inline_upload(paths, "metadata/export.json", export_json)?;
+    let host_metadata_key = format!("hosts/{}/metadata/export.json", config.host.id);
+    enqueue_inline_upload(
+        paths,
+        &host_metadata_key,
+        serde_json::to_vec_pretty(&export)?,
+    )?;
     enqueue_inline_upload(
         paths,
         "config.toml",
@@ -1590,7 +1616,18 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     )?;
     if let Some(current) = export.refs.get("current") {
         enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
+        enqueue_inline_upload(
+            paths,
+            &format!("hosts/{}/current", config.host.id),
+            current.as_bytes().to_vec(),
+        )?;
     }
+    let host_index = update_remote_host_index(&remote, &config, &export, &host_metadata_key)?;
+    enqueue_inline_upload(
+        paths,
+        "hosts/index.json",
+        serde_json::to_vec_pretty(&host_index)?,
+    )?;
 
     for key in local_object_keys(&export) {
         let local = paths.home.join(&key);
@@ -1635,6 +1672,55 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
     println!("missing_remote_objects {}", missing_remote);
     println!("queued_uploads {}", upload_queue_items(paths)?.len());
     Ok(())
+}
+
+fn update_remote_host_index(
+    remote: &RemoteStore,
+    config: &Config,
+    export: &MetadataExport,
+    metadata_key: &str,
+) -> Result<RemoteHostIndex> {
+    let mut index = read_remote_host_index(remote)?;
+    let summary = RemoteHostSummary {
+        id: config.host.id.clone(),
+        name: config.host.name.clone(),
+        last_synced_at: Utc::now(),
+        current_snapshot: export.refs.get("current").cloned(),
+        metadata_key: metadata_key.to_string(),
+    };
+    index.hosts.retain(|host| host.id != summary.id);
+    index.hosts.push(summary);
+    index.hosts.sort_by(|a, b| a.id.cmp(&b.id));
+    index.updated_at = Utc::now();
+    Ok(index)
+}
+
+fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
+    if remote.exists("hosts/index.json")? {
+        let mut index: RemoteHostIndex = serde_json::from_slice(&remote.get("hosts/index.json")?)?;
+        index.hosts.sort_by(|a, b| a.id.cmp(&b.id));
+        return Ok(index);
+    }
+    Ok(RemoteHostIndex {
+        version: 1,
+        updated_at: Utc::now(),
+        hosts: Vec::new(),
+    })
+}
+
+fn remote_host_index_with_legacy(remote: &RemoteStore) -> Result<RemoteHostIndex> {
+    let mut index = read_remote_host_index(remote)?;
+    if index.hosts.is_empty() && remote.exists("metadata/export.json")? {
+        let export: MetadataExport = serde_json::from_slice(&remote.get("metadata/export.json")?)?;
+        index.hosts.push(RemoteHostSummary {
+            id: export.config.host.id.clone(),
+            name: export.config.host.name.clone(),
+            last_synced_at: export.exported_at,
+            current_snapshot: export.refs.get("current").cloned(),
+            metadata_key: "metadata/export.json".into(),
+        });
+    }
+    Ok(index)
 }
 
 fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()> {
@@ -1756,6 +1842,41 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         RemoteCommand::Fsck => {
             remote_fsck(&remote)?;
         }
+        RemoteCommand::Hosts => {
+            let index = remote_host_index_with_legacy(&remote)?;
+            println!("remote {}", remote.describe());
+            println!("hosts {}", index.hosts.len());
+            for host in index.hosts {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    host.id,
+                    host.name,
+                    host.last_synced_at.to_rfc3339(),
+                    host.current_snapshot.unwrap_or_else(|| "(none)".into()),
+                    host.metadata_key
+                );
+            }
+        }
+        RemoteCommand::Host { id } => {
+            let index = remote_host_index_with_legacy(&remote)?;
+            let host = index
+                .hosts
+                .into_iter()
+                .find(|host| host.id == id || host.name == id)
+                .ok_or_else(|| anyhow!("remote host not found: {id}"))?;
+            let export: MetadataExport = serde_json::from_slice(&remote.get(&host.metadata_key)?)?;
+            println!("id {}", host.id);
+            println!("name {}", host.name);
+            println!("last_synced_at {}", host.last_synced_at.to_rfc3339());
+            println!(
+                "current_snapshot {}",
+                host.current_snapshot.unwrap_or_else(|| "(none)".into())
+            );
+            println!("metadata_key {}", host.metadata_key);
+            println!("roots {}", export.roots.len());
+            println!("snapshots {}", export.snapshots.len());
+            println!("operations {}", export.operations.len());
+        }
     }
     Ok(())
 }
@@ -1767,7 +1888,18 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     create_layout(paths)?;
     let remote_config = RemoteConfig { url: args.remote };
     let remote = open_remote(&remote_config)?;
-    let export_bytes = remote.get("metadata/export.json")?;
+    let metadata_key = if let Some(host_id) = args.host.as_ref() {
+        let index = remote_host_index_with_legacy(&remote)?;
+        index
+            .hosts
+            .into_iter()
+            .find(|host| host.id == *host_id || host.name == *host_id)
+            .map(|host| host.metadata_key)
+            .ok_or_else(|| anyhow!("remote host not found: {host_id}"))?
+    } else {
+        "metadata/export.json".into()
+    };
+    let export_bytes = remote.get(&metadata_key)?;
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
     write_config(paths, &export.config)?;

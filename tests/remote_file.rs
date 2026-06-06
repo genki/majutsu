@@ -49,7 +49,9 @@ fn file_remote_clone_restores_normal_and_large_files() {
     let remote = tmp.path().join("remote");
     let state = tmp.path().join("state");
     let clone = tmp.path().join("clone");
+    let host_clone = tmp.path().join("host-clone");
     let restore = tmp.path().join("restore");
+    let host_restore = tmp.path().join("host-restore");
     fs::create_dir_all(source.join("sub")).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
     fs::write(source.join("sub/beta.txt"), b"beta\n").unwrap();
@@ -109,6 +111,25 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c.arg("--home").arg(&state).arg("remote").arg("fsck");
         c
     });
+    let hosts = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("hosts");
+        c
+    });
+    assert!(hosts.contains("hosts 1"));
+    assert!(hosts.contains("test-host"));
+    let host = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("host")
+            .arg("test-host");
+        c
+    });
+    assert!(host.contains("name test-host"));
+    assert!(host.contains("roots 1"));
+    assert!(host.contains("snapshots 1"));
     assert!(remote.join("objects/trees").exists());
     run({
         let mut c = mj();
@@ -117,6 +138,17 @@ fn file_remote_clone_restores_normal_and_large_files() {
             .arg("clone")
             .arg("--remote")
             .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&host_clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()))
+            .arg("--host")
+            .arg("test-host");
         c
     });
     run({
@@ -134,6 +166,16 @@ fn file_remote_clone_restores_normal_and_large_files() {
             .arg(&restore);
         c
     });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&host_clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&host_restore);
+        c
+    });
 
     assert_eq!(
         fs::read(source.join("alpha.txt")).unwrap(),
@@ -146,6 +188,10 @@ fn file_remote_clone_restores_normal_and_large_files() {
     assert_eq!(
         fs::read(source.join("payload.zip")).unwrap(),
         fs::read(restore.join("sample/payload.zip")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("payload.zip")).unwrap(),
+        fs::read(host_restore.join("sample/payload.zip")).unwrap()
     );
 }
 
@@ -783,18 +829,11 @@ fn restore_prepare_requests_archive_for_missing_local_objects() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let object = fs::read_dir(state.join("objects/blobs"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .read_dir()
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let alpha_oid = blake3::hash(b"alpha\n").to_hex().to_string();
+    let object = state
+        .join("objects/blobs")
+        .join(&alpha_oid[..2])
+        .join(&alpha_oid[2..]);
     fs::remove_file(object).unwrap();
 
     let prepare = output({
