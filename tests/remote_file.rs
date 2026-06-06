@@ -2230,6 +2230,50 @@ fn root_set_updates_large_policy_for_existing_root() {
 }
 
 #[test]
+fn large_config_accepts_spec_size_strings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("tiny.dat"), b"tiny-large-policy\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = \"4 B\"")
+        .replace("binary_min_size = 16777216", "binary_min_size = \"16 MiB\"")
+        .replace("chunk_size = 8388608", "target_chunk_size = \"4 B\"");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("large_objects 1"));
+    assert!(stat.contains("chunks 5"));
+}
+
+#[test]
 fn large_chunks_can_be_compressed_and_restored() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

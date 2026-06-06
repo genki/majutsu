@@ -18,7 +18,7 @@ use rand::RngCore;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -748,10 +748,23 @@ struct LargePinExport {
 #[derive(Debug, Serialize, Deserialize)]
 struct LargeConfig {
     enabled: bool,
+    #[serde(
+        default = "default_large_min_size",
+        deserialize_with = "deserialize_u64_bytes"
+    )]
     min_size: u64,
+    #[serde(
+        default = "default_large_binary_min_size",
+        deserialize_with = "deserialize_u64_bytes"
+    )]
     binary_min_size: u64,
     #[serde(default = "default_large_chunking")]
     default_chunking: String,
+    #[serde(
+        default = "default_chunk_size",
+        alias = "target_chunk_size",
+        deserialize_with = "deserialize_usize_bytes"
+    )]
     chunk_size: usize,
     always: Vec<String>,
     never: Vec<String>,
@@ -798,13 +811,17 @@ struct RootConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct RootLargeConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_option_u64_bytes")]
     min_size: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_option_u64_bytes")]
     binary_min_size: Option<u64>,
     #[serde(default)]
     default_chunking: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "target_chunk_size",
+        deserialize_with = "deserialize_option_usize_bytes"
+    )]
     chunk_size: Option<usize>,
     #[serde(default)]
     always: Vec<String>,
@@ -5796,6 +5813,105 @@ fn validate_large_chunking(chunking: &str) -> Result<()> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ByteSizeValue {
+    Integer(u64),
+    String(String),
+}
+
+fn deserialize_u64_bytes<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = ByteSizeValue::deserialize(deserializer)?;
+    byte_size_value(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_usize_bytes<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = deserialize_u64_bytes(deserializer)?;
+    usize::try_from(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_option_u64_bytes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<ByteSizeValue>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    byte_size_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_option_usize_bytes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = deserialize_option_u64_bytes(deserializer)? else {
+        return Ok(None);
+    };
+    usize::try_from(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+fn byte_size_value(value: ByteSizeValue) -> Result<u64> {
+    match value {
+        ByteSizeValue::Integer(value) => Ok(value),
+        ByteSizeValue::String(value) => parse_byte_size(&value),
+    }
+}
+
+fn parse_byte_size(input: &str) -> Result<u64> {
+    let normalized = input.trim().replace('_', "");
+    if normalized.is_empty() {
+        bail!("size must not be empty");
+    }
+    if let Ok(value) = normalized.parse::<u64>() {
+        return Ok(value);
+    }
+    let split_at = normalized
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .ok_or_else(|| anyhow!("size is missing a unit: {input}"))?;
+    let number = normalized[..split_at].trim();
+    let unit = normalized[split_at..]
+        .trim()
+        .replace(' ', "")
+        .to_ascii_lowercase();
+    let value: f64 = number
+        .parse()
+        .with_context(|| format!("invalid size number: {input}"))?;
+    if !value.is_finite() || value < 0.0 {
+        bail!("invalid size number: {input}");
+    }
+    let multiplier = match unit.as_str() {
+        "b" | "byte" | "bytes" => 1.0,
+        "k" | "kb" => 1_000.0,
+        "m" | "mb" => 1_000_000.0,
+        "g" | "gb" => 1_000_000_000.0,
+        "t" | "tb" => 1_000_000_000_000.0,
+        "kib" => 1024.0,
+        "mib" => 1024.0 * 1024.0,
+        "gib" => 1024.0 * 1024.0 * 1024.0,
+        "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => bail!("unsupported size unit in {input}"),
+    };
+    let bytes = value * multiplier;
+    if bytes > u64::MAX as f64 {
+        bail!("size is too large: {input}");
+    }
+    Ok(bytes.round() as u64)
+}
+
 fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
     if root.snapshot_mode == "transactional" {
         run_application_plugin(paths, root, "pre")?;
@@ -6008,6 +6124,18 @@ fn default_chunk_compression() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_large_min_size() -> u64 {
+    DEFAULT_LARGE_MIN_SIZE
+}
+
+fn default_large_binary_min_size() -> u64 {
+    DEFAULT_LARGE_BINARY_MIN_SIZE
+}
+
+fn default_chunk_size() -> usize {
+    DEFAULT_CHUNK_SIZE
 }
 
 fn default_tiering_rules() -> Vec<TieringRule> {

@@ -176,8 +176,11 @@ Chunking defaults to fixed-size chunks. Set `large.default_chunking` to
 ```toml
 [large]
 default_chunking = "fastcdc"
-chunk_size = 8388608
+target_chunk_size = "8 MiB"
 ```
+
+Large size settings accept either byte integers or strings such as `"64 MiB"`,
+`"16 MiB"`, and `"8 MiB"`.
 
 Root-specific large-file policy can override the global thresholds and
 patterns:
