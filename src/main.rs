@@ -397,6 +397,8 @@ struct RestoreQueueItem {
     target: String,
     required_objects: Vec<String>,
     archived_objects: Vec<String>,
+    #[serde(default)]
+    archive_requested_objects: Vec<String>,
     created_at: DateTime<Utc>,
     status: String,
 }
@@ -1154,7 +1156,8 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
         }
         RestoreCommand::Prepare(args) => {
             let plan = build_restore_plan(paths, &conn, &args)?;
-            let job = build_restore_job(paths, &plan, &args)?;
+            let mut job = build_restore_job(paths, &plan, &args)?;
+            request_archive_restore_for_job(paths, &mut job)?;
             write_restore_job(paths, &job)?;
             record_op(
                 &conn,
@@ -1167,6 +1170,10 @@ fn restore_cmd(paths: &Paths, command: RestoreCommand) -> Result<()> {
             println!("snapshot {}", job.snapshot_id);
             println!("required_objects {}", job.required_objects.len());
             println!("archived_objects {}", job.archived_objects.len());
+            println!(
+                "archive_requested_objects {}",
+                job.archive_requested_objects.len()
+            );
         }
         RestoreCommand::Resume { job_id } => {
             let job = read_restore_job(paths, &job_id)?;
@@ -2246,9 +2253,32 @@ fn build_restore_job(
         target: args.to.display().to_string(),
         required_objects,
         archived_objects,
+        archive_requested_objects: Vec::new(),
         created_at: Utc::now(),
         status: "prepared".into(),
     })
+}
+
+fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) -> Result<()> {
+    if job.archived_objects.is_empty() {
+        return Ok(());
+    }
+    let config = read_config(paths)?;
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(());
+    };
+    let remote = open_remote(remote_config)?;
+    let mut requested = Vec::new();
+    for key in &job.archived_objects {
+        if remote.restore_archive(key, 7, "Standard")? {
+            requested.push(key.clone());
+        }
+    }
+    if !requested.is_empty() {
+        job.status = "archive-requested".into();
+        job.archive_requested_objects = requested;
+    }
+    Ok(())
 }
 
 fn required_object_keys_for_plan(
@@ -3642,6 +3672,13 @@ impl RemoteStore {
             RemoteStore::S3(remote) => remote.list(prefix),
         }
     }
+
+    fn restore_archive(&self, key: &str, days: u32, tier: &str) -> Result<bool> {
+        match self {
+            RemoteStore::File(_) => Ok(true),
+            RemoteStore::S3(remote) => remote.restore_archive(key, days, tier),
+        }
+    }
 }
 
 impl S3Remote {
@@ -3817,6 +3854,42 @@ impl S3Remote {
         } else {
             bail!("s3 abort multipart failed: HTTP {}", response.status())
         }
+    }
+
+    fn restore_archive(&self, key: &str, days: u32, tier: &str) -> Result<bool> {
+        let remote_key = self.remote_key(key);
+        let query = "restore=".to_string();
+        let body = format!(
+            "<RestoreRequest><Days>{days}</Days><GlacierJobParameters><Tier>{}</Tier></GlacierJobParameters></RestoreRequest>",
+            xml_escape(tier)
+        );
+        if self.uses_sigv2() {
+            let date = http_date();
+            let path = format!("/{}/{}?restore", self.bucket, remote_key);
+            let auth = self.auth_v2("POST", "", "application/xml", &date, &path)?;
+            let response = self
+                .client
+                .post(self.object_url_query(&remote_key, &query))
+                .header(DATE, date)
+                .header(CONTENT_TYPE, "application/xml")
+                .header(AUTHORIZATION, auth)
+                .body(body)
+                .send()?;
+            return archive_restore_status(key, response.status().as_u16());
+        }
+        let payload_hash = sha256_hex(body.as_bytes());
+        let auth = self.auth_v4("POST", &remote_key, &query, &payload_hash, &[])?;
+        let response = self
+            .client
+            .post(self.object_url_query(&remote_key, &query))
+            .header(HOST, self.host_header()?)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(AUTHORIZATION, auth.authorization)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(body)
+            .send()?;
+        archive_restore_status(key, response.status().as_u16())
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
@@ -4183,4 +4256,12 @@ fn xml_escape(input: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
+    match status {
+        200 | 202 | 204 | 409 => Ok(true),
+        404 => Ok(false),
+        _ => bail!("archive restore request failed for {key}: HTTP {status}"),
+    }
 }

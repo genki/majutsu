@@ -43,8 +43,8 @@ large object handling.
 - Large object pin/unpin metadata
 - Basic object-store fsck
 
-Provider-side archive restore requests and advanced pack compaction are
-intentionally left for later iterations.
+Lazy mount/FUSE, daemon IPC, and crate splitting are intentionally left for
+later iterations.
 
 ## Install
 
@@ -357,6 +357,11 @@ mj restore resume restore-job-id
 Prepared jobs are stored under `$MAJUTSU_HOME/queue/restores`. Resume applies
 the prepared snapshot and target once no required objects are pending archive
 hydration.
+
+If `restore prepare` finds required objects missing from local state and a
+remote is configured, it issues provider-side archive restore requests for
+those object keys. S3 remotes use `POST ?restore` with a 7-day Standard restore
+request; file remotes record the request as a no-op for local validation.
 
 ## Packs
 

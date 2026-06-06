@@ -745,6 +745,83 @@ fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
 }
 
 #[test]
+fn restore_prepare_requests_archive_for_missing_local_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let object = fs::read_dir(state.join("objects/blobs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(object).unwrap();
+
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(prepare.contains("archived_objects 1"));
+    assert!(prepare.contains("archive_requested_objects 1"));
+    let job = fs::read_to_string(
+        fs::read_dir(state.join("queue/restores"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(job.contains("\"status\": \"archive-requested\""));
+}
+
+#[test]
 fn xdg_config_can_select_state_home() {
     let tmp = tempfile::tempdir().unwrap();
     let config_home = tmp.path().join("xdg");
