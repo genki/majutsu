@@ -151,6 +151,10 @@ fn file_remote_clone_restores_normal_and_large_files() {
     assert!(host.contains("roots 1"));
     assert!(host.contains("snapshots 1"));
     assert!(remote.join("objects/trees").exists());
+    assert!(remote.join("trees").exists());
+    assert!(remote.join("blobs/loose").exists());
+    assert!(remote.join("large/manifests").exists());
+    assert!(remote.join("large/chunks/fixed-8m").exists());
     let host_ref_dirs = fs::read_dir(remote.join("hosts"))
         .unwrap()
         .filter_map(|entry| {
@@ -290,6 +294,63 @@ fn remote_fsck_detects_missing_canonical_host_ref() {
         .unwrap()
         .join("refs/current");
     fs::remove_file(host_ref).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_detects_missing_canonical_object_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let alias_shard = fs::read_dir(remote.join("trees"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
+    let alias = fs::read_dir(alias_shard)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file())
+        .unwrap();
+    fs::remove_file(alias).unwrap();
 
     fails({
         let mut c = mj();
@@ -1412,8 +1473,8 @@ fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
             .arg("gcs");
         c
     });
-    assert!(policy.contains("objects/packs/normal/"));
-    assert!(policy.contains("objects/large/chunks/fixed/"));
+    assert!(policy.contains("packs/normal/"));
+    assert!(policy.contains("large/chunks/fixed-8m/"));
 }
 
 #[test]

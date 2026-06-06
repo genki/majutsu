@@ -199,10 +199,20 @@ hosts/<host-id>/refs/current
 hosts/<host-id>/refs/last-synced
 objects/trees/...
 objects/...
+trees/...
+blobs/loose/...
+packs/normal/...
+indexes/pack-index/...
+large/manifests/...
+large/chunks/fixed-8m/...
 ```
 
 This is the critical path for host-disk-loss recovery: a fresh state directory
 can be reconstructed from remote metadata.
+Metadata keeps the local object keys for backward-compatible restore and clone,
+while `mj sync` also writes canonical remote-layout aliases matching the spec's
+`trees/`, `blobs/loose/`, `packs/`, `indexes/`, and `large/` prefixes. `mj
+remote fsck` verifies both the metadata keys and these canonical aliases.
 
 For S3-compatible storage:
 
@@ -515,13 +525,13 @@ storage = "standard"
 
 [[tiering.rules]]
 name = "packs-to-ia"
-prefix = "objects/packs/normal/"
+prefix = "packs/normal/"
 after = "30d"
 transition_to = "infrequent"
 
 [[tiering.rules]]
 name = "large-chunks-to-archive"
-prefix = "objects/large/chunks/fixed/"
+prefix = "large/chunks/fixed-8m/"
 after = "180d"
 storage = "archive"
 ```

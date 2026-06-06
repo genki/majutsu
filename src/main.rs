@@ -2555,6 +2555,9 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         let local = paths.home.join(&key);
         if local.exists() {
             enqueue_file_upload(paths, &key, &local)?;
+            for alias in canonical_remote_aliases(&key) {
+                enqueue_file_upload(paths, &alias, &local)?;
+            }
         }
     }
     let uploaded = drain_upload_queue(paths, &remote)?;
@@ -2764,12 +2767,13 @@ fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
                 item.key
             );
         };
-        let upload_result =
-            if item.key.starts_with("objects/") && remote.capabilities().conditional_put {
-                remote.put_if_absent(&item.key, &bytes).map(|_| ())
-            } else {
-                remote.put(&item.key, &bytes)
-            };
+        let upload_result = if is_content_addressed_remote_key(&item.key)
+            && remote.capabilities().conditional_put
+        {
+            remote.put_if_absent(&item.key, &bytes).map(|_| ())
+        } else {
+            remote.put(&item.key, &bytes)
+        };
         match upload_result {
             Ok(()) => {
                 fs::remove_file(path)?;
@@ -4073,6 +4077,12 @@ fn remote_fsck_export(
         if !remote.exists(&key)? {
             *missing += 1;
             eprintln!("missing remote object {key}");
+        }
+        for alias in canonical_remote_aliases(&key) {
+            if !remote.exists(&alias)? {
+                *missing += 1;
+                eprintln!("missing canonical remote object alias {alias}");
+            }
         }
     }
     if let Some(current) = export.refs.get("current") {
@@ -5454,6 +5464,43 @@ fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     keys
 }
 
+fn canonical_remote_aliases(key: &str) -> Vec<String> {
+    let Some(alias) = canonical_remote_alias(key) else {
+        return Vec::new();
+    };
+    if alias == key {
+        Vec::new()
+    } else {
+        vec![alias]
+    }
+}
+
+fn canonical_remote_alias(key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix("objects/trees/") {
+        Some(format!("trees/{rest}"))
+    } else if let Some(rest) = key.strip_prefix("objects/blobs/") {
+        Some(format!("blobs/loose/{rest}"))
+    } else if let Some(rest) = key.strip_prefix("objects/packs/normal/") {
+        Some(format!("packs/normal/{rest}"))
+    } else if let Some(rest) = key.strip_prefix("objects/indexes/pack/") {
+        Some(format!("indexes/pack-index/{rest}"))
+    } else if let Some(rest) = key.strip_prefix("objects/large/manifests/") {
+        Some(format!("large/manifests/{rest}"))
+    } else {
+        key.strip_prefix("objects/large/chunks/fixed/")
+            .map(|rest| format!("large/chunks/fixed-8m/{rest}"))
+    }
+}
+
+fn is_content_addressed_remote_key(key: &str) -> bool {
+    key.starts_with("objects/")
+        || key.starts_with("trees/")
+        || key.starts_with("blobs/loose/")
+        || key.starts_with("packs/")
+        || key.starts_with("indexes/")
+        || key.starts_with("large/")
+}
+
 fn all_local_object_keys(paths: &Paths) -> Result<Vec<String>> {
     let root = paths.home.join("objects");
     if !root.exists() {
@@ -5872,31 +5919,31 @@ fn default_tiering_rules() -> Vec<TieringRule> {
         },
         TieringRule {
             name: "keep-trees-hot".into(),
-            prefix: "objects/trees/".into(),
+            prefix: "trees/".into(),
             after: None,
             storage: Some("standard".into()),
         },
         TieringRule {
             name: "keep-large-manifests-hot".into(),
-            prefix: "objects/large/manifests/".into(),
+            prefix: "large/manifests/".into(),
             after: None,
             storage: Some("standard".into()),
         },
         TieringRule {
             name: "keep-indexes-hot".into(),
-            prefix: "objects/indexes/".into(),
+            prefix: "indexes/".into(),
             after: None,
             storage: Some("standard".into()),
         },
         TieringRule {
             name: "packs-to-ia".into(),
-            prefix: "objects/packs/normal/".into(),
+            prefix: "packs/normal/".into(),
             after: Some("30d".into()),
             storage: Some("infrequent".into()),
         },
         TieringRule {
             name: "large-chunks-to-archive".into(),
-            prefix: "objects/large/chunks/fixed/".into(),
+            prefix: "large/chunks/fixed-8m/".into(),
             after: Some("180d".into()),
             storage: Some("archive".into()),
         },
@@ -7296,12 +7343,16 @@ fn s3_object_class(key: &str) -> &'static str {
         "metadata"
     } else if key.starts_with("refs/") || key.contains("/refs/") || key.ends_with("current") {
         "ref"
-    } else if key.starts_with("objects/trees/") {
+    } else if key.starts_with("objects/trees/") || key.starts_with("trees/") {
         "tree"
-    } else if key.starts_with("objects/packs/") {
+    } else if key.starts_with("objects/packs/") || key.starts_with("packs/") {
         "pack"
-    } else if key.starts_with("objects/large/") {
+    } else if key.starts_with("objects/large/") || key.starts_with("large/") {
         "large"
+    } else if key.starts_with("objects/indexes/") || key.starts_with("indexes/") {
+        "index"
+    } else if key.starts_with("objects/blobs/") || key.starts_with("blobs/") {
+        "blob"
     } else {
         "object"
     }
