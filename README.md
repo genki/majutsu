@@ -17,11 +17,14 @@ large object handling.
 - Content-addressed local object store
 - Large file pointer manifests with fixed-size chunks
 - Operation log
+- Remote sync of metadata and objects
+- S3-compatible remote backend
+- Bootstrap clone from remote metadata
 - Restore planning and restore to an alternate directory
 - Basic object-store fsck
 
-Remote S3 sync, daemon watching, encryption, lifecycle policy generation, and
-archive restore are intentionally left for later iterations.
+Daemon watching, encryption, lifecycle policy generation, archive restore, and
+pack compaction are intentionally left for later iterations.
 
 ## Install
 
@@ -37,6 +40,7 @@ This installs `mj`.
 mj init
 mj root add home-notes ~/notes --exclude '**/.git/**'
 mj snapshot --message 'first snapshot'
+mj sync
 mj log
 mj restore plan --to /tmp/majutsu-restore
 mj restore apply --to /tmp/majutsu-restore
@@ -63,6 +67,47 @@ mj large stat
 mj large list
 mj large verify
 ```
+
+## Remote Sync
+
+`mj sync` writes hot metadata and all referenced local objects to the configured
+remote:
+
+```text
+metadata/export.json
+config.toml
+host.toml
+hosts/current
+objects/...
+```
+
+This is the critical path for host-disk-loss recovery: a fresh state directory
+can be reconstructed from remote metadata.
+
+For S3-compatible storage:
+
+```sh
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_ENDPOINT_URL=https://storage.googleapis.com
+
+mj init --remote s3://bucket/prefix
+mj root add sample /path/to/sample
+mj snapshot --message 'first remote snapshot'
+mj sync
+mj remote check
+```
+
+To rebuild an empty state directory from remote:
+
+```sh
+mj --home /tmp/recovered-majutsu clone --remote s3://bucket/prefix
+mj --home /tmp/recovered-majutsu fsck
+mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
+```
+
+The current S3 backend uses path-style requests and AWS Signature V2, which is
+compatible with Google Cloud Storage HMAC keys in the validation environment.
 
 ## Safety Notes
 

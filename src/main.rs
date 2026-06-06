@@ -1,15 +1,23 @@
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use hmac::{Hmac, Mac};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use quick_xml::Reader;
+use quick_xml::events::Event;
+use reqwest::blocking::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -48,6 +56,12 @@ enum Command {
         #[command(subcommand)]
         command: LargeCommand,
     },
+    Sync,
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+    Clone(CloneArgs),
     Fsck,
 }
 
@@ -117,6 +131,17 @@ enum LargeCommand {
     Verify,
 }
 
+#[derive(Subcommand)]
+enum RemoteCommand {
+    Check,
+}
+
+#[derive(Args)]
+struct CloneArgs {
+    #[arg(long)]
+    remote: String,
+}
+
 #[derive(Debug)]
 struct Paths {
     home: PathBuf,
@@ -145,6 +170,62 @@ struct HostConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct RemoteConfig {
     url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MetadataExport {
+    version: u32,
+    exported_at: DateTime<Utc>,
+    config: Config,
+    roots: Vec<RootConfig>,
+    snapshots: Vec<SnapshotExport>,
+    operations: Vec<OperationExport>,
+    refs: BTreeMap<String, String>,
+    blobs: Vec<BlobExport>,
+    large_objects: Vec<LargeObjectExport>,
+    chunks: Vec<ChunkExport>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotExport {
+    id: String,
+    parent_id: Option<String>,
+    op_id: String,
+    created_at: String,
+    manifest_key: String,
+    manifest_json: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OperationExport {
+    id: String,
+    kind: String,
+    before_snapshot: Option<String>,
+    after_snapshot: Option<String>,
+    created_at: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BlobExport {
+    oid: String,
+    size: u64,
+    object_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LargeObjectExport {
+    oid: String,
+    size: u64,
+    chunk_count: usize,
+    manifest_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChunkExport {
+    oid: String,
+    size: u64,
+    object_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -244,6 +325,9 @@ fn main() -> Result<()> {
         Command::Log(args) => log_ops(&paths, args),
         Command::Restore { command } => restore_cmd(&paths, command),
         Command::Large { command } => large_cmd(&paths, command),
+        Command::Sync => sync_cmd(&paths),
+        Command::Remote { command } => remote_cmd(&paths, command),
+        Command::Clone(args) => clone_cmd(&paths, args),
         Command::Fsck => fsck(&paths),
     }
 }
@@ -540,6 +624,106 @@ fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
         }
         LargeCommand::Verify => fsck(paths)?,
     }
+    Ok(())
+}
+
+fn sync_cmd(paths: &Paths) -> Result<()> {
+    ensure_ready(paths)?;
+    let config = read_config(paths)?;
+    let remote = open_remote(
+        config
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?,
+    )?;
+    let conn = open_db(paths)?;
+    let current = current_snapshot(&conn)?;
+    record_op(
+        &conn,
+        "remote-sync",
+        current.as_deref(),
+        current.as_deref(),
+        Some("pushed metadata and objects"),
+    )?;
+    let export = export_metadata(&conn, &config)?;
+    let export_json = serde_json::to_vec_pretty(&export)?;
+    remote.put("metadata/export.json", &export_json)?;
+    remote.put("config.toml", toml::to_string_pretty(&config)?.as_bytes())?;
+    remote.put(
+        "host.toml",
+        toml::to_string_pretty(&config.host)?.as_bytes(),
+    )?;
+    if let Some(current) = export.refs.get("current") {
+        remote.put("hosts/current", current.as_bytes())?;
+    }
+
+    let mut uploaded = 3usize;
+    for key in local_object_keys(&export) {
+        let local = paths.home.join(&key);
+        if local.exists() {
+            remote.put(
+                &key,
+                &fs::read(&local).with_context(|| format!("read {}", local.display()))?,
+            )?;
+            uploaded += 1;
+        }
+    }
+    println!("synced {} objects to {}", uploaded, remote.describe());
+    Ok(())
+}
+
+fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
+    ensure_ready(paths)?;
+    let config = read_config(paths)?;
+    let remote = open_remote(
+        config
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?,
+    )?;
+    match command {
+        RemoteCommand::Check => {
+            let keys = remote.list("")?;
+            println!("remote {}", remote.describe());
+            println!("objects {}", keys.len());
+            if remote.exists("metadata/export.json")? {
+                println!("metadata ok");
+            } else {
+                bail!("metadata/export.json is missing on remote");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
+    if paths.home.exists() && paths.home.read_dir()?.next().is_some() {
+        bail!("target majutsu home is not empty: {}", paths.home.display());
+    }
+    create_layout(paths)?;
+    let remote_config = RemoteConfig { url: args.remote };
+    let remote = open_remote(&remote_config)?;
+    let export_bytes = remote.get("metadata/export.json")?;
+    let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
+    export.config.remote = Some(remote_config);
+    write_config(paths, &export.config)?;
+    fs::write(&paths.host, toml::to_string_pretty(&export.config.host)?)?;
+    for key in local_object_keys(&export) {
+        let dest = paths.home.join(&key);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            dest,
+            remote
+                .get(&key)
+                .with_context(|| format!("download {key}"))?,
+        )?;
+    }
+    let conn = open_db(paths)?;
+    import_metadata(&conn, &export)?;
+    println!("cloned {} into {}", remote.describe(), paths.home.display());
+    println!("host {} {}", export.config.host.name, export.config.host.id);
     Ok(())
 }
 
@@ -879,6 +1063,205 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport> {
+    let mut snapshots = Vec::new();
+    let mut stmt = conn.prepare(
+        "select id, parent_id, op_id, created_at, manifest_key, manifest_json from snapshots order by created_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SnapshotExport {
+            id: row.get(0)?,
+            parent_id: row.get(1)?,
+            op_id: row.get(2)?,
+            created_at: row.get(3)?,
+            manifest_key: row.get(4)?,
+            manifest_json: row.get(5)?,
+        })
+    })?;
+    for row in rows {
+        snapshots.push(row?);
+    }
+
+    let mut operations = Vec::new();
+    let mut stmt = conn.prepare(
+        "select id, kind, before_snapshot, after_snapshot, created_at, message from operations order by created_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(OperationExport {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            before_snapshot: row.get(2)?,
+            after_snapshot: row.get(3)?,
+            created_at: row.get(4)?,
+            message: row.get(5)?,
+        })
+    })?;
+    for row in rows {
+        operations.push(row?);
+    }
+
+    let mut refs = BTreeMap::new();
+    let mut stmt = conn.prepare("select name, value from refs order by name")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (name, value) = row?;
+        refs.insert(name, value);
+    }
+
+    Ok(MetadataExport {
+        version: 1,
+        exported_at: Utc::now(),
+        config: Config {
+            host: HostConfig {
+                id: config.host.id.clone(),
+                name: config.host.name.clone(),
+            },
+            remote: config.remote.as_ref().map(|remote| RemoteConfig {
+                url: remote.url.clone(),
+            }),
+            large: LargeConfig {
+                enabled: config.large.enabled,
+                min_size: config.large.min_size,
+                binary_min_size: config.large.binary_min_size,
+                chunk_size: config.large.chunk_size,
+                always: config.large.always.clone(),
+                never: config.large.never.clone(),
+            },
+        },
+        roots: roots(conn)?,
+        snapshots,
+        operations,
+        refs,
+        blobs: query_blobs(conn)?,
+        large_objects: query_large_objects(conn)?,
+        chunks: query_chunks(conn)?,
+    })
+}
+
+fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
+    for root in &export.roots {
+        conn.execute(
+            "insert or replace into roots(id, data_json) values (?1, ?2)",
+            params![root.id, serde_json::to_string(root)?],
+        )?;
+    }
+    for snapshot in &export.snapshots {
+        conn.execute(
+            "insert or replace into snapshots(id, parent_id, op_id, created_at, manifest_key, manifest_json)
+             values (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                snapshot.id,
+                snapshot.parent_id,
+                snapshot.op_id,
+                snapshot.created_at,
+                snapshot.manifest_key,
+                snapshot.manifest_json
+            ],
+        )?;
+    }
+    for op in &export.operations {
+        conn.execute(
+            "insert or replace into operations(id, kind, before_snapshot, after_snapshot, created_at, message)
+             values (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                op.id,
+                op.kind,
+                op.before_snapshot,
+                op.after_snapshot,
+                op.created_at,
+                op.message
+            ],
+        )?;
+    }
+    for (name, value) in &export.refs {
+        conn.execute(
+            "insert or replace into refs(name, value) values (?1, ?2)",
+            params![name, value],
+        )?;
+    }
+    for blob in &export.blobs {
+        conn.execute(
+            "insert or replace into blobs(oid, size, object_key) values (?1, ?2, ?3)",
+            params![blob.oid, blob.size, blob.object_key],
+        )?;
+    }
+    for large in &export.large_objects {
+        conn.execute(
+            "insert or replace into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
+            params![large.oid, large.size, large.chunk_count, large.manifest_key],
+        )?;
+    }
+    for chunk in &export.chunks {
+        conn.execute(
+            "insert or replace into chunks(oid, size, object_key) values (?1, ?2, ?3)",
+            params![chunk.oid, chunk.size, chunk.object_key],
+        )?;
+    }
+    Ok(())
+}
+
+fn query_blobs(conn: &Connection) -> Result<Vec<BlobExport>> {
+    let mut stmt = conn.prepare("select oid, size, object_key from blobs order by oid")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(BlobExport {
+            oid: row.get(0)?,
+            size: row.get(1)?,
+            object_key: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn query_large_objects(conn: &Connection) -> Result<Vec<LargeObjectExport>> {
+    let mut stmt = conn
+        .prepare("select oid, size, chunk_count, manifest_key from large_objects order by oid")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(LargeObjectExport {
+            oid: row.get(0)?,
+            size: row.get(1)?,
+            chunk_count: row.get(2)?,
+            manifest_key: row.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn query_chunks(conn: &Connection) -> Result<Vec<ChunkExport>> {
+    let mut stmt = conn.prepare("select oid, size, object_key from chunks order by oid")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ChunkExport {
+            oid: row.get(0)?,
+            size: row.get(1)?,
+            object_key: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn local_object_keys(export: &MetadataExport) -> Vec<String> {
+    let mut keys = Vec::new();
+    for snapshot in &export.snapshots {
+        keys.push(snapshot.manifest_key.clone());
+    }
+    for blob in &export.blobs {
+        keys.push(blob.object_key.clone());
+    }
+    for large in &export.large_objects {
+        keys.push(large.manifest_key.clone());
+    }
+    for chunk in &export.chunks {
+        keys.push(chunk.object_key.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 fn roots(conn: &Connection) -> Result<Vec<RootConfig>> {
     let mut stmt = conn.prepare("select data_json from roots order by id")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1080,4 +1463,270 @@ fn parse_time(input: &str) -> Result<String> {
         return Ok(Utc::now().to_rfc3339());
     }
     bail!("time must be RFC3339 for now, got: {input}");
+}
+
+enum RemoteStore {
+    File(FileRemote),
+    S3(S3Remote),
+}
+
+struct FileRemote {
+    root: PathBuf,
+}
+
+struct S3Remote {
+    bucket: String,
+    prefix: String,
+    endpoint: String,
+    access_key: String,
+    secret_key: String,
+    client: Client,
+}
+
+fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
+    if let Some(path) = config.url.strip_prefix("file://") {
+        return Ok(RemoteStore::File(FileRemote {
+            root: PathBuf::from(path),
+        }));
+    }
+    if config.url.starts_with("s3://") {
+        let url = Url::parse(&config.url)?;
+        let bucket = url
+            .host_str()
+            .ok_or_else(|| anyhow!("s3 remote is missing bucket: {}", config.url))?
+            .to_string();
+        let prefix = url.path().trim_matches('/').to_string();
+        return Ok(RemoteStore::S3(S3Remote {
+            bucket,
+            prefix,
+            endpoint: env::var("AWS_ENDPOINT_URL")
+                .unwrap_or_else(|_| "https://storage.googleapis.com".into()),
+            access_key: env::var("AWS_ACCESS_KEY_ID")
+                .context("AWS_ACCESS_KEY_ID is required for s3 remote")?,
+            secret_key: env::var("AWS_SECRET_ACCESS_KEY")
+                .context("AWS_SECRET_ACCESS_KEY is required for s3 remote")?,
+            client: Client::new(),
+        }));
+    }
+    bail!("unsupported remote URL: {}", config.url);
+}
+
+impl RemoteStore {
+    fn describe(&self) -> String {
+        match self {
+            RemoteStore::File(remote) => format!("file://{}", remote.root.display()),
+            RemoteStore::S3(remote) => {
+                let prefix = if remote.prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{}", remote.prefix)
+                };
+                format!("s3://{}{}", remote.bucket, prefix)
+            }
+        }
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        match self {
+            RemoteStore::File(remote) => {
+                let path = remote.root.join(key);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, bytes)?;
+                Ok(())
+            }
+            RemoteStore::S3(remote) => remote.put(key, bytes),
+        }
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
+        match self {
+            RemoteStore::File(remote) => Ok(fs::read(remote.root.join(key))?),
+            RemoteStore::S3(remote) => remote.get(key),
+        }
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        match self {
+            RemoteStore::File(remote) => Ok(remote.root.join(key).exists()),
+            RemoteStore::S3(remote) => remote.exists(key),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        match self {
+            RemoteStore::File(remote) => list_file_remote(&remote.root, prefix),
+            RemoteStore::S3(remote) => remote.list(prefix),
+        }
+    }
+}
+
+impl S3Remote {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let remote_key = self.remote_key(key);
+        let date = http_date();
+        let path = format!("/{}/{}", self.bucket, remote_key);
+        let auth = self.auth("PUT", "", "application/octet-stream", &date, &path)?;
+        let url = self.object_url(&remote_key);
+        let response = self
+            .client
+            .put(url)
+            .header(DATE, date)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(AUTHORIZATION, auth)
+            .body(bytes.to_vec())
+            .send()?;
+        if !response.status().is_success() {
+            bail!("s3 put failed for {key}: HTTP {}", response.status());
+        }
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let remote_key = self.remote_key(key);
+        let date = http_date();
+        let path = format!("/{}/{}", self.bucket, remote_key);
+        let auth = self.auth("GET", "", "", &date, &path)?;
+        let response = self
+            .client
+            .get(self.object_url(&remote_key))
+            .header(DATE, date)
+            .header(AUTHORIZATION, auth)
+            .send()?;
+        if !response.status().is_success() {
+            bail!("s3 get failed for {key}: HTTP {}", response.status());
+        }
+        Ok(response.bytes()?.to_vec())
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        let remote_key = self.remote_key(key);
+        let date = http_date();
+        let path = format!("/{}/{}", self.bucket, remote_key);
+        let auth = self.auth("HEAD", "", "", &date, &path)?;
+        let response = self
+            .client
+            .head(self.object_url(&remote_key))
+            .header(DATE, date)
+            .header(AUTHORIZATION, auth)
+            .send()?;
+        if response.status().is_success() {
+            Ok(true)
+        } else if response.status().as_u16() == 404 {
+            Ok(false)
+        } else {
+            bail!("s3 head failed for {key}: HTTP {}", response.status());
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let remote_prefix = self.remote_key(prefix);
+        let date = http_date();
+        let resource = format!("/{}/", self.bucket);
+        let auth = self.auth("GET", "", "", &date, &resource)?;
+        let url = format!(
+            "{}/{}/?prefix={}",
+            self.endpoint.trim_end_matches('/'),
+            self.bucket,
+            remote_prefix
+        );
+        let response = self
+            .client
+            .get(url)
+            .header(DATE, date)
+            .header(AUTHORIZATION, auth)
+            .send()?;
+        if !response.status().is_success() {
+            bail!("s3 list failed: HTTP {}", response.status());
+        }
+        let xml = response.text()?;
+        let mut reader = Reader::from_str(&xml);
+        reader.config_mut().trim_text(true);
+        let mut in_key = false;
+        let mut keys = Vec::new();
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) if e.name().as_ref() == b"Key" => in_key = true,
+                Ok(Event::End(e)) if e.name().as_ref() == b"Key" => in_key = false,
+                Ok(Event::Text(e)) if in_key => {
+                    let key = e.unescape()?.into_owned();
+                    if let Some(local) = self.local_key(&key) {
+                        keys.push(local);
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(err) => return Err(err.into()),
+                _ => {}
+            }
+        }
+        Ok(keys)
+    }
+
+    fn auth(
+        &self,
+        method: &str,
+        md5: &str,
+        content_type: &str,
+        date: &str,
+        resource: &str,
+    ) -> Result<String> {
+        let canonical = format!("{method}\n{md5}\n{content_type}\n{date}\n{resource}");
+        let mut mac = Hmac::<Sha1>::new_from_slice(self.secret_key.as_bytes())?;
+        mac.update(canonical.as_bytes());
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        Ok(format!("AWS {}:{}", self.access_key, signature))
+    }
+
+    fn object_url(&self, remote_key: &str) -> String {
+        format!(
+            "{}/{}/{}",
+            self.endpoint.trim_end_matches('/'),
+            self.bucket,
+            remote_key
+        )
+    }
+
+    fn remote_key(&self, key: &str) -> String {
+        let clean = key.trim_start_matches('/');
+        if self.prefix.is_empty() {
+            clean.to_string()
+        } else if clean.is_empty() {
+            self.prefix.clone()
+        } else {
+            format!("{}/{}", self.prefix.trim_matches('/'), clean)
+        }
+    }
+
+    fn local_key(&self, remote_key: &str) -> Option<String> {
+        if self.prefix.is_empty() {
+            Some(remote_key.to_string())
+        } else {
+            remote_key
+                .strip_prefix(&format!("{}/", self.prefix.trim_matches('/')))
+                .map(|s| s.to_string())
+        }
+    }
+}
+
+fn list_file_remote(root: &Path, prefix: &str) -> Result<Vec<String>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::new();
+    for entry in WalkDir::new(root).sort_by_file_name() {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            let rel = path_to_slash(entry.path().strip_prefix(root)?);
+            if rel.starts_with(prefix) {
+                keys.push(rel);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn http_date() -> String {
+    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
