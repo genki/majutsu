@@ -28,6 +28,9 @@ use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+
 const DEFAULT_LARGE_MIN_SIZE: u64 = 64 * 1024 * 1024;
 const DEFAULT_LARGE_BINARY_MIN_SIZE: u64 = 16 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -1550,6 +1553,7 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     if !args.foreground {
         bail!("daemonized watch is not implemented yet; use --foreground");
     }
+    start_daemon_ipc(paths)?;
     match args.backend.as_str() {
         "notify" => watch_notify(paths, args),
         "poll" => watch_poll(paths, args),
@@ -1677,12 +1681,18 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 }
             }
             let _ = fs::remove_file(&paths.daemon_pid);
+            let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
             println!("stopped daemon pid {pid}");
         }
         DaemonCommand::Status => {
             if let Some(pid) = read_pid(&paths.daemon_pid)? {
                 if pid_alive(pid) {
-                    println!("running pid {pid}");
+                    if let Ok(reply) = daemon_ipc_request(paths, "status") {
+                        println!("{reply}");
+                    } else {
+                        println!("running pid {pid}");
+                        println!("ipc unavailable");
+                    }
                 } else {
                     println!("stale pid {pid}");
                 }
@@ -1692,6 +1702,69 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn start_daemon_ipc(paths: &Paths) -> Result<()> {
+    fs::create_dir_all(&paths.runtime)?;
+    let sock = paths.runtime.join("daemon.sock");
+    let _ = fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock)?;
+    let home = paths.home.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    let _ = handle_daemon_ipc(&home, &mut stream);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn start_daemon_ipc(_: &Paths) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn handle_daemon_ipc(home: &Path, stream: &mut UnixStream) -> Result<()> {
+    let mut command = String::new();
+    stream.read_to_string(&mut command)?;
+    let paths = resolve_paths(Some(home.to_path_buf()))?;
+    match command.trim() {
+        "status" => {
+            let conn = open_db(&paths)?;
+            let roots = roots(&conn)?.len();
+            let current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
+            let pid = std::process::id();
+            writeln!(stream, "running pid {pid}")?;
+            writeln!(stream, "ipc ok")?;
+            writeln!(stream, "roots {roots}")?;
+            writeln!(stream, "current {current}")?;
+        }
+        other => {
+            writeln!(stream, "error unknown command {other}")?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn daemon_ipc_request(paths: &Paths, command: &str) -> Result<String> {
+    let mut stream = UnixStream::connect(paths.runtime.join("daemon.sock"))?;
+    stream.write_all(command.as_bytes())?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply.trim_end().to_string())
+}
+
+#[cfg(not(unix))]
+fn daemon_ipc_request(_: &Paths, _: &str) -> Result<String> {
+    bail!("daemon IPC is not supported on this platform")
 }
 
 fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {

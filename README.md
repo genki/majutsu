@@ -43,8 +43,8 @@ large object handling.
 - Large object pin/unpin metadata
 - Basic object-store fsck
 
-Lazy mount/FUSE, daemon IPC, and crate splitting are intentionally left for
-later iterations.
+Lazy mount/FUSE and crate splitting are intentionally left for later
+iterations.
 
 ## Install
 
@@ -303,8 +303,9 @@ mj daemon status
 mj daemon stop
 ```
 
-The current daemon is a small process wrapper around foreground watch. It does
-use the notify backend and records filesystem events in the event journal.
+The daemon is a process wrapper around foreground watch. It uses the notify
+backend by default, records filesystem events in the event journal, and exposes
+a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock` for status IPC.
 
 ## Root State
 

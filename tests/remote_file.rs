@@ -1208,6 +1208,58 @@ fn watch_once_creates_snapshot_without_daemonizing() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("current snap-"));
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_status_uses_ipc_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("watch")
+        .arg("--backend")
+        .arg("poll")
+        .arg("--interval-secs")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    fs::create_dir_all(state.join("runtime")).unwrap();
+    fs::write(state.join("runtime/daemon.pid"), child.id().to_string()).unwrap();
+    for _ in 0..50 {
+        if state.join("runtime/daemon.sock").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("status");
+        c
+    });
+    assert!(status.contains("ipc ok"));
+    assert!(status.contains("roots 1"));
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
 #[test]
 fn transactional_snapshot_runs_pre_and_post_hooks() {
     let tmp = tempfile::tempdir().unwrap();
