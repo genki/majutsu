@@ -505,6 +505,47 @@ fn invalid_tiering_config_is_rejected_when_reading_config() {
 }
 
 #[test]
+fn invalid_large_and_pack_config_is_rejected_when_reading_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let large_state = tmp.path().join("large-state");
+    let pack_state = tmp.path().join("pack-state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&large_state).arg("init");
+        c
+    });
+    let config_path = large_state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("chunk_size = 8388608", "chunk_size = 0");
+    fs::write(&config_path, config).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&large_state).arg("status");
+        c
+    });
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&pack_state).arg("init");
+        c
+    });
+    let config_path = pack_state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("small_pack_target = 67108864", "small_pack_target = 0");
+    fs::write(&config_path, config).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&pack_state).arg("status");
+        c
+    });
+}
+
+#[test]
 fn clone_can_restore_from_canonical_object_aliases() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

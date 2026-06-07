@@ -7898,6 +7898,8 @@ fn read_config(paths: &Paths) -> Result<Config> {
 fn validate_config(config: &Config) -> Result<()> {
     normalize_watch_backend(&config.watch.backend)?;
     validate_watch_mode(&config.watch.mode)?;
+    validate_large_config(&config.large)?;
+    validate_pack_config(&config.pack)?;
     validate_security_config(&config.security)?;
     validate_restore_archive_config(&config.restore.archive)?;
     validate_tiering_config(&config.tiering)?;
@@ -7930,6 +7932,27 @@ fn validate_watch_mode(mode: &str) -> Result<()> {
 fn validate_security_config(security: &SecurityConfig) -> Result<()> {
     encryption_enabled(security)?;
     majutsu_crypto::validate_security_hash(&security.hash)
+}
+
+fn validate_large_config(large: &LargeConfig) -> Result<()> {
+    validate_large_chunking(&large.default_chunking)?;
+    if large.chunk_size == 0 {
+        bail!("large chunk_size must be greater than zero");
+    }
+    if large.max_parallel_uploads == 0 {
+        bail!("large max_parallel_uploads must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_pack_config(pack: &PackConfig) -> Result<()> {
+    if pack.small_pack_target == 0 {
+        bail!("pack small_pack_target must be greater than zero");
+    }
+    if pack.normal_pack_target == 0 {
+        bail!("pack normal_pack_target must be greater than zero");
+    }
+    Ok(())
 }
 
 fn validate_tiering_config(tiering: &TieringConfig) -> Result<()> {
