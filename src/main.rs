@@ -4919,6 +4919,7 @@ fn fsck(paths: &Paths) -> Result<()> {
     validate_local_metadata_references(paths, &export, &mut missing)?;
     validate_local_oplog(&conn, &mut missing)?;
     validate_upload_queue(paths, &mut missing)?;
+    validate_event_queue(paths, &mut missing)?;
     validate_restore_queue(paths, &conn, &mut missing)?;
     if missing > 0 {
         bail!("fsck found {missing} problems");
@@ -4975,6 +4976,55 @@ fn validate_local_metadata_references(
         if !live_chunks.contains(&chunk.oid) {
             *missing += 1;
             eprintln!("dangling chunk metadata {}", chunk.oid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_event_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
+    let dir = &paths.event_queue;
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut seen = BTreeSet::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let event: EventJournalRecord = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(event) => event,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid event journal item {}: {err}", path.display());
+                continue;
+            }
+        };
+        if path.file_stem().and_then(OsStr::to_str) != Some(event.event_id.as_str()) {
+            *missing += 1;
+            eprintln!(
+                "event journal filename does not match event id {}",
+                path.display()
+            );
+        }
+        if event.event_id.trim().is_empty() {
+            *missing += 1;
+            eprintln!("event journal item has empty event id {}", path.display());
+        }
+        if event.kind.trim().is_empty() {
+            *missing += 1;
+            eprintln!("event journal item has empty kind {}", event.event_id);
+        }
+        if event.detail.trim().is_empty() {
+            *missing += 1;
+            eprintln!("event journal item has empty detail {}", event.event_id);
+        }
+        if !seen.insert(event.event_id.clone()) {
+            *missing += 1;
+            eprintln!("duplicate event journal id {}", event.event_id);
         }
     }
     Ok(())
