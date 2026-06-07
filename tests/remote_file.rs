@@ -1432,6 +1432,54 @@ fn remote_fsck_detects_missing_canonical_host_export() {
 }
 
 #[test]
+fn remote_fsck_detects_corrupt_gc_mark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let mark = find_file_ending(&remote.join("gc/marks"), ".json");
+    fs::write(mark, b"{not valid json").unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_detects_missing_canonical_operation_log() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -3776,6 +3824,77 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         .count();
     assert_eq!(after, 1);
     assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
+}
+
+#[test]
+fn remote_fsck_detects_corrupt_gc_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("0")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let tombstone = find_file_ending(&remote.join("gc/tombstones"), ".json");
+    fs::write(tombstone, b"{not valid json").unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
 }
 
 #[test]

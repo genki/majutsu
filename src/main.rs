@@ -5487,6 +5487,7 @@ fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                     eprintln!("missing canonical host operation export {key}");
                 }
             }
+            validate_remote_gc_records(remote, &host.id, &export, &mut missing)?;
         }
     }
 
@@ -5504,6 +5505,119 @@ fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     println!("hosts {}", verified_hosts);
     if has_legacy_export {
         println!("legacy_metadata ok");
+    }
+    Ok(())
+}
+
+fn validate_remote_gc_records(
+    remote: &RemoteStore,
+    host_id: &str,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    let mark_key = format!("gc/marks/{host_id}.json");
+    if !remote.exists(&mark_key)? {
+        *missing += 1;
+        eprintln!("missing remote gc mark {mark_key}");
+    } else {
+        let mark: GcMarkExport = match serde_json::from_slice(&remote.get(&mark_key)?) {
+            Ok(mark) => mark,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid remote gc mark {mark_key}: {err}");
+                return validate_remote_gc_tombstones(remote, host_id, missing);
+            }
+        };
+        if mark.version != 1 {
+            *missing += 1;
+            eprintln!("unsupported remote gc mark version {mark_key}");
+        }
+        if mark.host_id != host_id {
+            *missing += 1;
+            eprintln!(
+                "remote gc mark host id {} does not match {host_id}",
+                mark.host_id
+            );
+        }
+        if mark.current_snapshot.as_ref() != export.refs.get("current") {
+            *missing += 1;
+            eprintln!("remote gc mark current snapshot does not match metadata {mark_key}");
+        }
+        let expected = expected_gc_mark_object_keys(export);
+        let actual = mark.object_keys.iter().collect::<BTreeSet<_>>();
+        if actual.len() != mark.object_keys.len() {
+            *missing += 1;
+            eprintln!("remote gc mark contains duplicate object keys {mark_key}");
+        }
+        for key in &expected {
+            if !actual.contains(key) {
+                *missing += 1;
+                eprintln!("remote gc mark is missing live object {mark_key} {key}");
+            }
+        }
+    }
+    validate_remote_gc_tombstones(remote, host_id, missing)
+}
+
+fn expected_gc_mark_object_keys(export: &MetadataExport) -> BTreeSet<String> {
+    let mut object_keys = local_object_keys(export);
+    for key in object_keys.clone() {
+        object_keys.extend(canonical_remote_aliases(&key));
+    }
+    object_keys.into_iter().collect()
+}
+
+fn validate_remote_gc_tombstones(
+    remote: &RemoteStore,
+    host_id: &str,
+    missing: &mut usize,
+) -> Result<()> {
+    let prefix = format!("gc/tombstones/{host_id}/");
+    let mut seen_keys = BTreeSet::new();
+    for key in remote.list(&prefix)? {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let tombstone: GcTombstoneExport = match serde_json::from_slice(&remote.get(&key)?) {
+            Ok(tombstone) => tombstone,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid remote gc tombstone {key}: {err}");
+                continue;
+            }
+        };
+        if tombstone.version != 1 {
+            *missing += 1;
+            eprintln!("unsupported remote gc tombstone version {key}");
+        }
+        if tombstone.host_id != host_id {
+            *missing += 1;
+            eprintln!(
+                "remote gc tombstone host id {} does not match {host_id}",
+                tombstone.host_id
+            );
+        }
+        if tombstone.key.is_empty()
+            || tombstone.key.starts_with('/')
+            || tombstone.key.contains("..")
+        {
+            *missing += 1;
+            eprintln!("remote gc tombstone has invalid deleted key {key}");
+        }
+        if remote.exists(&tombstone.key)? {
+            *missing += 1;
+            eprintln!(
+                "remote gc tombstone points to existing object {} {}",
+                key, tombstone.key
+            );
+        }
+        if !seen_keys.insert(tombstone.key.clone()) {
+            *missing += 1;
+            eprintln!(
+                "duplicate remote gc tombstone deleted key {}",
+                tombstone.key
+            );
+        }
     }
     Ok(())
 }
