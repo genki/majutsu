@@ -3429,6 +3429,59 @@ fn missing_root_is_not_snapshotted_as_deletion() {
 }
 
 #[test]
+fn root_mark_deleted_requires_explicit_operator_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let marked = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("mark-deleted")
+            .arg("sample");
+        c
+    });
+    assert!(marked.contains("marked root sample deleted"));
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(roots.contains("sample\tdeleted"));
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(snapshot.contains("files 0, large 0"));
+    let ops = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(ops.contains("root-mark-deleted"));
+}
+
+#[test]
 fn require_mount_root_is_skipped_as_unmounted_without_mass_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
