@@ -86,9 +86,9 @@ mod watch_runtime;
 use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use restore_runtime::{
-    ensure_restore_job_has_no_missing_objects, ensure_restore_job_not_blocked,
-    ensure_restore_job_resumable, mark_restore_job_done, print_restore_conflicts,
-    print_restore_deletes, read_restore_job, remove_empty_restore_parents,
+    RestoreDelete, RestorePlan, ensure_restore_job_has_no_missing_objects,
+    ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
+    print_restore_conflicts, print_restore_deletes, read_restore_job, remove_empty_restore_parents,
     restore_delete_destination, restore_destination, restore_root_base, restore_target_label,
     write_restore_job,
 };
@@ -5824,21 +5824,6 @@ fn validate_remote_pack_objects(
         eprintln!("packed blob references missing pack metadata {pack_id}");
     }
     Ok(())
-}
-
-#[derive(Debug)]
-pub(crate) struct RestorePlan {
-    pub(crate) snapshot: SnapshotManifest,
-    pub(crate) to: Option<PathBuf>,
-    pub(crate) root_paths: BTreeMap<String, PathBuf>,
-    pub(crate) files: Vec<FileRecord>,
-    pub(crate) deletes: Vec<RestoreDelete>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RestoreDelete {
-    pub(crate) root_id: String,
-    pub(crate) path: String,
 }
 
 struct RestoreObjectStats {

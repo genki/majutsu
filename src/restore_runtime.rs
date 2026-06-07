@@ -1,11 +1,26 @@
 use anyhow::{Result, anyhow, bail};
-use majutsu_core::FileRecord;
+use majutsu_core::{FileRecord, SnapshotManifest};
 use majutsu_restore::RestoreQueueItem;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::{Paths, RestoreDelete, RestorePlan};
+use crate::Paths;
+
+#[derive(Debug)]
+pub(crate) struct RestorePlan {
+    pub(crate) snapshot: SnapshotManifest,
+    pub(crate) to: Option<PathBuf>,
+    pub(crate) root_paths: BTreeMap<String, PathBuf>,
+    pub(crate) files: Vec<FileRecord>,
+    pub(crate) deletes: Vec<RestoreDelete>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RestoreDelete {
+    pub(crate) root_id: String,
+    pub(crate) path: String,
+}
 
 pub(crate) fn write_restore_job(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
     let dir = paths.home.join("queue/restores");
