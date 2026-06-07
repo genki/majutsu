@@ -1,11 +1,13 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use majutsu_core::{
     ConfigRootIssue, HistoryGraphIssue, HostFileIssue, LargeManifest, OperationLogComparisonIssue,
     OperationLogEntry as OperationExport, OperationLogEntryIssue, config_root_consistency_issues,
     decode_operation_log, history_graph_issues, host_file_issues, operation_log_comparison_issues,
 };
 use majutsu_db::{local_ref_issues, remote_ref_issues};
-use majutsu_large::{LargePinIssue, large_chunk_hash_matches, large_pin_issues};
+use majutsu_large::{
+    LargePinIssue, large_chunk_hash_matches, large_manifest_issues, large_pin_issues,
+};
 use majutsu_store::{
     REMOTE_CHUNK_INDEX_SHARD_KEY, RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
     RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
@@ -23,11 +25,11 @@ use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::{
-    decode_canonical_remote_export, decode_canonical_remote_oplog, export_metadata, open_db,
-    read_blob_payload, read_large_chunk, read_object, validate_event_queue,
-    validate_local_large_manifest_objects, validate_local_metadata_references,
-    validate_local_oplog, validate_local_pack_objects, validate_local_snapshot_objects,
-    validate_restore_queue, validate_upload_queue,
+    decode_canonical_remote_export, decode_canonical_remote_oplog, decode_object, export_metadata,
+    open_db, read_blob_payload, read_large_chunk, read_object, remote_local_object_variants,
+    validate_event_queue, validate_local_large_manifest_objects,
+    validate_local_metadata_references, validate_local_oplog, validate_local_pack_objects,
+    validate_local_snapshot_objects, validate_restore_queue, validate_upload_queue,
 };
 
 pub(crate) fn fsck(paths: &Paths) -> Result<()> {
@@ -548,6 +550,35 @@ pub(crate) fn validate_remote_chunk_index(
             }
             RemoteChunkIndexIssue::MissingEntry(oid) => {
                 eprintln!("chunk missing from remote chunk index {oid}");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_remote_large_manifest_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &crate::MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    for large in &export.large_objects {
+        for bytes in remote_local_object_variants(paths, remote, &large.manifest_key)? {
+            let manifest: LargeManifest =
+                serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
+                    || {
+                        format!(
+                            "parse large manifest {} from {}",
+                            large.manifest_key, bytes.remote_key
+                        )
+                    },
+                )?;
+            if !large_manifest_issues(&manifest, large).is_empty() {
+                *missing += 1;
+                eprintln!(
+                    "large manifest object does not match metadata {} {}",
+                    large.oid, bytes.remote_key
+                );
             }
         }
     }

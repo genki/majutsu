@@ -100,7 +100,8 @@ use db_refs::{
 };
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::{
-    fsck, validate_remote_chunk_index, validate_remote_gc_records, validate_remote_oplog,
+    fsck, validate_remote_chunk_index, validate_remote_gc_records,
+    validate_remote_large_manifest_objects, validate_remote_oplog,
 };
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use object_paths::{
@@ -3520,12 +3521,12 @@ fn validate_remote_snapshot_objects(
     Ok(())
 }
 
-struct RemoteObjectVariant {
-    remote_key: String,
-    bytes: Vec<u8>,
+pub(crate) struct RemoteObjectVariant {
+    pub(crate) remote_key: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
-fn remote_local_object_variants(
+pub(crate) fn remote_local_object_variants(
     paths: &Paths,
     remote: &RemoteStore,
     key: &str,
@@ -3549,35 +3550,6 @@ fn remote_local_object_variants(
         }
     }
     Ok(variants)
-}
-
-fn validate_remote_large_manifest_objects(
-    paths: &Paths,
-    remote: &RemoteStore,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    for large in &export.large_objects {
-        for bytes in remote_local_object_variants(paths, remote, &large.manifest_key)? {
-            let manifest: LargeManifest =
-                serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
-                    || {
-                        format!(
-                            "parse large manifest {} from {}",
-                            large.manifest_key, bytes.remote_key
-                        )
-                    },
-                )?;
-            if !large_manifest_issues(&manifest, large).is_empty() {
-                *missing += 1;
-                eprintln!(
-                    "large manifest object does not match metadata {} {}",
-                    large.oid, bytes.remote_key
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_remote_pack_objects(
@@ -4845,7 +4817,7 @@ fn read_blob_payload(
     }
 }
 
-fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
     majutsu_crypto::decode_object(bytes, &paths.master_key, &recipients_path(paths))
 }
 
