@@ -9614,6 +9614,140 @@ fn daemon_watch_snapshot_survives_sync_retry_and_remote_recovery() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_watch_large_snapshot_sync_clone_restore_preserves_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 4096");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let started = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("start")
+            .arg("--backend")
+            .arg("notify")
+            .arg("--settle-ms")
+            .arg("50")
+            .arg("--periodic-rescan-secs")
+            .arg("3600");
+        c
+    });
+    assert!(started.contains("started daemon pid"));
+    for _ in 0..50 {
+        if state.join("runtime/daemon.sock").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    for _ in 0..100 {
+        let events = fs::read_dir(state.join("queue/events"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if events.contains("watch-root") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut payload = vec![4u8; 4096];
+    payload.extend(vec![5u8; 4096]);
+    fs::write(source.join("payload.bin"), &payload).unwrap();
+    let mut captured = false;
+    for _ in 0..100 {
+        if db_ref(&state, "current").is_some() {
+            captured = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
+    assert!(
+        captured,
+        "daemon did not create a large snapshot for the file event"
+    );
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("large_objects 1"));
+    assert!(stat.contains("chunks 2"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert_eq!(
+        count_files_ending(&remote.join("large/chunks/fixed-8m"), ".chunk.enc"),
+        2
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("payload.bin")).unwrap(),
+        fs::read(restore.join("sample/payload.bin")).unwrap()
+    );
+}
+
 #[test]
 fn transactional_snapshot_runs_pre_and_post_hooks() {
     let tmp = tempfile::tempdir().unwrap();
