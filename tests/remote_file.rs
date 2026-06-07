@@ -619,6 +619,97 @@ fn restore_preserves_file_mode_and_mtime() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn restore_preserves_empty_directory_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    let parent_dir = source.join("empty");
+    let dir = source.join("empty/subdir");
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut parent_perms = fs::metadata(&parent_dir).unwrap().permissions();
+    parent_perms.set_mode(0o751);
+    fs::set_permissions(&parent_dir, parent_perms).unwrap();
+    filetime::set_file_mtime(
+        &parent_dir,
+        filetime::FileTime::from_unix_time(1_709_999_000, 0),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o750);
+    fs::set_permissions(&dir, perms).unwrap();
+    filetime::set_file_mtime(&dir, filetime::FileTime::from_unix_time(1_710_000_000, 0)).unwrap();
+    let xattr_supported = xattr::set(&dir, "user.majutsu_dir_test", b"dir-xattr").is_ok();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(snapshot.contains("files 0, large 0"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    let restored_parent = restore.join("sample/empty");
+    let restored = restore.join("sample/empty/subdir");
+    let parent_metadata = fs::metadata(&restored_parent).unwrap();
+    let metadata = fs::metadata(&restored).unwrap();
+    assert!(parent_metadata.is_dir());
+    assert!(metadata.is_dir());
+    assert_eq!(parent_metadata.permissions().mode() & 0o777, 0o751);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o750);
+    if xattr_supported {
+        assert_eq!(
+            xattr::get(&restored, "user.majutsu_dir_test").unwrap(),
+            Some(b"dir-xattr".to_vec())
+        );
+    }
+    assert_eq!(
+        parent_metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        1_709_999_000
+    );
+    assert_eq!(
+        metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        1_710_000_000
+    );
+}
+
 #[test]
 fn restore_atomic_writes_do_not_clobber_legacy_temp_names() {
     let tmp = tempfile::tempdir().unwrap();

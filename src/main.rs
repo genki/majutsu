@@ -951,6 +951,7 @@ struct FileRecord {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Payload {
+    Directory,
     Blob {
         oid: String,
         object_key: String,
@@ -1451,7 +1452,10 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .iter()
             .filter(|r| matches!(r.payload, Payload::Large { .. }))
             .count();
-        total_files += records.len();
+        total_files += records
+            .iter()
+            .filter(|r| !matches!(r.payload, Payload::Directory))
+            .count();
         let tree = build_tree_manifest(&root.id, records)?;
         let tree_json = serde_json::to_vec_pretty(&tree)?;
         let tree_oid = blake3_hex(&tree_json);
@@ -1950,12 +1954,17 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
     let lazy_root = mountpoint.join(".majutsu-lazy");
     let mut lazy_files = 0usize;
     let mut hydrated_large = 0usize;
+    let mut directory_metadata = Vec::new();
     for record in &plan.files {
         let dest = mountpoint.join(&record.root_id).join(&record.path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
         match &record.payload {
+            Payload::Directory => {
+                fs::create_dir_all(&dest)?;
+                directory_metadata.push((dest, record));
+            }
             Payload::Blob { oid, object_key } => {
                 write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
                 apply_file_metadata(&dest, record)?;
@@ -2005,6 +2014,9 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
                 fs::write(&dest, target)?;
             }
         }
+    }
+    for (dest, record) in directory_metadata {
+        apply_file_metadata(&dest, record)?;
     }
     record_op(
         &conn,
@@ -2146,6 +2158,9 @@ impl MajutsuFuseFs {
                 .to_os_string();
             let ino = fs.next_ino();
             let kind = match &record.payload {
+                Payload::Directory => FuseNodeKind::Directory {
+                    children: BTreeMap::new(),
+                },
                 Payload::Symlink { target } => FuseNodeKind::Symlink {
                     target: target.clone(),
                 },
@@ -2154,6 +2169,7 @@ impl MajutsuFuseFs {
                 },
             };
             let file_type = match kind {
+                FuseNodeKind::Directory { .. } => FileType::Directory,
                 FuseNodeKind::Symlink { .. } => FileType::Symlink,
                 _ => FileType::RegularFile,
             };
@@ -2256,6 +2272,7 @@ impl MajutsuFuseFs {
                 }
                 Ok(out)
             }
+            Payload::Directory => Ok(Vec::new()),
             Payload::Symlink { .. } => Ok(Vec::new()),
         }
     }
@@ -3799,6 +3816,7 @@ fn rewrite_manifest_payload_keys(
     for records in manifest.roots.values_mut() {
         for record in records {
             match &mut record.payload {
+                Payload::Directory => {}
                 Payload::Blob { oid, object_key } => {
                     *object_key = blob_keys
                         .get(oid)
@@ -4133,6 +4151,7 @@ fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<Prune
         for records in manifest.roots.values() {
             for record in records {
                 match &record.payload {
+                    Payload::Directory => {}
                     Payload::Blob { oid, .. } => {
                         live_blobs.insert(oid.clone());
                     }
@@ -4558,6 +4577,7 @@ fn build_restore_plan(
                 modified: record.modified,
                 xattrs: record.xattrs.clone(),
                 payload: match &record.payload {
+                    Payload::Directory => Payload::Directory,
                     Payload::Blob { oid, object_key } => Payload::Blob {
                         oid: oid.clone(),
                         object_key: object_key.clone(),
@@ -4935,6 +4955,7 @@ fn required_object_keys_for_plan(
     let mut keys = Vec::new();
     for record in &plan.files {
         match &record.payload {
+            Payload::Directory => {}
             Payload::Blob { oid, object_key } => {
                 let blob = query_blobs(conn)?
                     .into_iter()
@@ -5025,12 +5046,17 @@ fn apply_restore_plan(
             remove_empty_restore_parents(plan, delete, &dest)?;
         }
     }
+    let mut directory_metadata = Vec::new();
     for record in &plan.files {
         let dest = restore_destination(plan, record)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
         match &record.payload {
+            Payload::Directory => {
+                fs::create_dir_all(&dest)?;
+                directory_metadata.push((dest, record));
+            }
             Payload::Blob { oid, object_key } => {
                 write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
                 apply_file_metadata(&dest, record)?;
@@ -5048,6 +5074,9 @@ fn apply_restore_plan(
                 fs::write(&dest, target)?;
             }
         }
+    }
+    for (dest, record) in directory_metadata {
+        apply_file_metadata(&dest, record)?;
     }
     Ok(())
 }
@@ -5102,6 +5131,7 @@ fn restore_record_matches_path(
 ) -> Result<bool> {
     let meta = fs::symlink_metadata(dest)?;
     match &record.payload {
+        Payload::Directory => Ok(meta.file_type().is_dir()),
         Payload::Blob { oid, object_key } => {
             if !meta.file_type().is_file() {
                 return Ok(false);
@@ -5232,6 +5262,17 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
         }
         let rel_s = path_to_slash(&rel);
         if entry.file_type().is_dir() {
+            let meta = fs::symlink_metadata(entry.path())?;
+            records.push(FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s,
+                kind: "directory".into(),
+                size: 0,
+                mode: file_mode(&meta),
+                modified: modified_secs(&meta),
+                xattrs: read_xattrs(entry.path()),
+                payload: Payload::Directory,
+            });
             continue;
         }
         let link_meta = fs::symlink_metadata(entry.path())?;
