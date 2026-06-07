@@ -27,7 +27,10 @@ use majutsu_db::{
     local_ref_issues, remote_ref_issues,
 };
 use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
-use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
+use majutsu_pack::{
+    PackEntry, PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackTier,
+    PackedBlobMetadata, missing_pack_metadata_ids, pack_index_issues, pack_object_issues,
+};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
     parse_db_time as restore_parse_db_time, parse_duration_ago as restore_parse_duration_ago,
@@ -5247,38 +5250,30 @@ fn validate_local_pack_objects(
             .get(pack.pack_id.as_str())
             .cloned()
             .unwrap_or_default();
+        let expected_blob_metadata = packed_blob_metadata(&expected_blobs);
         match read_object(paths, &pack.index_key)
             .and_then(|bytes| serde_json::from_slice::<PackIndex>(&bytes).map_err(Into::into))
         {
             Ok(index) => {
-                if !pack.matches_index(&index) || index.entries.len() != expected_blobs.len() {
+                for issue in pack_index_issues(pack, &index, &expected_blob_metadata) {
                     *missing += 1;
-                    eprintln!("pack index does not match metadata {}", pack.pack_id);
-                } else {
-                    let mut seen = BTreeSet::new();
-                    for entry in &index.entries {
-                        let Some(blob) = expected_blobs.get(entry.oid.as_str()) else {
-                            *missing += 1;
+                    match issue {
+                        PackIndexIssue::PackMetadataMismatch => {
+                            eprintln!("pack index does not match metadata {}", pack.pack_id);
+                        }
+                        PackIndexIssue::EntryWithoutBlobMetadata { oid } => {
                             eprintln!(
                                 "pack index entry has no matching blob metadata {} {}",
-                                pack.pack_id, entry.oid
-                            );
-                            continue;
-                        };
-                        seen.insert(entry.oid.as_str());
-                        if blob.pack_offset != Some(entry.offset)
-                            || blob.pack_len != Some(entry.len)
-                        {
-                            *missing += 1;
-                            eprintln!(
-                                "pack index entry does not match blob offset metadata {} {}",
-                                pack.pack_id, entry.oid
+                                pack.pack_id, oid
                             );
                         }
-                    }
-                    for oid in expected_blobs.keys() {
-                        if !seen.contains(oid) {
-                            *missing += 1;
+                        PackIndexIssue::EntryOffsetMismatch { oid } => {
+                            eprintln!(
+                                "pack index entry does not match blob offset metadata {} {}",
+                                pack.pack_id, oid
+                            );
+                        }
+                        PackIndexIssue::MissingBlobEntry { oid } => {
                             eprintln!(
                                 "packed blob missing from pack index {} {}",
                                 pack.pack_id, oid
@@ -5297,37 +5292,30 @@ fn validate_local_pack_objects(
         }
         match fs::read(paths.home.join(&pack.pack_key)) {
             Ok(bytes) => {
-                if bytes.len() as u64 != pack.size {
+                for issue in pack_object_issues(pack, bytes.len() as u64, &expected_blob_metadata) {
                     *missing += 1;
-                    eprintln!("pack object size does not match metadata {}", pack.pack_id);
-                }
-                for blob in expected_blobs.values() {
-                    let Some(offset) = blob.pack_offset else {
-                        *missing += 1;
-                        eprintln!(
-                            "packed blob missing offset metadata {} {}",
-                            pack.pack_id, blob.oid
-                        );
-                        continue;
-                    };
-                    let Some(len) = blob.pack_len else {
-                        *missing += 1;
-                        eprintln!(
-                            "packed blob missing length metadata {} {}",
-                            pack.pack_id, blob.oid
-                        );
-                        continue;
-                    };
-                    if offset.checked_add(len).is_none_or(|end| end > pack.size)
-                        || offset
-                            .checked_add(len)
-                            .is_none_or(|end| end as usize > bytes.len())
-                    {
-                        *missing += 1;
-                        eprintln!(
-                            "packed blob range out of pack bounds {} {}",
-                            pack.pack_id, blob.oid
-                        );
+                    match issue {
+                        PackObjectIssue::SizeMismatch => {
+                            eprintln!("pack object size does not match metadata {}", pack.pack_id);
+                        }
+                        PackObjectIssue::MissingBlobOffset { oid } => {
+                            eprintln!(
+                                "packed blob missing offset metadata {} {}",
+                                pack.pack_id, oid
+                            );
+                        }
+                        PackObjectIssue::MissingBlobLength { oid } => {
+                            eprintln!(
+                                "packed blob missing length metadata {} {}",
+                                pack.pack_id, oid
+                            );
+                        }
+                        PackObjectIssue::BlobRangeOutOfBounds { oid } => {
+                            eprintln!(
+                                "packed blob range out of pack bounds {} {}",
+                                pack.pack_id, oid
+                            );
+                        }
                     }
                 }
             }
@@ -5340,13 +5328,25 @@ fn validate_local_pack_objects(
             }
         }
     }
-    for pack_id in blobs_by_pack.keys() {
-        if !export.packs.iter().any(|pack| pack.pack_id == **pack_id) {
-            *missing += 1;
-            eprintln!("packed blob references missing pack metadata {pack_id}");
-        }
+    for pack_id in missing_pack_metadata_ids(
+        blobs_by_pack.keys().copied(),
+        export.packs.iter().map(|pack| pack.pack_id.as_str()),
+    ) {
+        *missing += 1;
+        eprintln!("packed blob references missing pack metadata {pack_id}");
     }
     Ok(())
+}
+
+fn packed_blob_metadata(blobs: &BTreeMap<&str, &BlobExport>) -> Vec<PackedBlobMetadata> {
+    blobs
+        .values()
+        .map(|blob| PackedBlobMetadata {
+            oid: blob.oid.clone(),
+            pack_offset: blob.pack_offset,
+            pack_len: blob.pack_len,
+        })
+        .collect()
 }
 
 fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
@@ -6037,6 +6037,7 @@ fn validate_remote_pack_objects(
             .get(pack.pack_id.as_str())
             .cloned()
             .unwrap_or_default();
+        let expected_blob_metadata = packed_blob_metadata(&expected_blobs);
         for bytes in remote_local_object_variants(paths, remote, &pack.index_key)? {
             let index: PackIndex = serde_json::from_slice(&bytes.bytes).with_context(|| {
                 format!(
@@ -6044,87 +6045,79 @@ fn validate_remote_pack_objects(
                     pack.index_key, bytes.remote_key
                 )
             })?;
-            if !pack.matches_index(&index) || index.entries.len() != expected_blobs.len() {
+            for issue in pack_index_issues(pack, &index, &expected_blob_metadata) {
                 *missing += 1;
-                eprintln!(
-                    "pack index object does not match metadata {} {}",
-                    pack.pack_id, bytes.remote_key
-                );
-                continue;
-            }
-            let mut seen = BTreeSet::new();
-            for entry in &index.entries {
-                let Some(blob) = expected_blobs.get(entry.oid.as_str()) else {
-                    *missing += 1;
-                    eprintln!(
-                        "pack index entry has no matching blob metadata {} {}",
-                        pack.pack_id, entry.oid
-                    );
-                    continue;
-                };
-                seen.insert(entry.oid.as_str());
-                if blob.pack_offset != Some(entry.offset) || blob.pack_len != Some(entry.len) {
-                    *missing += 1;
-                    eprintln!(
-                        "pack index entry does not match blob offset metadata {} {}",
-                        pack.pack_id, entry.oid
-                    );
+                let stop_after_issue = matches!(issue, PackIndexIssue::PackMetadataMismatch);
+                match issue {
+                    PackIndexIssue::PackMetadataMismatch => {
+                        eprintln!(
+                            "pack index object does not match metadata {} {}",
+                            pack.pack_id, bytes.remote_key
+                        );
+                    }
+                    PackIndexIssue::EntryWithoutBlobMetadata { oid } => {
+                        eprintln!(
+                            "pack index entry has no matching blob metadata {} {}",
+                            pack.pack_id, oid
+                        );
+                    }
+                    PackIndexIssue::EntryOffsetMismatch { oid } => {
+                        eprintln!(
+                            "pack index entry does not match blob offset metadata {} {}",
+                            pack.pack_id, oid
+                        );
+                    }
+                    PackIndexIssue::MissingBlobEntry { oid } => {
+                        eprintln!(
+                            "packed blob missing from pack index {} {}",
+                            pack.pack_id, oid
+                        );
+                    }
                 }
-            }
-            for oid in expected_blobs.keys() {
-                if !seen.contains(oid) {
-                    *missing += 1;
-                    eprintln!(
-                        "packed blob missing from pack index {} {}",
-                        pack.pack_id, oid
-                    );
+                if stop_after_issue {
+                    break;
                 }
             }
         }
         for bytes in remote_local_object_variants(paths, remote, &pack.pack_key)? {
-            if bytes.bytes.len() as u64 != pack.size {
+            for issue in pack_object_issues(pack, bytes.bytes.len() as u64, &expected_blob_metadata)
+            {
                 *missing += 1;
-                eprintln!(
-                    "pack object size does not match metadata {} {}",
-                    pack.pack_id, bytes.remote_key
-                );
-            }
-            for blob in expected_blobs.values() {
-                let Some(offset) = blob.pack_offset else {
-                    *missing += 1;
-                    eprintln!(
-                        "packed blob missing offset metadata {} {}",
-                        pack.pack_id, blob.oid
-                    );
-                    continue;
-                };
-                let Some(len) = blob.pack_len else {
-                    *missing += 1;
-                    eprintln!(
-                        "packed blob missing length metadata {} {}",
-                        pack.pack_id, blob.oid
-                    );
-                    continue;
-                };
-                if offset.checked_add(len).is_none_or(|end| end > pack.size)
-                    || offset
-                        .checked_add(len)
-                        .is_none_or(|end| end as usize > bytes.bytes.len())
-                {
-                    *missing += 1;
-                    eprintln!(
-                        "packed blob range out of pack bounds {} {}",
-                        pack.pack_id, blob.oid
-                    );
+                match issue {
+                    PackObjectIssue::SizeMismatch => {
+                        eprintln!(
+                            "pack object size does not match metadata {} {}",
+                            pack.pack_id, bytes.remote_key
+                        );
+                    }
+                    PackObjectIssue::MissingBlobOffset { oid } => {
+                        eprintln!(
+                            "packed blob missing offset metadata {} {}",
+                            pack.pack_id, oid
+                        );
+                    }
+                    PackObjectIssue::MissingBlobLength { oid } => {
+                        eprintln!(
+                            "packed blob missing length metadata {} {}",
+                            pack.pack_id, oid
+                        );
+                    }
+                    PackObjectIssue::BlobRangeOutOfBounds { oid } => {
+                        eprintln!(
+                            "packed blob range out of pack bounds {} {}",
+                            pack.pack_id, oid
+                        );
+                    }
                 }
             }
         }
     }
-    for pack_id in blobs_by_pack.keys() {
-        if !export.packs.iter().any(|pack| pack.pack_id == **pack_id) {
-            *missing += 1;
-            eprintln!("packed blob references missing pack metadata {pack_id}");
-        }
+    for pack_id in missing_pack_metadata_ids(
+        blobs_by_pack.keys().copied(),
+        export.packs.iter().map(|pack| pack.pack_id.as_str()),
+    ) {
+        *missing += 1;
+        eprintln!("packed blob references missing pack metadata {pack_id}");
     }
     Ok(())
 }
