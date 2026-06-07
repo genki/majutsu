@@ -3306,6 +3306,63 @@ fn root_set_updates_filters_and_records_config_change() {
 }
 
 #[test]
+fn root_commands_sync_config_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--exclude")
+            .arg("*.tmp");
+        c
+    });
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    assert!(config.contains("[[roots]]"));
+    assert!(config.contains("id = \"sample\""));
+    assert!(config.contains("exclude = [\"*.tmp\"]"));
+    assert!(config.contains("status = \"active\""));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("pause")
+            .arg("sample");
+        c
+    });
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    assert!(config.contains("status = \"paused\""));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("remove")
+            .arg("sample");
+        c
+    });
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    assert!(!config.contains("[[roots]]"));
+    assert!(!config.contains("id = \"sample\""));
+}
+
+#[test]
 fn root_include_can_select_subtree_patterns() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

@@ -1216,6 +1216,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                  on conflict(id) do update set data_json=excluded.data_json",
                 params![root.id, serde_json::to_string(&root)?],
             )?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "root-added", None, None, Some(&root.id))?;
             println!("added root {} -> {}", root.id, root.path.display());
         }
@@ -1292,6 +1293,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             }
             apply_root_large_set(&mut root, &args)?;
             save_root(&conn, &root)?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "config-change", None, None, Some(&root.id))?;
             println!("updated root {} -> {}", root.id, root.path.display());
         }
@@ -1308,21 +1310,25 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
         }
         RootCommand::Remove { id } => {
             conn.execute("delete from roots where id=?1", params![id])?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "root-removed", None, None, Some(&id))?;
             println!("removed root {id}");
         }
         RootCommand::Pause { id } => {
             update_root_status(&conn, &id, "paused")?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "root-paused", None, None, Some(&id))?;
             println!("paused root {id}");
         }
         RootCommand::Resume { id } => {
             update_root_status(&conn, &id, "active")?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "root-resumed", None, None, Some(&id))?;
             println!("resumed root {id}");
         }
         RootCommand::MarkDeleted { id } => {
             update_root_status(&conn, &id, "deleted")?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "root-mark-deleted", None, None, Some(&id))?;
             println!("marked root {id} deleted");
         }
@@ -1363,6 +1369,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         }
         if !root.path.exists() {
             update_root_status(&conn, &root.id, "missing")?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(
                 &conn,
                 "root-missing",
@@ -1380,6 +1387,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         }
         if root.require_mount && !is_mount_point(&root.path) {
             update_root_status(&conn, &root.id, "unmounted")?;
+            sync_roots_to_config(paths, &conn)?;
             record_op(
                 &conn,
                 "root-unmounted",
@@ -1417,6 +1425,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             Ok(records) => records,
             Err(err) if is_permission_denied_error(&err) => {
                 update_root_status(&conn, &root.id, "permission-denied")?;
+                sync_roots_to_config(paths, &conn)?;
                 record_op(
                     &conn,
                     "root-permission-denied",
@@ -6295,7 +6304,7 @@ impl From<&RootConfig> for ConfigRoot {
             exclude: root.exclude.clone(),
             follow_symlinks: root.follow_symlinks,
             require_mount: root.require_mount,
-            status: None,
+            status: Some(root.status.clone()),
             snapshot_mode: root.snapshot_mode.clone(),
             pre_snapshot: root.pre_snapshot.clone(),
             post_snapshot: root.post_snapshot.clone(),
@@ -6320,6 +6329,12 @@ fn sync_config_roots(paths: &Paths, conn: &Connection, config: &Config) -> Resul
         )?;
     }
     Ok(())
+}
+
+fn sync_roots_to_config(paths: &Paths, conn: &Connection) -> Result<()> {
+    let mut config = read_config(paths)?;
+    config.roots = roots(conn)?.iter().map(ConfigRoot::from).collect();
+    write_config(paths, &config)
 }
 
 impl ConfigRoot {
