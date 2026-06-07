@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use majutsu_core::{
     ConfigRootIssue, HistoryGraphIssue, HostFileIssue, LargeManifest, LiveMetadataReferences,
     MetadataReferenceIssue, OperationLogComparisonIssue, OperationLogEntry as OperationExport,
-    OperationLogEntryIssue, SnapshotManifest, TreeManifest, config_root_consistency_issues,
-    decode_operation_log, history_graph_issues, host_file_issues, metadata_reference_issues,
-    operation_log_comparison_issues, snapshot_manifest_matches, tree_manifest_issues,
+    OperationLogEntryIssue, SnapshotExport, SnapshotManifest, TreeManifest,
+    config_root_consistency_issues, decode_operation_log, history_graph_issues, host_file_issues,
+    metadata_reference_issues, operation_log_comparison_issues, operation_log_entry_matches,
+    snapshot_export_matches, snapshot_manifest_matches, tree_manifest_issues,
 };
 use majutsu_db::{local_ref_issues, remote_ref_issues};
 use majutsu_large::{
@@ -15,27 +16,34 @@ use majutsu_pack::{
     pack_object_issues,
 };
 use majutsu_store::{
-    BlobExport, REMOTE_CHUNK_INDEX_SHARD_KEY, RemoteChunkIndexEntry as ChunkIndexEntry,
-    RemoteChunkIndexIssue, RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
-    RemoteGcTombstone as GcTombstoneExport, canonical_remote_alias, canonical_remote_aliases,
-    host_oplog_canonical_key, host_oplog_key, remote_gc_mark_key, remote_gc_tombstone_prefix,
+    BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
+    RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
+    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
+    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndexIssue, RemoteObjectAvailabilityIssue,
+    canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
+    host_last_synced_ref_key, host_legacy_current_key, host_operation_canonical_key,
+    host_operation_key, host_oplog_canonical_key, host_oplog_key, host_snapshot_canonical_key,
+    host_snapshot_key, remote_gc_mark_key, remote_gc_tombstone_prefix,
+    remote_object_availability_issues,
 };
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
-use crate::config::{Config, HostConfig, Paths, RootConfig, read_config};
+use crate::config::{Config, HostConfig, Paths, RootConfig, read_config, validate_config};
 use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
 use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
+use crate::util::parse_db_time;
 use crate::{
     decode_canonical_remote_export, decode_canonical_remote_oplog, decode_object, export_metadata,
     open_db, packed_blob_metadata, read_blob_payload, read_large_chunk, read_object,
-    remote_local_object_variants, validate_event_queue, validate_local_large_manifest_objects,
-    validate_local_metadata_references, validate_local_oplog, validate_local_pack_objects,
-    validate_local_snapshot_objects, validate_restore_queue, validate_upload_queue,
+    read_remote_host_index, remote_local_object_variants, remote_ref, validate_event_queue,
+    validate_local_large_manifest_objects, validate_local_metadata_references,
+    validate_local_oplog, validate_local_pack_objects, validate_local_snapshot_objects,
+    validate_restore_queue, validate_upload_queue,
 };
 
 pub(crate) fn fsck(paths: &Paths) -> Result<()> {
@@ -799,4 +807,279 @@ pub(crate) fn validate_remote_pack_objects(
         eprintln!("packed blob references missing pack metadata {pack_id}");
     }
     Ok(())
+}
+
+pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
+    let mut missing = 0usize;
+    let mut verified_hosts = 0usize;
+    let has_legacy_export = remote.exists(LEGACY_METADATA_EXPORT_KEY)?;
+    let has_host_index = remote.exists(REMOTE_HOST_INDEX_KEY)?;
+
+    if has_legacy_export {
+        let export = remote_fsck_export(
+            paths,
+            remote,
+            LEGACY_METADATA_EXPORT_KEY,
+            None,
+            &mut missing,
+        )?;
+        if let Some(current) = export.refs.get("current") {
+            let legacy_current = remote_ref(remote, "hosts/current")?;
+            if legacy_current.as_deref() != Some(current.as_str()) {
+                missing += 1;
+                eprintln!("legacy hosts/current does not match metadata current ref");
+            }
+        }
+    }
+
+    if has_host_index {
+        let index = read_remote_host_index(remote)?;
+        for issue in index.duplicate_issues() {
+            missing += 1;
+            match issue {
+                RemoteHostIndexIssue::DuplicateHostId(id) => {
+                    eprintln!("duplicate host id in hosts/index.json: {id}");
+                }
+                RemoteHostIndexIssue::DuplicateMetadataKey(key) => {
+                    eprintln!("duplicate host metadata_key in hosts/index.json: {key}");
+                }
+            }
+        }
+        for host in &index.hosts {
+            verified_hosts += 1;
+            if !remote.exists(&host.metadata_key)? {
+                missing += 1;
+                eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
+                continue;
+            }
+            let export = remote_fsck_export(
+                paths,
+                remote,
+                &host.metadata_key,
+                Some(&host.id),
+                &mut missing,
+            )?;
+            if export.config.host.id != host.id {
+                missing += 1;
+                eprintln!(
+                    "host index id {} does not match metadata host id {}",
+                    host.id, export.config.host.id
+                );
+            }
+            if export.config.host.name != host.name {
+                missing += 1;
+                eprintln!(
+                    "host index name {} does not match metadata host name {}",
+                    host.name, export.config.host.name
+                );
+            }
+            let current = export.refs.get("current");
+            if host.current_snapshot.as_ref() != current {
+                missing += 1;
+                eprintln!(
+                    "host index current snapshot does not match metadata for {}",
+                    host.id
+                );
+            }
+            let current_ref_key = host_current_ref_key(&host.id);
+            if let Some(current) = current {
+                match remote_ref(remote, &current_ref_key)? {
+                    Some(remote_current) if remote_current == *current => {}
+                    Some(remote_current) => {
+                        missing += 1;
+                        eprintln!(
+                            "{current_ref_key} points to {remote_current}, expected {current}"
+                        );
+                    }
+                    None => {
+                        missing += 1;
+                        eprintln!("missing remote ref {current_ref_key}");
+                    }
+                }
+                let legacy_current_key = host_legacy_current_key(&host.id);
+                if let Some(legacy_current) = remote_ref(remote, &legacy_current_key)?
+                    && legacy_current != *current
+                {
+                    missing += 1;
+                    eprintln!(
+                        "{legacy_current_key} points to {legacy_current}, expected {current}"
+                    );
+                }
+            }
+            if let Some(last_synced) = export.refs.get("last-synced") {
+                match parse_db_time(last_synced) {
+                    Ok(metadata_last_synced) if host.last_synced_at == metadata_last_synced => {}
+                    Ok(metadata_last_synced) => {
+                        missing += 1;
+                        eprintln!(
+                            "host index last_synced_at {} does not match metadata last-synced {} for {}",
+                            host.last_synced_at.to_rfc3339(),
+                            metadata_last_synced.to_rfc3339(),
+                            host.id
+                        );
+                    }
+                    Err(err) => {
+                        missing += 1;
+                        eprintln!("invalid metadata last-synced for {}: {err}", host.id);
+                    }
+                }
+                let last_synced_ref_key = host_last_synced_ref_key(&host.id);
+                match remote_ref(remote, &last_synced_ref_key)? {
+                    Some(remote_last_synced) if remote_last_synced == *last_synced => {}
+                    Some(remote_last_synced) => {
+                        missing += 1;
+                        eprintln!(
+                            "{last_synced_ref_key} points to {remote_last_synced}, expected {last_synced}"
+                        );
+                    }
+                    None => {
+                        missing += 1;
+                        eprintln!("missing remote ref {last_synced_ref_key}");
+                    }
+                }
+            }
+            for snapshot in &export.snapshots {
+                let key = host_snapshot_canonical_key(&host.id, &snapshot.id);
+                if !remote.exists(&key)? {
+                    missing += 1;
+                    eprintln!("missing canonical host snapshot export {key}");
+                }
+            }
+            for operation in &export.operations {
+                let key = host_operation_canonical_key(&host.id, &operation.id);
+                if !remote.exists(&key)? {
+                    missing += 1;
+                    eprintln!("missing canonical host operation export {key}");
+                }
+            }
+            validate_remote_gc_records(remote, &host.id, &export, &mut missing)?;
+        }
+    }
+
+    if !has_legacy_export && !has_host_index {
+        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    }
+    if has_host_index && verified_hosts == 0 {
+        missing += 1;
+        eprintln!("hosts/index.json contains no hosts");
+    }
+    if missing > 0 {
+        bail!("remote fsck found {missing} issue(s)");
+    }
+    println!("remote fsck ok");
+    println!("hosts {}", verified_hosts);
+    if has_legacy_export {
+        println!("legacy_metadata ok");
+    }
+    Ok(())
+}
+
+fn remote_fsck_export(
+    paths: &Paths,
+    remote: &RemoteStore,
+    metadata_key: &str,
+    host_id: Option<&str>,
+    missing: &mut usize,
+) -> Result<crate::MetadataExport> {
+    let export: crate::MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
+        .with_context(|| format!("parse remote metadata {metadata_key}"))?;
+    if let Err(err) = validate_config(&export.config) {
+        *missing += 1;
+        eprintln!("invalid remote config in {metadata_key}: {err}");
+    }
+    for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
+        *missing += 1;
+        match issue {
+            LargePinIssue::Dangling { oid, .. } => {
+                eprintln!("dangling remote large pin {oid} in {metadata_key}");
+            }
+            LargePinIssue::InvalidTimestamp { oid, .. } => {
+                eprintln!("invalid remote large pin timestamp {oid} in {metadata_key}");
+            }
+        }
+    }
+    validate_remote_chunk_index(paths, remote, &export, missing)?;
+    for key in local_object_keys(&export) {
+        let legacy_exists = remote.exists(&key)?;
+        let aliases = canonical_remote_aliases(&key);
+        let alias_exists = aliases
+            .iter()
+            .map(|alias| remote.exists(alias))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .any(|exists| exists);
+        for issue in remote_object_availability_issues(legacy_exists, &aliases, alias_exists) {
+            *missing += 1;
+            match issue {
+                RemoteObjectAvailabilityIssue::MissingObjectOrAlias => {
+                    eprintln!("missing remote object {key} or canonical alias");
+                }
+                RemoteObjectAvailabilityIssue::MissingCanonicalAlias => {
+                    eprintln!("missing canonical remote object alias for {key}");
+                }
+            }
+        }
+    }
+    validate_remote_snapshot_objects(paths, remote, &export, missing)?;
+    validate_remote_large_manifest_objects(paths, remote, &export, missing)?;
+    validate_remote_pack_objects(paths, remote, &export, missing)?;
+    validate_remote_metadata_references(paths, remote, &export, missing)?;
+    if let Some(current) = export.refs.get("current") {
+        let found = export
+            .snapshots
+            .iter()
+            .any(|snapshot| &snapshot.id == current);
+        if !found {
+            *missing += 1;
+            eprintln!("remote current ref points to missing snapshot {current}");
+        }
+    }
+    if let Some(host_id) = host_id {
+        validate_remote_oplog(paths, remote, host_id, &export.operations, missing)?;
+        for snapshot in &export.snapshots {
+            let key = host_snapshot_key(host_id, &snapshot.id);
+            if remote.exists(&key)? {
+                let remote_snapshot: SnapshotExport = serde_json::from_slice(&remote.get(&key)?)
+                    .with_context(|| format!("parse remote snapshot export {key}"))?;
+                if !snapshot_export_matches(&remote_snapshot, snapshot) {
+                    *missing += 1;
+                    eprintln!("host snapshot export does not match metadata {key}");
+                }
+            }
+            let canonical_key = host_snapshot_canonical_key(host_id, &snapshot.id);
+            if remote.exists(&canonical_key)? {
+                let remote_snapshot: SnapshotExport =
+                    decode_canonical_remote_export(paths, &remote.get(&canonical_key)?)
+                        .with_context(|| format!("parse remote snapshot export {canonical_key}"))?;
+                if !snapshot_export_matches(&remote_snapshot, snapshot) {
+                    *missing += 1;
+                    eprintln!("host snapshot export does not match metadata {canonical_key}");
+                }
+            }
+        }
+        for operation in &export.operations {
+            let key = host_operation_key(host_id, &operation.id);
+            if remote.exists(&key)? {
+                let remote_operation: OperationExport = serde_json::from_slice(&remote.get(&key)?)
+                    .with_context(|| format!("parse remote operation export {key}"))?;
+                if !operation_log_entry_matches(&remote_operation, operation) {
+                    *missing += 1;
+                    eprintln!("host operation export does not match metadata {key}");
+                }
+            }
+            let canonical_key = host_operation_canonical_key(host_id, &operation.id);
+            if remote.exists(&canonical_key)? {
+                let remote_operation: OperationExport =
+                    decode_canonical_remote_export(paths, &remote.get(&canonical_key)?)
+                        .with_context(|| {
+                            format!("parse remote operation export {canonical_key}")
+                        })?;
+                if !operation_log_entry_matches(&remote_operation, operation) {
+                    *missing += 1;
+                    eprintln!("host operation export does not match metadata {canonical_key}");
+                }
+            }
+        }
+    }
+    Ok(export)
 }
