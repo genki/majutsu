@@ -23,12 +23,19 @@ pub struct Root {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RootStatus {
+    #[serde(alias = "Active")]
     Active,
+    #[serde(alias = "Paused")]
     Paused,
+    #[serde(alias = "Missing")]
     Missing,
+    #[serde(alias = "Unmounted")]
     Unmounted,
+    #[serde(alias = "PermissionDenied")]
     PermissionDenied,
+    #[serde(alias = "Deleted")]
     Deleted,
 }
 
@@ -349,6 +356,41 @@ mod tests {
         assert_eq!(op.actor, "local");
         assert_eq!(op.status, OperationStatus::Done);
         assert_eq!(op.timestamp, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn root_status_model_accepts_current_cli_statuses() {
+        let root: Root = serde_json::from_str(
+            r#"{
+                "id": "sample",
+                "name": "Sample",
+                "path": "/tmp/sample",
+                "status": "permission-denied"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(root.status, RootStatus::PermissionDenied);
+        assert_eq!(
+            serde_json::to_value(RootStatus::PermissionDenied).unwrap(),
+            "permission-denied"
+        );
+        assert_eq!(
+            serde_json::from_value::<RootStatus>(serde_json::Value::String("Active".into()))
+                .unwrap(),
+            RootStatus::Active
+        );
+        for status in [
+            "active",
+            "paused",
+            "missing",
+            "unmounted",
+            "permission-denied",
+            "deleted",
+        ] {
+            serde_json::from_value::<RootStatus>(serde_json::Value::String(status.into()))
+                .unwrap_or_else(|err| panic!("root status {status} should deserialize: {err}"));
+        }
     }
 
     #[test]
