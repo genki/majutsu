@@ -101,7 +101,8 @@ use db_refs::{
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::{
     fsck, validate_remote_chunk_index, validate_remote_gc_records,
-    validate_remote_large_manifest_objects, validate_remote_oplog,
+    validate_remote_large_manifest_objects, validate_remote_metadata_references,
+    validate_remote_oplog, validate_remote_pack_objects, validate_remote_snapshot_objects,
 };
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use object_paths::{
@@ -3128,7 +3129,7 @@ fn validate_local_pack_objects(
     Ok(())
 }
 
-fn packed_blob_metadata(blobs: &BTreeMap<&str, &BlobExport>) -> Vec<PackedBlobMetadata> {
+pub(crate) fn packed_blob_metadata(blobs: &BTreeMap<&str, &BlobExport>) -> Vec<PackedBlobMetadata> {
     blobs
         .values()
         .map(|blob| PackedBlobMetadata {
@@ -3416,111 +3417,6 @@ fn remote_fsck_export(
     Ok(export)
 }
 
-fn validate_remote_metadata_references(
-    paths: &Paths,
-    remote: &RemoteStore,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    let mut live = LiveMetadataReferences::default();
-    for snapshot in &export.snapshots {
-        let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
-            Ok(manifest) => manifest,
-            Err(_) => continue,
-        };
-        for manifest_key in live.add_snapshot_manifest(&manifest) {
-            for bytes in remote_local_object_variants(paths, remote, &manifest_key)? {
-                let large_manifest: LargeManifest =
-                    match serde_json::from_slice(&decode_object(paths, &bytes.bytes)?) {
-                        Ok(manifest) => manifest,
-                        Err(_) => continue,
-                    };
-                live.add_large_manifest(large_manifest);
-            }
-        }
-    }
-    for issue in metadata_reference_issues(
-        export.blobs.iter().map(|blob| blob.oid.as_str()),
-        export.large_objects.iter().map(|large| large.oid.as_str()),
-        export.chunks.iter().map(|chunk| chunk.oid.as_str()),
-        &live.blobs,
-        &live.large_objects,
-        &live.chunks,
-    ) {
-        *missing += 1;
-        match issue {
-            MetadataReferenceIssue::DanglingBlob { oid } => {
-                eprintln!("dangling remote blob metadata {oid}");
-            }
-            MetadataReferenceIssue::DanglingLargeObject { oid } => {
-                eprintln!("dangling remote large object metadata {oid}");
-            }
-            MetadataReferenceIssue::DanglingChunk { oid } => {
-                eprintln!("dangling remote chunk metadata {oid}");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_remote_snapshot_objects(
-    paths: &Paths,
-    remote: &RemoteStore,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    for snapshot in &export.snapshots {
-        let metadata_manifest: SnapshotManifest =
-            match serde_json::from_str(&snapshot.manifest_json) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    *missing += 1;
-                    eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
-                    continue;
-                }
-            };
-        for bytes in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
-            let remote_manifest: SnapshotManifest =
-                serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
-                    || {
-                        format!(
-                            "parse snapshot manifest {} from {}",
-                            snapshot.manifest_key, bytes.remote_key
-                        )
-                    },
-                )?;
-            if !snapshot_manifest_matches(&remote_manifest, &metadata_manifest) {
-                *missing += 1;
-                eprintln!(
-                    "snapshot manifest object does not match metadata {} {}",
-                    snapshot.id, bytes.remote_key
-                );
-            }
-        }
-        for (root_id, root_tree) in &metadata_manifest.root_trees {
-            for bytes in remote_local_object_variants(paths, remote, &root_tree.tree_key)? {
-                let tree: TreeManifest =
-                    serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
-                        || {
-                            format!(
-                                "parse tree manifest {} from {}",
-                                root_tree.tree_key, bytes.remote_key
-                            )
-                        },
-                    )?;
-                if !tree_manifest_issues(&tree, root_id, root_tree).is_empty() {
-                    *missing += 1;
-                    eprintln!(
-                        "tree manifest object does not match snapshot metadata {} {}",
-                        snapshot.id, bytes.remote_key
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) struct RemoteObjectVariant {
     pub(crate) remote_key: String,
     pub(crate) bytes: Vec<u8>,
@@ -3550,111 +3446,6 @@ pub(crate) fn remote_local_object_variants(
         }
     }
     Ok(variants)
-}
-
-fn validate_remote_pack_objects(
-    paths: &Paths,
-    remote: &RemoteStore,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
-    for blob in &export.blobs {
-        if let Some(pack_id) = blob.pack_id.as_deref() {
-            blobs_by_pack
-                .entry(pack_id)
-                .or_default()
-                .insert(blob.oid.as_str(), blob);
-        }
-    }
-    for pack in &export.packs {
-        let expected_blobs = blobs_by_pack
-            .get(pack.pack_id.as_str())
-            .cloned()
-            .unwrap_or_default();
-        let expected_blob_metadata = packed_blob_metadata(&expected_blobs);
-        for bytes in remote_local_object_variants(paths, remote, &pack.index_key)? {
-            let index: PackIndex = serde_json::from_slice(&bytes.bytes).with_context(|| {
-                format!(
-                    "parse pack index {} from {}",
-                    pack.index_key, bytes.remote_key
-                )
-            })?;
-            for issue in pack_index_issues(pack, &index, &expected_blob_metadata) {
-                *missing += 1;
-                let stop_after_issue = matches!(issue, PackIndexIssue::PackMetadataMismatch);
-                match issue {
-                    PackIndexIssue::PackMetadataMismatch => {
-                        eprintln!(
-                            "pack index object does not match metadata {} {}",
-                            pack.pack_id, bytes.remote_key
-                        );
-                    }
-                    PackIndexIssue::EntryWithoutBlobMetadata { oid } => {
-                        eprintln!(
-                            "pack index entry has no matching blob metadata {} {}",
-                            pack.pack_id, oid
-                        );
-                    }
-                    PackIndexIssue::EntryOffsetMismatch { oid } => {
-                        eprintln!(
-                            "pack index entry does not match blob offset metadata {} {}",
-                            pack.pack_id, oid
-                        );
-                    }
-                    PackIndexIssue::MissingBlobEntry { oid } => {
-                        eprintln!(
-                            "packed blob missing from pack index {} {}",
-                            pack.pack_id, oid
-                        );
-                    }
-                }
-                if stop_after_issue {
-                    break;
-                }
-            }
-        }
-        for bytes in remote_local_object_variants(paths, remote, &pack.pack_key)? {
-            for issue in pack_object_issues(pack, bytes.bytes.len() as u64, &expected_blob_metadata)
-            {
-                *missing += 1;
-                match issue {
-                    PackObjectIssue::SizeMismatch => {
-                        eprintln!(
-                            "pack object size does not match metadata {} {}",
-                            pack.pack_id, bytes.remote_key
-                        );
-                    }
-                    PackObjectIssue::MissingBlobOffset { oid } => {
-                        eprintln!(
-                            "packed blob missing offset metadata {} {}",
-                            pack.pack_id, oid
-                        );
-                    }
-                    PackObjectIssue::MissingBlobLength { oid } => {
-                        eprintln!(
-                            "packed blob missing length metadata {} {}",
-                            pack.pack_id, oid
-                        );
-                    }
-                    PackObjectIssue::BlobRangeOutOfBounds { oid } => {
-                        eprintln!(
-                            "packed blob range out of pack bounds {} {}",
-                            pack.pack_id, oid
-                        );
-                    }
-                }
-            }
-        }
-    }
-    for pack_id in missing_pack_metadata_ids(
-        blobs_by_pack.keys().copied(),
-        export.packs.iter().map(|pack| pack.pack_id.as_str()),
-    ) {
-        *missing += 1;
-        eprintln!("packed blob references missing pack metadata {pack_id}");
-    }
-    Ok(())
 }
 
 fn build_restore_plan(
