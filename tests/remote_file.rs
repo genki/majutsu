@@ -1904,7 +1904,7 @@ fn clone_rejects_invalid_remote_restore_archive_config_without_creating_home() {
 }
 
 #[test]
-fn clone_cleans_staging_home_when_object_download_fails() {
+fn clone_rejects_missing_remote_objects_before_creating_home() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let remote = tmp.path().join("remote");

@@ -3285,6 +3285,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
     validate_config(&export.config)?;
+    ensure_clone_objects_available(&remote, &export)?;
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
     let clone_result = (|| -> Result<()> {
@@ -3352,6 +3353,33 @@ fn clone_staging_home(home: &Path) -> PathBuf {
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| "majutsu".into());
     parent.join(format!(".{name}.clone-{}", Uuid::new_v4()))
+}
+
+fn ensure_clone_objects_available(remote: &RemoteStore, export: &MetadataExport) -> Result<()> {
+    let mut missing = Vec::new();
+    for key in local_object_keys(export) {
+        if !remote_object_available(remote, &key)? {
+            missing.push(key);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let sample = missing
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if missing.len() > 5 {
+        format!(", ... {} more", missing.len() - 5)
+    } else {
+        String::new()
+    };
+    bail!(
+        "remote is missing {} object(s) required for clone: {sample}{suffix}",
+        missing.len()
+    )
 }
 
 fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String> {
