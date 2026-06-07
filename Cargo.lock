@@ -1562,6 +1562,7 @@ dependencies = [
 name = "majutsu-restore"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "majutsu-core",
  "serde",
