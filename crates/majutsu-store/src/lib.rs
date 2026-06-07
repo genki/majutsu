@@ -144,6 +144,46 @@ impl RemoteChunkIndexShard {
             .collect::<std::collections::BTreeSet<_>>();
         unique.len() != self.chunks.len()
     }
+
+    pub fn validation_issues(
+        &self,
+        expected: &[RemoteChunkIndexEntry],
+    ) -> Vec<RemoteChunkIndexIssue> {
+        let mut issues = Vec::new();
+        if self.version != 1
+            || self.shard != DEFAULT_CHUNK_INDEX_SHARD
+            || self.chunks.len() != expected.len()
+        {
+            issues.push(RemoteChunkIndexIssue::ShardMetadataMismatch);
+            return issues;
+        }
+        if self.has_duplicate_oids() {
+            issues.push(RemoteChunkIndexIssue::DuplicateShardOids);
+        }
+        let expected = expected
+            .iter()
+            .map(|entry| (entry.oid.as_str(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &self.chunks {
+            let Some(expected_entry) = expected.get(entry.oid.as_str()) else {
+                issues.push(RemoteChunkIndexIssue::UnexpectedEntry(entry.oid.clone()));
+                continue;
+            };
+            if !seen.insert(entry.oid.as_str()) {
+                issues.push(RemoteChunkIndexIssue::DuplicateEntry(entry.oid.clone()));
+            }
+            if entry != *expected_entry {
+                issues.push(RemoteChunkIndexIssue::EntryMismatch(entry.oid.clone()));
+            }
+        }
+        for oid in expected.keys() {
+            if !seen.contains(oid) {
+                issues.push(RemoteChunkIndexIssue::MissingEntry((*oid).to_string()));
+            }
+        }
+        issues
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +204,16 @@ impl RemoteChunkIndexEntry {
             canonical_key,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteChunkIndexIssue {
+    ShardMetadataMismatch,
+    DuplicateShardOids,
+    UnexpectedEntry(String),
+    DuplicateEntry(String),
+    EntryMismatch(String),
+    MissingEntry(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,6 +615,63 @@ mod tests {
         );
 
         assert!(shard.has_duplicate_oids());
+    }
+
+    #[test]
+    fn remote_chunk_index_validation_accepts_matching_entries() {
+        let expected = vec![RemoteChunkIndexEntry::new(
+            "oid-1".into(),
+            42,
+            "objects/chunks/oid-1".into(),
+            Some("objects/by-hash/chunks/oid-1".into()),
+        )];
+        let shard = RemoteChunkIndexShard::new(DateTime::<Utc>::UNIX_EPOCH, expected.clone());
+
+        assert!(shard.validation_issues(&expected).is_empty());
+    }
+
+    #[test]
+    fn remote_chunk_index_validation_reports_shape_mismatch() {
+        let expected = vec![RemoteChunkIndexEntry::new(
+            "oid-1".into(),
+            42,
+            "objects/chunks/oid-1".into(),
+            None,
+        )];
+        let mut shard = RemoteChunkIndexShard::new(DateTime::<Utc>::UNIX_EPOCH, expected.clone());
+        shard.shard = "other".into();
+
+        assert_eq!(
+            shard.validation_issues(&expected),
+            vec![RemoteChunkIndexIssue::ShardMetadataMismatch]
+        );
+    }
+
+    #[test]
+    fn remote_chunk_index_validation_reports_entry_issues() {
+        let expected = vec![
+            RemoteChunkIndexEntry::new("oid-1".into(), 42, "objects/chunks/oid-1".into(), None),
+            RemoteChunkIndexEntry::new("oid-2".into(), 43, "objects/chunks/oid-2".into(), None),
+            RemoteChunkIndexEntry::new("oid-3".into(), 44, "objects/chunks/oid-3".into(), None),
+        ];
+        let shard = RemoteChunkIndexShard::new(
+            DateTime::<Utc>::UNIX_EPOCH,
+            vec![
+                RemoteChunkIndexEntry::new("oid-1".into(), 99, "objects/chunks/oid-1".into(), None),
+                RemoteChunkIndexEntry::new("oid-2".into(), 43, "objects/chunks/oid-2".into(), None),
+                RemoteChunkIndexEntry::new("oid-2".into(), 43, "objects/chunks/oid-2".into(), None),
+            ],
+        );
+
+        assert_eq!(
+            shard.validation_issues(&expected),
+            vec![
+                RemoteChunkIndexIssue::DuplicateShardOids,
+                RemoteChunkIndexIssue::EntryMismatch("oid-1".into()),
+                RemoteChunkIndexIssue::DuplicateEntry("oid-2".into()),
+                RemoteChunkIndexIssue::MissingEntry("oid-3".into()),
+            ]
+        );
     }
 
     #[test]
