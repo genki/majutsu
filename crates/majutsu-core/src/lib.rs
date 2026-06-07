@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -21,6 +21,32 @@ pub struct Root {
     pub name: String,
     pub path: String,
     pub status: RootStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotMode {
+    Default,
+    Strict,
+    Transactional,
+}
+
+impl SnapshotMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "default" => Ok(Self::Default),
+            "strict" => Ok(Self::Strict),
+            "transactional" => Ok(Self::Transactional),
+            _ => bail!("snapshot mode must be default, strict, or transactional"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Strict => "strict",
+            Self::Transactional => "transactional",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +496,24 @@ mod tests {
             serde_json::from_value::<RootStatus>(serde_json::Value::String(status.into()))
                 .unwrap_or_else(|err| panic!("root status {status} should deserialize: {err}"));
         }
+    }
+
+    #[test]
+    fn snapshot_mode_matches_spec_guarantee_levels() {
+        assert_eq!(
+            SnapshotMode::parse("default").unwrap(),
+            SnapshotMode::Default
+        );
+        assert_eq!(SnapshotMode::parse("strict").unwrap(), SnapshotMode::Strict);
+        assert_eq!(
+            SnapshotMode::parse("transactional").unwrap(),
+            SnapshotMode::Transactional
+        );
+        assert_eq!(SnapshotMode::Transactional.as_str(), "transactional");
+        assert_eq!(
+            SnapshotMode::parse("eventual").unwrap_err().to_string(),
+            "snapshot mode must be default, strict, or transactional"
+        );
     }
 
     #[test]

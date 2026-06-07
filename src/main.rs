@@ -12,9 +12,9 @@ use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
     FileRecord, LargeChunk, LargeManifest, OperationLogEntry as OperationExport, Payload,
-    RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
-    encode_operation_log, operation_log_entry_matches, payload_blob_ref, payload_blob_ref_mut,
-    payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
+    RootSnapshot, SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest,
+    decode_operation_log, encode_operation_log, operation_log_entry_matches, payload_blob_ref,
+    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -8384,10 +8384,7 @@ fn build_ignore(root: &RootConfig) -> Result<Gitignore> {
 }
 
 fn validate_snapshot_mode(mode: &str) -> Result<()> {
-    match mode {
-        "default" | "strict" | "transactional" => Ok(()),
-        _ => bail!("snapshot mode must be default, strict, or transactional"),
-    }
+    SnapshotMode::parse(mode).map(|_| ())
 }
 
 fn validate_watch_mode(mode: &str) -> Result<()> {
