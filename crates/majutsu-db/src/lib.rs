@@ -77,6 +77,20 @@ pub struct UploadQueueItem {
     pub attempts: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadQueueItemIssue {
+    IdDoesNotMatchKey { expected: String },
+    InvalidKey { reason: RemoteObjectKeyIssue },
+    BothSourceAndInline,
+    MissingPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteObjectKeyIssue {
+    NotRelativeSlashPath,
+    UnsafeComponent,
+}
+
 impl UploadQueueItem {
     pub fn inline(id: String, key: String, bytes: Vec<u8>, created_at: DateTime<Utc>) -> Self {
         Self {
@@ -111,6 +125,46 @@ impl UploadQueueItem {
     pub fn record_attempt(&mut self) {
         self.attempts += 1;
     }
+
+    pub fn validation_issues(&self) -> Vec<UploadQueueItemIssue> {
+        let mut issues = Vec::new();
+        let expected_id = expected_upload_queue_item_id(&self.key);
+        if self.id != expected_id {
+            issues.push(UploadQueueItemIssue::IdDoesNotMatchKey {
+                expected: expected_id,
+            });
+        }
+        if let Some(reason) = remote_object_key_issue(&self.key) {
+            issues.push(UploadQueueItemIssue::InvalidKey { reason });
+        }
+        match (&self.source, &self.inline) {
+            (Some(_), Some(_)) => issues.push(UploadQueueItemIssue::BothSourceAndInline),
+            (None, None) => issues.push(UploadQueueItemIssue::MissingPayload),
+            _ => {}
+        }
+        issues
+    }
+}
+
+pub fn expected_upload_queue_item_id(key: &str) -> String {
+    format!("upload-{}", blake3::hash(key.as_bytes()).to_hex())
+}
+
+pub fn is_valid_remote_object_key(key: &str) -> bool {
+    remote_object_key_issue(key).is_none()
+}
+
+pub fn remote_object_key_issue(key: &str) -> Option<RemoteObjectKeyIssue> {
+    if key.is_empty() || key.starts_with('/') || key.ends_with('/') || key.contains('\\') {
+        return Some(RemoteObjectKeyIssue::NotRelativeSlashPath);
+    }
+    if key
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Some(RemoteObjectKeyIssue::UnsafeComponent);
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +173,13 @@ pub struct EventJournalRecord {
     pub kind: String,
     pub observed_at: DateTime<Utc>,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventJournalRecordIssue {
+    EmptyEventId,
+    EmptyKind,
+    EmptyDetail,
 }
 
 impl EventJournalRecord {
@@ -137,6 +198,20 @@ impl EventJournalRecord {
 
     pub fn is_pending_trigger(&self) -> bool {
         matches!(self.kind.as_str(), "fs-event" | "periodic-rescan")
+    }
+
+    pub fn validation_issues(&self) -> Vec<EventJournalRecordIssue> {
+        let mut issues = Vec::new();
+        if self.event_id.trim().is_empty() {
+            issues.push(EventJournalRecordIssue::EmptyEventId);
+        }
+        if self.kind.trim().is_empty() {
+            issues.push(EventJournalRecordIssue::EmptyKind);
+        }
+        if self.detail.trim().is_empty() {
+            issues.push(EventJournalRecordIssue::EmptyDetail);
+        }
+        issues
     }
 }
 
@@ -258,6 +333,78 @@ mod tests {
     }
 
     #[test]
+    fn upload_queue_item_validation_reports_fsck_invariants() {
+        let item = UploadQueueItem {
+            id: "wrong".into(),
+            key: "../bad".into(),
+            source: Some("/tmp/a".into()),
+            inline: Some(b"abc".to_vec()),
+            created_at: time(10),
+            attempts: 0,
+        };
+
+        let issues = item.validation_issues();
+
+        assert_eq!(
+            issues,
+            vec![
+                UploadQueueItemIssue::IdDoesNotMatchKey {
+                    expected: expected_upload_queue_item_id("../bad"),
+                },
+                UploadQueueItemIssue::InvalidKey {
+                    reason: RemoteObjectKeyIssue::UnsafeComponent,
+                },
+                UploadQueueItemIssue::BothSourceAndInline,
+            ]
+        );
+
+        let mut missing_payload = item;
+        missing_payload.id = expected_upload_queue_item_id("objects/a");
+        missing_payload.key = "objects/a".into();
+        missing_payload.source = None;
+        missing_payload.inline = None;
+        assert_eq!(
+            missing_payload.validation_issues(),
+            vec![UploadQueueItemIssue::MissingPayload]
+        );
+    }
+
+    #[test]
+    fn upload_queue_item_validation_accepts_valid_file_and_inline_items() {
+        let key = "objects/blobs/aa";
+        let inline = UploadQueueItem::inline(
+            expected_upload_queue_item_id(key),
+            key.into(),
+            b"abc".to_vec(),
+            time(10),
+        );
+        let file = UploadQueueItem::file(
+            expected_upload_queue_item_id(key),
+            key.into(),
+            "/tmp/a".into(),
+            time(10),
+        );
+
+        assert!(inline.validation_issues().is_empty());
+        assert!(file.validation_issues().is_empty());
+    }
+
+    #[test]
+    fn remote_object_key_validation_rejects_unsafe_shapes() {
+        for key in [
+            "",
+            "/objects/a",
+            "objects/a/",
+            "objects//a",
+            "objects/../a",
+            "a\\b",
+        ] {
+            assert!(!is_valid_remote_object_key(key), "{key} should be invalid");
+        }
+        assert!(is_valid_remote_object_key("objects/blobs/a"));
+    }
+
+    #[test]
     fn journal_pending_events_follow_latest_snapshot_finish() {
         assert!(has_pending_journal_events(&[EventJournalRecord::new(
             "event-1".into(),
@@ -302,5 +449,19 @@ mod tests {
             time(30),
             "replay".into(),
         )]));
+    }
+
+    #[test]
+    fn event_journal_record_validation_reports_empty_fields() {
+        let event = EventJournalRecord::new(" ".into(), "".into(), time(10), "\t".into());
+
+        assert_eq!(
+            event.validation_issues(),
+            vec![
+                EventJournalRecordIssue::EmptyEventId,
+                EventJournalRecordIssue::EmptyKind,
+                EventJournalRecordIssue::EmptyDetail,
+            ]
+        );
     }
 }

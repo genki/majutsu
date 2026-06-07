@@ -20,7 +20,10 @@ use majutsu_core::{
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
-use majutsu_db::{EventJournalRecord, UploadQueueItem};
+use majutsu_db::{
+    EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
+    UploadQueueItemIssue, expected_upload_queue_item_id,
+};
 use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
 use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
 use majutsu_restore::{
@@ -3036,7 +3039,7 @@ fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()>
     write_upload_item(
         paths,
         UploadQueueItem::inline(
-            format!("upload-{}", blake3_hex(key.as_bytes())),
+            expected_upload_queue_item_id(key),
             key.to_string(),
             bytes,
             Utc::now(),
@@ -3048,7 +3051,7 @@ fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Result<()> {
     write_upload_item(
         paths,
         UploadQueueItem::file(
-            format!("upload-{}", blake3_hex(key.as_bytes())),
+            expected_upload_queue_item_id(key),
             key.to_string(),
             path_to_slash(source),
             Utc::now(),
@@ -4916,17 +4919,19 @@ fn validate_event_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
                 path.display()
             );
         }
-        if event.event_id.trim().is_empty() {
+        for issue in event.validation_issues() {
             *missing += 1;
-            eprintln!("event journal item has empty event id {}", path.display());
-        }
-        if event.kind.trim().is_empty() {
-            *missing += 1;
-            eprintln!("event journal item has empty kind {}", event.event_id);
-        }
-        if event.detail.trim().is_empty() {
-            *missing += 1;
-            eprintln!("event journal item has empty detail {}", event.event_id);
+            match issue {
+                EventJournalRecordIssue::EmptyEventId => {
+                    eprintln!("event journal item has empty event id {}", path.display());
+                }
+                EventJournalRecordIssue::EmptyKind => {
+                    eprintln!("event journal item has empty kind {}", event.event_id);
+                }
+                EventJournalRecordIssue::EmptyDetail => {
+                    eprintln!("event journal item has empty detail {}", event.event_id);
+                }
+            }
         }
         if !seen.insert(event.event_id.clone()) {
             *missing += 1;
@@ -4964,52 +4969,52 @@ fn validate_upload_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
                 path.display()
             );
         }
-        let expected_id = format!("upload-{}", blake3_hex(item.key.as_bytes()));
-        if item.id != expected_id {
-            *missing += 1;
-            eprintln!(
-                "upload queue item id does not match key {} expected {}",
-                item.id, expected_id
-            );
-        }
-        if let Err(err) = validate_remote_object_key(&item.key) {
-            *missing += 1;
-            eprintln!("upload queue item has invalid key {}: {err}", item.id);
-        }
+        let mut missing_source = None;
         match (&item.source, &item.inline) {
             (Some(source), None) => {
                 if !Path::new(source).exists() {
-                    *missing += 1;
-                    eprintln!("upload queue item source is missing {} {source}", item.id);
+                    missing_source = Some(source.as_str());
                 }
             }
-            (None, Some(_)) => {}
-            (Some(_), Some(_)) => {
-                *missing += 1;
-                eprintln!(
-                    "upload queue item has both source and inline payload {}",
-                    item.id
-                );
-            }
-            (None, None) => {
-                *missing += 1;
-                eprintln!(
-                    "upload queue item has neither source nor inline payload {}",
-                    item.id
-                );
+            _ => {}
+        }
+        for issue in item.validation_issues() {
+            *missing += 1;
+            match issue {
+                UploadQueueItemIssue::IdDoesNotMatchKey { expected } => {
+                    eprintln!(
+                        "upload queue item id does not match key {} expected {}",
+                        item.id, expected
+                    );
+                }
+                UploadQueueItemIssue::InvalidKey { reason } => {
+                    let reason = match reason {
+                        RemoteObjectKeyIssue::NotRelativeSlashPath => {
+                            "remote object key must be a relative slash path"
+                        }
+                        RemoteObjectKeyIssue::UnsafeComponent => {
+                            "remote object key must not contain empty, '.', or '..' components"
+                        }
+                    };
+                    eprintln!("upload queue item has invalid key {}: {reason}", item.id);
+                }
+                UploadQueueItemIssue::BothSourceAndInline => {
+                    eprintln!(
+                        "upload queue item has both source and inline payload {}",
+                        item.id
+                    );
+                }
+                UploadQueueItemIssue::MissingPayload => {
+                    eprintln!(
+                        "upload queue item has neither source nor inline payload {}",
+                        item.id
+                    );
+                }
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_remote_object_key(key: &str) -> Result<()> {
-    if key.is_empty() || key.starts_with('/') || key.ends_with('/') || key.contains('\\') {
-        bail!("remote object key must be a relative slash path");
-    }
-    for part in key.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            bail!("remote object key must not contain empty, '.', or '..' components");
+        if let Some(source) = missing_source {
+            *missing += 1;
+            eprintln!("upload queue item source is missing {} {source}", item.id);
         }
     }
     Ok(())
