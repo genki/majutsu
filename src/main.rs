@@ -7917,55 +7917,10 @@ fn open_db(paths: &Paths) -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "
-        create table if not exists roots(id text primary key, data_json text not null);
-        create table if not exists snapshots(
-          id text primary key,
-          parent_id text,
-          op_id text not null,
-          created_at text not null,
-          manifest_key text not null,
-          manifest_json text not null
-        );
-        create table if not exists operations(
-          id text primary key,
-          parent_op text,
-          kind text not null,
-          actor text not null default 'local',
-          status text not null default 'done',
-          before_snapshot text,
-          after_snapshot text,
-          created_at text not null,
-          message text
-        );
-        create table if not exists refs(name text primary key, value text not null);
-        create table if not exists blobs(oid text primary key, size integer not null, object_key text not null);
-        create table if not exists packs(pack_id text primary key, pack_key text not null, index_key text not null, object_count integer not null, size integer not null);
-        create table if not exists large_objects(oid text primary key, size integer not null, chunk_count integer not null, manifest_key text not null);
-        create table if not exists chunks(oid text primary key, size integer not null, object_key text not null);
-        create table if not exists large_pins(oid text primary key, pinned_at text not null, reason text);
-        create table if not exists remote_refs(
-          remote text not null,
-          name text not null,
-          value text not null,
-          observed_at text not null,
-          primary key(remote, name)
-        );
-        ",
-    )?;
-    let _ = conn.execute("alter table blobs add column pack_id text", []);
-    let _ = conn.execute("alter table blobs add column pack_offset integer", []);
-    let _ = conn.execute("alter table blobs add column pack_len integer", []);
-    let _ = conn.execute("alter table operations add column parent_op text", []);
-    let _ = conn.execute(
-        "alter table operations add column actor text not null default 'local'",
-        [],
-    );
-    let _ = conn.execute(
-        "alter table operations add column status text not null default 'done'",
-        [],
-    );
+    conn.execute_batch(majutsu_db::schema_sql())?;
+    for migration in majutsu_db::compat_migrations() {
+        let _ = conn.execute(migration, []);
+    }
     Ok(())
 }
 

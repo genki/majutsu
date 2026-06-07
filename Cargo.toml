@@ -34,6 +34,7 @@ libc = "0.2"
 majutsu-core = { path = "crates/majutsu-core" }
 majutsu-crypto = { path = "crates/majutsu-crypto" }
 majutsu-daemon = { path = "crates/majutsu-daemon" }
+majutsu-db = { path = "crates/majutsu-db" }
 majutsu-large = { path = "crates/majutsu-large" }
 majutsu-pack = { path = "crates/majutsu-pack" }
 majutsu-policy = { path = "crates/majutsu-policy" }

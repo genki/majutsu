@@ -1458,6 +1458,7 @@ dependencies = [
  "majutsu-core",
  "majutsu-crypto",
  "majutsu-daemon",
+ "majutsu-db",
  "majutsu-large",
  "majutsu-pack",
  "majutsu-policy",
