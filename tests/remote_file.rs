@@ -1130,6 +1130,9 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     assert!(config.contains("encryption = \"age\""));
     assert!(config.contains("key_id = \"default\""));
     assert!(config.contains("hash = \"blake3-keyed\""));
+    let recipients = fs::read_to_string(state.join("keys/recipients.toml")).unwrap();
+    assert!(recipients.contains("age1"));
+    assert!(recipients.contains("AGE-SECRET-KEY-"));
     run({
         let mut c = mj();
         c.arg("--home")
@@ -1150,17 +1153,6 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let key_output = mj()
-        .arg("--home")
-        .arg(&state)
-        .arg("key")
-        .arg("export")
-        .output()
-        .unwrap();
-    assert!(key_output.status.success());
-    let key = String::from_utf8_lossy(&key_output.stdout)
-        .trim()
-        .to_string();
     let plain_oid = blake3::hash(b"secret\n").to_hex().to_string();
     assert!(
         !remote
@@ -1174,7 +1166,8 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     let object_key = export["blobs"][0]["object_key"].as_str().unwrap();
     assert!(!object_key.contains(&plain_oid));
     let object = fs::read(remote.join(object_key)).unwrap();
-    assert!(object.starts_with(b"MJENC1\n"));
+    assert!(object.starts_with(b"age-encryption.org/v1"));
+    assert!(remote.join("keys/recipients.toml").exists());
 
     let status = mj()
         .arg("--home")
@@ -1182,7 +1175,6 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
         .arg("clone")
         .arg("--remote")
         .arg(format!("file://{}", remote.display()))
-        .env("MAJUTSU_MASTER_KEY", &key)
         .status()
         .unwrap();
     assert!(status.success());
@@ -1240,7 +1232,6 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
         .arg("clone")
         .arg("--remote")
         .arg(format!("file://{}", remote.display()))
-        .env("MAJUTSU_MASTER_KEY", new_key)
         .status()
         .unwrap();
     assert!(status.success());

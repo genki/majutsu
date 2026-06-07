@@ -1,3 +1,4 @@
+use age::secrecy::ExposeSecret;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -567,6 +568,14 @@ struct SecurityConfig {
     key_id: String,
     #[serde(default = "default_security_hash")]
     hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct AgeKeyring {
+    #[serde(default)]
+    recipients: Vec<String>,
+    #[serde(default)]
+    identities: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1228,6 +1237,9 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
     fs::write(&paths.host, toml::to_string_pretty(&config.host)?)?;
     if encryption_enabled(&config.security)? && !paths.master_key.exists() {
         write_master_key(paths, &random_key_hex()?)?;
+    }
+    if config.security.encryption == "age" {
+        ensure_age_keyring(paths)?;
     }
     let conn = open_db(paths)?;
     migrate(&conn)?;
@@ -2899,6 +2911,10 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         "hosts/index.json",
         serde_json::to_vec_pretty(&host_index)?,
     )?;
+    let recipients = paths.home.join("keys/recipients.toml");
+    if recipients.exists() {
+        enqueue_file_upload(paths, "keys/recipients.toml", &recipients)?;
+    }
     enqueue_inline_upload(
         paths,
         CHUNK_INDEX_SHARD_KEY,
@@ -3388,6 +3404,12 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     export.config.remote = Some(remote_config);
     write_config(paths, &export.config)?;
     fs::write(&paths.host, toml::to_string_pretty(&export.config.host)?)?;
+    if remote.exists("keys/recipients.toml")? {
+        fs::write(
+            paths.home.join("keys/recipients.toml"),
+            remote.get("keys/recipients.toml")?,
+        )?;
+    }
     if export.config.security.encryption != "none" {
         if let Ok(key) = env::var("MAJUTSU_MASTER_KEY") {
             write_master_key(paths, &key)?;
@@ -7560,6 +7582,7 @@ fn fsync_parent_dir(path: &Path) -> Result<()> {
 }
 
 const ENC_MAGIC: &[u8] = b"MJENC1\n";
+const AGE_MAGIC: &[u8] = b"age-encryption.org/v1";
 
 fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
     let config = if paths.config.exists() {
@@ -7573,6 +7596,14 @@ fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
         .transpose()?
         .unwrap_or(false)
     {
+        if config
+            .as_ref()
+            .is_some_and(|config| config.security.encryption == "age")
+        {
+            if let Some(ciphertext) = age_encrypt_object(paths, bytes)? {
+                return Ok(ciphertext);
+            }
+        }
         let key_hex = read_master_key(paths)?;
         let key_bytes = hex::decode(key_hex.trim())?;
         let key = Key::from_slice(&key_bytes);
@@ -7647,6 +7678,9 @@ fn read_blob_payload(
 }
 
 fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.starts_with(AGE_MAGIC) {
+        return age_decrypt_object(paths, bytes);
+    }
     if !bytes.starts_with(ENC_MAGIC) {
         return Ok(bytes.to_vec());
     }
@@ -7662,6 +7696,98 @@ fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
     cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext)
         .map_err(|_| anyhow!("object decryption failed"))
+}
+
+fn age_encrypt_object(paths: &Paths, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let recipients = read_age_recipients(paths)?;
+    if recipients.is_empty() {
+        return Ok(None);
+    }
+    let recipient_refs = recipients
+        .iter()
+        .map(|recipient| recipient as &dyn age::Recipient)
+        .collect::<Vec<_>>();
+    let encryptor = age::Encryptor::with_recipients(recipient_refs.into_iter())?;
+    let mut ciphertext = Vec::with_capacity(bytes.len());
+    let mut writer = encryptor.wrap_output(&mut ciphertext)?;
+    writer.write_all(bytes)?;
+    writer.finish()?;
+    Ok(Some(ciphertext))
+}
+
+fn age_decrypt_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
+    let identities = read_age_identities(paths)?;
+    if identities.is_empty() {
+        bail!("age encrypted object requires an identity in keys/recipients.toml");
+    }
+    let identity_refs = identities
+        .iter()
+        .map(|identity| identity as &dyn age::Identity)
+        .collect::<Vec<_>>();
+    let decryptor = age::Decryptor::new_buffered(bytes)?;
+    let mut reader = decryptor.decrypt(identity_refs.into_iter())?;
+    let mut plaintext = Vec::new();
+    reader.read_to_end(&mut plaintext)?;
+    Ok(plaintext)
+}
+
+fn recipients_path(paths: &Paths) -> PathBuf {
+    paths.home.join("keys/recipients.toml")
+}
+
+fn read_age_keyring(paths: &Paths) -> Result<AgeKeyring> {
+    let path = recipients_path(paths);
+    if !path.exists() {
+        return Ok(AgeKeyring::default());
+    }
+    toml::from_str(&fs::read_to_string(&path)?)
+        .with_context(|| format!("parse age keyring {}", path.display()))
+}
+
+fn write_age_keyring(paths: &Paths, keyring: &AgeKeyring) -> Result<()> {
+    let path = recipients_path(paths);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, toml::to_string_pretty(keyring)?)?;
+    Ok(())
+}
+
+fn ensure_age_keyring(paths: &Paths) -> Result<()> {
+    let mut keyring = read_age_keyring(paths)?;
+    if keyring.recipients.is_empty() && keyring.identities.is_empty() {
+        let identity = age::x25519::Identity::generate();
+        keyring.recipients.push(identity.to_public().to_string());
+        keyring
+            .identities
+            .push(identity.to_string().expose_secret().to_string());
+        write_age_keyring(paths, &keyring)?;
+    }
+    Ok(())
+}
+
+fn read_age_recipients(paths: &Paths) -> Result<Vec<age::x25519::Recipient>> {
+    read_age_keyring(paths)?
+        .recipients
+        .into_iter()
+        .map(|recipient| {
+            recipient
+                .parse()
+                .map_err(|err| anyhow!("invalid age recipient {recipient}: {err}"))
+        })
+        .collect()
+}
+
+fn read_age_identities(paths: &Paths) -> Result<Vec<age::x25519::Identity>> {
+    read_age_keyring(paths)?
+        .identities
+        .into_iter()
+        .map(|identity| {
+            identity
+                .parse()
+                .map_err(|err| anyhow!("invalid age identity: {err}"))
+        })
+        .collect()
 }
 
 fn random_key_hex() -> Result<String> {
