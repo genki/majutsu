@@ -9286,6 +9286,23 @@ fn daemon_status_uses_ipc_socket() {
             .arg(&source);
         c
     });
+    let restore = tmp.path().join("restore");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(prepare.contains("restore_job "));
     let mut child = mj()
         .arg("--home")
         .arg(&state)
@@ -9311,6 +9328,11 @@ fn daemon_status_uses_ipc_socket() {
     });
     assert!(status.contains("ipc ok"));
     assert!(status.contains("roots 1"));
+    assert!(status.contains("root_status active 1"));
+    assert!(status.contains("pending_journal_events false"));
+    assert!(status.contains("queued_uploads 0"));
+    assert!(status.contains("restore_jobs 1"));
+    assert!(status.contains("restore_status prepared 1"));
     child.kill().unwrap();
     let _ = child.wait();
 }

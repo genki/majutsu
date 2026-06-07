@@ -1,4 +1,6 @@
 use anyhow::{Result, bail};
+use majutsu_restore::RestoreQueueItem;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -6,6 +8,7 @@ use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::process_runtime::{pid_alive, read_pid};
+use crate::queue_runtime::{has_pending_journal_events, upload_queue_items};
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::{Paths, open_db, resolve_paths};
@@ -91,19 +94,59 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
     match command.trim() {
         "status" => {
             let conn = open_db(&paths)?;
-            let roots = roots(&conn)?.len();
+            let roots = roots(&conn)?;
+            let mut root_statuses = BTreeMap::new();
+            for root in &roots {
+                *root_statuses.entry(root.status.as_str()).or_insert(0usize) += 1;
+            }
             let current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
+            let pending_journal_events = has_pending_journal_events(&paths)?;
+            let queued_uploads = upload_queue_items(&paths)?.len();
+            let restore_jobs = restore_queue_status_counts(&paths)?;
+            let active_restore_jobs = restore_jobs
+                .iter()
+                .filter(|(status, _)| status.as_str() != "done")
+                .map(|(_, count)| *count)
+                .sum::<usize>();
             let pid = std::process::id();
             writeln!(stream, "running pid {pid}")?;
             writeln!(stream, "ipc ok")?;
-            writeln!(stream, "roots {roots}")?;
+            writeln!(stream, "roots {}", roots.len())?;
             writeln!(stream, "current {current}")?;
+            writeln!(stream, "pending_journal_events {pending_journal_events}")?;
+            writeln!(stream, "queued_uploads {queued_uploads}")?;
+            writeln!(stream, "restore_jobs {active_restore_jobs}")?;
+            for (status, count) in root_statuses {
+                writeln!(stream, "root_status {status} {count}")?;
+            }
+            for (status, count) in restore_jobs {
+                writeln!(stream, "restore_status {status} {count}")?;
+            }
         }
         other => {
             writeln!(stream, "error unknown command {other}")?;
         }
     }
     Ok(())
+}
+
+fn restore_queue_status_counts(paths: &Paths) -> Result<BTreeMap<String, usize>> {
+    let dir = paths.home.join("queue/restores");
+    let mut counts = BTreeMap::new();
+    if !dir.exists() {
+        return Ok(counts);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let job: RestoreQueueItem = serde_json::from_slice(&fs::read(entry.path())?)?;
+        *counts.entry(job.status).or_insert(0) += 1;
+    }
+    Ok(counts)
 }
 
 #[cfg(unix)]
