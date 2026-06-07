@@ -396,6 +396,153 @@ fn file_remote_clone_restores_normal_and_large_files() {
 }
 
 #[test]
+fn multi_root_sync_clone_restore_preserves_host_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs");
+    let projects = tmp.path().join("projects");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(projects.join("data")).unwrap();
+    fs::write(docs.join("notes.txt"), b"docs v1\n").unwrap();
+    fs::write(projects.join("app.rs"), b"fn main() {}\n").unwrap();
+    fs::write(projects.join("data/payload.zip"), vec![7u8; 32 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--host-name")
+            .arg("multi-host")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("docs")
+            .arg(&docs);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("projects")
+            .arg(&projects)
+            .arg("--exclude")
+            .arg("**/target/**");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("initial multi-root");
+        c
+    });
+    fs::write(
+        projects.join("app.rs"),
+        b"fn main() { println!(\"v2\"); }\n",
+    )
+    .unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("project changed");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    assert_eq!(export["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(export["snapshots"].as_array().unwrap().len(), 2);
+    let first_manifest: serde_json::Value =
+        serde_json::from_str(export["snapshots"][0]["manifest_json"].as_str().unwrap()).unwrap();
+    let second_manifest: serde_json::Value =
+        serde_json::from_str(export["snapshots"][1]["manifest_json"].as_str().unwrap()).unwrap();
+    assert!(first_manifest["root_trees"].get("docs").is_some());
+    assert!(first_manifest["root_trees"].get("projects").is_some());
+    assert_eq!(
+        first_manifest["root_trees"]["docs"]["tree_id"],
+        second_manifest["root_trees"]["docs"]["tree_id"]
+    );
+    assert_ne!(
+        first_manifest["root_trees"]["projects"]["tree_id"],
+        second_manifest["root_trees"]["projects"]["tree_id"]
+    );
+
+    let host = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("host")
+            .arg("multi-host");
+        c
+    });
+    assert!(host.contains("roots 2"));
+    assert!(host.contains("snapshots 2"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(docs.join("notes.txt")).unwrap(),
+        fs::read(restore.join("docs/notes.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(projects.join("app.rs")).unwrap(),
+        fs::read(restore.join("projects/app.rs")).unwrap()
+    );
+    assert_eq!(
+        fs::read(projects.join("data/payload.zip")).unwrap(),
+        fs::read(restore.join("projects/data/payload.zip")).unwrap()
+    );
+}
+
+#[test]
 fn file_remote_clone_preserves_restore_archive_config() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
