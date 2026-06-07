@@ -1461,6 +1461,7 @@ dependencies = [
  "majutsu-pack",
  "majutsu-policy",
  "majutsu-restore",
+ "majutsu-watch",
  "notify",
  "quick-xml",
  "reqwest",

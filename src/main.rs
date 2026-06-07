@@ -16,6 +16,7 @@ use majutsu_core::{
 use majutsu_crypto::EncryptionMode;
 use majutsu_pack::{PackEntry, PackIndex, PackTier};
 use majutsu_restore::{RestoreChangeStats, RestorePathState, count_restore_changes};
+use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -3659,18 +3660,9 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
 }
 
 fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
-    match backend {
-        "notify" | "native" => Ok("notify"),
-        "poll" => Ok("poll"),
-        "inotify" => {
-            if cfg!(target_os = "linux") {
-                Ok("inotify")
-            } else {
-                bail!("inotify backend is only available on Linux")
-            }
-        }
-        other => bail!("unsupported watch backend: {other}"),
-    }
+    WatchBackend::normalize(backend)
+        .map(|backend| backend.as_cli())
+        .map_err(anyhow::Error::msg)
 }
 
 fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedWatchArgs> {
@@ -3689,11 +3681,7 @@ fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedW
 }
 
 fn default_daemon_backend() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "inotify"
-    } else {
-        "notify"
-    }
+    majutsu_watch::default_backend()
 }
 
 fn default_watch_backend() -> String {
@@ -8922,10 +8910,9 @@ fn validate_snapshot_mode(mode: &str) -> Result<()> {
 }
 
 fn validate_watch_mode(mode: &str) -> Result<()> {
-    match mode {
-        "default" | "strict" | "transactional" => Ok(()),
-        _ => bail!("watch mode must be default, strict, or transactional"),
-    }
+    WatchMode::normalize(mode)
+        .map(|_| ())
+        .map_err(anyhow::Error::msg)
 }
 
 fn validate_security_config(security: &SecurityConfig) -> Result<()> {
@@ -9412,23 +9399,23 @@ impl Default for PackConfig {
 }
 
 fn default_watch_mode() -> String {
-    "default".into()
+    majutsu_watch::default_mode().into()
 }
 
 fn default_watch_debounce_ms() -> u64 {
-    1500
+    majutsu_watch::default_debounce().as_millis() as u64
 }
 
 fn default_watch_settle_ms() -> u64 {
-    500
+    majutsu_watch::default_settle().as_millis() as u64
 }
 
 fn default_watch_periodic_rescan_secs() -> u64 {
-    3600
+    majutsu_watch::default_periodic_rescan().as_secs()
 }
 
 fn default_watch_interval_secs() -> u64 {
-    60
+    majutsu_watch::default_poll_interval().as_secs()
 }
 
 fn default_security_key_id() -> String {

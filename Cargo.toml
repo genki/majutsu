@@ -37,6 +37,7 @@ majutsu-large = { path = "crates/majutsu-large" }
 majutsu-pack = { path = "crates/majutsu-pack" }
 majutsu-policy = { path = "crates/majutsu-policy" }
 majutsu-restore = { path = "crates/majutsu-restore" }
+majutsu-watch = { path = "crates/majutsu-watch" }
 notify = "8"
 quick-xml = "0.37"
 reqwest = { version = "0.12", features = ["blocking"] }
