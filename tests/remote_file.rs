@@ -1994,13 +1994,18 @@ fn xdg_config_can_select_state_home() {
 fn operations_are_appended_to_local_oplog() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
     let state = tmp.path().join("state");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
 
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("init");
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
         c
     });
     let oplog = state.join("ops/local-oplog.cborl");
@@ -2027,6 +2032,45 @@ fn operations_are_appended_to_local_oplog() {
         c
     });
     assert!(fs::metadata(&oplog).unwrap().len() > root_add_len);
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    let snapshot_op = op_log
+        .lines()
+        .find(|line| line.contains("manual-snapshot"))
+        .and_then(|line| line.split('\t').next())
+        .unwrap()
+        .to_string();
+    let op_show = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("show")
+            .arg(&snapshot_op);
+        c
+    });
+    assert!(op_show.contains("parent op-"));
+    assert!(op_show.contains("actor "));
+    assert!(op_show.contains("status done"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let op = export["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|op| op["id"] == snapshot_op)
+        .unwrap();
+    assert!(op["parent_op"].as_str().unwrap().starts_with("op-"));
+    assert_eq!(op["status"], "done");
+    assert!(op["actor"].as_str().unwrap().contains('@'));
 }
 
 #[test]

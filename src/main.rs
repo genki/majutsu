@@ -725,7 +725,10 @@ struct SnapshotExport {
 #[derive(Debug, Serialize, Deserialize)]
 struct OperationExport {
     id: String,
+    parent_op: Option<String>,
     kind: String,
+    actor: String,
+    status: String,
     before_snapshot: Option<String>,
     after_snapshot: Option<String>,
     created_at: String,
@@ -1546,7 +1549,10 @@ fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
         OpCommand::Show { op_id } => {
             let op = query_operation(&conn, &op_id)?;
             println!("id {}", op.id);
+            println!("parent {}", op.parent_op.unwrap_or_else(|| "(none)".into()));
             println!("kind {}", op.kind);
+            println!("actor {}", op.actor);
+            println!("status {}", op.status);
             println!(
                 "before {}",
                 op.before_snapshot.unwrap_or_else(|| "(none)".into())
@@ -5445,7 +5451,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         create table if not exists operations(
           id text primary key,
+          parent_op text,
           kind text not null,
+          actor text not null default 'local',
+          status text not null default 'done',
           before_snapshot text,
           after_snapshot text,
           created_at text not null,
@@ -5462,6 +5471,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute("alter table blobs add column pack_id text", []);
     let _ = conn.execute("alter table blobs add column pack_offset integer", []);
     let _ = conn.execute("alter table blobs add column pack_len integer", []);
+    let _ = conn.execute("alter table operations add column parent_op text", []);
+    let _ = conn.execute(
+        "alter table operations add column actor text not null default 'local'",
+        [],
+    );
+    let _ = conn.execute(
+        "alter table operations add column status text not null default 'done'",
+        [],
+    );
     Ok(())
 }
 
@@ -5486,16 +5504,19 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
 
     let mut operations = Vec::new();
     let mut stmt = conn.prepare(
-        "select id, kind, before_snapshot, after_snapshot, created_at, message from operations order by created_at",
+        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations order by created_at",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(OperationExport {
             id: row.get(0)?,
-            kind: row.get(1)?,
-            before_snapshot: row.get(2)?,
-            after_snapshot: row.get(3)?,
-            created_at: row.get(4)?,
-            message: row.get(5)?,
+            parent_op: row.get(1)?,
+            kind: row.get(2)?,
+            actor: row.get(3)?,
+            status: row.get(4)?,
+            before_snapshot: row.get(5)?,
+            after_snapshot: row.get(6)?,
+            created_at: row.get(7)?,
+            message: row.get(8)?,
         })
     })?;
     for row in rows {
@@ -5573,11 +5594,14 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
     }
     for op in &export.operations {
         conn.execute(
-            "insert or replace into operations(id, kind, before_snapshot, after_snapshot, created_at, message)
-             values (?1, ?2, ?3, ?4, ?5, ?6)",
+            "insert or replace into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 op.id,
+                op.parent_op,
                 op.kind,
+                op.actor,
+                op.status,
                 op.before_snapshot,
                 op.after_snapshot,
                 op.created_at,
@@ -5898,16 +5922,24 @@ fn record_op_with_id(
     message: Option<&str>,
 ) -> Result<()> {
     let created_at = Utc::now().to_rfc3339();
+    let parent_op = current_operation(conn)?;
+    let actor = operation_actor();
+    let status = "done";
     conn.execute(
-        "insert into operations(id, kind, before_snapshot, after_snapshot, created_at, message)
-         values (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, kind, before, after, created_at, message],
+        "insert into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id, parent_op, kind, actor, status, before, after, created_at, message
+        ],
     )?;
     append_local_oplog(
         conn,
         &OperationExport {
             id: id.to_string(),
+            parent_op,
             kind: kind.to_string(),
+            actor,
+            status: status.to_string(),
             before_snapshot: before.map(str::to_string),
             after_snapshot: after.map(str::to_string),
             created_at,
@@ -5955,18 +5987,39 @@ fn local_oplog_path(conn: &Connection) -> Result<Option<PathBuf>> {
     Ok(Some(home.join("ops/local-oplog.cborl")))
 }
 
+fn current_operation(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "select id from operations order by rowid desc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn operation_actor() -> String {
+    let user = env::var("USER")
+        .or_else(|_| env::var("LOGNAME"))
+        .unwrap_or_else(|_| "local".into());
+    let host = env::var("HOSTNAME").unwrap_or_else(|_| "host".into());
+    format!("{user}@{host}")
+}
+
 fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
     conn.query_row(
-        "select id, kind, before_snapshot, after_snapshot, created_at, message from operations where id=?1",
+        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations where id=?1",
         params![op_id],
         |row| {
             Ok(OperationExport {
                 id: row.get(0)?,
-                kind: row.get(1)?,
-                before_snapshot: row.get(2)?,
-                after_snapshot: row.get(3)?,
-                created_at: row.get(4)?,
-                message: row.get(5)?,
+                parent_op: row.get(1)?,
+                kind: row.get(2)?,
+                actor: row.get(3)?,
+                status: row.get(4)?,
+                before_snapshot: row.get(5)?,
+                after_snapshot: row.get(6)?,
+                created_at: row.get(7)?,
+                message: row.get(8)?,
             })
         },
     )
