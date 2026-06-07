@@ -550,6 +550,8 @@ struct Config {
     security: SecurityConfig,
     #[serde(default)]
     tiering: TieringConfig,
+    #[serde(default)]
+    restore: RestoreConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -630,6 +632,20 @@ struct SecurityConfig {
     key_id: String,
     #[serde(default = "default_security_hash")]
     hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RestoreConfig {
+    #[serde(default)]
+    archive: RestoreArchiveConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RestoreArchiveConfig {
+    #[serde(default = "default_restore_archive_days")]
+    days: u32,
+    #[serde(default = "default_restore_archive_tier")]
+    tier: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1046,6 +1062,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                 hash: default_security_hash(),
             },
             tiering: TieringConfig::default(),
+            restore: RestoreConfig::default(),
         }
     };
     write_config(paths, &config)?;
@@ -6182,6 +6199,7 @@ fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) ->
         return Ok(());
     }
     let config = read_config(paths)?;
+    validate_restore_archive_config(&config.restore.archive)?;
     let Some(remote_config) = config.remote.as_ref() else {
         return Ok(());
     };
@@ -6189,11 +6207,25 @@ fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) ->
     let mut requested = Vec::new();
     for key in &job.archived_objects {
         let restore_key = remote_available_key(&remote, key)?;
-        if remote.restore_archive(&restore_key, 7, "Standard")? {
+        if remote.restore_archive(
+            &restore_key,
+            config.restore.archive.days,
+            &config.restore.archive.tier,
+        )? {
             requested.push(key.clone());
         }
     }
     job.mark_archive_requested(requested);
+    Ok(())
+}
+
+fn validate_restore_archive_config(config: &RestoreArchiveConfig) -> Result<()> {
+    if config.days == 0 {
+        bail!("restore archive days must be greater than zero");
+    }
+    if config.tier.trim().is_empty() {
+        bail!("restore archive tier must not be empty");
+    }
     Ok(())
 }
 
@@ -7147,6 +7179,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
             watch: config.watch.clone(),
             security: config.security.clone(),
             tiering: config.tiering.clone(),
+            restore: config.restore.clone(),
         },
         roots,
         snapshots,
@@ -8226,6 +8259,31 @@ fn default_security_key_id() -> String {
 
 fn default_security_hash() -> String {
     majutsu_crypto::default_security_hash().into()
+}
+
+fn default_restore_archive_days() -> u32 {
+    7
+}
+
+fn default_restore_archive_tier() -> String {
+    "Standard".into()
+}
+
+impl Default for RestoreArchiveConfig {
+    fn default() -> Self {
+        Self {
+            days: default_restore_archive_days(),
+            tier: default_restore_archive_tier(),
+        }
+    }
+}
+
+impl Default for RestoreConfig {
+    fn default() -> Self {
+        Self {
+            archive: RestoreArchiveConfig::default(),
+        }
+    }
 }
 
 impl Default for WatchConfig {
@@ -9862,6 +9920,62 @@ mod tests {
         assert!(remote.put_if_absent("objects/test", b"first").unwrap());
         assert!(!remote.put_if_absent("objects/test", b"second").unwrap());
         assert_eq!(remote.get("objects/test").unwrap(), b"first");
+    }
+
+    #[test]
+    fn restore_archive_config_defaults_and_validates() {
+        let legacy = r#"
+[host]
+id = "host-1"
+name = "test-host"
+
+[large]
+enabled = true
+always = []
+never = []
+"#;
+        let config: Config = toml::from_str(legacy).unwrap();
+        assert_eq!(config.restore.archive.days, 7);
+        assert_eq!(config.restore.archive.tier, "Standard");
+        validate_restore_archive_config(&config.restore.archive).unwrap();
+
+        let custom = r#"
+[host]
+id = "host-1"
+name = "test-host"
+
+[large]
+enabled = true
+always = []
+never = []
+
+[restore.archive]
+days = 3
+tier = "Bulk"
+"#;
+        let config: Config = toml::from_str(custom).unwrap();
+        assert_eq!(config.restore.archive.days, 3);
+        assert_eq!(config.restore.archive.tier, "Bulk");
+        validate_restore_archive_config(&config.restore.archive).unwrap();
+
+        assert!(
+            validate_restore_archive_config(&RestoreArchiveConfig {
+                days: 0,
+                tier: "Standard".into(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("restore archive days must be greater than zero")
+        );
+        assert!(
+            validate_restore_archive_config(&RestoreArchiveConfig {
+                days: 1,
+                tier: " ".into(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("restore archive tier must not be empty")
+        );
     }
 
     #[test]
