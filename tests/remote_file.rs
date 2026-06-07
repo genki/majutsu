@@ -114,7 +114,11 @@ fn db_total_operation_count(state: &std::path::Path) -> i64 {
 }
 
 fn local_oplog_record_count(state: &std::path::Path) -> usize {
-    let bytes = fs::read(state.join("ops/local-oplog.cborl")).unwrap();
+    cborl_record_count(&state.join("ops/local-oplog.cborl"))
+}
+
+fn cborl_record_count(path: &std::path::Path) -> usize {
+    let bytes = fs::read(path).unwrap();
     let mut deserializer = serde_cbor::de::Deserializer::from_slice(&bytes);
     let mut count = 0usize;
     while serde::Deserialize::deserialize(&mut deserializer)
@@ -1387,6 +1391,58 @@ fn remote_fsck_detects_missing_canonical_host_export() {
         .find(|path| path.to_string_lossy().ends_with(".cbor.zst.enc"))
         .unwrap();
     fs::remove_file(canonical_snapshot).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_detects_missing_canonical_operation_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let host_dir = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("ops/local-oplog.cborl.zst.enc").exists())
+        .unwrap();
+    fs::remove_file(host_dir.join("ops/local-oplog.cborl.zst.enc")).unwrap();
 
     fails({
         let mut c = mj();
@@ -5000,6 +5056,16 @@ fn operations_are_appended_to_local_oplog() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
+    let host_dir = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("ops/local-oplog.cborl").exists())
+        .unwrap();
+    assert_eq!(
+        cborl_record_count(&host_dir.join("ops/local-oplog.cborl")) as i64,
+        db_total_operation_count(&state)
+    );
+    assert!(host_dir.join("ops/local-oplog.cborl.zst.enc").exists());
     let export: serde_json::Value =
         serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
     let op = export["operations"]

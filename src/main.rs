@@ -2755,6 +2755,16 @@ fn enqueue_and_drain_sync(
     }
     enqueue_inline_upload(
         paths,
+        &host_oplog_key(&config.host.id),
+        encode_operation_log(&export.operations)?,
+    )?;
+    enqueue_inline_upload(
+        paths,
+        &host_oplog_canonical_key(&config.host.id),
+        encode_canonical_remote_oplog(paths, &export.operations)?,
+    )?;
+    enqueue_inline_upload(
+        paths,
         "config.toml",
         toml::to_string_pretty(&config)?.into_bytes(),
     )?;
@@ -2924,6 +2934,14 @@ fn host_operation_canonical_key(host_id: &str, op_id: &str) -> String {
     format!("hosts/{host_id}/ops/{op_id}.cbor.zst.enc")
 }
 
+fn host_oplog_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/ops/local-oplog.cborl")
+}
+
+fn host_oplog_canonical_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/ops/local-oplog.cborl.zst.enc")
+}
+
 fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Result<Vec<u8>> {
     let cbor = serde_cbor::to_vec(value)?;
     let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
@@ -2937,6 +2955,26 @@ fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(
     let compressed = decode_object(paths, bytes)?;
     let cbor = zstd::stream::decode_all(compressed.as_slice())?;
     Ok(serde_cbor::from_slice(&cbor)?)
+}
+
+fn encode_operation_log(operations: &[OperationExport]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for operation in operations {
+        bytes.extend(serde_cbor::to_vec(operation)?);
+    }
+    Ok(bytes)
+}
+
+fn encode_canonical_remote_oplog(paths: &Paths, operations: &[OperationExport]) -> Result<Vec<u8>> {
+    let cborl = encode_operation_log(operations)?;
+    let compressed = zstd::stream::encode_all(cborl.as_slice(), 3)?;
+    encode_object(paths, &compressed)
+}
+
+fn decode_canonical_remote_oplog(paths: &Paths, bytes: &[u8]) -> Result<Vec<OperationExport>> {
+    let compressed = decode_object(paths, bytes)?;
+    let cborl = zstd::stream::decode_all(compressed.as_slice())?;
+    decode_operation_log(&cborl)
 }
 
 fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
@@ -3042,7 +3080,7 @@ fn prune_remote_host_exports(
             ]
         })
         .collect::<BTreeSet<_>>();
-    let live_ops = export
+    let mut live_ops = export
         .operations
         .iter()
         .flat_map(|operation| {
@@ -3052,6 +3090,8 @@ fn prune_remote_host_exports(
             ]
         })
         .collect::<BTreeSet<_>>();
+    live_ops.insert(host_oplog_key(host_id));
+    live_ops.insert(host_oplog_canonical_key(host_id));
     let mut removed = 0usize;
     for key in remote.list(&format!("hosts/{host_id}/snapshots/"))? {
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc"))
@@ -4654,23 +4694,14 @@ fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
             return Ok(());
         }
     };
-    let mut actual = Vec::new();
-    let mut stream =
-        serde_cbor::de::Deserializer::from_slice(&bytes).into_iter::<OperationExport>();
-    while let Some(record) = stream.next() {
-        match record {
-            Ok(operation) => actual.push(operation),
-            Err(err) => {
-                *missing += 1;
-                eprintln!(
-                    "invalid local operation log {} at byte {}: {err}",
-                    path.display(),
-                    stream.byte_offset()
-                );
-                return Ok(());
-            }
+    let actual = match decode_operation_log(&bytes) {
+        Ok(actual) => actual,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("invalid local operation log {}: {err}", path.display());
+            return Ok(());
         }
-    }
+    };
     if actual.len() != expected.len() {
         *missing += 1;
         eprintln!(
@@ -4691,6 +4722,17 @@ fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn decode_operation_log(bytes: &[u8]) -> Result<Vec<OperationExport>> {
+    let mut operations = Vec::new();
+    let mut stream = serde_cbor::de::Deserializer::from_slice(bytes).into_iter::<OperationExport>();
+    while let Some(record) = stream.next() {
+        let offset = stream.byte_offset();
+        let operation = record.with_context(|| format!("decode CBOR stream at byte {offset}"))?;
+        operations.push(operation);
+    }
+    Ok(operations)
 }
 
 fn validate_local_snapshot_objects(
@@ -5135,6 +5177,7 @@ fn remote_fsck_export(
         }
     }
     if let Some(host_id) = host_id {
+        validate_remote_oplog(paths, remote, host_id, &export.operations, missing)?;
         for snapshot in &export.snapshots {
             let key = host_snapshot_key(host_id, &snapshot.id);
             if !remote.exists(&key)? {
@@ -5183,6 +5226,58 @@ fn remote_fsck_export(
         }
     }
     Ok(export)
+}
+
+fn validate_remote_oplog(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+    expected: &[OperationExport],
+    missing: &mut usize,
+) -> Result<()> {
+    let canonical_key = host_oplog_canonical_key(host_id);
+    if !remote.exists(&canonical_key)? {
+        *missing += 1;
+        eprintln!("missing canonical host operation log {canonical_key}");
+    } else {
+        let operations = decode_canonical_remote_oplog(paths, &remote.get(&canonical_key)?)
+            .with_context(|| format!("parse remote operation log {canonical_key}"))?;
+        validate_remote_oplog_entries(&canonical_key, &operations, expected, missing);
+    }
+
+    let legacy_key = host_oplog_key(host_id);
+    if remote.exists(&legacy_key)? {
+        let operations = decode_operation_log(&remote.get(&legacy_key)?)
+            .with_context(|| format!("parse remote operation log {legacy_key}"))?;
+        validate_remote_oplog_entries(&legacy_key, &operations, expected, missing);
+    }
+    Ok(())
+}
+
+fn validate_remote_oplog_entries(
+    key: &str,
+    actual: &[OperationExport],
+    expected: &[OperationExport],
+    missing: &mut usize,
+) {
+    if actual.len() != expected.len() {
+        *missing += 1;
+        eprintln!(
+            "remote operation log count mismatch {key} expected={} actual={}",
+            expected.len(),
+            actual.len()
+        );
+        return;
+    }
+    for (index, (remote, metadata)) in actual.iter().zip(expected.iter()).enumerate() {
+        if !operation_export_matches(remote, metadata) {
+            *missing += 1;
+            eprintln!(
+                "remote operation log entry does not match metadata {key} {} index={index}",
+                remote.id
+            );
+        }
+    }
 }
 
 fn validate_remote_chunk_index(

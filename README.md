@@ -221,6 +221,7 @@ hosts/index.json
 hosts/<host-id>/metadata/export.json
 hosts/<host-id>/snapshots/<snapshot-id>.json
 hosts/<host-id>/ops/<op-id>.json
+hosts/<host-id>/ops/local-oplog.cborl
 config.toml
 host.toml
 hosts/current
@@ -242,9 +243,9 @@ This is the critical path for host-disk-loss recovery: a fresh state directory
 can be reconstructed from remote metadata.
 Metadata keeps the local object keys for backward-compatible restore and clone,
 while `mj sync` also writes canonical remote-layout aliases matching the spec's
-`trees/`, `blobs/loose/`, `packs/`, `indexes/`, and `large/` prefixes. `mj
-remote fsck` accepts canonical-only payload storage and also validates legacy
-compatibility keys when they are present.
+`trees/`, `blobs/loose/`, `packs/`, `indexes/`, `large/`, and canonical host
+operation-log prefixes. `mj remote fsck` accepts canonical-only payload storage
+and also validates legacy compatibility keys when they are present.
 
 For S3-compatible storage:
 
@@ -288,9 +289,9 @@ path = "/tmp/majutsu-remote"
 
 `mj remote fsck` verifies canonical `hosts/index.json`, each host metadata
 export, canonical `hosts/<host>/refs/*` values, canonical per-host
-snapshot/operation exports, and every referenced object through either its
-canonical remote key or its legacy compatibility key. Legacy bootstrap metadata
-and JSON per-host exports are checked when present.
+snapshot/operation exports, aggregate operation logs, and every referenced
+object through either its canonical remote key or its legacy compatibility key.
+Legacy bootstrap metadata and JSON per-host exports are checked when present.
 
 To rebuild an empty state directory from remote:
 
