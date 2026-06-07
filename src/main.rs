@@ -4916,6 +4916,7 @@ fn fsck(paths: &Paths) -> Result<()> {
     validate_host_file(paths, &config, &mut missing)?;
     validate_config_roots(paths, &conn, &config, &mut missing)?;
     validate_local_refs(&conn, &mut missing)?;
+    validate_remote_refs(&conn, &config, &mut missing)?;
     validate_local_snapshot_objects(paths, &export, &mut missing)?;
     validate_local_large_manifest_objects(paths, &export, &mut missing)?;
     validate_local_pack_objects(paths, &export, &mut missing)?;
@@ -4929,6 +4930,76 @@ fn fsck(paths: &Paths) -> Result<()> {
     }
     println!("fsck ok");
     Ok(())
+}
+
+fn validate_remote_refs(conn: &Connection, config: &Config, missing: &mut usize) -> Result<()> {
+    let snapshot_ids = {
+        let mut stmt = conn.prepare("select id from snapshots")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?
+    };
+    let mut stmt = conn.prepare(
+        "select remote, name, value, observed_at from remote_refs order by remote, name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (remote, name, value, observed_at) = row?;
+        if remote.trim().is_empty() {
+            *missing += 1;
+            eprintln!("remote ref has empty remote for {name}");
+        }
+        if let Err(err) = parse_db_time(&observed_at) {
+            *missing += 1;
+            eprintln!("remote ref {name} has invalid observed_at {observed_at}: {err}");
+        }
+        let Some((host_id, ref_name)) = parse_canonical_host_ref_name(&name) else {
+            *missing += 1;
+            eprintln!("remote ref has unsupported name {name}");
+            continue;
+        };
+        if host_id != config.host.id {
+            *missing += 1;
+            eprintln!(
+                "remote ref host id {host_id} does not match config host id {}",
+                config.host.id
+            );
+        }
+        match ref_name {
+            "current" => {
+                if !snapshot_ids.contains(&value) {
+                    *missing += 1;
+                    eprintln!("remote ref {name} points to missing snapshot {value}");
+                }
+            }
+            "last-synced" => {
+                if let Err(err) = parse_db_time(&value) {
+                    *missing += 1;
+                    eprintln!("remote ref {name} has invalid last-synced {value}: {err}");
+                }
+            }
+            _ => {
+                *missing += 1;
+                eprintln!("remote ref has unsupported ref name {name}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_canonical_host_ref_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("hosts/")?;
+    let (host_id, rest) = rest.split_once("/refs/")?;
+    if host_id.is_empty() || rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some((host_id, rest))
 }
 
 fn validate_local_refs(conn: &Connection, missing: &mut usize) -> Result<()> {
