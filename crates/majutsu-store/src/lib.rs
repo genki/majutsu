@@ -77,6 +77,69 @@ pub fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
     }
 }
 
+pub fn canonical_remote_alias(key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix("objects/trees/") {
+        Some(format!("trees/{rest}.cbor.zst.enc"))
+    } else if let Some(rest) = key.strip_prefix("objects/blobs/") {
+        Some(format!("blobs/loose/{rest}.blob.enc"))
+    } else if let Some(rest) = key.strip_prefix("objects/packs/small/") {
+        Some(format!("packs/small/{rest}"))
+    } else if let Some(rest) = key.strip_prefix("objects/packs/normal/") {
+        Some(format!("packs/normal/{rest}"))
+    } else if let Some(rest) = key.strip_prefix("objects/indexes/pack/") {
+        let rest = rest.strip_suffix(".json").unwrap_or(rest);
+        Some(format!("indexes/pack-index/{rest}.cbor.zst.enc"))
+    } else if let Some(rest) = key.strip_prefix("objects/large/manifests/") {
+        Some(format!("large/manifests/{rest}.cbor.zst.enc"))
+    } else if let Some(rest) = key.strip_prefix("objects/large/chunks/fixed/") {
+        Some(format!("large/chunks/fixed-8m/{rest}.chunk.enc"))
+    } else {
+        key.strip_prefix("objects/large/chunks/fastcdc/")
+            .map(|rest| format!("large/chunks/fastcdc/{rest}.chunk.enc"))
+    }
+}
+
+pub fn canonical_remote_aliases(key: &str) -> Vec<String> {
+    let Some(alias) = canonical_remote_alias(key) else {
+        return Vec::new();
+    };
+    if alias == key {
+        Vec::new()
+    } else {
+        vec![alias]
+    }
+}
+
+pub fn is_content_addressed_remote_key(key: &str) -> bool {
+    key.starts_with("objects/")
+        || key.starts_with("trees/")
+        || key.starts_with("blobs/loose/")
+        || key.starts_with("packs/")
+        || key.starts_with("indexes/")
+        || key.starts_with("large/")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteObjectAvailabilityIssue {
+    MissingObjectOrAlias,
+    MissingCanonicalAlias,
+}
+
+pub fn remote_object_availability_issues(
+    legacy_exists: bool,
+    aliases: &[String],
+    alias_exists: bool,
+) -> Vec<RemoteObjectAvailabilityIssue> {
+    let mut issues = Vec::new();
+    if !legacy_exists && !alias_exists {
+        issues.push(RemoteObjectAvailabilityIssue::MissingObjectOrAlias);
+    }
+    if legacy_exists && !aliases.is_empty() && !alias_exists {
+        issues.push(RemoteObjectAvailabilityIssue::MissingCanonicalAlias);
+    }
+    issues
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobExport {
     pub oid: String,
@@ -436,6 +499,57 @@ mod tests {
         assert!(!capabilities.multipart_upload);
         assert!(capabilities.range_get);
         assert!(capabilities.conditional_put);
+    }
+
+    #[test]
+    fn canonical_remote_aliases_cover_local_object_layouts() {
+        assert_eq!(
+            canonical_remote_alias("objects/trees/tree-1").as_deref(),
+            Some("trees/tree-1.cbor.zst.enc")
+        );
+        assert_eq!(
+            canonical_remote_alias("objects/blobs/blob-1").as_deref(),
+            Some("blobs/loose/blob-1.blob.enc")
+        );
+        assert_eq!(
+            canonical_remote_alias("objects/packs/small/pack-1.mpack").as_deref(),
+            Some("packs/small/pack-1.mpack")
+        );
+        assert_eq!(
+            canonical_remote_alias("objects/indexes/pack/2026/06/pack-1.json").as_deref(),
+            Some("indexes/pack-index/2026/06/pack-1.cbor.zst.enc")
+        );
+        assert_eq!(
+            canonical_remote_alias("objects/large/manifests/large-1").as_deref(),
+            Some("large/manifests/large-1.cbor.zst.enc")
+        );
+        assert_eq!(
+            canonical_remote_alias("objects/large/chunks/fixed/chunk-1").as_deref(),
+            Some("large/chunks/fixed-8m/chunk-1.chunk.enc")
+        );
+        assert_eq!(
+            canonical_remote_alias("objects/large/chunks/fastcdc/chunk-1").as_deref(),
+            Some("large/chunks/fastcdc/chunk-1.chunk.enc")
+        );
+        assert!(canonical_remote_alias("logs/local").is_none());
+        assert!(is_content_addressed_remote_key(
+            "large/chunks/fixed-8m/chunk-1.chunk.enc"
+        ));
+        assert!(!is_content_addressed_remote_key("queue/uploads/item.json"));
+    }
+
+    #[test]
+    fn remote_object_availability_reports_missing_alias_states() {
+        assert_eq!(
+            remote_object_availability_issues(false, &["alias".into()], false),
+            vec![RemoteObjectAvailabilityIssue::MissingObjectOrAlias]
+        );
+        assert_eq!(
+            remote_object_availability_issues(true, &["alias".into()], false),
+            vec![RemoteObjectAvailabilityIssue::MissingCanonicalAlias]
+        );
+        assert!(remote_object_availability_issues(false, &["alias".into()], true).is_empty());
+        assert!(remote_object_availability_issues(true, &[], false).is_empty());
     }
 
     #[test]

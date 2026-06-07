@@ -46,8 +46,10 @@ use majutsu_store::{
     RemoteCapabilities, RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
     RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport, RemoteGcMarkIssue,
     RemoteGcTombstone as GcTombstoneExport, RemoteGcTombstoneIssue, RemoteHostIndex,
-    RemoteHostIndexIssue, RemoteHostSummary, archive_restore_status, remote_gc_mark_key,
-    remote_gc_tombstone_key, remote_gc_tombstone_prefix, select_remote_host,
+    RemoteHostIndexIssue, RemoteHostSummary, RemoteObjectAvailabilityIssue, archive_restore_status,
+    canonical_remote_alias, canonical_remote_aliases, is_content_addressed_remote_key,
+    remote_gc_mark_key, remote_gc_tombstone_key, remote_gc_tombstone_prefix,
+    remote_object_availability_issues, select_remote_host,
 };
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -5594,13 +5596,16 @@ fn remote_fsck_export(
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .any(|exists| exists);
-        if !legacy_exists && !alias_exists {
+        for issue in remote_object_availability_issues(legacy_exists, &aliases, alias_exists) {
             *missing += 1;
-            eprintln!("missing remote object {key} or canonical alias");
-        }
-        if legacy_exists && !aliases.is_empty() && !alias_exists {
-            *missing += 1;
-            eprintln!("missing canonical remote object alias for {key}");
+            match issue {
+                RemoteObjectAvailabilityIssue::MissingObjectOrAlias => {
+                    eprintln!("missing remote object {key} or canonical alias");
+                }
+                RemoteObjectAvailabilityIssue::MissingCanonicalAlias => {
+                    eprintln!("missing canonical remote object alias for {key}");
+                }
+            }
         }
     }
     validate_remote_snapshot_objects(paths, remote, &export, missing)?;
@@ -7720,17 +7725,6 @@ fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     keys
 }
 
-fn canonical_remote_aliases(key: &str) -> Vec<String> {
-    let Some(alias) = canonical_remote_alias(key) else {
-        return Vec::new();
-    };
-    if alias == key {
-        Vec::new()
-    } else {
-        vec![alias]
-    }
-}
-
 fn large_chunk_base(paths: &Paths, chunking: &str) -> PathBuf {
     match chunking {
         "fastcdc" => paths.home.join("objects/large/chunks/fastcdc"),
@@ -7744,37 +7738,6 @@ fn large_chunk_base_for_key(paths: &Paths, key: &str) -> PathBuf {
     } else {
         large_chunk_base(paths, "fixed")
     }
-}
-
-fn canonical_remote_alias(key: &str) -> Option<String> {
-    if let Some(rest) = key.strip_prefix("objects/trees/") {
-        Some(format!("trees/{rest}.cbor.zst.enc"))
-    } else if let Some(rest) = key.strip_prefix("objects/blobs/") {
-        Some(format!("blobs/loose/{rest}.blob.enc"))
-    } else if let Some(rest) = key.strip_prefix("objects/packs/small/") {
-        Some(format!("packs/small/{rest}"))
-    } else if let Some(rest) = key.strip_prefix("objects/packs/normal/") {
-        Some(format!("packs/normal/{rest}"))
-    } else if let Some(rest) = key.strip_prefix("objects/indexes/pack/") {
-        let rest = rest.strip_suffix(".json").unwrap_or(rest);
-        Some(format!("indexes/pack-index/{rest}.cbor.zst.enc"))
-    } else if let Some(rest) = key.strip_prefix("objects/large/manifests/") {
-        Some(format!("large/manifests/{rest}.cbor.zst.enc"))
-    } else if let Some(rest) = key.strip_prefix("objects/large/chunks/fixed/") {
-        Some(format!("large/chunks/fixed-8m/{rest}.chunk.enc"))
-    } else {
-        key.strip_prefix("objects/large/chunks/fastcdc/")
-            .map(|rest| format!("large/chunks/fastcdc/{rest}.chunk.enc"))
-    }
-}
-
-fn is_content_addressed_remote_key(key: &str) -> bool {
-    key.starts_with("objects/")
-        || key.starts_with("trees/")
-        || key.starts_with("blobs/loose/")
-        || key.starts_with("packs/")
-        || key.starts_with("indexes/")
-        || key.starts_with("large/")
 }
 
 fn all_local_object_keys(paths: &Paths) -> Result<Vec<String>> {
