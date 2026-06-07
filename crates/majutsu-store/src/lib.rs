@@ -69,6 +69,14 @@ pub fn remote_gc_tombstone_key(host_id: &str, tombstone_id: &str) -> String {
     format!("{}{tombstone_id}.json", remote_gc_tombstone_prefix(host_id))
 }
 
+pub fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
+    match status {
+        200 | 202 | 204 | 409 => Ok(true),
+        404 => Ok(false),
+        _ => bail!("archive restore request failed for {key}: HTTP {status}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobExport {
     pub oid: String,
@@ -348,6 +356,24 @@ mod tests {
     #[test]
     fn s3_multipart_follows_large_object_policy() {
         assert!(!RemoteCapabilities::s3(false, false).multipart_upload);
+    }
+
+    #[test]
+    fn archive_restore_status_maps_s3_responses() {
+        for status in [200, 202, 204, 409] {
+            assert_eq!(
+                archive_restore_status("objects/large/chunk", status).unwrap(),
+                true
+            );
+        }
+        assert_eq!(
+            archive_restore_status("objects/large/chunk", 404).unwrap(),
+            false
+        );
+        let err = archive_restore_status("objects/large/chunk", 500)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("archive restore request failed for objects/large/chunk: HTTP 500"));
     }
 
     fn host(id: &str, name: &str, metadata_key: &str) -> RemoteHostSummary {

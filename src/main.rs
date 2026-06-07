@@ -31,8 +31,8 @@ use majutsu_store::{
     REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY, RemoteCapabilities,
     RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexShard as ChunkIndexShard,
     RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex,
-    RemoteHostIndexIssue, RemoteHostSummary, remote_gc_mark_key, remote_gc_tombstone_key,
-    remote_gc_tombstone_prefix, select_remote_host,
+    RemoteHostIndexIssue, RemoteHostSummary, archive_restore_status, remote_gc_mark_key,
+    remote_gc_tombstone_key, remote_gc_tombstone_prefix, select_remote_host,
 };
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -10438,14 +10438,6 @@ fn xml_escape(input: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-}
-
-fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
-    match status {
-        200 | 202 | 204 | 409 => Ok(true),
-        404 => Ok(false),
-        _ => bail!("archive restore request failed for {key}: HTTP {status}"),
-    }
 }
 
 #[cfg(test)]
