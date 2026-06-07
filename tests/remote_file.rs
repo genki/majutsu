@@ -3827,6 +3827,7 @@ fn diff_reports_added_modified_and_deleted_paths() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    let first_snapshot = db_ref(&state, "current").unwrap();
     let first_at = output({
         let mut c = mj();
         c.arg("--home")
@@ -3850,11 +3851,23 @@ fn diff_reports_added_modified_and_deleted_paths() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    let second_snapshot = db_ref(&state, "current").unwrap();
     let diff_output = mj().arg("--home").arg(&state).arg("diff").output().unwrap();
     assert!(diff_output.status.success());
     let stdout = String::from_utf8_lossy(&diff_output.stdout);
     assert!(stdout.contains("D\tsample/alpha.txt"));
     assert!(stdout.contains("A\tsample/beta.txt"));
+    let positional = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("diff")
+            .arg(&first_snapshot)
+            .arg(&second_snapshot);
+        c
+    });
+    assert!(positional.contains("D\tsample/alpha.txt"));
+    assert!(positional.contains("A\tsample/beta.txt"));
     let at_output = output({
         let mut c = mj();
         c.arg("--home")
