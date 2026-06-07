@@ -88,7 +88,8 @@ use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use restore_runtime::{
     ensure_restore_job_has_no_missing_objects, ensure_restore_job_not_blocked,
     ensure_restore_job_resumable, mark_restore_job_done, print_restore_conflicts,
-    print_restore_deletes, read_restore_job, write_restore_job,
+    print_restore_deletes, read_restore_job, restore_delete_destination, restore_destination,
+    restore_root_base, restore_target_label, write_restore_job,
 };
 use watch_runtime::{
     default_watch_backend, format_notify_event, normalize_watch_backend, recv_watch_event,
@@ -5825,18 +5826,18 @@ fn validate_remote_pack_objects(
 }
 
 #[derive(Debug)]
-struct RestorePlan {
-    snapshot: SnapshotManifest,
-    to: Option<PathBuf>,
-    root_paths: BTreeMap<String, PathBuf>,
-    files: Vec<FileRecord>,
-    deletes: Vec<RestoreDelete>,
+pub(crate) struct RestorePlan {
+    pub(crate) snapshot: SnapshotManifest,
+    pub(crate) to: Option<PathBuf>,
+    pub(crate) root_paths: BTreeMap<String, PathBuf>,
+    pub(crate) files: Vec<FileRecord>,
+    pub(crate) deletes: Vec<RestoreDelete>,
 }
 
 #[derive(Debug)]
-struct RestoreDelete {
-    root_id: String,
-    path: String,
+pub(crate) struct RestoreDelete {
+    pub(crate) root_id: String,
+    pub(crate) path: String,
 }
 
 struct RestoreObjectStats {
@@ -5962,19 +5963,6 @@ fn build_restore_plan(
     })
 }
 
-fn restore_destination(plan: &RestorePlan, record: &FileRecord) -> Result<PathBuf> {
-    if let Some(to) = &plan.to {
-        return Ok(to.join(&record.root_id).join(&record.path));
-    }
-    let root = plan.root_paths.get(&record.root_id).ok_or_else(|| {
-        anyhow!(
-            "snapshot root is not configured locally: {}",
-            record.root_id
-        )
-    })?;
-    Ok(root.join(&record.path))
-}
-
 fn build_restore_deletes(
     args: &RestoreArgs,
     root_paths: &BTreeMap<String, PathBuf>,
@@ -5995,7 +5983,7 @@ fn build_restore_deletes(
                 continue;
             }
         }
-        let base = restore_root_base(args, root_paths, root_id)?;
+        let base = restore_root_base(args.to.as_ref(), root_paths, root_id)?;
         let scan_base = args
             .path
             .as_ref()
@@ -6030,40 +6018,6 @@ fn build_restore_deletes(
             .then_with(|| a.path.cmp(&b.path))
     });
     Ok(deletes)
-}
-
-fn restore_root_base(
-    args: &RestoreArgs,
-    root_paths: &BTreeMap<String, PathBuf>,
-    root_id: &str,
-) -> Result<PathBuf> {
-    if let Some(to) = &args.to {
-        return Ok(to.join(root_id));
-    }
-    root_paths
-        .get(root_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("snapshot root is not configured locally: {root_id}"))
-}
-
-fn restore_delete_destination(plan: &RestorePlan, delete: &RestoreDelete) -> Result<PathBuf> {
-    if let Some(to) = &plan.to {
-        return Ok(to.join(&delete.root_id).join(&delete.path));
-    }
-    let root = plan.root_paths.get(&delete.root_id).ok_or_else(|| {
-        anyhow!(
-            "snapshot root is not configured locally: {}",
-            delete.root_id
-        )
-    })?;
-    Ok(root.join(&delete.path))
-}
-
-fn restore_target_label(plan: &RestorePlan) -> String {
-    plan.to
-        .as_ref()
-        .map(|to| to.display().to_string())
-        .unwrap_or_else(|| "original-roots".into())
 }
 
 fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<()> {

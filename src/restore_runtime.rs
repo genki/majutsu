@@ -1,8 +1,11 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+use majutsu_core::FileRecord;
 use majutsu_restore::RestoreQueueItem;
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 
-use crate::{Paths, RestorePlan};
+use crate::{Paths, RestoreDelete, RestorePlan};
 
 pub(crate) fn write_restore_job(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
     let dir = paths.home.join("queue/restores");
@@ -41,6 +44,56 @@ pub(crate) fn ensure_restore_job_has_no_missing_objects(job: &RestoreQueueItem) 
         bail!("{message}");
     }
     Ok(())
+}
+
+pub(crate) fn restore_destination(plan: &RestorePlan, record: &FileRecord) -> Result<PathBuf> {
+    if let Some(to) = &plan.to {
+        return Ok(to.join(&record.root_id).join(&record.path));
+    }
+    let root = plan.root_paths.get(&record.root_id).ok_or_else(|| {
+        anyhow!(
+            "snapshot root is not configured locally: {}",
+            record.root_id
+        )
+    })?;
+    Ok(root.join(&record.path))
+}
+
+pub(crate) fn restore_root_base(
+    to: Option<&PathBuf>,
+    root_paths: &BTreeMap<String, PathBuf>,
+    root_id: &str,
+) -> Result<PathBuf> {
+    if let Some(to) = to {
+        return Ok(to.join(root_id));
+    }
+    root_paths
+        .get(root_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("snapshot root is not configured locally: {root_id}"))
+}
+
+pub(crate) fn restore_delete_destination(
+    plan: &RestorePlan,
+    delete: &RestoreDelete,
+) -> Result<PathBuf> {
+    if let Some(to) = &plan.to {
+        return Ok(to.join(&delete.root_id).join(&delete.path));
+    }
+    let root = plan.root_paths.get(&delete.root_id).ok_or_else(|| {
+        anyhow!(
+            "snapshot root is not configured locally: {}",
+            delete.root_id
+        )
+    })?;
+    Ok(root.join(&delete.path))
+}
+
+pub(crate) fn restore_target_label(plan: &RestorePlan) -> String {
+    plan.to
+        .as_ref()
+        .map(|to| to.display().to_string())
+        .unwrap_or_else(|| "original-roots".into())
 }
 
 pub(crate) fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {
