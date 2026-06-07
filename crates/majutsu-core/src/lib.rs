@@ -105,6 +105,20 @@ pub enum Payload {
         oid: String,
         manifest_key: String,
         chunk_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+        #[serde(default)]
+        binary: bool,
+        #[serde(default = "default_large_chunking")]
+        chunking: String,
+        #[serde(default = "default_large_pointer_compression")]
+        compression: String,
+        #[serde(default = "default_large_pointer_encryption")]
+        encryption: String,
+        #[serde(default = "default_large_storage_tier_hint")]
+        storage_tier_hint: String,
+        #[serde(default = "default_large_hydrate_policy")]
+        hydrate_policy: String,
     },
     Blob {
         oid: String,
@@ -152,6 +166,7 @@ pub fn payload_large_ref(payload: &Payload) -> Option<(&str, &str, usize)> {
             oid,
             manifest_key,
             chunk_count,
+            ..
         }
         | Payload::Large {
             oid,
@@ -228,6 +243,22 @@ pub struct LargeChunk {
 
 fn default_large_chunking() -> String {
     "fixed".into()
+}
+
+fn default_large_pointer_compression() -> String {
+    "per-chunk".into()
+}
+
+fn default_large_pointer_encryption() -> String {
+    "none".into()
+}
+
+fn default_large_storage_tier_hint() -> String {
+    "hot-manifest-cold-chunks".into()
+}
+
+fn default_large_hydrate_policy() -> String {
+    "on-demand".into()
 }
 
 fn default_chunk_compression() -> String {

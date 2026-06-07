@@ -1339,6 +1339,30 @@ fn snapshot_manifest_uses_spec_payload_variants() {
         tree["entries"]["payload.zip"]["payload"]["type"],
         "large-object"
     );
+    assert_eq!(
+        tree["entries"]["payload.zip"]["payload"]["media_type"],
+        "application/zip"
+    );
+    assert_eq!(
+        tree["entries"]["payload.zip"]["payload"]["chunking"],
+        "fixed"
+    );
+    assert_eq!(
+        tree["entries"]["payload.zip"]["payload"]["compression"],
+        "per-chunk:zstd"
+    );
+    assert_eq!(
+        tree["entries"]["payload.zip"]["payload"]["encryption"],
+        "none"
+    );
+    assert_eq!(
+        tree["entries"]["payload.zip"]["payload"]["storage_tier_hint"],
+        "hot-manifest-cold-chunks"
+    );
+    assert_eq!(
+        tree["entries"]["payload.zip"]["payload"]["hydrate_policy"],
+        "on-demand"
+    );
 }
 
 #[test]

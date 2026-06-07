@@ -4637,10 +4637,24 @@ fn build_restore_plan(
                         oid,
                         manifest_key,
                         chunk_count,
+                        media_type,
+                        binary,
+                        chunking,
+                        compression,
+                        encryption,
+                        storage_tier_hint,
+                        hydrate_policy,
                     } => Payload::LargeObject {
                         oid: oid.clone(),
                         manifest_key: manifest_key.clone(),
                         chunk_count: *chunk_count,
+                        media_type: media_type.clone(),
+                        binary: *binary,
+                        chunking: chunking.clone(),
+                        compression: compression.clone(),
+                        encryption: encryption.clone(),
+                        storage_tier_hint: storage_tier_hint.clone(),
+                        hydrate_policy: hydrate_policy.clone(),
                     },
                     Payload::Blob { oid, object_key } => Payload::Blob {
                         oid: oid.clone(),
@@ -5472,6 +5486,13 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 oid,
                 manifest_key,
                 chunk_count,
+                media_type: media_type_for_path(&rel),
+                binary,
+                chunking: large_config.default_chunking.clone(),
+                compression: large_pointer_compression(&large_config),
+                encryption: config.security.encryption.clone(),
+                storage_tier_hint: "hot-manifest-cold-chunks".into(),
+                hydrate_policy: "on-demand".into(),
             }
         } else {
             let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
@@ -7225,6 +7246,14 @@ fn media_type_for_path(path: &Path) -> Option<String> {
         }
     };
     Some(media_type.to_string())
+}
+
+fn large_pointer_compression(config: &LargeConfig) -> String {
+    if config.compression.enabled {
+        format!("per-chunk:{}", config.compression.algorithm)
+    } else {
+        "none".into()
+    }
 }
 
 fn stable_read(path: &Path, mode: &str) -> Result<Vec<u8>> {
