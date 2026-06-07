@@ -21,7 +21,7 @@ use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_db::{
     EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
-    UploadQueueItemIssue, expected_upload_queue_item_id, local_ref_issues, remote_ref_issues,
+    UploadQueueItemIssue, local_ref_issues, remote_ref_issues,
 };
 use majutsu_large::{
     ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_chunk_hash_matches,
@@ -45,9 +45,8 @@ use majutsu_store::{
     canonical_remote_aliases, host_current_ref_key, host_last_synced_ref_key,
     host_legacy_current_key, host_metadata_key, host_operation_canonical_key, host_operation_key,
     host_oplog_canonical_key, host_oplog_key, host_ops_prefix, host_snapshot_canonical_key,
-    host_snapshot_key, host_snapshots_prefix, is_content_addressed_remote_key, remote_gc_mark_key,
-    remote_gc_tombstone_key, remote_gc_tombstone_prefix, remote_object_availability_issues,
-    select_remote_host,
+    host_snapshot_key, host_snapshots_prefix, remote_gc_mark_key, remote_gc_tombstone_key,
+    remote_gc_tombstone_prefix, remote_object_availability_issues, select_remote_host,
 };
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 #[cfg(test)]
@@ -74,6 +73,7 @@ mod db_refs;
 mod fs_meta;
 mod object_paths;
 mod process_runtime;
+mod queue_runtime;
 mod remote_store;
 mod restore_runtime;
 mod snapshot_rules;
@@ -107,6 +107,10 @@ use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
 };
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
+use queue_runtime::{
+    drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, has_pending_journal_events,
+    record_event, upload_queue_items,
+};
 #[cfg(test)]
 use remote_store::{
     DEFAULT_MULTIPART_THRESHOLD, FileRemote, MIN_MULTIPART_PART_SIZE, S3Remote, s3_object_class,
@@ -2100,131 +2104,6 @@ fn remote_host_index_with_legacy(remote: &RemoteStore) -> Result<RemoteHostIndex
         });
     }
     Ok(index)
-}
-
-fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()> {
-    write_upload_item(
-        paths,
-        UploadQueueItem::inline(
-            expected_upload_queue_item_id(key),
-            key.to_string(),
-            bytes,
-            Utc::now(),
-        ),
-    )
-}
-
-fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Result<()> {
-    write_upload_item(
-        paths,
-        UploadQueueItem::file(
-            expected_upload_queue_item_id(key),
-            key.to_string(),
-            path_to_slash(source),
-            Utc::now(),
-        ),
-    )
-}
-
-fn write_upload_item(paths: &Paths, item: UploadQueueItem) -> Result<()> {
-    fs::create_dir_all(&paths.upload_queue)?;
-    let path = paths.upload_queue.join(format!("{}.json", item.id));
-    let item = if path.exists() {
-        let existing: UploadQueueItem = serde_json::from_slice(&fs::read(&path)?)?;
-        item.preserve_retry_state(&existing)
-    } else {
-        item
-    };
-    fs::write(path, serde_json::to_vec_pretty(&item)?)?;
-    Ok(())
-}
-
-fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQueueItem)>> {
-    if !paths.upload_queue.exists() {
-        return Ok(Vec::new());
-    }
-    let mut items = Vec::new();
-    for entry in fs::read_dir(&paths.upload_queue)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry.path().extension().and_then(OsStr::to_str) == Some("json")
-        {
-            let item: UploadQueueItem = serde_json::from_slice(&fs::read(entry.path())?)?;
-            items.push((entry.path(), item));
-        }
-    }
-    items.sort_by(|a, b| a.1.key.cmp(&b.1.key));
-    Ok(items)
-}
-
-fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
-    let mut uploaded = 0usize;
-    for (path, mut item) in upload_queue_items(paths)? {
-        let bytes = if let Some(bytes) = item.inline.take() {
-            bytes
-        } else if let Some(source) = &item.source {
-            fs::read(source).with_context(|| format!("read queued upload source {source}"))?
-        } else {
-            bail!(
-                "queued upload has neither inline payload nor source: {}",
-                item.key
-            );
-        };
-        let upload_result = if is_content_addressed_remote_key(&item.key)
-            && remote.capabilities().conditional_put
-        {
-            remote.put_if_absent(&item.key, &bytes).map(|_| ())
-        } else {
-            remote.put(&item.key, &bytes)
-        };
-        match upload_result {
-            Ok(()) => {
-                fs::remove_file(path)?;
-                uploaded += 1;
-            }
-            Err(err) => {
-                item.record_attempt();
-                fs::write(&path, serde_json::to_vec_pretty(&item)?)?;
-                return Err(err).with_context(|| format!("upload failed for {}", item.key));
-            }
-        }
-    }
-    Ok(uploaded)
-}
-
-fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {
-    fs::create_dir_all(&paths.event_queue)?;
-    let event = EventJournalRecord::new(
-        new_id("event"),
-        kind.to_string(),
-        Utc::now(),
-        detail.to_string(),
-    );
-    let path = paths.event_queue.join(format!("{}.json", event.event_id));
-    fs::write(path, serde_json::to_vec_pretty(&event)?)?;
-    Ok(())
-}
-
-fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRecord>> {
-    if !paths.event_queue.exists() {
-        return Ok(Vec::new());
-    }
-    let mut records: Vec<EventJournalRecord> = Vec::new();
-    for entry in fs::read_dir(&paths.event_queue)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry.path().extension().and_then(OsStr::to_str) == Some("json")
-        {
-            records.push(serde_json::from_slice(&fs::read(entry.path())?)?);
-        }
-    }
-    records.sort_by(|a, b| a.observed_at.cmp(&b.observed_at));
-    Ok(records)
-}
-
-fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
-    let records = event_journal_records(paths)?;
-    Ok(majutsu_db::has_pending_journal_events(&records))
 }
 
 fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
