@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type HostId = String;
 pub type RootId = String;
@@ -155,6 +155,57 @@ pub fn history_graph_issues(
                     operation_id: operation.id.clone(),
                 });
             }
+        }
+    }
+    issues
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataReferenceIssue {
+    DanglingBlob { oid: String },
+    DanglingLargeObject { oid: String },
+    DanglingChunk { oid: String },
+}
+
+pub fn metadata_reference_issues<B, L, C>(
+    blob_oids: B,
+    large_object_oids: L,
+    chunk_oids: C,
+    live_blobs: &BTreeSet<String>,
+    live_large_objects: &BTreeSet<String>,
+    live_chunks: &BTreeSet<String>,
+) -> Vec<MetadataReferenceIssue>
+where
+    B: IntoIterator,
+    B::Item: AsRef<str>,
+    L: IntoIterator,
+    L::Item: AsRef<str>,
+    C: IntoIterator,
+    C::Item: AsRef<str>,
+{
+    let mut issues = Vec::new();
+    for oid in blob_oids {
+        let oid = oid.as_ref();
+        if !live_blobs.contains(oid) {
+            issues.push(MetadataReferenceIssue::DanglingBlob {
+                oid: oid.to_string(),
+            });
+        }
+    }
+    for oid in large_object_oids {
+        let oid = oid.as_ref();
+        if !live_large_objects.contains(oid) {
+            issues.push(MetadataReferenceIssue::DanglingLargeObject {
+                oid: oid.to_string(),
+            });
+        }
+    }
+    for oid in chunk_oids {
+        let oid = oid.as_ref();
+        if !live_chunks.contains(oid) {
+            issues.push(MetadataReferenceIssue::DanglingChunk {
+                oid: oid.to_string(),
+            });
         }
     }
     issues
@@ -676,6 +727,48 @@ mod tests {
         assert_eq!(
             SnapshotMode::parse("eventual").unwrap_err().to_string(),
             "snapshot mode must be default, strict, or transactional"
+        );
+    }
+
+    #[test]
+    fn metadata_reference_validation_reports_dangling_metadata() {
+        let issues = metadata_reference_issues(
+            ["blob-live", "blob-dangling"],
+            ["large-live", "large-dangling"],
+            ["chunk-live", "chunk-dangling"],
+            &BTreeSet::from(["blob-live".to_string()]),
+            &BTreeSet::from(["large-live".to_string()]),
+            &BTreeSet::from(["chunk-live".to_string()]),
+        );
+
+        assert_eq!(
+            issues,
+            vec![
+                MetadataReferenceIssue::DanglingBlob {
+                    oid: "blob-dangling".into(),
+                },
+                MetadataReferenceIssue::DanglingLargeObject {
+                    oid: "large-dangling".into(),
+                },
+                MetadataReferenceIssue::DanglingChunk {
+                    oid: "chunk-dangling".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_reference_validation_accepts_live_metadata() {
+        assert!(
+            metadata_reference_issues(
+                ["blob-live"],
+                ["large-live"],
+                ["chunk-live"],
+                &BTreeSet::from(["blob-live".to_string()]),
+                &BTreeSet::from(["large-live".to_string()]),
+                &BTreeSet::from(["chunk-live".to_string()]),
+            )
+            .is_empty()
         );
     }
 

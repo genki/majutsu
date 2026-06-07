@@ -11,12 +11,12 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
-    FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, OperationLogComparisonIssue,
-    OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload, RootSnapshot,
-    SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest, decode_operation_log,
-    encode_operation_log, history_graph_issues, operation_log_comparison_issues,
-    operation_log_entry_matches, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
-    payload_large_ref_mut, snapshot_export_matches,
+    FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, MetadataReferenceIssue,
+    OperationLogComparisonIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue,
+    Payload, RootSnapshot, SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest,
+    decode_operation_log, encode_operation_log, history_graph_issues, metadata_reference_issues,
+    operation_log_comparison_issues, operation_log_entry_matches, payload_blob_ref,
+    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -4863,22 +4863,25 @@ fn validate_local_metadata_references(
             }
         }
     }
-    for blob in &export.blobs {
-        if !live_blobs.contains(&blob.oid) {
-            *missing += 1;
-            eprintln!("dangling blob metadata {}", blob.oid);
-        }
-    }
-    for large in &export.large_objects {
-        if !live_large.contains(&large.oid) {
-            *missing += 1;
-            eprintln!("dangling large object metadata {}", large.oid);
-        }
-    }
-    for chunk in &export.chunks {
-        if !live_chunks.contains(&chunk.oid) {
-            *missing += 1;
-            eprintln!("dangling chunk metadata {}", chunk.oid);
+    for issue in metadata_reference_issues(
+        export.blobs.iter().map(|blob| blob.oid.as_str()),
+        export.large_objects.iter().map(|large| large.oid.as_str()),
+        export.chunks.iter().map(|chunk| chunk.oid.as_str()),
+        &live_blobs,
+        &live_large,
+        &live_chunks,
+    ) {
+        *missing += 1;
+        match issue {
+            MetadataReferenceIssue::DanglingBlob { oid } => {
+                eprintln!("dangling blob metadata {oid}");
+            }
+            MetadataReferenceIssue::DanglingLargeObject { oid } => {
+                eprintln!("dangling large object metadata {oid}");
+            }
+            MetadataReferenceIssue::DanglingChunk { oid } => {
+                eprintln!("dangling chunk metadata {oid}");
+            }
         }
     }
     Ok(())
@@ -5763,22 +5766,25 @@ fn validate_remote_metadata_references(
             }
         }
     }
-    for blob in &export.blobs {
-        if !live_blobs.contains(&blob.oid) {
-            *missing += 1;
-            eprintln!("dangling remote blob metadata {}", blob.oid);
-        }
-    }
-    for large in &export.large_objects {
-        if !live_large.contains(&large.oid) {
-            *missing += 1;
-            eprintln!("dangling remote large object metadata {}", large.oid);
-        }
-    }
-    for chunk in &export.chunks {
-        if !live_chunks.contains(&chunk.oid) {
-            *missing += 1;
-            eprintln!("dangling remote chunk metadata {}", chunk.oid);
+    for issue in metadata_reference_issues(
+        export.blobs.iter().map(|blob| blob.oid.as_str()),
+        export.large_objects.iter().map(|large| large.oid.as_str()),
+        export.chunks.iter().map(|chunk| chunk.oid.as_str()),
+        &live_blobs,
+        &live_large,
+        &live_chunks,
+    ) {
+        *missing += 1;
+        match issue {
+            MetadataReferenceIssue::DanglingBlob { oid } => {
+                eprintln!("dangling remote blob metadata {oid}");
+            }
+            MetadataReferenceIssue::DanglingLargeObject { oid } => {
+                eprintln!("dangling remote large object metadata {oid}");
+            }
+            MetadataReferenceIssue::DanglingChunk { oid } => {
+                eprintln!("dangling remote chunk metadata {oid}");
+            }
         }
     }
     Ok(())
