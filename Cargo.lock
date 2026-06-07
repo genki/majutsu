@@ -1542,6 +1542,7 @@ dependencies = [
  "chrono",
  "majutsu-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

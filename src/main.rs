@@ -19,7 +19,7 @@ use majutsu_core::{
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_large::{LargeObjectExport, LargePinExport};
-use majutsu_pack::{PackEntry, PackIndex, PackTier};
+use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
 };
@@ -626,15 +626,6 @@ struct MetadataExport {
     packs: Vec<PackExport>,
     #[serde(default)]
     large_pins: Vec<LargePinExport>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PackExport {
-    pack_id: String,
-    pack_key: String,
-    index_key: String,
-    object_count: usize,
-    size: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5388,11 +5379,7 @@ fn validate_local_pack_objects(
             .and_then(|bytes| serde_json::from_slice::<PackIndex>(&bytes).map_err(Into::into))
         {
             Ok(index) => {
-                if index.pack_id != pack.pack_id
-                    || index.pack_key != pack.pack_key
-                    || index.entries.len() != pack.object_count
-                    || index.entries.len() != expected_blobs.len()
-                {
+                if !pack.matches_index(&index) || index.entries.len() != expected_blobs.len() {
                     *missing += 1;
                     eprintln!("pack index does not match metadata {}", pack.pack_id);
                 } else {
@@ -6202,11 +6189,7 @@ fn validate_remote_pack_objects(
                     pack.index_key, bytes.remote_key
                 )
             })?;
-            if index.pack_id != pack.pack_id
-                || index.pack_key != pack.pack_key
-                || index.entries.len() != pack.object_count
-                || index.entries.len() != expected_blobs.len()
-            {
+            if !pack.matches_index(&index) || index.entries.len() != expected_blobs.len() {
                 *missing += 1;
                 eprintln!(
                     "pack index object does not match metadata {} {}",
