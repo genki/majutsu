@@ -24,7 +24,7 @@ use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
     parse_db_time as restore_parse_db_time, parse_duration_ago as restore_parse_duration_ago,
-    parse_restore_time_rfc3339,
+    parse_restore_time_rfc3339, validate_relative_filter_path,
 };
 use majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
@@ -6426,23 +6426,6 @@ fn restore_target_label(plan: &RestorePlan) -> String {
         .as_ref()
         .map(|to| to.display().to_string())
         .unwrap_or_else(|| "original-roots".into())
-}
-
-fn validate_relative_filter_path(path: &Path, label: &str) -> Result<()> {
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        bail!("{label} must be a relative path inside the selected root");
-    }
-    let mut has_component = false;
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(_) => has_component = true,
-            _ => bail!("{label} must not contain '.', '..', prefixes, or root separators"),
-        }
-    }
-    if !has_component {
-        bail!("{label} must not be empty");
-    }
-    Ok(())
 }
 
 fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<()> {

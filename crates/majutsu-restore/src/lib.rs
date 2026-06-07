@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use majutsu_core::{ObjectKey, RootId, SnapshotId};
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestorePlanSummary {
@@ -139,6 +140,23 @@ where
     Ok(stats)
 }
 
+pub fn validate_relative_filter_path(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!("{label} must be a relative path inside the selected root");
+    }
+    let mut has_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => has_component = true,
+            _ => bail!("{label} must not contain '.', '..', prefixes, or root separators"),
+        }
+    }
+    if !has_component {
+        bail!("{label} must not be empty");
+    }
+    Ok(())
+}
+
 pub fn parse_restore_time(input: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(input) {
         return Ok(dt.with_timezone(&Utc));
@@ -213,8 +231,10 @@ mod tests {
     use super::{
         RestorePathState, RestoreQueueItem, count_restore_changes, parse_db_time,
         parse_duration_ago, parse_relative_ago, parse_restore_time, parse_restore_time_rfc3339,
+        validate_relative_filter_path,
     };
     use chrono::{DateTime, TimeZone, Utc};
+    use std::path::Path;
 
     fn time(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).unwrap()
@@ -234,6 +254,37 @@ mod tests {
         assert_eq!(stats.keep_files, 1);
         assert_eq!(stats.modify_files, 2);
         assert_eq!(stats.delete_files, 3);
+    }
+
+    #[test]
+    fn relative_filter_path_rejects_unsafe_paths() {
+        validate_relative_filter_path(Path::new("subtree/file.txt"), "restore --path").unwrap();
+        validate_relative_filter_path(Path::new("subtree"), "restore --path").unwrap();
+
+        assert_eq!(
+            validate_relative_filter_path(Path::new(""), "restore --path")
+                .unwrap_err()
+                .to_string(),
+            "restore --path must be a relative path inside the selected root"
+        );
+        assert_eq!(
+            validate_relative_filter_path(Path::new("/tmp/out"), "restore --path")
+                .unwrap_err()
+                .to_string(),
+            "restore --path must be a relative path inside the selected root"
+        );
+        assert_eq!(
+            validate_relative_filter_path(Path::new("../out"), "restore --path")
+                .unwrap_err()
+                .to_string(),
+            "restore --path must not contain '.', '..', prefixes, or root separators"
+        );
+        assert_eq!(
+            validate_relative_filter_path(Path::new("./out"), "restore --path")
+                .unwrap_err()
+                .to_string(),
+            "restore --path must not contain '.', '..', prefixes, or root separators"
+        );
     }
 
     #[test]
