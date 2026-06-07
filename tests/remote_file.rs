@@ -342,6 +342,12 @@ fn clone_can_restore_from_canonical_object_aliases() {
         c
     });
     fs::remove_dir_all(remote.join("objects")).unwrap();
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("status");
+        c
+    });
+    assert!(status.contains("missing_remote_objects 0"));
 
     run({
         let mut c = mj();

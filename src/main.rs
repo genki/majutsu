@@ -2820,7 +2820,7 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
     let local_keys = local_object_keys(&export);
     let mut missing_remote = 0usize;
     for key in &local_keys {
-        if !remote.exists(key)? {
+        if !remote_object_available(remote, key)? {
             missing_remote += 1;
         }
     }
