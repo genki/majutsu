@@ -1,6 +1,7 @@
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use rusqlite::Connection;
 use std::fs;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::process::Command;
@@ -5917,6 +5918,178 @@ fn restore_prepare_requests_archive_for_missing_local_objects() {
             .arg(&job_id);
         c
     });
+}
+
+#[test]
+fn restore_prepare_requests_s3_archive_restore_via_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let alpha_oid = blake3::hash(b"alpha\n").to_hex().to_string();
+    let object = state
+        .join("objects/blobs")
+        .join(&alpha_oid[..2])
+        .join(&alpha_oid[2..]);
+    fs::remove_file(object).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let started = std::time::Instant::now();
+        let mut seen = Vec::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                if started.elapsed() > Duration::from_secs(5) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let mut headers_done = false;
+            while !headers_done {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                headers_done = request.windows(4).any(|w| w == b"\r\n\r\n");
+            }
+            let header_end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+                .unwrap_or(request.len());
+            let header = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_len = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .or_else(|| line_header_value(&header, "Content-Length"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_len {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let first = header.lines().next().unwrap_or("").to_string();
+            let body = String::from_utf8_lossy(&request[header_end..]).to_string();
+            let saw_restore_request = first.starts_with("POST ") && first.contains("?restore");
+            seen.push((first, body));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            if saw_restore_request {
+                break;
+            }
+        }
+        tx.send(seen).unwrap();
+    });
+
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let before_remote = config.split("\n[remote]\n").next().unwrap();
+    let after_remote = config.split("\n[large]\n").nth(1).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            r#"{before_remote}
+[remote]
+type = "s3"
+bucket = "archive-bucket"
+prefix = "majutsu/v1"
+endpoint = "http://{addr}"
+region = "us-test-1"
+signature_version = "s3v4"
+
+[large]
+{after_remote}"#
+        ),
+    )
+    .unwrap();
+
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--to")
+            .arg(&restore)
+            .env("AWS_ACCESS_KEY_ID", "dummy")
+            .env("AWS_SECRET_ACCESS_KEY", "dummy");
+        c
+    });
+    assert!(prepare.contains("archived_objects 1"));
+    assert!(prepare.contains("archive_requested_objects 1"));
+
+    let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.join().unwrap();
+    assert!(seen.iter().any(|(line, _)| line.starts_with("HEAD ")));
+    let restore_request = seen
+        .iter()
+        .find(|(line, _)| line.starts_with("POST ") && line.contains("?restore"))
+        .expect("missing S3 archive restore request");
+    assert!(
+        restore_request
+            .0
+            .contains("/archive-bucket/majutsu/v1/objects/blobs/")
+    );
+    assert!(restore_request.1.contains("<Days>7</Days>"));
+    assert!(restore_request.1.contains("<Tier>Standard</Tier>"));
+}
+
+fn line_header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        line.split_once(':').and_then(|(header, value)| {
+            if header.eq_ignore_ascii_case(name) {
+                Some(value)
+            } else {
+                None
+            }
+        })
+    })
 }
 
 #[test]

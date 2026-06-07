@@ -673,8 +673,9 @@ If `restore prepare` finds required objects missing from local state, it checks
 the configured remote. Objects that exist remotely are tracked as
 `archived_objects` and receive provider-side archive restore requests; objects
 missing both locally and remotely are tracked as `missing_objects` and block
-`restore resume` until the data is repaired. S3 remotes use `POST ?restore`
-using `[restore.archive]`; file remotes record the request as a no-op for local
+`restore resume` until the data is repaired. S3-compatible remotes probe object
+availability with `HEAD` and use `POST ?restore` with XML derived from
+`[restore.archive]`; file remotes record the request as a no-op for local
 validation. On resume, majutsu tries to download pending remote objects into the
 local object store before applying the prepared restore.
 
