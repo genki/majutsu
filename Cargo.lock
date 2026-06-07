@@ -1563,7 +1563,11 @@ dependencies = [
 name = "majutsu-store"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
  "majutsu-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

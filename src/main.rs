@@ -22,7 +22,10 @@ use majutsu_pack::{PackEntry, PackIndex, PackTier};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
 };
-use majutsu_store::RemoteCapabilities;
+use majutsu_store::{
+    LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteCapabilities, RemoteHostIndex,
+    RemoteHostIndexIssue, RemoteHostSummary, select_remote_host,
+};
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
@@ -669,22 +672,6 @@ struct MountViewMetadata {
     files: usize,
     lazy_large_files: usize,
     hydrated_large_files: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RemoteHostSummary {
-    id: String,
-    name: String,
-    last_synced_at: DateTime<Utc>,
-    current_snapshot: Option<String>,
-    metadata_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RemoteHostIndex {
-    version: u32,
-    updated_at: DateTime<Utc>,
-    hosts: Vec<RemoteHostSummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2767,7 +2754,7 @@ fn enqueue_and_drain_sync(
     let host_index = update_remote_host_index(&remote, &config, &export, &host_metadata_key)?;
     enqueue_inline_upload(
         paths,
-        "hosts/index.json",
+        REMOTE_HOST_INDEX_KEY,
         serde_json::to_vec_pretty(&host_index)?,
     )?;
     enqueue_inline_upload(
@@ -3062,10 +3049,7 @@ fn update_remote_host_index(
         current_snapshot: export.refs.get("current").cloned(),
         metadata_key: metadata_key.to_string(),
     };
-    index.hosts.retain(|host| host.id != summary.id);
-    index.hosts.push(summary);
-    index.hosts.sort_by(|a, b| a.id.cmp(&b.id));
-    index.updated_at = Utc::now();
+    index.upsert_host(summary, Utc::now());
     Ok(index)
 }
 
@@ -3130,28 +3114,26 @@ fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> 
 }
 
 fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
-    if remote.exists("hosts/index.json")? {
-        let mut index: RemoteHostIndex = serde_json::from_slice(&remote.get("hosts/index.json")?)?;
-        index.hosts.sort_by(|a, b| a.id.cmp(&b.id));
+    if remote.exists(REMOTE_HOST_INDEX_KEY)? {
+        let mut index: RemoteHostIndex =
+            serde_json::from_slice(&remote.get(REMOTE_HOST_INDEX_KEY)?)?;
+        index.sort_hosts();
         return Ok(index);
     }
-    Ok(RemoteHostIndex {
-        version: 1,
-        updated_at: Utc::now(),
-        hosts: Vec::new(),
-    })
+    Ok(RemoteHostIndex::empty(Utc::now()))
 }
 
 fn remote_host_index_with_legacy(remote: &RemoteStore) -> Result<RemoteHostIndex> {
     let mut index = read_remote_host_index(remote)?;
-    if index.hosts.is_empty() && remote.exists("metadata/export.json")? {
-        let export: MetadataExport = serde_json::from_slice(&remote.get("metadata/export.json")?)?;
+    if index.hosts.is_empty() && remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
+        let export: MetadataExport =
+            serde_json::from_slice(&remote.get(LEGACY_METADATA_EXPORT_KEY)?)?;
         index.hosts.push(RemoteHostSummary {
             id: export.config.host.id.clone(),
             name: export.config.host.name.clone(),
             last_synced_at: export.exported_at,
             current_snapshot: export.refs.get("current").cloned(),
-            metadata_key: "metadata/export.json".into(),
+            metadata_key: LEGACY_METADATA_EXPORT_KEY.into(),
         });
     }
     Ok(index)
@@ -3334,10 +3316,10 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             let keys = remote.list("")?;
             println!("remote {}", remote.describe());
             println!("objects {}", keys.len());
-            let metadata_key = if remote.exists("hosts/index.json")? {
-                "hosts/index.json"
-            } else if remote.exists("metadata/export.json")? {
-                "metadata/export.json"
+            let metadata_key = if remote.exists(REMOTE_HOST_INDEX_KEY)? {
+                REMOTE_HOST_INDEX_KEY
+            } else if remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
+                LEGACY_METADATA_EXPORT_KEY
             } else {
                 bail!(
                     "remote metadata is missing: metadata/export.json and hosts/index.json not found"
@@ -3466,33 +3448,11 @@ fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String
     let index = remote_host_index_with_legacy(remote)?;
     match index.hosts.as_slice() {
         [host] => Ok(host.metadata_key.clone()),
-        [] if remote.exists("metadata/export.json")? => Ok("metadata/export.json".into()),
+        [] if remote.exists(LEGACY_METADATA_EXPORT_KEY)? => Ok(LEGACY_METADATA_EXPORT_KEY.into()),
         [] => {
             bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")
         }
         _ => bail!("remote contains multiple hosts; rerun clone with --host"),
-    }
-}
-
-fn select_remote_host(hosts: Vec<RemoteHostSummary>, selector: &str) -> Result<RemoteHostSummary> {
-    let mut by_id = hosts
-        .iter()
-        .filter(|host| host.id == selector)
-        .cloned()
-        .collect::<Vec<_>>();
-    match by_id.len() {
-        0 => {}
-        1 => return Ok(by_id.remove(0)),
-        _ => bail!("remote host id is duplicated in hosts/index.json: {selector}"),
-    }
-    let mut by_name = hosts
-        .into_iter()
-        .filter(|host| host.name == selector)
-        .collect::<Vec<_>>();
-    match by_name.len() {
-        0 => bail!("remote host not found: {selector}"),
-        1 => Ok(by_name.remove(0)),
-        _ => bail!("remote host name is ambiguous: {selector}; use the host id"),
     }
 }
 
@@ -5588,11 +5548,17 @@ fn validate_local_pack_objects(
 fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     let mut missing = 0usize;
     let mut verified_hosts = 0usize;
-    let has_legacy_export = remote.exists("metadata/export.json")?;
-    let has_host_index = remote.exists("hosts/index.json")?;
+    let has_legacy_export = remote.exists(LEGACY_METADATA_EXPORT_KEY)?;
+    let has_host_index = remote.exists(REMOTE_HOST_INDEX_KEY)?;
 
     if has_legacy_export {
-        let export = remote_fsck_export(paths, remote, "metadata/export.json", None, &mut missing)?;
+        let export = remote_fsck_export(
+            paths,
+            remote,
+            LEGACY_METADATA_EXPORT_KEY,
+            None,
+            &mut missing,
+        )?;
         if let Some(current) = export.refs.get("current") {
             let legacy_current = remote_ref(remote, "hosts/current")?;
             if legacy_current.as_deref() != Some(current.as_str()) {
@@ -5604,21 +5570,19 @@ fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
 
     if has_host_index {
         let index = read_remote_host_index(remote)?;
-        let mut seen_host_ids = BTreeSet::new();
-        let mut seen_metadata_keys = BTreeSet::new();
+        for issue in index.duplicate_issues() {
+            missing += 1;
+            match issue {
+                RemoteHostIndexIssue::DuplicateHostId(id) => {
+                    eprintln!("duplicate host id in hosts/index.json: {id}");
+                }
+                RemoteHostIndexIssue::DuplicateMetadataKey(key) => {
+                    eprintln!("duplicate host metadata_key in hosts/index.json: {key}");
+                }
+            }
+        }
         for host in &index.hosts {
             verified_hosts += 1;
-            if !seen_host_ids.insert(host.id.clone()) {
-                missing += 1;
-                eprintln!("duplicate host id in hosts/index.json: {}", host.id);
-            }
-            if !seen_metadata_keys.insert(host.metadata_key.clone()) {
-                missing += 1;
-                eprintln!(
-                    "duplicate host metadata_key in hosts/index.json: {}",
-                    host.metadata_key
-                );
-            }
             if !remote.exists(&host.metadata_key)? {
                 missing += 1;
                 eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
