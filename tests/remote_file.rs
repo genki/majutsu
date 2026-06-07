@@ -488,6 +488,7 @@ fn remote_fsck_detects_missing_canonical_host_export() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
+    assert!(find_file_ending(&remote.join("gc/marks"), ".json").exists());
     let host_dir = fs::read_dir(remote.join("hosts"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -1812,6 +1813,7 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
         .count();
     assert_eq!(after, 1);
+    assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
 }
 
 #[test]

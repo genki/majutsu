@@ -793,6 +793,23 @@ struct ChunkIndexEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct GcMarkExport {
+    version: u32,
+    host_id: String,
+    marked_at: DateTime<Utc>,
+    current_snapshot: Option<String>,
+    object_keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GcTombstoneExport {
+    version: u32,
+    host_id: String,
+    deleted_at: DateTime<Utc>,
+    key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct LargePinExport {
     oid: String,
     pinned_at: String,
@@ -2911,6 +2928,11 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         "hosts/index.json",
         serde_json::to_vec_pretty(&host_index)?,
     )?;
+    enqueue_inline_upload(
+        paths,
+        &format!("gc/marks/{}.json", config.host.id),
+        serde_json::to_vec_pretty(&build_gc_mark_export(&config, &export))?,
+    )?;
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
         enqueue_file_upload(paths, "keys/recipients.toml", &recipients)?;
@@ -3033,6 +3055,22 @@ fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
     }
 }
 
+fn build_gc_mark_export(config: &Config, export: &MetadataExport) -> GcMarkExport {
+    let mut object_keys = local_object_keys(export);
+    for key in object_keys.clone() {
+        object_keys.extend(canonical_remote_aliases(&key));
+    }
+    object_keys.sort();
+    object_keys.dedup();
+    GcMarkExport {
+        version: 1,
+        host_id: config.host.id.clone(),
+        marked_at: Utc::now(),
+        current_snapshot: export.refs.get("current").cloned(),
+        object_keys,
+    }
+}
+
 fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
     let bytes = read_object(paths, key)?;
     if key.starts_with("objects/trees/") {
@@ -3109,17 +3147,32 @@ fn prune_remote_host_exports(
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc"))
             && !live_snapshots.contains(&key)
         {
+            write_remote_gc_tombstone(remote, host_id, &key)?;
             remote.delete(&key)?;
             removed += 1;
         }
     }
     for key in remote.list(&format!("hosts/{host_id}/ops/"))? {
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc")) && !live_ops.contains(&key) {
+            write_remote_gc_tombstone(remote, host_id, &key)?;
             remote.delete(&key)?;
             removed += 1;
         }
     }
     Ok(removed)
+}
+
+fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> Result<()> {
+    let tombstone = GcTombstoneExport {
+        version: 1,
+        host_id: host_id.to_string(),
+        deleted_at: Utc::now(),
+        key: key.to_string(),
+    };
+    remote.put(
+        &format!("gc/tombstones/{host_id}/{}.json", new_id("tombstone")),
+        &serde_json::to_vec_pretty(&tombstone)?,
+    )
 }
 
 fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
