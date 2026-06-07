@@ -4859,6 +4859,20 @@ fn restore_prepare_requests_archive_for_missing_local_objects() {
         .join(&alpha_oid[2..]);
     fs::remove_file(object).unwrap();
 
+    let plan = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(plan.contains("archived_objects 1"));
+    assert!(plan.contains("missing_objects 0"));
+    assert!(plan.contains("archive_or_missing_objects 1"));
+
     let prepare = output({
         let mut c = mj();
         c.arg("--home")
@@ -5227,6 +5241,20 @@ fn restore_prepare_reports_objects_missing_from_local_and_remote() {
         &alpha_oid[2..]
     )))
     .unwrap();
+
+    let plan = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(plan.contains("archived_objects 0"));
+    assert!(plan.contains("missing_objects 1"));
+    assert!(plan.contains("archive_or_missing_objects 1"));
 
     let prepare = output({
         let mut c = mj();

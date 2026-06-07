@@ -6661,6 +6661,8 @@ struct RestoreObjectStats {
     required_chunks: usize,
     local_objects: usize,
     remote_objects: usize,
+    archived_objects: usize,
+    missing_objects: usize,
     archive_or_missing_objects: usize,
 }
 
@@ -6929,6 +6931,8 @@ fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> R
     println!("required_chunks {}", stats.required_chunks);
     println!("local_objects {}", stats.local_objects);
     println!("remote_objects {}", stats.remote_objects);
+    println!("archived_objects {}", stats.archived_objects);
+    println!("missing_objects {}", stats.missing_objects);
     println!(
         "archive_or_missing_objects {}",
         stats.archive_or_missing_objects
@@ -6968,30 +6972,42 @@ fn restore_object_stats(
         .ok()
         .and_then(|config| config.remote.and_then(|remote| open_remote(&remote).ok()));
     let mut remote_objects = 0usize;
+    let mut archived_objects = 0usize;
+    let mut missing_objects = 0usize;
+    for key in &required_objects {
+        if paths.home.join(key).exists() {
+            continue;
+        }
+        let available_remote = remote
+            .as_ref()
+            .map(|remote| remote_object_available(remote, key))
+            .transpose()?
+            .unwrap_or(false);
+        if available_remote {
+            remote_objects += 1;
+            archived_objects += 1;
+        } else {
+            missing_objects += 1;
+        }
+    }
     if let Some(remote) = remote.as_ref() {
-        for key in &required_objects {
+        for key in required_objects
+            .iter()
+            .filter(|key| paths.home.join(key).exists())
+        {
             if remote_object_available(remote, key)? {
                 remote_objects += 1;
             }
         }
     }
-    let archive_or_missing_objects = required_objects.len().saturating_sub(
-        required_objects
-            .iter()
-            .filter(|key| {
-                paths.home.join(key).exists()
-                    || remote
-                        .as_ref()
-                        .and_then(|remote| remote_object_available(remote, key).ok())
-                        .unwrap_or(false)
-            })
-            .count(),
-    );
+    let archive_or_missing_objects = archived_objects + missing_objects;
     Ok(RestoreObjectStats {
         required_objects: required_objects.len(),
         required_chunks,
         local_objects,
         remote_objects,
+        archived_objects,
+        missing_objects,
         archive_or_missing_objects,
     })
 }
