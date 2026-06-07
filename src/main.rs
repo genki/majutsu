@@ -7829,6 +7829,7 @@ fn read_config(paths: &Paths) -> Result<Config> {
     normalize_watch_backend(&config.watch.backend)?;
     validate_watch_mode(&config.watch.mode)?;
     validate_security_config(&config.security)?;
+    validate_restore_archive_config(&config.restore.archive)?;
     Ok(config)
 }
 

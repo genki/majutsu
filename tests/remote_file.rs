@@ -457,6 +457,29 @@ fn file_remote_clone_preserves_restore_archive_config() {
 }
 
 #[test]
+fn invalid_restore_archive_config_is_rejected_when_reading_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("days = 7", "days = 0");
+    fs::write(&config_path, config).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+}
+
+#[test]
 fn clone_can_restore_from_canonical_object_aliases() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
