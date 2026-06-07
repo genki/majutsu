@@ -396,6 +396,67 @@ fn file_remote_clone_restores_normal_and_large_files() {
 }
 
 #[test]
+fn file_remote_clone_preserves_restore_archive_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("days = 7", "days = 4")
+        .replace("tier = \"Standard\"", "tier = \"Bulk\"");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+
+    let cloned_config = fs::read_to_string(clone.join("config.toml")).unwrap();
+    assert!(cloned_config.contains("[restore.archive]"));
+    assert!(cloned_config.contains("days = 4"));
+    assert!(cloned_config.contains("tier = \"Bulk\""));
+}
+
+#[test]
 fn clone_can_restore_from_canonical_object_aliases() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
