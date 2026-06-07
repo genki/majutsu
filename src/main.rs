@@ -100,7 +100,7 @@ use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use prune_runtime::{gc_cmd, prune_cmd};
 use queue_runtime::{
     drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, has_pending_journal_events,
-    record_event, upload_queue_items,
+    record_event, upload_queue_items, upload_queue_stats,
 };
 #[cfg(test)]
 use remote_store::{
@@ -1298,11 +1298,29 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     sync_configured_remote(paths, &conn, &config, &remote)
 }
 
-pub(crate) fn sync_current_if_remote(paths: &Paths) -> Result<bool> {
+pub(crate) enum AutoSyncResult {
+    NoRemote,
+    Synced,
+    Deferred {
+        delayed: usize,
+        next_retry_after: Option<String>,
+    },
+}
+
+pub(crate) fn sync_current_if_remote(paths: &Paths) -> Result<AutoSyncResult> {
     let config = read_config(paths)?;
     let Some(remote_config) = config.remote.as_ref() else {
-        return Ok(false);
+        return Ok(AutoSyncResult::NoRemote);
     };
+    let upload_stats = upload_queue_stats(paths)?;
+    if upload_stats.delayed > 0 {
+        return Ok(AutoSyncResult::Deferred {
+            delayed: upload_stats.delayed,
+            next_retry_after: upload_stats
+                .next_retry_after
+                .map(|retry_after| retry_after.to_rfc3339()),
+        });
+    }
     let remote = open_remote_with_upload_policy(
         remote_config,
         config.large.multipart,
@@ -1310,7 +1328,7 @@ pub(crate) fn sync_current_if_remote(paths: &Paths) -> Result<bool> {
     )?;
     let conn = open_db(paths)?;
     sync_configured_remote(paths, &conn, &config, &remote)?;
-    Ok(true)
+    Ok(AutoSyncResult::Synced)
 }
 
 fn sync_configured_remote(

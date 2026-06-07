@@ -2667,6 +2667,7 @@ fn sync_retry_queue_preserves_attempt_count_across_reenqueue() {
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
         .collect::<Vec<_>>();
     assert!(queued.iter().any(|item| item.contains("\"attempts\": 2")));
+    assert!(queued.iter().any(|item| item.contains("\"retry_after\"")));
 
     fs::remove_file(&remote).unwrap();
     fs::create_dir_all(&remote).unwrap();
@@ -9312,7 +9313,8 @@ fn daemon_status_uses_ipc_socket() {
             "source": null,
             "inline": [114, 101, 116, 114, 121],
             "created_at": "2026-06-07T00:00:00Z",
-            "attempts": 2
+            "attempts": 2,
+            "retry_after": "2999-01-01T00:00:00Z"
         })
         .to_string(),
     )
@@ -9347,6 +9349,8 @@ fn daemon_status_uses_ipc_socket() {
     assert!(status.contains("pending_journal_events false"));
     assert!(status.contains("queued_uploads 1"));
     assert!(status.contains("queued_uploads_retrying 1"));
+    assert!(status.contains("queued_uploads_delayed 1"));
+    assert!(status.contains("queued_upload_next_retry_after 2999-01-01T00:00:00+00:00"));
     assert!(status.contains("queued_upload_attempts 2"));
     assert!(status.contains("queued_upload_max_attempts 2"));
     assert!(status.contains("upload_queue_backpressure true"));
@@ -9624,6 +9628,28 @@ fn daemon_watch_snapshot_survives_sync_retry_and_remote_recovery() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(queued.iter().any(|item| item.contains("\"attempts\": 1")));
+    assert!(queued.iter().any(|item| item.contains("\"retry_after\"")));
+    fs::write(source.join("beta.txt"), b"deferred while remote is down\n").unwrap();
+    let mut deferred = false;
+    for _ in 0..100 {
+        let events = fs::read_dir(state.join("queue/events"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if events.contains("watch-sync-deferred") {
+            deferred = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        deferred,
+        "daemon did not defer auto sync during upload backoff"
+    );
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("daemon").arg("stop");

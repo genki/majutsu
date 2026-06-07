@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use majutsu_db::{EventJournalRecord, UploadQueueItem, expected_upload_queue_item_id};
 use majutsu_store::is_content_addressed_remote_key;
 use std::ffi::OsStr;
@@ -14,8 +14,10 @@ use crate::util::{new_id, path_to_slash};
 pub(crate) struct UploadQueueStats {
     pub(crate) total: usize,
     pub(crate) retrying: usize,
+    pub(crate) delayed: usize,
     pub(crate) attempts: u64,
     pub(crate) max_attempts: u32,
+    pub(crate) next_retry_after: Option<DateTime<Utc>>,
 }
 
 impl UploadQueueStats {
@@ -84,12 +86,24 @@ pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
     let mut stats = UploadQueueStats {
         total: items.len(),
         retrying: 0,
+        delayed: 0,
         attempts: 0,
         max_attempts: 0,
+        next_retry_after: None,
     };
+    let now = Utc::now();
     for (_, item) in items {
         if item.attempts > 0 {
             stats.retrying += 1;
+        }
+        if let Some(retry_after) = item.retry_after {
+            if retry_after > now {
+                stats.delayed += 1;
+                stats.next_retry_after = stats
+                    .next_retry_after
+                    .map(|current| current.min(retry_after))
+                    .or(Some(retry_after));
+            }
         }
         stats.attempts += u64::from(item.attempts);
         stats.max_attempts = stats.max_attempts.max(item.attempts);
@@ -123,13 +137,23 @@ pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<
                 uploaded += 1;
             }
             Err(err) => {
-                item.record_attempt();
+                let next_attempt = item.attempts.saturating_add(1);
+                item.record_attempt(Some(next_retry_after(Utc::now(), next_attempt)));
                 fs::write(&path, serde_json::to_vec_pretty(&item)?)?;
                 return Err(err).with_context(|| format!("upload failed for {}", item.key));
             }
         }
     }
     Ok(uploaded)
+}
+
+pub(crate) fn next_retry_after(now: DateTime<Utc>, attempts: u32) -> DateTime<Utc> {
+    now + Duration::seconds(retry_backoff_secs(attempts))
+}
+
+fn retry_backoff_secs(attempts: u32) -> i64 {
+    let exponent = attempts.saturating_sub(1).min(6);
+    (5 * 2_i64.pow(exponent)).min(300)
 }
 
 pub(crate) fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {

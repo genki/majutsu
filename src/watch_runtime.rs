@@ -10,7 +10,8 @@ use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::record_event;
 use crate::root_state::roots;
 use crate::{
-    ensure_ready, open_db, replay_pending_journal_events, snapshot, sync_current_if_remote,
+    AutoSyncResult, ensure_ready, open_db, replay_pending_journal_events, snapshot,
+    sync_current_if_remote,
 };
 
 pub fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
@@ -241,8 +242,22 @@ fn watch_notify_loop<W: Watcher>(
 fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     snapshot(paths, args)?;
     match sync_current_if_remote(paths) {
-        Ok(true) => record_event(paths, "watch-sync", "synced current snapshot to remote")?,
-        Ok(false) => {}
+        Ok(AutoSyncResult::Synced) => {
+            record_event(paths, "watch-sync", "synced current snapshot to remote")?
+        }
+        Ok(AutoSyncResult::Deferred {
+            delayed,
+            next_retry_after,
+        }) => record_event(
+            paths,
+            "watch-sync-deferred",
+            &format!(
+                "delayed_uploads={} next_retry_after={}",
+                delayed,
+                next_retry_after.unwrap_or_else(|| "(unknown)".into())
+            ),
+        )?,
+        Ok(AutoSyncResult::NoRemote) => {}
         Err(err) => record_event(paths, "watch-sync-error", &format!("{err:#}"))?,
     }
     Ok(())

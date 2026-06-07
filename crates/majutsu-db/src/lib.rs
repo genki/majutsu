@@ -76,6 +76,8 @@ pub struct UploadQueueItem {
     pub inline: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
     pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +103,7 @@ impl UploadQueueItem {
             inline: Some(bytes),
             created_at,
             attempts: 0,
+            retry_after: None,
         }
     }
 
@@ -112,19 +115,22 @@ impl UploadQueueItem {
             inline: None,
             created_at,
             attempts: 0,
+            retry_after: None,
         }
     }
 
     pub fn preserve_retry_state(self, existing: &Self) -> Self {
         Self {
             attempts: existing.attempts,
+            retry_after: existing.retry_after,
             created_at: existing.created_at,
             ..self
         }
     }
 
-    pub fn record_attempt(&mut self) {
+    pub fn record_attempt(&mut self, retry_after: Option<DateTime<Utc>>) {
         self.attempts += 1;
+        self.retry_after = retry_after;
     }
 
     pub fn validation_issues(&self) -> Vec<UploadQueueItemIssue> {
@@ -476,8 +482,8 @@ mod tests {
             time(10),
         );
         let mut existing = existing;
-        existing.record_attempt();
-        existing.record_attempt();
+        existing.record_attempt(Some(time(30)));
+        existing.record_attempt(Some(time(40)));
 
         let reenqueued = UploadQueueItem::file(
             "upload-a".into(),
@@ -488,6 +494,7 @@ mod tests {
         .preserve_retry_state(&existing);
 
         assert_eq!(reenqueued.attempts, 2);
+        assert_eq!(reenqueued.retry_after, Some(time(40)));
         assert_eq!(reenqueued.created_at, time(10));
         assert_eq!(reenqueued.source.as_deref(), Some("/tmp/a"));
         assert!(reenqueued.inline.is_none());
@@ -508,6 +515,7 @@ mod tests {
         assert_eq!(json["source"], serde_json::Value::Null);
         assert_eq!(json["inline"], serde_json::json!([97, 98, 99]));
         assert_eq!(json["attempts"], 0);
+        assert_eq!(json.get("retry_after"), None);
     }
 
     #[test]
@@ -519,6 +527,7 @@ mod tests {
             inline: Some(b"abc".to_vec()),
             created_at: time(10),
             attempts: 0,
+            retry_after: None,
         };
 
         let issues = item.validation_issues();

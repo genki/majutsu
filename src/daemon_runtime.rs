@@ -118,6 +118,15 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
             writeln!(stream, "pending_journal_events {pending_journal_events}")?;
             writeln!(stream, "queued_uploads {}", upload_stats.total)?;
             writeln!(stream, "queued_uploads_retrying {}", upload_stats.retrying)?;
+            writeln!(stream, "queued_uploads_delayed {}", upload_stats.delayed)?;
+            writeln!(
+                stream,
+                "queued_upload_next_retry_after {}",
+                upload_stats
+                    .next_retry_after
+                    .map(|retry_after| retry_after.to_rfc3339())
+                    .unwrap_or_else(|| "(none)".into())
+            )?;
             writeln!(stream, "queued_upload_attempts {}", upload_stats.attempts)?;
             writeln!(
                 stream,
