@@ -7900,6 +7900,7 @@ fn validate_config(config: &Config) -> Result<()> {
     validate_watch_mode(&config.watch.mode)?;
     validate_security_config(&config.security)?;
     validate_restore_archive_config(&config.restore.archive)?;
+    validate_tiering_config(&config.tiering)?;
     Ok(())
 }
 
@@ -7929,6 +7930,10 @@ fn validate_watch_mode(mode: &str) -> Result<()> {
 fn validate_security_config(security: &SecurityConfig) -> Result<()> {
     encryption_enabled(security)?;
     majutsu_crypto::validate_security_hash(&security.hash)
+}
+
+fn validate_tiering_config(tiering: &TieringConfig) -> Result<()> {
+    majutsu_policy::s3_lifecycle_policy(&policy_config(tiering)).map(|_| ())
 }
 
 fn encryption_enabled(security: &SecurityConfig) -> Result<bool> {
