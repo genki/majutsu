@@ -128,8 +128,8 @@ use restore_runtime::{
     RestoreDelete, RestorePlan, ensure_restore_job_has_no_missing_objects,
     ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
     print_restore_conflicts, print_restore_deletes, read_restore_job, remove_empty_restore_parents,
-    restore_delete_destination, restore_destination, restore_root_base, restore_target_label,
-    write_restore_job,
+    required_object_keys_for_plan, restore_delete_destination, restore_destination,
+    restore_object_stats, restore_root_base, restore_target_label, write_restore_job,
 };
 use root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_config_roots, sync_roots_to_config,
@@ -3872,16 +3872,6 @@ fn validate_remote_pack_objects(
     Ok(())
 }
 
-struct RestoreObjectStats {
-    required_objects: usize,
-    required_chunks: usize,
-    local_objects: usize,
-    remote_objects: usize,
-    archived_objects: usize,
-    missing_objects: usize,
-    archive_or_missing_objects: usize,
-}
-
 fn build_restore_plan(
     _paths: &Paths,
     conn: &Connection,
@@ -4109,79 +4099,6 @@ fn restore_change_stats(
     })
 }
 
-fn restore_object_stats(
-    paths: &Paths,
-    conn: &Connection,
-    plan: &RestorePlan,
-) -> Result<RestoreObjectStats> {
-    let required_objects = required_object_keys_for_plan(paths, conn, plan)?;
-    let required_chunks = required_chunk_count_for_plan(paths, plan)?;
-    let local_objects = required_objects
-        .iter()
-        .filter(|key| paths.home.join(key).exists())
-        .count();
-    let remote = read_config(paths)
-        .ok()
-        .and_then(|config| config.remote.and_then(|remote| open_remote(&remote).ok()));
-    let mut remote_objects = 0usize;
-    let mut archived_objects = 0usize;
-    let mut missing_objects = 0usize;
-    for key in &required_objects {
-        if paths.home.join(key).exists() {
-            continue;
-        }
-        let available_remote = remote
-            .as_ref()
-            .map(|remote| remote_object_available(remote, key))
-            .transpose()?
-            .unwrap_or(false);
-        if available_remote {
-            remote_objects += 1;
-            archived_objects += 1;
-        } else {
-            missing_objects += 1;
-        }
-    }
-    if let Some(remote) = remote.as_ref() {
-        for key in required_objects
-            .iter()
-            .filter(|key| paths.home.join(key).exists())
-        {
-            if remote_object_available(remote, key)? {
-                remote_objects += 1;
-            }
-        }
-    }
-    let archive_or_missing_objects = archived_objects + missing_objects;
-    Ok(RestoreObjectStats {
-        required_objects: required_objects.len(),
-        required_chunks,
-        local_objects,
-        remote_objects,
-        archived_objects,
-        missing_objects,
-        archive_or_missing_objects,
-    })
-}
-
-fn required_chunk_count_for_plan(paths: &Paths, plan: &RestorePlan) -> Result<usize> {
-    let mut chunks = 0usize;
-    for record in &plan.files {
-        if let Some((_, manifest_key, chunk_count)) = payload_large_ref(&record.payload) {
-            let manifest = read_large_manifest_for_restore(paths, manifest_key)
-                .with_context(|| format!("read large manifest {manifest_key}"))?;
-            if manifest.chunks.len() != chunk_count {
-                bail!(
-                    "large manifest chunk count mismatch for {manifest_key}: payload={chunk_count} manifest={}",
-                    manifest.chunks.len()
-                );
-            }
-            chunks += manifest.chunks.len();
-        }
-    }
-    Ok(chunks)
-}
-
 fn build_restore_job(
     paths: &Paths,
     plan: &RestorePlan,
@@ -4291,80 +4208,6 @@ fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Res
         )?;
     }
     Ok(())
-}
-
-fn required_object_keys_for_plan(
-    paths: &Paths,
-    conn: &Connection,
-    plan: &RestorePlan,
-) -> Result<Vec<String>> {
-    let mut keys = Vec::new();
-    for record in &plan.files {
-        if let Some((oid, object_key)) = payload_blob_ref(&record.payload) {
-            let blob = query_blobs(conn)?
-                .into_iter()
-                .find(|blob| blob.oid == oid)
-                .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
-            if let Some(pack_id) = blob.pack_id {
-                let pack: PackExport = conn.query_row(
-                    "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",
-                    params![pack_id],
-                    |row| {
-                        Ok(PackExport {
-                            pack_id: row.get(0)?,
-                            pack_key: row.get(1)?,
-                            index_key: row.get(2)?,
-                            object_count: row.get(3)?,
-                            size: row.get(4)?,
-                        })
-                    },
-                )?;
-                keys.push(pack.pack_key);
-                keys.push(pack.index_key);
-            } else {
-                keys.push(object_key.to_string());
-            }
-        } else if let Some((_, manifest_key, chunk_count)) = payload_large_ref(&record.payload) {
-            keys.push(manifest_key.to_string());
-            let manifest = read_large_manifest_for_restore(paths, manifest_key)
-                .with_context(|| format!("read large manifest {manifest_key}"))?;
-            if manifest.chunks.len() != chunk_count {
-                bail!(
-                    "large manifest chunk count mismatch for {manifest_key}: payload={chunk_count} manifest={}",
-                    manifest.chunks.len()
-                );
-            }
-            for chunk in manifest.chunks {
-                keys.push(chunk.object_key);
-            }
-        }
-    }
-    keys.sort();
-    keys.dedup();
-    Ok(keys)
-}
-
-fn read_large_manifest_for_restore(paths: &Paths, manifest_key: &str) -> Result<LargeManifest> {
-    match read_object(paths, manifest_key) {
-        Ok(bytes) => return serde_json::from_slice(&bytes).map_err(Into::into),
-        Err(local_err) => {
-            let config = read_config(paths).with_context(|| {
-                format!(
-                    "read config after local large manifest {manifest_key} was unavailable: {local_err}"
-                )
-            })?;
-            let Some(remote_config) = config.remote.as_ref() else {
-                return Err(local_err)
-                    .with_context(|| format!("read local large manifest {manifest_key}"));
-            };
-            let remote = open_remote(remote_config)?;
-            let bytes = download_local_object_from_remote(paths, &remote, manifest_key)
-                .with_context(|| format!("download large manifest {manifest_key}"))?;
-            let decoded = decode_object(paths, &bytes)
-                .with_context(|| format!("decode large manifest {manifest_key}"))?;
-            serde_json::from_slice(&decoded).map_err(Into::into)
-        }
-    }
 }
 
 fn apply_restore_plan(
