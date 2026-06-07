@@ -1455,6 +1455,7 @@ dependencies = [
  "hmac",
  "ignore",
  "libc",
+ "majutsu-cli",
  "majutsu-core",
  "majutsu-crypto",
  "majutsu-daemon",
@@ -1486,6 +1487,9 @@ dependencies = [
 [[package]]
 name = "majutsu-cli"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
 
 [[package]]
 name = "majutsu-core"

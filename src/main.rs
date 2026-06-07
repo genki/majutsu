@@ -9,6 +9,7 @@ use fuser::{
 use hmac::{Hmac, Mac};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
+use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
     FileRecord, LargeChunk, LargeManifest, Payload, RootSnapshot, SnapshotManifest, TreeManifest,
     payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
@@ -8726,47 +8727,6 @@ fn byte_size_value(value: ByteSizeValue) -> Result<u64> {
     }
 }
 
-fn parse_byte_size(input: &str) -> Result<u64> {
-    let normalized = input.trim().replace('_', "");
-    if normalized.is_empty() {
-        bail!("size must not be empty");
-    }
-    if let Ok(value) = normalized.parse::<u64>() {
-        return Ok(value);
-    }
-    let split_at = normalized
-        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
-        .ok_or_else(|| anyhow!("size is missing a unit: {input}"))?;
-    let number = normalized[..split_at].trim();
-    let unit = normalized[split_at..]
-        .trim()
-        .replace(' ', "")
-        .to_ascii_lowercase();
-    let value: f64 = number
-        .parse()
-        .with_context(|| format!("invalid size number: {input}"))?;
-    if !value.is_finite() || value < 0.0 {
-        bail!("invalid size number: {input}");
-    }
-    let multiplier = match unit.as_str() {
-        "b" | "byte" | "bytes" => 1.0,
-        "k" | "kb" => 1_000.0,
-        "m" | "mb" => 1_000_000.0,
-        "g" | "gb" => 1_000_000_000.0,
-        "t" | "tb" => 1_000_000_000_000.0,
-        "kib" => 1024.0,
-        "mib" => 1024.0 * 1024.0,
-        "gib" => 1024.0 * 1024.0 * 1024.0,
-        "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => bail!("unsupported size unit in {input}"),
-    };
-    let bytes = value * multiplier;
-    if bytes > u64::MAX as f64 {
-        bail!("size is too large: {input}");
-    }
-    Ok(bytes.round() as u64)
-}
-
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum DurationValue {
@@ -8802,43 +8762,6 @@ fn duration_value_seconds(value: DurationValue) -> Result<u64> {
         DurationValue::Integer(value) => Ok(value),
         DurationValue::String(value) => Ok(parse_duration_millis(&value)? / 1000),
     }
-}
-
-fn parse_duration_millis(input: &str) -> Result<u64> {
-    let normalized = input.trim().replace('_', "");
-    if normalized.is_empty() {
-        bail!("duration must not be empty");
-    }
-    if let Ok(value) = normalized.parse::<u64>() {
-        return Ok(value);
-    }
-    let split_at = normalized
-        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
-        .ok_or_else(|| anyhow!("duration is missing a unit: {input}"))?;
-    let number = normalized[..split_at].trim();
-    let unit = normalized[split_at..]
-        .trim()
-        .replace(' ', "")
-        .to_ascii_lowercase();
-    let value: f64 = number
-        .parse()
-        .with_context(|| format!("invalid duration number: {input}"))?;
-    if !value.is_finite() || value < 0.0 {
-        bail!("invalid duration number: {input}");
-    }
-    let multiplier = match unit.as_str() {
-        "ms" | "millisecond" | "milliseconds" => 1.0,
-        "s" | "sec" | "secs" | "second" | "seconds" => 1000.0,
-        "m" | "min" | "mins" | "minute" | "minutes" => 60_000.0,
-        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000.0,
-        "d" | "day" | "days" => 86_400_000.0,
-        _ => bail!("unsupported duration unit in {input}"),
-    };
-    let millis = value * multiplier;
-    if millis > u64::MAX as f64 {
-        bail!("duration is too large: {input}");
-    }
-    Ok(millis.round() as u64)
 }
 
 fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
