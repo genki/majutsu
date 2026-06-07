@@ -159,6 +159,11 @@ fn file_remote_clone_restores_normal_and_large_files() {
     fs::create_dir_all(source.join("sub")).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
     fs::write(source.join("sub/beta.txt"), b"beta\n").unwrap();
+    let mut medium = Vec::new();
+    for i in 0..256 * 1024 {
+        medium.push(b'a' + (i % 26) as u8);
+    }
+    fs::write(source.join("medium.log"), &medium).unwrap();
     fs::write(source.join("payload.zip"), vec![0u8; 32 * 1024]).unwrap();
 
     run({
@@ -172,6 +177,12 @@ fn file_remote_clone_restores_normal_and_large_files() {
             .arg(format!("file://{}", remote.display()));
         c
     });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("binary_min_size = 16777216", "binary_min_size = 131072")
+        .replace("chunk_size = 8388608", "chunk_size = 65536");
+    fs::write(&config_path, config).unwrap();
     run({
         let mut c = mj();
         c.arg("--home")
@@ -390,8 +401,16 @@ fn file_remote_clone_restores_normal_and_large_files() {
         fs::read(restore.join("sample/payload.zip")).unwrap()
     );
     assert_eq!(
+        fs::read(source.join("medium.log")).unwrap(),
+        fs::read(restore.join("sample/medium.log")).unwrap()
+    );
+    assert_eq!(
         fs::read(source.join("payload.zip")).unwrap(),
         fs::read(host_restore.join("sample/payload.zip")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("medium.log")).unwrap(),
+        fs::read(host_restore.join("sample/medium.log")).unwrap()
     );
 }
 
