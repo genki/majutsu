@@ -4929,6 +4929,14 @@ fn fsck(paths: &Paths) -> Result<()> {
     if missing > 0 {
         bail!("fsck found {missing} problems");
     }
+    let current = current_snapshot(&conn)?;
+    record_op(
+        &conn,
+        "fsck",
+        current.as_deref(),
+        current.as_deref(),
+        Some("checked local state"),
+    )?;
     println!("fsck ok");
     Ok(())
 }
@@ -5037,6 +5045,7 @@ fn valid_operation_kind(kind: &str) -> bool {
             | "pack-compact"
             | "prune"
             | "gc"
+            | "fsck"
     )
 }
 

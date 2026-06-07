@@ -5340,6 +5340,16 @@ fn operations_are_appended_to_local_oplog() {
     assert!(op_show.contains("status done"));
     run({
         let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+    assert_eq!(db_operation_count(&state, "fsck"), 1);
+    assert_eq!(
+        local_oplog_record_count(&state) as i64,
+        db_total_operation_count(&state)
+    );
+    run({
+        let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
         c
     });
