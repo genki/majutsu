@@ -46,9 +46,6 @@ use walkdir::WalkDir;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-const DEFAULT_LARGE_MIN_SIZE: u64 = 64 * 1024 * 1024;
-const DEFAULT_LARGE_BINARY_MIN_SIZE: u64 = 16 * 1024 * 1024;
-const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
 const CHUNK_INDEX_SHARD_KEY: &str = "indexes/chunk-index/shard-0000.cbor.zst.enc";
@@ -1113,35 +1110,14 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
             roots: Vec::new(),
             large: LargeConfig {
                 enabled: true,
-                min_size: DEFAULT_LARGE_MIN_SIZE,
-                binary_min_size: DEFAULT_LARGE_BINARY_MIN_SIZE,
-                default_chunking: "fixed".into(),
-                chunk_size: DEFAULT_CHUNK_SIZE,
+                min_size: default_large_min_size(),
+                binary_min_size: default_large_binary_min_size(),
+                default_chunking: default_large_chunking(),
+                chunk_size: default_chunk_size(),
                 max_parallel_uploads: default_large_max_parallel_uploads(),
                 multipart: true,
-                always: vec![
-                    "*.mp4".into(),
-                    "*.mov".into(),
-                    "*.mkv".into(),
-                    "*.zip".into(),
-                    "*.tar".into(),
-                    "*.tar.zst".into(),
-                    "*.parquet".into(),
-                    "*.sqlite".into(),
-                    "*.db".into(),
-                    "*.vmdk".into(),
-                    "*.qcow2".into(),
-                    "*.iso".into(),
-                    "*.psd".into(),
-                    "*.blend".into(),
-                ],
-                never: vec![
-                    "*.rs".into(),
-                    "*.toml".into(),
-                    "*.yaml".into(),
-                    "*.json".into(),
-                    "*.md".into(),
-                ],
+                always: majutsu_large::default_large_always_patterns(),
+                never: majutsu_large::default_large_never_patterns(),
                 compression: LargeCompressionConfig::default(),
             },
             pack: PackConfig::default(),
@@ -9083,7 +9059,7 @@ fn default_snapshot_mode() -> String {
 }
 
 fn default_large_chunking() -> String {
-    "fixed".into()
+    majutsu_large::default_chunking().into()
 }
 
 fn default_true() -> bool {
@@ -9091,51 +9067,39 @@ fn default_true() -> bool {
 }
 
 fn default_large_min_size() -> u64 {
-    DEFAULT_LARGE_MIN_SIZE
+    majutsu_large::default_large_min_size()
 }
 
 fn default_large_max_parallel_uploads() -> usize {
-    8
+    majutsu_large::default_max_parallel_uploads()
 }
 
 fn default_large_binary_min_size() -> u64 {
-    DEFAULT_LARGE_BINARY_MIN_SIZE
+    majutsu_large::default_large_binary_min_size()
 }
 
 fn default_chunk_size() -> usize {
-    DEFAULT_CHUNK_SIZE
+    majutsu_large::default_chunk_size()
 }
 
 fn default_large_compression_algorithm() -> String {
-    "zstd".into()
+    majutsu_large::default_compression_algorithm().into()
 }
 
 fn default_large_compression_level() -> i32 {
-    3
+    majutsu_large::default_compression_level()
 }
 
 fn default_large_compression_sample_bytes() -> usize {
-    1024 * 1024
+    majutsu_large::default_compression_sample_bytes()
 }
 
 fn default_large_compression_min_gain_ratio() -> f64 {
-    0.05
+    majutsu_large::default_compression_min_gain_ratio()
 }
 
 fn default_large_compression_skip_extensions() -> Vec<String> {
-    vec![
-        "*.jpg".into(),
-        "*.jpeg".into(),
-        "*.png".into(),
-        "*.heic".into(),
-        "*.mp4".into(),
-        "*.mov".into(),
-        "*.zip".into(),
-        "*.gz".into(),
-        "*.zst".into(),
-        "*.xz".into(),
-        "*.parquet".into(),
-    ]
+    majutsu_large::default_compression_skip_extensions()
 }
 
 fn default_small_pack_target() -> u64 {

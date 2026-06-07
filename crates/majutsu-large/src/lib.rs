@@ -1,6 +1,14 @@
 use anyhow::Result;
 use majutsu_core::ObjectKey;
 
+pub const DEFAULT_LARGE_MIN_SIZE: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_LARGE_BINARY_MIN_SIZE: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_PARALLEL_UPLOADS: usize = 8;
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+pub const DEFAULT_COMPRESSION_SAMPLE_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_COMPRESSION_MIN_GAIN_RATIO: f64 = 0.05;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Chunking {
     Fixed { size: usize },
@@ -146,6 +154,90 @@ pub fn should_compress(
             .any(|pattern| glob_match(pattern, file_name))
 }
 
+pub fn default_large_min_size() -> u64 {
+    DEFAULT_LARGE_MIN_SIZE
+}
+
+pub fn default_large_binary_min_size() -> u64 {
+    DEFAULT_LARGE_BINARY_MIN_SIZE
+}
+
+pub fn default_chunk_size() -> usize {
+    DEFAULT_CHUNK_SIZE
+}
+
+pub fn default_chunking() -> &'static str {
+    "fixed"
+}
+
+pub fn default_max_parallel_uploads() -> usize {
+    DEFAULT_MAX_PARALLEL_UPLOADS
+}
+
+pub fn default_compression_algorithm() -> &'static str {
+    "zstd"
+}
+
+pub fn default_compression_level() -> i32 {
+    DEFAULT_COMPRESSION_LEVEL
+}
+
+pub fn default_compression_sample_bytes() -> usize {
+    DEFAULT_COMPRESSION_SAMPLE_BYTES
+}
+
+pub fn default_compression_min_gain_ratio() -> f64 {
+    DEFAULT_COMPRESSION_MIN_GAIN_RATIO
+}
+
+pub fn default_large_always_patterns() -> Vec<String> {
+    [
+        "*.mp4",
+        "*.mov",
+        "*.mkv",
+        "*.zip",
+        "*.tar",
+        "*.tar.zst",
+        "*.parquet",
+        "*.sqlite",
+        "*.db",
+        "*.vmdk",
+        "*.qcow2",
+        "*.iso",
+        "*.psd",
+        "*.blend",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn default_large_never_patterns() -> Vec<String> {
+    ["*.rs", "*.toml", "*.yaml", "*.json", "*.md"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn default_compression_skip_extensions() -> Vec<String> {
+    [
+        "*.jpg",
+        "*.jpeg",
+        "*.png",
+        "*.heic",
+        "*.mp4",
+        "*.mov",
+        "*.zip",
+        "*.gz",
+        "*.zst",
+        "*.xz",
+        "*.parquet",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 fn glob_match(pattern: &str, name: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -161,7 +253,7 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::compress_chunk_if_useful;
+    use super::*;
 
     #[test]
     fn compression_sample_can_skip_full_chunk_compression() {
@@ -193,5 +285,40 @@ mod tests {
 
         assert_eq!(stored.compression, "zstd");
         assert!(stored.bytes.len() < bytes.len());
+    }
+
+    #[test]
+    fn defaults_match_large_pipeline_spec() {
+        assert_eq!(default_large_min_size(), 64 * 1024 * 1024);
+        assert_eq!(default_large_binary_min_size(), 16 * 1024 * 1024);
+        assert_eq!(default_chunk_size(), 8 * 1024 * 1024);
+        assert_eq!(default_chunking(), "fixed");
+        assert_eq!(default_max_parallel_uploads(), 8);
+        assert_eq!(default_compression_algorithm(), "zstd");
+        assert_eq!(default_compression_level(), 3);
+        assert_eq!(default_compression_sample_bytes(), 1024 * 1024);
+        assert_eq!(default_compression_min_gain_ratio(), 0.05);
+    }
+
+    #[test]
+    fn default_patterns_route_binary_archives_and_skip_precompressed_media() {
+        let always = default_large_always_patterns();
+        assert!(always.contains(&"*.mp4".into()));
+        assert!(always.contains(&"*.tar.zst".into()));
+        assert!(always.contains(&"*.sqlite".into()));
+
+        let never = default_large_never_patterns();
+        assert!(never.contains(&"*.rs".into()));
+        assert!(never.contains(&"*.md".into()));
+
+        let skip = default_compression_skip_extensions();
+        assert!(skip.contains(&"*.jpg".into()));
+        assert!(skip.contains(&"*.parquet".into()));
+        assert!(!should_compress(
+            true,
+            default_compression_algorithm(),
+            &skip,
+            "payload.zip"
+        ));
     }
 }
