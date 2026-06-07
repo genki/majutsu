@@ -4613,11 +4613,19 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
     if has_host_index {
         let index = read_remote_host_index(remote)?;
         let mut seen_host_ids = BTreeSet::new();
+        let mut seen_metadata_keys = BTreeSet::new();
         for host in &index.hosts {
             verified_hosts += 1;
             if !seen_host_ids.insert(host.id.clone()) {
                 missing += 1;
                 eprintln!("duplicate host id in hosts/index.json: {}", host.id);
+            }
+            if !seen_metadata_keys.insert(host.metadata_key.clone()) {
+                missing += 1;
+                eprintln!(
+                    "duplicate host metadata_key in hosts/index.json: {}",
+                    host.metadata_key
+                );
             }
             if !remote.exists(&host.metadata_key)? {
                 missing += 1;

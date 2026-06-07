@@ -739,6 +739,63 @@ fn remote_host_index_duplicate_id_is_rejected() {
 }
 
 #[test]
+fn remote_host_index_duplicate_metadata_key_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--host-name")
+            .arg("dup-key-host")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let index_path = remote.join("hosts/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    let mut duplicate = index["hosts"][0].clone();
+    duplicate["id"] = serde_json::Value::String("other-host-id".into());
+    duplicate["name"] = serde_json::Value::String("other-host".into());
+    index["hosts"].as_array_mut().unwrap().push(duplicate);
+    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_accepts_canonical_only_payloads() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
