@@ -4672,6 +4672,171 @@ fn large_pin_filters_by_root_and_since() {
 }
 
 #[test]
+fn large_verify_rejects_dangling_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.execute(
+        "insert into large_pins(oid, pinned_at, reason) values (?1, ?2, ?3)",
+        rusqlite::params![
+            "missing-large-object",
+            Utc::now().to_rfc3339(),
+            "corrupt test"
+        ],
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("verify");
+        c
+    });
+}
+
+#[test]
+fn prune_removes_pins_for_pruned_large_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.zip"), vec![7u8; 16 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
+    fs::write(source.join("payload.zip"), vec![8u8; 16 * 1024]).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
+    let before = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(before.contains("large_objects 2"));
+    assert!(before.contains("pinned 2"));
+
+    let pruned = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("0")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    assert!(pruned.contains("removed_large_metadata 1"));
+    assert!(pruned.contains("removed_large_pins 1"));
+    let after = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(after.contains("large_objects 1"));
+    assert!(after.contains("pinned 1"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_rejects_dangling_large_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.zip"), vec![7u8; 16 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export_path = remote.join("metadata/export.json");
+    let mut export: serde_json::Value =
+        serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
+    export["large_pins"][0]["oid"] = serde_json::Value::String("missing-large-object".into());
+    fs::write(&export_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn root_large_policy_override_can_route_small_files_to_large_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

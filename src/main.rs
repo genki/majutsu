@@ -4383,6 +4383,7 @@ fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
         println!("removed_blob_metadata {}", removed.blobs);
         println!("removed_large_metadata {}", removed.large_objects);
         println!("removed_chunk_metadata {}", removed.chunks);
+        println!("removed_large_pins {}", removed.large_pins);
     }
     Ok(())
 }
@@ -4401,6 +4402,7 @@ struct PrunedMetadata {
     blobs: usize,
     large_objects: usize,
     chunks: usize,
+    large_pins: usize,
 }
 
 fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<PrunePlan> {
@@ -4471,10 +4473,12 @@ fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<Prune
     let blobs = delete_rows_not_in(conn, "blobs", "oid", &live_blobs)?;
     let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live_large)?;
     let chunks = delete_rows_not_in(conn, "chunks", "oid", &live_chunks)?;
+    let large_pins = delete_rows_not_in(conn, "large_pins", "oid", &live_large)?;
     Ok(PrunedMetadata {
         blobs,
         large_objects,
         chunks,
+        large_pins,
     })
 }
 
@@ -4608,6 +4612,19 @@ fn fsck(paths: &Paths) -> Result<()> {
                 eprintln!("unreadable large manifest {oid} {manifest_key}: {err}");
             }
         }
+    }
+    let mut stmt = conn.prepare(
+        "select p.oid, p.pinned_at
+         from large_pins p left join large_objects l on l.oid = p.oid
+         where l.oid is null",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (oid, pinned_at) = row?;
+        missing += 1;
+        eprintln!("dangling large pin {oid} pinned_at={pinned_at}");
     }
     if missing > 0 {
         bail!("fsck found {missing} missing objects");
@@ -4779,6 +4796,24 @@ fn remote_fsck_export(
 ) -> Result<MetadataExport> {
     let export: MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
+    let large_object_ids = export
+        .large_objects
+        .iter()
+        .map(|large| large.oid.as_str())
+        .collect::<BTreeSet<_>>();
+    for pin in &export.large_pins {
+        if !large_object_ids.contains(pin.oid.as_str()) {
+            *missing += 1;
+            eprintln!("dangling remote large pin {} in {metadata_key}", pin.oid);
+        }
+        if parse_db_time(&pin.pinned_at).is_err() {
+            *missing += 1;
+            eprintln!(
+                "invalid remote large pin timestamp {} in {metadata_key}",
+                pin.oid
+            );
+        }
+    }
     if !export.chunks.is_empty() && !remote.exists(CHUNK_INDEX_SHARD_KEY)? {
         *missing += 1;
         eprintln!("missing remote chunk index shard {CHUNK_INDEX_SHARD_KEY}");
