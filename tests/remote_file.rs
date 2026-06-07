@@ -2612,6 +2612,86 @@ fn restore_prepare_requests_archive_for_missing_local_objects() {
 }
 
 #[test]
+fn restore_prepare_can_hydrate_from_canonical_aliases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fs::remove_dir_all(remote.join("objects")).unwrap();
+    let alpha_oid = blake3::hash(b"alpha\n").to_hex().to_string();
+    let object = state
+        .join("objects/blobs")
+        .join(&alpha_oid[..2])
+        .join(&alpha_oid[2..]);
+    fs::remove_file(object).unwrap();
+
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(prepare.contains("archived_objects 1"));
+    assert!(prepare.contains("missing_objects 0"));
+    let job_id = prepare
+        .lines()
+        .find_map(|line| line.strip_prefix("restore_job "))
+        .unwrap()
+        .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id);
+        c
+    });
+
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+}
+
+#[test]
 fn restore_prepare_reports_objects_missing_from_local_and_remote() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -2654,6 +2734,12 @@ fn restore_prepare_reports_objects_missing_from_local_and_remote() {
     let object_key = format!("objects/blobs/{}/{}", &alpha_oid[..2], &alpha_oid[2..]);
     fs::remove_file(state.join(&object_key)).unwrap();
     fs::remove_file(remote.join(&object_key)).unwrap();
+    fs::remove_file(remote.join(format!(
+        "blobs/loose/{}/{}.blob.enc",
+        &alpha_oid[..2],
+        &alpha_oid[2..]
+    )))
+    .unwrap();
 
     let prepare = output({
         let mut c = mj();

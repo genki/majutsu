@@ -3317,6 +3317,28 @@ fn canonical_remote_object_to_local_bytes(
     Ok(bytes.to_vec())
 }
 
+fn remote_object_available(remote: &RemoteStore, key: &str) -> Result<bool> {
+    if remote.exists(key)? {
+        return Ok(true);
+    }
+    let Some(alias) = canonical_remote_alias(key) else {
+        return Ok(false);
+    };
+    remote.exists(&alias)
+}
+
+fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<String> {
+    if remote.exists(key)? {
+        return Ok(key.to_string());
+    }
+    if let Some(alias) = canonical_remote_alias(key) {
+        if remote.exists(&alias)? {
+            return Ok(alias);
+        }
+    }
+    Ok(key.to_string())
+}
+
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
@@ -4915,7 +4937,7 @@ fn restore_object_stats(
     let mut remote_objects = 0usize;
     if let Some(remote) = remote.as_ref() {
         for key in &required_objects {
-            if remote.exists(key)? {
+            if remote_object_available(remote, key)? {
                 remote_objects += 1;
             }
         }
@@ -4927,7 +4949,7 @@ fn restore_object_stats(
                 paths.home.join(key).exists()
                     || remote
                         .as_ref()
-                        .and_then(|remote| remote.exists(key).ok())
+                        .and_then(|remote| remote_object_available(remote, key).ok())
                         .unwrap_or(false)
             })
             .count(),
@@ -4971,7 +4993,7 @@ fn build_restore_job(
         }
         if remote
             .as_ref()
-            .and_then(|remote| remote.exists(key).ok())
+            .and_then(|remote| remote_object_available(remote, key).ok())
             .unwrap_or(false)
         {
             archived_objects.push(key.clone());
@@ -5011,7 +5033,8 @@ fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) ->
     let remote = open_remote(remote_config)?;
     let mut requested = Vec::new();
     for key in &job.archived_objects {
-        if remote.restore_archive(key, 7, "Standard")? {
+        let restore_key = remote_available_key(&remote, key)?;
+        if remote.restore_archive(&restore_key, 7, "Standard")? {
             requested.push(key.clone());
         }
     }
@@ -5039,11 +5062,11 @@ fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Res
             hydrated.push(key.clone());
             continue;
         }
-        if !remote.exists(key)? {
+        if !remote_object_available(&remote, key)? {
             still_pending.push(key.clone());
             continue;
         }
-        match remote.get(key) {
+        match download_local_object_from_remote(paths, &remote, key) {
             Ok(bytes) => {
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)?;
