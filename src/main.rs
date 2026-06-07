@@ -1744,21 +1744,9 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
         RestoreCommand::Resume { job_id } => {
             let mut job = read_restore_job(paths, &job_id)?;
             ensure_restore_job_resumable(&job)?;
-            if !job.missing_objects.is_empty() {
-                bail!(
-                    "restore job {} has missing objects: {}",
-                    job.id,
-                    job.missing_objects.len()
-                );
-            }
+            ensure_restore_job_has_no_missing_objects(&job)?;
             hydrate_restore_job_objects(paths, &mut job)?;
-            if !job.archived_objects.is_empty() {
-                bail!(
-                    "restore job {} still has archived objects pending: {}",
-                    job.id,
-                    job.archived_objects.len()
-                );
-            }
+            ensure_restore_job_not_blocked(&job)?;
             let args = RestoreArgs {
                 snapshot: Some(job.snapshot_id.clone()),
                 at: None,
@@ -6572,15 +6560,24 @@ fn read_restore_job(paths: &Paths, job_id: &str) -> Result<RestoreQueueItem> {
 }
 
 fn ensure_restore_job_resumable(job: &RestoreQueueItem) -> Result<()> {
-    if job.is_resumable() {
-        Ok(())
-    } else {
-        bail!(
-            "restore job {} is not resumable: status {}",
-            job.id,
-            job.status
-        )
+    if let Some(message) = job.non_resumable_message() {
+        bail!("{message}");
     }
+    Ok(())
+}
+
+fn ensure_restore_job_not_blocked(job: &RestoreQueueItem) -> Result<()> {
+    if let Some(message) = job.blocking_resume_message() {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+fn ensure_restore_job_has_no_missing_objects(job: &RestoreQueueItem) -> Result<()> {
+    if let Some(message) = job.missing_objects_message() {
+        bail!("{message}");
+    }
+    Ok(())
 }
 
 fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {

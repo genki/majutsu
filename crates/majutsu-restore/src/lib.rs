@@ -132,6 +132,43 @@ impl RestoreQueueItem {
         self.status == "done"
             && (!self.archived_objects.is_empty() || !self.missing_objects.is_empty())
     }
+
+    pub fn non_resumable_message(&self) -> Option<String> {
+        if self.is_resumable() {
+            None
+        } else {
+            Some(format!(
+                "restore job {} is not resumable: status {}",
+                self.id, self.status
+            ))
+        }
+    }
+
+    pub fn blocking_resume_message(&self) -> Option<String> {
+        if let Some(message) = self.missing_objects_message() {
+            Some(message)
+        } else if !self.archived_objects.is_empty() {
+            Some(format!(
+                "restore job {} still has archived objects pending: {}",
+                self.id,
+                self.archived_objects.len()
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn missing_objects_message(&self) -> Option<String> {
+        if self.missing_objects.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "restore job {} has missing objects: {}",
+                self.id,
+                self.missing_objects.len()
+            ))
+        }
+    }
 }
 
 fn default_check_conflicts() -> bool {
@@ -408,6 +445,10 @@ mod tests {
         job.mark_done();
         assert_eq!(job.status, "done");
         assert!(!job.is_resumable());
+        assert_eq!(
+            job.non_resumable_message().as_deref(),
+            Some("restore job restore-1 is not resumable: status done")
+        );
     }
 
     #[test]
@@ -449,6 +490,37 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
         assert_eq!(outside, vec!["objects/blobs/bb"]);
+    }
+
+    #[test]
+    fn restore_queue_item_reports_resume_blockers_in_priority_order() {
+        let mut job = RestoreQueueItem {
+            id: "restore-1".into(),
+            snapshot_id: "snap-1".into(),
+            root: Some("sample".into()),
+            path: None,
+            target: "original-roots".into(),
+            required_objects: vec!["objects/blobs/aa".into(), "objects/blobs/bb".into()],
+            archived_objects: vec!["objects/blobs/aa".into()],
+            missing_objects: vec!["objects/blobs/bb".into()],
+            archive_requested_objects: vec!["objects/blobs/aa".into()],
+            force: false,
+            check_conflicts: true,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            status: "archive-requested".into(),
+        };
+
+        assert_eq!(
+            job.blocking_resume_message().as_deref(),
+            Some("restore job restore-1 has missing objects: 1")
+        );
+        job.missing_objects.clear();
+        assert_eq!(
+            job.blocking_resume_message().as_deref(),
+            Some("restore job restore-1 still has archived objects pending: 1")
+        );
+        job.archived_objects.clear();
+        assert!(job.blocking_resume_message().is_none());
     }
 
     #[test]
