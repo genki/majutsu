@@ -562,6 +562,169 @@ fn multi_root_sync_clone_restore_preserves_host_snapshot() {
 }
 
 #[test]
+fn remote_recovery_preserves_paused_resumed_and_missing_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs");
+    let photos = tmp.path().join("photos");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(&photos).unwrap();
+    fs::write(docs.join("notes.txt"), b"docs v1\n").unwrap();
+    fs::write(photos.join("image.txt"), b"photo v1\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--host-name")
+            .arg("root-state-host")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("docs")
+            .arg(&docs);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("photos")
+            .arg(&photos);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("initial roots");
+        c
+    });
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("pause")
+            .arg("docs");
+        c
+    });
+    fs::write(docs.join("notes.txt"), b"docs while paused\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("docs paused");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("resume")
+            .arg("docs");
+        c
+    });
+    fs::write(docs.join("notes.txt"), b"docs resumed\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("docs resumed");
+        c
+    });
+
+    fs::remove_dir_all(&photos).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("photos missing");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    assert_eq!(db_operation_count(&state, "root-paused"), 1);
+    assert_eq!(db_operation_count(&state, "root-resumed"), 1);
+    assert_eq!(db_operation_count(&state, "root-missing"), 1);
+    let root_list = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(root_list.contains("docs\tactive"));
+    assert!(root_list.contains("photos\tmissing"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("fsck");
+        c
+    });
+    let clone_root_list = output({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("root").arg("list");
+        c
+    });
+    assert!(clone_root_list.contains("docs\tactive"));
+    assert!(clone_root_list.contains("photos\tmissing"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("docs/notes.txt")).unwrap(),
+        b"docs resumed\n"
+    );
+    assert_eq!(
+        fs::read(restore.join("photos/image.txt")).unwrap(),
+        b"photo v1\n"
+    );
+}
+
+#[test]
 fn encrypted_multi_root_remote_recovery_uses_exported_master_key() {
     let tmp = tempfile::tempdir().unwrap();
     let docs = tmp.path().join("docs");
