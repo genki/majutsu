@@ -4844,6 +4844,7 @@ fn remote_fsck_export(
     }
     validate_remote_snapshot_objects(paths, remote, &export, missing)?;
     validate_remote_large_manifest_objects(paths, remote, &export, missing)?;
+    validate_remote_pack_objects(paths, remote, &export, missing)?;
     if let Some(current) = export.refs.get("current") {
         let found = export
             .snapshots
@@ -5024,6 +5025,122 @@ fn validate_remote_large_manifest_objects(
                     large.oid, bytes.remote_key
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_pack_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
+    for blob in &export.blobs {
+        if let Some(pack_id) = blob.pack_id.as_deref() {
+            blobs_by_pack
+                .entry(pack_id)
+                .or_default()
+                .insert(blob.oid.as_str(), blob);
+        }
+    }
+    for pack in &export.packs {
+        let expected_blobs = blobs_by_pack
+            .get(pack.pack_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        for bytes in remote_local_object_variants(paths, remote, &pack.index_key)? {
+            let index: PackIndex = serde_json::from_slice(&bytes.bytes).with_context(|| {
+                format!(
+                    "parse pack index {} from {}",
+                    pack.index_key, bytes.remote_key
+                )
+            })?;
+            if index.pack_id != pack.pack_id
+                || index.pack_key != pack.pack_key
+                || index.entries.len() != pack.object_count
+                || index.entries.len() != expected_blobs.len()
+            {
+                *missing += 1;
+                eprintln!(
+                    "pack index object does not match metadata {} {}",
+                    pack.pack_id, bytes.remote_key
+                );
+                continue;
+            }
+            let mut seen = BTreeSet::new();
+            for entry in &index.entries {
+                let Some(blob) = expected_blobs.get(entry.oid.as_str()) else {
+                    *missing += 1;
+                    eprintln!(
+                        "pack index entry has no matching blob metadata {} {}",
+                        pack.pack_id, entry.oid
+                    );
+                    continue;
+                };
+                seen.insert(entry.oid.as_str());
+                if blob.pack_offset != Some(entry.offset) || blob.pack_len != Some(entry.len) {
+                    *missing += 1;
+                    eprintln!(
+                        "pack index entry does not match blob offset metadata {} {}",
+                        pack.pack_id, entry.oid
+                    );
+                }
+            }
+            for oid in expected_blobs.keys() {
+                if !seen.contains(oid) {
+                    *missing += 1;
+                    eprintln!(
+                        "packed blob missing from pack index {} {}",
+                        pack.pack_id, oid
+                    );
+                }
+            }
+        }
+        for bytes in remote_local_object_variants(paths, remote, &pack.pack_key)? {
+            if bytes.bytes.len() as u64 != pack.size {
+                *missing += 1;
+                eprintln!(
+                    "pack object size does not match metadata {} {}",
+                    pack.pack_id, bytes.remote_key
+                );
+            }
+            for blob in expected_blobs.values() {
+                let Some(offset) = blob.pack_offset else {
+                    *missing += 1;
+                    eprintln!(
+                        "packed blob missing offset metadata {} {}",
+                        pack.pack_id, blob.oid
+                    );
+                    continue;
+                };
+                let Some(len) = blob.pack_len else {
+                    *missing += 1;
+                    eprintln!(
+                        "packed blob missing length metadata {} {}",
+                        pack.pack_id, blob.oid
+                    );
+                    continue;
+                };
+                if offset.checked_add(len).is_none_or(|end| end > pack.size)
+                    || offset
+                        .checked_add(len)
+                        .is_none_or(|end| end as usize > bytes.bytes.len())
+                {
+                    *missing += 1;
+                    eprintln!(
+                        "packed blob range out of pack bounds {} {}",
+                        pack.pack_id, blob.oid
+                    );
+                }
+            }
+        }
+    }
+    for pack_id in blobs_by_pack.keys() {
+        if !export.packs.iter().any(|pack| pack.pack_id == **pack_id) {
+            *missing += 1;
+            eprintln!("packed blob references missing pack metadata {pack_id}");
         }
     }
     Ok(())
