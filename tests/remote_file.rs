@@ -622,6 +622,37 @@ signature_version = "s3v4"
     assert!(capabilities.contains("lifecycle_rules true"));
 }
 
+#[test]
+fn s3_remote_capabilities_honor_large_multipart_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg("s3://split-bucket/majutsu/v1");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("multipart = true", "multipart = false");
+    fs::write(&config_path, config).unwrap();
+    let capabilities = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("capabilities")
+            .env("AWS_ACCESS_KEY_ID", "dummy")
+            .env("AWS_SECRET_ACCESS_KEY", "dummy");
+        c
+    });
+    assert!(capabilities.contains("multipart_upload false"));
+}
+
 #[cfg(unix)]
 #[test]
 fn restore_preserves_file_mode_and_mtime() {

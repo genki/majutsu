@@ -2785,11 +2785,13 @@ fn parse_pin_since(input: &str) -> Result<DateTime<Utc>> {
 fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
-    let remote = open_remote(
+    let remote = open_remote_with_upload_policy(
         config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?,
+        config.large.multipart,
+        config.large.max_parallel_uploads,
     )?;
     let conn = open_db(paths)?;
     if let Some(SyncCommand::Status) = command {
@@ -3236,11 +3238,13 @@ fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
 fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
-    let remote = open_remote(
+    let remote = open_remote_with_upload_policy(
         config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?,
+        config.large.multipart,
+        config.large.max_parallel_uploads,
     )?;
     match command {
         RemoteCommand::Check => {
@@ -7810,10 +7814,20 @@ struct S3Remote {
     secret_key: String,
     storage_class: Option<String>,
     object_tags: Vec<(String, String)>,
+    multipart_enabled: bool,
+    max_parallel_uploads: usize,
     client: Client,
 }
 
 fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
+    open_remote_with_upload_policy(config, true, default_large_max_parallel_uploads())
+}
+
+fn open_remote_with_upload_policy(
+    config: &RemoteConfig,
+    multipart_enabled: bool,
+    max_parallel_uploads: usize,
+) -> Result<RemoteStore> {
     let remote_url = config.url()?;
     if let Some(path) = remote_url.strip_prefix("file://") {
         return Ok(RemoteStore::File(FileRemote {
@@ -7851,6 +7865,8 @@ fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
                 .context("AWS_SECRET_ACCESS_KEY is required for s3 remote")?,
             storage_class: optional_env("MAJUTSU_S3_STORAGE_CLASS")?,
             object_tags: parse_s3_object_tags_env()?,
+            multipart_enabled,
+            max_parallel_uploads: max_parallel_uploads.max(1),
             client: Client::new(),
         }));
     }
@@ -7982,7 +7998,7 @@ impl RemoteStore {
                 object_tags: !remote.uses_sigv2(),
                 storage_class_on_put: !remote.uses_sigv2(),
                 restore_archived_object: true,
-                multipart_upload: !remote.uses_sigv2(),
+                multipart_upload: remote.multipart_enabled && !remote.uses_sigv2(),
                 range_get: true,
                 conditional_put: !remote.uses_sigv2(),
             },
@@ -8003,7 +8019,7 @@ impl S3Remote {
     }
 
     fn put_object(&self, key: &str, bytes: &[u8], if_absent: bool) -> Result<bool> {
-        if !self.uses_sigv2() && bytes.len() >= self.multipart_threshold() {
+        if self.should_use_multipart(bytes.len()) {
             if if_absent && self.exists(key)? {
                 return Ok(false);
             }
@@ -8056,18 +8072,56 @@ impl S3Remote {
         let remote_key = self.remote_key(key);
         let upload_id = self.initiate_multipart(&remote_key)?;
         let result = (|| {
-            let mut parts = Vec::new();
-            for (idx, chunk) in bytes.chunks(MIN_MULTIPART_PART_SIZE).enumerate() {
-                let part_number = idx + 1;
-                let etag = self.upload_part(&remote_key, &upload_id, part_number, chunk)?;
-                parts.push(CompletedPart { part_number, etag });
-            }
+            let mut parts = self.upload_multipart_parts(&remote_key, &upload_id, bytes)?;
+            parts.sort_by_key(|part| part.part_number);
             self.complete_multipart(&remote_key, &upload_id, &parts)
         })();
         if result.is_err() {
             let _ = self.abort_multipart(&remote_key, &upload_id);
         }
         result.with_context(|| format!("multipart upload failed for {key}"))
+    }
+
+    fn upload_multipart_parts(
+        &self,
+        remote_key: &str,
+        upload_id: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<CompletedPart>> {
+        let chunks = bytes
+            .chunks(MIN_MULTIPART_PART_SIZE)
+            .enumerate()
+            .map(|(idx, chunk)| (idx + 1, chunk))
+            .collect::<Vec<_>>();
+        let mut parts = Vec::with_capacity(chunks.len());
+        let parallelism = self.max_parallel_uploads.max(1);
+        for batch in chunks.chunks(parallelism) {
+            let batch_parts = std::thread::scope(|scope| {
+                let handles = batch
+                    .iter()
+                    .map(|(part_number, chunk)| {
+                        scope.spawn(move || {
+                            let etag =
+                                self.upload_part(remote_key, upload_id, *part_number, chunk)?;
+                            Ok(CompletedPart {
+                                part_number: *part_number,
+                                etag,
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| anyhow!("multipart upload worker panicked"))?
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            parts.extend(batch_parts);
+        }
+        Ok(parts)
     }
 
     fn initiate_multipart(&self, remote_key: &str) -> Result<String> {
@@ -8522,6 +8576,10 @@ impl S3Remote {
             .max(MIN_MULTIPART_PART_SIZE)
     }
 
+    fn should_use_multipart(&self, len: usize) -> bool {
+        self.multipart_enabled && !self.uses_sigv2() && len >= self.multipart_threshold()
+    }
+
     fn remote_key(&self, key: &str) -> String {
         let clean = key.trim_start_matches('/');
         if self.prefix.is_empty() {
@@ -8753,6 +8811,8 @@ mod tests {
             secret_key: "secret".to_string(),
             storage_class: Some("STANDARD_IA".to_string()),
             object_tags: vec![("purpose".to_string(), "backup data".to_string())],
+            multipart_enabled: true,
+            max_parallel_uploads: 8,
             client: Client::new(),
         }
     }
@@ -8768,6 +8828,23 @@ mod tests {
             "x-amz-tagging".to_string(),
             "majutsu-class=large&purpose=backup%20data".to_string()
         )));
+    }
+
+    #[test]
+    fn s3_capabilities_honor_multipart_policy() {
+        let mut remote = test_s3_remote();
+        remote.multipart_enabled = false;
+        let store = RemoteStore::S3(remote);
+        assert!(!store.capabilities().multipart_upload);
+    }
+
+    #[test]
+    fn s3_multipart_threshold_requires_enabled_policy() {
+        let mut remote = test_s3_remote();
+        remote.multipart_enabled = false;
+        assert!(!remote.should_use_multipart(DEFAULT_MULTIPART_THRESHOLD));
+        remote.multipart_enabled = true;
+        assert!(remote.should_use_multipart(DEFAULT_MULTIPART_THRESHOLD));
     }
 
     #[test]
