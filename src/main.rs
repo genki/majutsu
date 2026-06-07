@@ -1,8 +1,5 @@
-use age::secrecy::ExposeSecret;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use fuser::{
@@ -16,10 +13,10 @@ use majutsu_core::{
     FileRecord, LargeChunk, LargeManifest, Payload, RootSnapshot, SnapshotManifest, TreeManifest,
     payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
 };
+use majutsu_crypto::EncryptionMode;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use rand::RngCore;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -572,14 +569,6 @@ struct SecurityConfig {
     key_id: String,
     #[serde(default = "default_security_hash")]
     hash: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct AgeKeyring {
-    #[serde(default)]
-    recipients: Vec<String>,
-    #[serde(default)]
-    identities: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1174,7 +1163,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
         write_master_key(paths, &random_key_hex()?)?;
     }
     if config.security.encryption == "age" {
-        ensure_age_keyring(paths)?;
+        majutsu_crypto::ensure_age_keyring(&recipients_path(paths))?;
     }
     let conn = open_db(paths)?;
     migrate(&conn)?;
@@ -6671,6 +6660,15 @@ fn encryption_enabled(security: &SecurityConfig) -> Result<bool> {
     }
 }
 
+fn encryption_mode(security: &SecurityConfig) -> Result<EncryptionMode> {
+    match security.encryption.as_str() {
+        "" | "none" => Ok(EncryptionMode::None),
+        "age" => Ok(EncryptionMode::Age),
+        "chacha20poly1305" => Ok(EncryptionMode::ChaCha20Poly1305),
+        _ => bail!("security encryption must be none, age, or chacha20poly1305"),
+    }
+}
+
 fn validate_large_chunking(chunking: &str) -> Result<()> {
     match chunking {
         "fixed" | "fastcdc" => Ok(()),
@@ -7550,9 +7548,6 @@ fn fsync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-const ENC_MAGIC: &[u8] = b"MJENC1\n";
-const AGE_MAGIC: &[u8] = b"age-encryption.org/v1";
-
 fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
     let config = if paths.config.exists() {
         Some(read_config(paths)?)
@@ -7565,28 +7560,12 @@ fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
         .transpose()?
         .unwrap_or(false)
     {
-        if config
+        let mode = config
             .as_ref()
-            .is_some_and(|config| config.security.encryption == "age")
-        {
-            if let Some(ciphertext) = age_encrypt_object(paths, bytes)? {
-                return Ok(ciphertext);
-            }
-        }
-        let key_hex = read_master_key(paths)?;
-        let key_bytes = hex::decode(key_hex.trim())?;
-        let key = Key::from_slice(&key_bytes);
-        let cipher = ChaCha20Poly1305::new(key);
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), bytes)
-            .map_err(|_| anyhow!("object encryption failed"))?;
-        let mut out = Vec::with_capacity(ENC_MAGIC.len() + nonce_bytes.len() + ciphertext.len());
-        out.extend_from_slice(ENC_MAGIC);
-        out.extend_from_slice(&nonce_bytes);
-        out.extend_from_slice(&ciphertext);
-        Ok(out)
+            .map(|config| encryption_mode(&config.security))
+            .transpose()?
+            .unwrap_or(EncryptionMode::None);
+        majutsu_crypto::encode_object(bytes, mode, &paths.master_key, &recipients_path(paths))
     } else {
         Ok(bytes.to_vec())
     }
@@ -7647,150 +7626,27 @@ fn read_blob_payload(
 }
 
 fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
-    if bytes.starts_with(AGE_MAGIC) {
-        return age_decrypt_object(paths, bytes);
-    }
-    if !bytes.starts_with(ENC_MAGIC) {
-        return Ok(bytes.to_vec());
-    }
-    let start = ENC_MAGIC.len();
-    if bytes.len() < start + 12 {
-        bail!("encrypted object is truncated");
-    }
-    let nonce = &bytes[start..start + 12];
-    let ciphertext = &bytes[start + 12..];
-    let key_hex = read_master_key(paths)?;
-    let key_bytes = hex::decode(key_hex.trim())?;
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-    cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
-        .map_err(|_| anyhow!("object decryption failed"))
-}
-
-fn age_encrypt_object(paths: &Paths, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
-    let recipients = read_age_recipients(paths)?;
-    if recipients.is_empty() {
-        return Ok(None);
-    }
-    let recipient_refs = recipients
-        .iter()
-        .map(|recipient| recipient as &dyn age::Recipient)
-        .collect::<Vec<_>>();
-    let encryptor = age::Encryptor::with_recipients(recipient_refs.into_iter())?;
-    let mut ciphertext = Vec::with_capacity(bytes.len());
-    let mut writer = encryptor.wrap_output(&mut ciphertext)?;
-    writer.write_all(bytes)?;
-    writer.finish()?;
-    Ok(Some(ciphertext))
-}
-
-fn age_decrypt_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
-    let identities = read_age_identities(paths)?;
-    if identities.is_empty() {
-        bail!("age encrypted object requires an identity in keys/recipients.toml");
-    }
-    let identity_refs = identities
-        .iter()
-        .map(|identity| identity as &dyn age::Identity)
-        .collect::<Vec<_>>();
-    let decryptor = age::Decryptor::new_buffered(bytes)?;
-    let mut reader = decryptor.decrypt(identity_refs.into_iter())?;
-    let mut plaintext = Vec::new();
-    reader.read_to_end(&mut plaintext)?;
-    Ok(plaintext)
+    majutsu_crypto::decode_object(bytes, &paths.master_key, &recipients_path(paths))
 }
 
 fn recipients_path(paths: &Paths) -> PathBuf {
     paths.home.join("keys/recipients.toml")
 }
 
-fn read_age_keyring(paths: &Paths) -> Result<AgeKeyring> {
-    let path = recipients_path(paths);
-    if !path.exists() {
-        return Ok(AgeKeyring::default());
-    }
-    toml::from_str(&fs::read_to_string(&path)?)
-        .with_context(|| format!("parse age keyring {}", path.display()))
-}
-
-fn write_age_keyring(paths: &Paths, keyring: &AgeKeyring) -> Result<()> {
-    let path = recipients_path(paths);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, toml::to_string_pretty(keyring)?)?;
-    Ok(())
-}
-
-fn ensure_age_keyring(paths: &Paths) -> Result<()> {
-    let mut keyring = read_age_keyring(paths)?;
-    if keyring.recipients.is_empty() && keyring.identities.is_empty() {
-        let identity = age::x25519::Identity::generate();
-        keyring.recipients.push(identity.to_public().to_string());
-        keyring
-            .identities
-            .push(identity.to_string().expose_secret().to_string());
-        write_age_keyring(paths, &keyring)?;
-    }
-    Ok(())
-}
-
-fn read_age_recipients(paths: &Paths) -> Result<Vec<age::x25519::Recipient>> {
-    read_age_keyring(paths)?
-        .recipients
-        .into_iter()
-        .map(|recipient| {
-            recipient
-                .parse()
-                .map_err(|err| anyhow!("invalid age recipient {recipient}: {err}"))
-        })
-        .collect()
-}
-
-fn read_age_identities(paths: &Paths) -> Result<Vec<age::x25519::Identity>> {
-    read_age_keyring(paths)?
-        .identities
-        .into_iter()
-        .map(|identity| {
-            identity
-                .parse()
-                .map_err(|err| anyhow!("invalid age identity: {err}"))
-        })
-        .collect()
-}
-
 fn random_key_hex() -> Result<String> {
-    let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
-    Ok(hex::encode(key))
+    majutsu_crypto::random_key_hex()
 }
 
 fn validate_key_hex(hex_key: &str) -> Result<()> {
-    let bytes = hex::decode(hex_key.trim())?;
-    if bytes.len() != 32 {
-        bail!("master key must be 32 bytes encoded as 64 hex characters");
-    }
-    Ok(())
+    majutsu_crypto::validate_key_hex(hex_key)
 }
 
 fn read_master_key(paths: &Paths) -> Result<String> {
-    if let Ok(key) = env::var("MAJUTSU_MASTER_KEY") {
-        validate_key_hex(&key)?;
-        return Ok(key);
-    }
-    let key = fs::read_to_string(&paths.master_key)
-        .with_context(|| format!("missing master key: {}", paths.master_key.display()))?;
-    validate_key_hex(key.trim())?;
-    Ok(key.trim().to_string())
+    majutsu_crypto::read_master_key(&paths.master_key)
 }
 
 fn write_master_key(paths: &Paths, hex_key: &str) -> Result<()> {
-    validate_key_hex(hex_key)?;
-    if let Some(parent) = paths.master_key.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&paths.master_key, format!("{}\n", hex_key.trim()))?;
-    Ok(())
+    majutsu_crypto::write_master_key(&paths.master_key, hex_key)
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {

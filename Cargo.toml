@@ -20,11 +20,9 @@ members = [
 ]
 
 [dependencies]
-age = "0.11"
 anyhow = "1"
 base64 = "0.22"
 blake3 = "1"
-chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 fuser = { version = "0.15", default-features = false }
@@ -34,9 +32,9 @@ hmac = "0.12"
 ignore = "0.4"
 libc = "0.2"
 majutsu-core = { path = "crates/majutsu-core" }
+majutsu-crypto = { path = "crates/majutsu-crypto" }
 notify = "8"
 quick-xml = "0.37"
-rand = "0.8"
 reqwest = { version = "0.12", features = ["blocking"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
