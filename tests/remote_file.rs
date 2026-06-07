@@ -374,6 +374,80 @@ fn clone_can_restore_from_canonical_object_aliases() {
 }
 
 #[test]
+fn encrypted_clone_can_restore_from_canonical_object_aliases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("secret.txt"), b"secret\n").unwrap();
+    fs::write(source.join("payload.zip"), vec![9u8; 32 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--encrypt")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fs::remove_dir_all(remote.join("objects")).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(source.join("secret.txt")).unwrap(),
+        fs::read(restore.join("sample/secret.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("payload.zip")).unwrap(),
+        fs::read(restore.join("sample/payload.zip")).unwrap()
+    );
+}
+
+#[test]
 fn remote_fsck_detects_missing_canonical_host_ref() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
