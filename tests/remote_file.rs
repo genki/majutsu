@@ -5631,6 +5631,35 @@ fn fsck_detects_config_root_drift() {
 }
 
 #[test]
+fn fsck_detects_host_file_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let host_path = state.join("host.toml");
+    let host = fs::read_to_string(&host_path)
+        .unwrap()
+        .replace("id = \"", "id = \"drifted-");
+    fs::write(host_path, host).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn large_pin_unpin_is_persisted_in_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

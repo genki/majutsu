@@ -4913,6 +4913,7 @@ fn fsck(paths: &Paths) -> Result<()> {
         missing += 1;
         eprintln!("dangling large pin {oid} pinned_at={pinned_at}");
     }
+    validate_host_file(paths, &config, &mut missing)?;
     validate_config_roots(paths, &conn, &config, &mut missing)?;
     validate_local_snapshot_objects(paths, &export, &mut missing)?;
     validate_local_large_manifest_objects(paths, &export, &mut missing)?;
@@ -4926,6 +4927,37 @@ fn fsck(paths: &Paths) -> Result<()> {
         bail!("fsck found {missing} problems");
     }
     println!("fsck ok");
+    Ok(())
+}
+
+fn validate_host_file(paths: &Paths, config: &Config, missing: &mut usize) -> Result<()> {
+    if !paths.host.exists() {
+        *missing += 1;
+        eprintln!("missing host file {}", paths.host.display());
+        return Ok(());
+    }
+    let host: HostConfig = match toml::from_str(&fs::read_to_string(&paths.host)?) {
+        Ok(host) => host,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("invalid host file {}: {err}", paths.host.display());
+            return Ok(());
+        }
+    };
+    if host.id != config.host.id {
+        *missing += 1;
+        eprintln!(
+            "host file id {} does not match config host id {}",
+            host.id, config.host.id
+        );
+    }
+    if host.name != config.host.name {
+        *missing += 1;
+        eprintln!(
+            "host file name {} does not match config host name {}",
+            host.name, config.host.name
+        );
+    }
     Ok(())
 }
 
