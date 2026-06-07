@@ -4738,11 +4738,65 @@ fn fsck(paths: &Paths) -> Result<()> {
     validate_local_snapshot_objects(paths, &export, &mut missing)?;
     validate_local_large_manifest_objects(paths, &export, &mut missing)?;
     validate_local_pack_objects(paths, &export, &mut missing)?;
+    validate_local_metadata_references(paths, &export, &mut missing)?;
     validate_local_oplog(&conn, &mut missing)?;
     if missing > 0 {
         bail!("fsck found {missing} problems");
     }
     println!("fsck ok");
+    Ok(())
+}
+
+fn validate_local_metadata_references(
+    paths: &Paths,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    let mut live_blobs = BTreeSet::new();
+    let mut live_large = BTreeSet::new();
+    let mut live_chunks = BTreeSet::new();
+    for snapshot in &export.snapshots {
+        let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        for records in manifest.roots.values() {
+            for record in records {
+                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+                    live_blobs.insert(oid.to_string());
+                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
+                    live_large.insert(oid.to_string());
+                    let Ok(bytes) = read_object(paths, manifest_key) else {
+                        continue;
+                    };
+                    let Ok(large_manifest) = serde_json::from_slice::<LargeManifest>(&bytes) else {
+                        continue;
+                    };
+                    for chunk in large_manifest.chunks {
+                        live_chunks.insert(chunk.oid);
+                    }
+                }
+            }
+        }
+    }
+    for blob in &export.blobs {
+        if !live_blobs.contains(&blob.oid) {
+            *missing += 1;
+            eprintln!("dangling blob metadata {}", blob.oid);
+        }
+    }
+    for large in &export.large_objects {
+        if !live_large.contains(&large.oid) {
+            *missing += 1;
+            eprintln!("dangling large object metadata {}", large.oid);
+        }
+    }
+    for chunk in &export.chunks {
+        if !live_chunks.contains(&chunk.oid) {
+            *missing += 1;
+            eprintln!("dangling chunk metadata {}", chunk.oid);
+        }
+    }
     Ok(())
 }
 

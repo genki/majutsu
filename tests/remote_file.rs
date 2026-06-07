@@ -3879,6 +3879,57 @@ fn fsck_detects_corrupt_local_pack_index() {
 }
 
 #[test]
+fn fsck_detects_dangling_blob_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let object_key: String = conn
+        .query_row("select object_key from blobs limit 1", [], |row| row.get(0))
+        .unwrap();
+    conn.execute(
+        "insert into blobs(oid, size, object_key) values (?1, ?2, ?3)",
+        rusqlite::params!["dangling-blob", 5u64, object_key],
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn fsck_detects_corrupt_local_snapshot_manifest_object() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
