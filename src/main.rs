@@ -52,7 +52,8 @@ use majutsu_store::{
     host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
     host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
     is_content_addressed_remote_key, remote_gc_mark_key, remote_gc_tombstone_key,
-    remote_gc_tombstone_prefix, remote_object_availability_issues, select_remote_host,
+    remote_gc_tombstone_prefix, remote_object_availability_issues, s3_archive_restore_request_xml,
+    select_remote_host,
 };
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -9621,10 +9622,7 @@ impl S3Remote {
     fn restore_archive(&self, key: &str, days: u32, tier: &str) -> Result<bool> {
         let remote_key = self.remote_key(key);
         let query = "restore=".to_string();
-        let body = format!(
-            "<RestoreRequest><Days>{days}</Days><GlacierJobParameters><Tier>{}</Tier></GlacierJobParameters></RestoreRequest>",
-            xml_escape(tier)
-        );
+        let body = s3_archive_restore_request_xml(days, tier)?;
         if self.uses_sigv2() {
             let date = http_date();
             let path = format!("/{}/{}?restore", self.bucket, remote_key);

@@ -129,6 +129,27 @@ pub fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
     }
 }
 
+pub fn s3_archive_restore_request_xml(days: u32, tier: &str) -> Result<String> {
+    if days == 0 {
+        bail!("archive restore days must be greater than zero");
+    }
+    let tier = tier.trim();
+    if tier.is_empty() {
+        bail!("archive restore tier must not be empty");
+    }
+    Ok(format!(
+        "<RestoreRequest><Days>{days}</Days><GlacierJobParameters><Tier>{}</Tier></GlacierJobParameters></RestoreRequest>",
+        xml_escape(tier)
+    ))
+}
+
+fn xml_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 pub fn canonical_remote_alias(key: &str) -> Option<String> {
     if let Some(rest) = key.strip_prefix("objects/trees/") {
         Some(format!("trees/{rest}.cbor.zst.enc"))
@@ -729,6 +750,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("archive restore request failed for objects/large/chunk: HTTP 500"));
+    }
+
+    #[test]
+    fn s3_archive_restore_request_xml_validates_and_escapes_inputs() {
+        assert_eq!(
+            s3_archive_restore_request_xml(7, "Standard").unwrap(),
+            "<RestoreRequest><Days>7</Days><GlacierJobParameters><Tier>Standard</Tier></GlacierJobParameters></RestoreRequest>"
+        );
+        assert_eq!(
+            s3_archive_restore_request_xml(3, " Bulk & <slow> ").unwrap(),
+            "<RestoreRequest><Days>3</Days><GlacierJobParameters><Tier>Bulk &amp; &lt;slow&gt;</Tier></GlacierJobParameters></RestoreRequest>"
+        );
+        assert!(
+            s3_archive_restore_request_xml(0, "Standard")
+                .unwrap_err()
+                .to_string()
+                .contains("archive restore days must be greater than zero")
+        );
+        assert!(
+            s3_archive_restore_request_xml(1, " ")
+                .unwrap_err()
+                .to_string()
+                .contains("archive restore tier must not be empty")
+        );
     }
 
     fn host(id: &str, name: &str, metadata_key: &str) -> RemoteHostSummary {
