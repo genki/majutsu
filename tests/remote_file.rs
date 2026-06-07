@@ -2909,6 +2909,9 @@ fn init_creates_spec_state_layout() {
         fs::read_to_string(state.join("keys/recipients.toml")).unwrap(),
         "recipients = []\n"
     );
+    let log = fs::read_to_string(state.join("logs/majutsu.log")).unwrap();
+    assert!(log.contains("\"kind\":\"init\""));
+    assert!(log.contains("\"status\":\"done\""));
 }
 
 #[test]

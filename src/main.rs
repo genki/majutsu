@@ -6943,6 +6943,10 @@ fn create_layout(paths: &Paths) -> Result<()> {
     if !recipients.exists() {
         fs::write(recipients, "recipients = []\n")?;
     }
+    let log = paths.home.join("logs/majutsu.log");
+    if !log.exists() {
+        File::create(log)?;
+    }
     Ok(())
 }
 
@@ -7591,20 +7595,19 @@ fn record_op_with_id_and_status(
             id, parent_op, kind, actor, status, before, after, created_at, message
         ],
     )?;
-    append_local_oplog(
-        conn,
-        &OperationExport {
-            id: id.to_string(),
-            parent_op,
-            kind: kind.to_string(),
-            actor,
-            status: status.to_string(),
-            before_snapshot: before.map(str::to_string),
-            after_snapshot: after.map(str::to_string),
-            created_at,
-            message: message.map(str::to_string),
-        },
-    )?;
+    let op = OperationExport {
+        id: id.to_string(),
+        parent_op,
+        kind: kind.to_string(),
+        actor,
+        status: status.to_string(),
+        before_snapshot: before.map(str::to_string),
+        after_snapshot: after.map(str::to_string),
+        created_at,
+        message: message.map(str::to_string),
+    };
+    append_local_oplog(conn, &op)?;
+    append_operation_audit_log(conn, &op)?;
     Ok(())
 }
 
@@ -7670,6 +7673,28 @@ fn local_oplog_path(conn: &Connection) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     Ok(Some(home.join("ops/local-oplog.cborl")))
+}
+
+fn append_operation_audit_log(conn: &Connection, op: &OperationExport) -> Result<()> {
+    let Some(oplog) = local_oplog_path(conn)? else {
+        return Ok(());
+    };
+    let Some(home) = oplog
+        .parent()
+        .and_then(|parent| parent.parent())
+        .map(Path::to_path_buf)
+    else {
+        return Ok(());
+    };
+    let log_dir = home.join("logs");
+    fs::create_dir_all(&log_dir)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("majutsu.log"))?;
+    file.write_all(&serde_json::to_vec(op)?)?;
+    file.write_all(b"\n")?;
+    Ok(())
 }
 
 fn current_operation(conn: &Connection) -> Result<Option<String>> {
