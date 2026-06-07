@@ -9,12 +9,11 @@ use fuser::{
 use hmac::{Hmac, Mac};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
-use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
     ConfigRootIssue, FileRecord, HistoryGraphIssue, HostFileIssue, LargeChunk, LargeManifest,
     LiveMetadataReferences, MetadataReferenceIssue, OperationLogComparisonIssue,
     OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload, RootSnapshot,
-    SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest, config_root_consistency_issues,
+    SnapshotExport, SnapshotManifest, TreeManifest, config_root_consistency_issues,
     decode_operation_log, encode_operation_log, history_graph_issues, host_file_issues,
     metadata_reference_issues, operation_log_comparison_issues, operation_log_entry_matches,
     payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
@@ -55,14 +54,13 @@ use majutsu_store::{
     remote_gc_tombstone_prefix, remote_object_availability_issues, s3_archive_restore_request_xml,
     select_remote_host,
 };
-use majutsu_watch::WatchMode;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,11 +76,22 @@ use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod config;
 mod daemon_runtime;
 mod process_runtime;
 mod restore_runtime;
 mod watch_runtime;
 
+use config::{
+    Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, LazyMountEntry,
+    MetadataExport, MountViewMetadata, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig,
+    RootLargeConfig, SecurityConfig, TieringConfig, WatchConfig, default_chunk_size,
+    default_include, default_large_binary_min_size, default_large_chunking,
+    default_large_max_parallel_uploads, default_large_min_size, default_root_status,
+    default_security_hash, default_security_key_id, encryption_enabled, encryption_mode,
+    policy_config, read_config, resolve_paths, validate_config, validate_large_chunking,
+    validate_restore_archive_config, validate_snapshot_mode, validate_watch_mode, write_config,
+};
 use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use restore_runtime::{
@@ -92,9 +101,7 @@ use restore_runtime::{
     restore_delete_destination, restore_destination, restore_root_base, restore_target_label,
     write_restore_job,
 };
-use watch_runtime::{
-    default_watch_backend, format_notify_event, normalize_watch_backend, recv_watch_event,
-};
+use watch_runtime::{format_notify_event, normalize_watch_backend, recv_watch_event};
 
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
@@ -513,368 +520,6 @@ struct PackArgs {
     compact: bool,
 }
 
-#[derive(Debug)]
-struct Paths {
-    home: PathBuf,
-    db: PathBuf,
-    config: PathBuf,
-    host: PathBuf,
-    objects: PathBuf,
-    trees: PathBuf,
-    large_chunks: PathBuf,
-    large_manifests: PathBuf,
-    packs: PathBuf,
-    pack_indexes: PathBuf,
-    logs: PathBuf,
-    runtime: PathBuf,
-    daemon_pid: PathBuf,
-    daemon_lock: PathBuf,
-    snapshot_lock: PathBuf,
-    upload_queue: PathBuf,
-    event_queue: PathBuf,
-    master_key: PathBuf,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Config {
-    host: HostConfig,
-    remote: Option<RemoteConfig>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    roots: Vec<ConfigRoot>,
-    large: LargeConfig,
-    #[serde(default)]
-    pack: PackConfig,
-    #[serde(default)]
-    watch: WatchConfig,
-    #[serde(default)]
-    security: SecurityConfig,
-    #[serde(default)]
-    tiering: TieringConfig,
-    #[serde(default)]
-    restore: RestoreConfig,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HostConfig {
-    id: String,
-    name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RemoteConfig {
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default, rename = "type")]
-    remote_type: Option<String>,
-    #[serde(default)]
-    path: Option<PathBuf>,
-    #[serde(default)]
-    bucket: Option<String>,
-    #[serde(default)]
-    prefix: Option<String>,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default)]
-    region: Option<String>,
-    #[serde(default)]
-    signature_version: Option<String>,
-}
-
-impl RemoteConfig {
-    fn from_url(url: String) -> Self {
-        Self {
-            url: Some(url),
-            remote_type: None,
-            path: None,
-            bucket: None,
-            prefix: None,
-            endpoint: None,
-            region: None,
-            signature_version: None,
-        }
-    }
-
-    fn url(&self) -> Result<String> {
-        if let Some(url) = &self.url {
-            return Ok(url.clone());
-        }
-        match self.remote_type.as_deref() {
-            Some("file") => {
-                let path = self
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("file remote requires [remote].path"))?;
-                Ok(format!("file://{}", path.display()))
-            }
-            Some("s3") | None if self.bucket.is_some() => {
-                let bucket = self
-                    .bucket
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("s3 remote requires [remote].bucket"))?;
-                let prefix = self.prefix.as_deref().unwrap_or_default().trim_matches('/');
-                if prefix.is_empty() {
-                    Ok(format!("s3://{bucket}"))
-                } else {
-                    Ok(format!("s3://{bucket}/{prefix}"))
-                }
-            }
-            Some(other) => bail!("unsupported remote type: {other}"),
-            None => bail!("remote requires url, or type plus path/bucket"),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct SecurityConfig {
-    #[serde(default)]
-    encryption: String,
-    #[serde(default = "default_security_key_id")]
-    key_id: String,
-    #[serde(default = "default_security_hash")]
-    hash: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RestoreConfig {
-    #[serde(default)]
-    archive: RestoreArchiveConfig,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RestoreArchiveConfig {
-    #[serde(default = "default_restore_archive_days")]
-    days: u32,
-    #[serde(default = "default_restore_archive_tier")]
-    tier: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TieringConfig {
-    #[serde(default = "default_true")]
-    enabled: bool,
-    #[serde(default = "default_tiering_rules")]
-    rules: Vec<TieringRule>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TieringRule {
-    name: String,
-    prefix: String,
-    #[serde(default)]
-    after: Option<String>,
-    #[serde(default, alias = "transition_to", alias = "keep")]
-    storage: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct MetadataExport {
-    version: u32,
-    exported_at: DateTime<Utc>,
-    config: Config,
-    roots: Vec<RootConfig>,
-    snapshots: Vec<SnapshotExport>,
-    operations: Vec<OperationExport>,
-    refs: BTreeMap<String, String>,
-    blobs: Vec<BlobExport>,
-    large_objects: Vec<LargeObjectExport>,
-    chunks: Vec<ChunkExport>,
-    packs: Vec<PackExport>,
-    #[serde(default)]
-    large_pins: Vec<LargePinExport>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LazyMountEntry {
-    version: u32,
-    snapshot_id: String,
-    root_id: String,
-    path: String,
-    size: u64,
-    manifest_key: String,
-    chunk_count: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct MountViewMetadata {
-    version: u32,
-    snapshot_id: String,
-    created_at: DateTime<Utc>,
-    hydrate_large: bool,
-    files: usize,
-    lazy_large_files: usize,
-    hydrated_large_files: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LargeConfig {
-    enabled: bool,
-    #[serde(
-        default = "default_large_min_size",
-        deserialize_with = "deserialize_u64_bytes"
-    )]
-    min_size: u64,
-    #[serde(
-        default = "default_large_binary_min_size",
-        deserialize_with = "deserialize_u64_bytes"
-    )]
-    binary_min_size: u64,
-    #[serde(default = "default_large_chunking")]
-    default_chunking: String,
-    #[serde(
-        default = "default_chunk_size",
-        alias = "target_chunk_size",
-        deserialize_with = "deserialize_usize_bytes"
-    )]
-    chunk_size: usize,
-    #[serde(default = "default_large_max_parallel_uploads")]
-    max_parallel_uploads: usize,
-    #[serde(default = "default_true")]
-    multipart: bool,
-    always: Vec<String>,
-    never: Vec<String>,
-    #[serde(default)]
-    compression: LargeCompressionConfig,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct PackConfig {
-    #[serde(
-        default = "default_small_pack_target",
-        deserialize_with = "deserialize_u64_bytes"
-    )]
-    small_pack_target: u64,
-    #[serde(
-        default = "default_normal_pack_target",
-        deserialize_with = "deserialize_u64_bytes"
-    )]
-    normal_pack_target: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct WatchConfig {
-    #[serde(default = "default_watch_backend")]
-    backend: String,
-    #[serde(default = "default_watch_mode")]
-    mode: String,
-    #[serde(
-        default = "default_watch_debounce_ms",
-        deserialize_with = "deserialize_millis"
-    )]
-    debounce: u64,
-    #[serde(
-        default = "default_watch_settle_ms",
-        deserialize_with = "deserialize_millis"
-    )]
-    settle: u64,
-    #[serde(
-        default = "default_watch_periodic_rescan_secs",
-        deserialize_with = "deserialize_seconds"
-    )]
-    periodic_rescan: u64,
-    #[serde(
-        default = "default_watch_interval_secs",
-        deserialize_with = "deserialize_seconds"
-    )]
-    interval: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ConfigRoot {
-    id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    path: PathBuf,
-    #[serde(default = "default_include")]
-    include: Vec<String>,
-    #[serde(default)]
-    exclude: Vec<String>,
-    #[serde(default)]
-    follow_symlinks: bool,
-    #[serde(default)]
-    require_mount: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    #[serde(default = "default_snapshot_mode")]
-    snapshot_mode: String,
-    #[serde(default)]
-    pre_snapshot: Option<String>,
-    #[serde(default)]
-    post_snapshot: Option<String>,
-    #[serde(default)]
-    snapshot_source: Option<PathBuf>,
-    #[serde(default)]
-    application_plugin: Option<String>,
-    #[serde(default)]
-    large: Option<RootLargeConfig>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct LargeCompressionConfig {
-    #[serde(default = "default_true")]
-    enabled: bool,
-    #[serde(default = "default_large_compression_algorithm")]
-    algorithm: String,
-    #[serde(default = "default_large_compression_level")]
-    level: i32,
-    #[serde(
-        default = "default_large_compression_sample_bytes",
-        deserialize_with = "deserialize_usize_bytes"
-    )]
-    sample_bytes: usize,
-    #[serde(default = "default_large_compression_min_gain_ratio")]
-    min_gain_ratio: f64,
-    #[serde(default = "default_large_compression_skip_extensions")]
-    skip_extensions: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RootConfig {
-    id: String,
-    name: String,
-    path: PathBuf,
-    #[serde(default = "default_include")]
-    include: Vec<String>,
-    #[serde(default)]
-    exclude: Vec<String>,
-    follow_symlinks: bool,
-    #[serde(default)]
-    require_mount: bool,
-    #[serde(default = "default_root_status")]
-    status: String,
-    #[serde(default = "default_snapshot_mode")]
-    snapshot_mode: String,
-    #[serde(default)]
-    pre_snapshot: Option<String>,
-    #[serde(default)]
-    post_snapshot: Option<String>,
-    #[serde(default)]
-    snapshot_source: Option<PathBuf>,
-    #[serde(default)]
-    application_plugin: Option<String>,
-    #[serde(default)]
-    large: Option<RootLargeConfig>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-struct RootLargeConfig {
-    #[serde(default, deserialize_with = "deserialize_option_u64_bytes")]
-    min_size: Option<u64>,
-    #[serde(default, deserialize_with = "deserialize_option_u64_bytes")]
-    binary_min_size: Option<u64>,
-    #[serde(default)]
-    default_chunking: Option<String>,
-    #[serde(
-        default,
-        alias = "target_chunk_size",
-        deserialize_with = "deserialize_option_usize_bytes"
-    )]
-    chunk_size: Option<usize>,
-    #[serde(default)]
-    always: Vec<String>,
-    #[serde(default)]
-    never: Vec<String>,
-}
-
 #[cfg(unix)]
 fn file_mode(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -958,68 +603,6 @@ fn main() -> Result<()> {
         Command::Gc => gc_cmd(&paths),
         Command::Fsck => fsck(&paths),
     }
-}
-
-fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
-    let home = if let Some(home) = home_arg {
-        home
-    } else if let Ok(home) = env::var("MAJUTSU_HOME") {
-        PathBuf::from(home)
-    } else if let Some(home) = configured_state_home()? {
-        home
-    } else {
-        let user_home = env::var("HOME").context("HOME is not set")?;
-        PathBuf::from(user_home).join(".majutsu")
-    };
-    Ok(Paths {
-        db: home.join("db/majutsu.sqlite"),
-        config: home.join("config.toml"),
-        host: home.join("host.toml"),
-        objects: home.join("objects/blobs"),
-        trees: home.join("objects/trees"),
-        large_chunks: home.join("objects/large/chunks/fixed"),
-        large_manifests: home.join("objects/large/manifests"),
-        packs: home.join("objects/packs/normal"),
-        pack_indexes: home.join("objects/indexes/pack"),
-        logs: home.join("logs"),
-        runtime: home.join("runtime"),
-        daemon_pid: home.join("runtime/daemon.pid"),
-        daemon_lock: home.join("locks/daemon.lock"),
-        snapshot_lock: home.join("locks/snapshot.lock"),
-        upload_queue: home.join("queue/uploads"),
-        event_queue: home.join("queue/events"),
-        master_key: home.join("keys/master.key"),
-        home,
-    })
-}
-
-fn configured_state_home() -> Result<Option<PathBuf>> {
-    let user_home = env::var("HOME").ok().map(PathBuf::from);
-    let config_home = env::var("XDG_CONFIG_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| user_home.as_ref().map(|home| home.join(".config")));
-    let Some(config_home) = config_home else {
-        return Ok(None);
-    };
-    let path = config_home.join("majutsu/config.toml");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let value: toml::Value = toml::from_str(&fs::read_to_string(path)?)?;
-    let Some(home) = value
-        .get("state")
-        .and_then(|state| state.get("home"))
-        .and_then(|home| home.as_str())
-    else {
-        return Ok(None);
-    };
-    if let Some(rest) = home.strip_prefix("~/") {
-        if let Some(user_home) = user_home {
-            return Ok(Some(user_home.join(rest)));
-        }
-    }
-    Ok(Some(PathBuf::from(home)))
 }
 
 fn init(paths: &Paths, args: InitArgs) -> Result<()> {
@@ -1649,22 +1232,6 @@ fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
         },
     }
     Ok(())
-}
-
-fn policy_config(tiering: &TieringConfig) -> majutsu_policy::PolicyConfig {
-    majutsu_policy::PolicyConfig {
-        enabled: tiering.enabled,
-        rules: tiering
-            .rules
-            .iter()
-            .map(|rule| majutsu_policy::PolicyRule {
-                name: rule.name.clone(),
-                prefix: rule.prefix.clone(),
-                after: rule.after.clone(),
-                storage: rule.storage.clone(),
-            })
-            .collect(),
-    }
 }
 
 fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
@@ -4183,16 +3750,6 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            encryption: "none".into(),
-            key_id: default_security_key_id(),
-            hash: default_security_hash(),
-        }
-    }
-}
-
 fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
@@ -6284,16 +5841,6 @@ fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) ->
     Ok(())
 }
 
-fn validate_restore_archive_config(config: &RestoreArchiveConfig) -> Result<()> {
-    if config.days == 0 {
-        bail!("restore archive days must be greater than zero");
-    }
-    if config.tier.trim().is_empty() {
-        bail!("restore archive tier must not be empty");
-    }
-    Ok(())
-}
-
 fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Result<()> {
     if job.archived_objects.is_empty() {
         return Ok(());
@@ -7889,181 +7436,12 @@ fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
     Ok(operations)
 }
 
-fn read_config(paths: &Paths) -> Result<Config> {
-    let config: Config = toml::from_str(&fs::read_to_string(&paths.config)?)?;
-    validate_config(&config)?;
-    Ok(config)
-}
-
-fn validate_config(config: &Config) -> Result<()> {
-    normalize_watch_backend(&config.watch.backend)?;
-    validate_watch_mode(&config.watch.mode)?;
-    validate_large_config(&config.large)?;
-    validate_pack_config(&config.pack)?;
-    validate_security_config(&config.security)?;
-    validate_restore_archive_config(&config.restore.archive)?;
-    validate_tiering_config(&config.tiering)?;
-    Ok(())
-}
-
-fn write_config(paths: &Paths, config: &Config) -> Result<()> {
-    fs::write(&paths.config, toml::to_string_pretty(config)?)?;
-    Ok(())
-}
-
 fn build_ignore(root: &RootConfig) -> Result<Gitignore> {
     let mut builder = GitignoreBuilder::new(&root.path);
     for pattern in &root.exclude {
         builder.add_line(None, pattern)?;
     }
     Ok(builder.build()?)
-}
-
-fn validate_snapshot_mode(mode: &str) -> Result<()> {
-    SnapshotMode::parse(mode).map(|_| ())
-}
-
-fn validate_watch_mode(mode: &str) -> Result<()> {
-    WatchMode::normalize(mode)
-        .map(|_| ())
-        .map_err(anyhow::Error::msg)
-}
-
-fn validate_security_config(security: &SecurityConfig) -> Result<()> {
-    encryption_enabled(security)?;
-    majutsu_crypto::validate_security_hash(&security.hash)
-}
-
-fn validate_large_config(large: &LargeConfig) -> Result<()> {
-    validate_large_chunking(&large.default_chunking)?;
-    if large.chunk_size == 0 {
-        bail!("large chunk_size must be greater than zero");
-    }
-    if large.max_parallel_uploads == 0 {
-        bail!("large max_parallel_uploads must be greater than zero");
-    }
-    Ok(())
-}
-
-fn validate_pack_config(pack: &PackConfig) -> Result<()> {
-    if pack.small_pack_target == 0 {
-        bail!("pack small_pack_target must be greater than zero");
-    }
-    if pack.normal_pack_target == 0 {
-        bail!("pack normal_pack_target must be greater than zero");
-    }
-    Ok(())
-}
-
-fn validate_tiering_config(tiering: &TieringConfig) -> Result<()> {
-    majutsu_policy::s3_lifecycle_policy(&policy_config(tiering)).map(|_| ())
-}
-
-fn encryption_enabled(security: &SecurityConfig) -> Result<bool> {
-    majutsu_crypto::encryption_enabled(&security.encryption)
-}
-
-fn encryption_mode(security: &SecurityConfig) -> Result<EncryptionMode> {
-    EncryptionMode::parse(&security.encryption)
-}
-
-fn validate_large_chunking(chunking: &str) -> Result<()> {
-    majutsu_large::validate_chunking(chunking)
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ByteSizeValue {
-    Integer(u64),
-    String(String),
-}
-
-fn deserialize_u64_bytes<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = ByteSizeValue::deserialize(deserializer)?;
-    byte_size_value(value).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_usize_bytes<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = deserialize_u64_bytes(deserializer)?;
-    usize::try_from(value).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_option_u64_bytes<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<u64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let Some(value) = Option::<ByteSizeValue>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    byte_size_value(value)
-        .map(Some)
-        .map_err(serde::de::Error::custom)
-}
-
-fn deserialize_option_usize_bytes<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<usize>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let Some(value) = deserialize_option_u64_bytes(deserializer)? else {
-        return Ok(None);
-    };
-    usize::try_from(value)
-        .map(Some)
-        .map_err(serde::de::Error::custom)
-}
-
-fn byte_size_value(value: ByteSizeValue) -> Result<u64> {
-    match value {
-        ByteSizeValue::Integer(value) => Ok(value),
-        ByteSizeValue::String(value) => parse_byte_size(&value),
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum DurationValue {
-    Integer(u64),
-    String(String),
-}
-
-fn deserialize_millis<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = DurationValue::deserialize(deserializer)?;
-    duration_value_millis(value).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_seconds<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = DurationValue::deserialize(deserializer)?;
-    duration_value_seconds(value).map_err(serde::de::Error::custom)
-}
-
-fn duration_value_millis(value: DurationValue) -> Result<u64> {
-    match value {
-        DurationValue::Integer(value) => Ok(value),
-        DurationValue::String(value) => parse_duration_millis(&value),
-    }
-}
-
-fn duration_value_seconds(value: DurationValue) -> Result<u64> {
-    match value {
-        DurationValue::Integer(value) => Ok(value),
-        DurationValue::String(value) => Ok(parse_duration_millis(&value)? / 1000),
-    }
 }
 
 fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
@@ -8259,166 +7637,6 @@ fn path_pattern_match(pattern: &str, rel: &str) -> bool {
     rel == pattern || rel.starts_with(&format!("{pattern}/"))
 }
 
-fn default_include() -> Vec<String> {
-    vec!["**".into()]
-}
-
-fn default_root_status() -> String {
-    "active".into()
-}
-
-fn default_snapshot_mode() -> String {
-    "default".into()
-}
-
-fn default_large_chunking() -> String {
-    majutsu_large::default_chunking().into()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_large_min_size() -> u64 {
-    majutsu_large::default_large_min_size()
-}
-
-fn default_large_max_parallel_uploads() -> usize {
-    majutsu_large::default_max_parallel_uploads()
-}
-
-fn default_large_binary_min_size() -> u64 {
-    majutsu_large::default_large_binary_min_size()
-}
-
-fn default_chunk_size() -> usize {
-    majutsu_large::default_chunk_size()
-}
-
-fn default_large_compression_algorithm() -> String {
-    majutsu_large::default_compression_algorithm().into()
-}
-
-fn default_large_compression_level() -> i32 {
-    majutsu_large::default_compression_level()
-}
-
-fn default_large_compression_sample_bytes() -> usize {
-    majutsu_large::default_compression_sample_bytes()
-}
-
-fn default_large_compression_min_gain_ratio() -> f64 {
-    majutsu_large::default_compression_min_gain_ratio()
-}
-
-fn default_large_compression_skip_extensions() -> Vec<String> {
-    majutsu_large::default_compression_skip_extensions()
-}
-
-fn default_small_pack_target() -> u64 {
-    majutsu_pack::default_small_pack_target()
-}
-
-fn default_normal_pack_target() -> u64 {
-    majutsu_pack::default_normal_pack_target()
-}
-
-impl Default for PackConfig {
-    fn default() -> Self {
-        Self {
-            small_pack_target: default_small_pack_target(),
-            normal_pack_target: default_normal_pack_target(),
-        }
-    }
-}
-
-fn default_watch_mode() -> String {
-    majutsu_watch::default_mode().into()
-}
-
-fn default_watch_debounce_ms() -> u64 {
-    majutsu_watch::default_debounce().as_millis() as u64
-}
-
-fn default_watch_settle_ms() -> u64 {
-    majutsu_watch::default_settle().as_millis() as u64
-}
-
-fn default_watch_periodic_rescan_secs() -> u64 {
-    majutsu_watch::default_periodic_rescan().as_secs()
-}
-
-fn default_watch_interval_secs() -> u64 {
-    majutsu_watch::default_poll_interval().as_secs()
-}
-
-fn default_security_key_id() -> String {
-    majutsu_crypto::default_security_key_id().into()
-}
-
-fn default_security_hash() -> String {
-    majutsu_crypto::default_security_hash().into()
-}
-
-fn default_restore_archive_days() -> u32 {
-    7
-}
-
-fn default_restore_archive_tier() -> String {
-    "Standard".into()
-}
-
-impl Default for RestoreArchiveConfig {
-    fn default() -> Self {
-        Self {
-            days: default_restore_archive_days(),
-            tier: default_restore_archive_tier(),
-        }
-    }
-}
-
-impl Default for RestoreConfig {
-    fn default() -> Self {
-        Self {
-            archive: RestoreArchiveConfig::default(),
-        }
-    }
-}
-
-impl Default for WatchConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_watch_backend(),
-            mode: default_watch_mode(),
-            debounce: default_watch_debounce_ms(),
-            settle: default_watch_settle_ms(),
-            periodic_rescan: default_watch_periodic_rescan_secs(),
-            interval: default_watch_interval_secs(),
-        }
-    }
-}
-
-fn default_tiering_rules() -> Vec<TieringRule> {
-    majutsu_policy::default_tiering_rules()
-        .into_iter()
-        .map(|rule| TieringRule {
-            name: rule.name,
-            prefix: rule.prefix,
-            after: rule.after,
-            storage: rule.storage,
-        })
-        .collect()
-}
-
-impl Default for TieringConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            rules: default_tiering_rules(),
-        }
-    }
-}
-
 fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {
     if args.large_min_size.is_none()
         && args.large_binary_min_size.is_none()
@@ -8486,19 +7704,6 @@ fn apply_root_large_set(root: &mut RootConfig, args: &RootSetArgs) -> Result<()>
     }
     large.never.extend(args.large_never.clone());
     Ok(())
-}
-
-impl Default for LargeCompressionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            algorithm: default_large_compression_algorithm(),
-            level: default_large_compression_level(),
-            sample_bytes: default_large_compression_sample_bytes(),
-            min_gain_ratio: default_large_compression_min_gain_ratio(),
-            skip_extensions: default_large_compression_skip_extensions(),
-        }
-    }
 }
 
 fn looks_binary(path: &Path) -> Result<bool> {
@@ -10058,7 +9263,7 @@ tier = "Bulk"
         validate_restore_archive_config(&config.restore.archive).unwrap();
 
         assert!(
-            validate_restore_archive_config(&RestoreArchiveConfig {
+            validate_restore_archive_config(&config::RestoreArchiveConfig {
                 days: 0,
                 tier: "Standard".into(),
             })
@@ -10067,7 +9272,7 @@ tier = "Bulk"
             .contains("restore archive days must be greater than zero")
         );
         assert!(
-            validate_restore_archive_config(&RestoreArchiveConfig {
+            validate_restore_archive_config(&config::RestoreArchiveConfig {
                 days: 1,
                 tier: " ".into(),
             })
