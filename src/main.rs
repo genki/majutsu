@@ -3307,7 +3307,7 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             }
         }
         RemoteCommand::Fsck => {
-            remote_fsck(&remote)?;
+            remote_fsck(paths, &remote)?;
         }
         RemoteCommand::Capabilities => {
             let capabilities = remote.capabilities();
@@ -4633,14 +4633,14 @@ fn fsck(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn remote_fsck(remote: &RemoteStore) -> Result<()> {
+fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     let mut missing = 0usize;
     let mut verified_hosts = 0usize;
     let has_legacy_export = remote.exists("metadata/export.json")?;
     let has_host_index = remote.exists("hosts/index.json")?;
 
     if has_legacy_export {
-        let export = remote_fsck_export(remote, "metadata/export.json", None, &mut missing)?;
+        let export = remote_fsck_export(paths, remote, "metadata/export.json", None, &mut missing)?;
         if let Some(current) = export.refs.get("current") {
             let legacy_current = remote_ref(remote, "hosts/current")?;
             if legacy_current.as_deref() != Some(current.as_str()) {
@@ -4672,8 +4672,13 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
                 eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
                 continue;
             }
-            let export =
-                remote_fsck_export(remote, &host.metadata_key, Some(&host.id), &mut missing)?;
+            let export = remote_fsck_export(
+                paths,
+                remote,
+                &host.metadata_key,
+                Some(&host.id),
+                &mut missing,
+            )?;
             if export.config.host.id != host.id {
                 missing += 1;
                 eprintln!(
@@ -4789,6 +4794,7 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
 }
 
 fn remote_fsck_export(
+    paths: &Paths,
     remote: &RemoteStore,
     metadata_key: &str,
     host_id: Option<&str>,
@@ -4850,35 +4856,72 @@ fn remote_fsck_export(
         for snapshot in &export.snapshots {
             let key = host_snapshot_key(host_id, &snapshot.id);
             if !remote.exists(&key)? {
-                continue;
+            } else {
+                let remote_snapshot: SnapshotExport = serde_json::from_slice(&remote.get(&key)?)
+                    .with_context(|| format!("parse remote snapshot export {key}"))?;
+                if !snapshot_export_matches(&remote_snapshot, snapshot) {
+                    *missing += 1;
+                    eprintln!("host snapshot export does not match metadata {key}");
+                }
             }
-            let remote_snapshot: SnapshotExport = serde_json::from_slice(&remote.get(&key)?)
-                .with_context(|| format!("parse remote snapshot export {key}"))?;
-            if remote_snapshot.id != snapshot.id
-                || remote_snapshot.manifest_key != snapshot.manifest_key
-                || remote_snapshot.op_id != snapshot.op_id
-            {
-                *missing += 1;
-                eprintln!("host snapshot export does not match metadata {key}");
+            let canonical_key = host_snapshot_canonical_key(host_id, &snapshot.id);
+            if remote.exists(&canonical_key)? {
+                let remote_snapshot: SnapshotExport =
+                    decode_canonical_remote_export(paths, &remote.get(&canonical_key)?)
+                        .with_context(|| format!("parse remote snapshot export {canonical_key}"))?;
+                if !snapshot_export_matches(&remote_snapshot, snapshot) {
+                    *missing += 1;
+                    eprintln!("host snapshot export does not match metadata {canonical_key}");
+                }
             }
         }
         for operation in &export.operations {
             let key = host_operation_key(host_id, &operation.id);
             if !remote.exists(&key)? {
-                continue;
+            } else {
+                let remote_operation: OperationExport = serde_json::from_slice(&remote.get(&key)?)
+                    .with_context(|| format!("parse remote operation export {key}"))?;
+                if !operation_export_matches(&remote_operation, operation) {
+                    *missing += 1;
+                    eprintln!("host operation export does not match metadata {key}");
+                }
             }
-            let remote_operation: OperationExport = serde_json::from_slice(&remote.get(&key)?)
-                .with_context(|| format!("parse remote operation export {key}"))?;
-            if remote_operation.id != operation.id
-                || remote_operation.kind != operation.kind
-                || remote_operation.after_snapshot != operation.after_snapshot
-            {
-                *missing += 1;
-                eprintln!("host operation export does not match metadata {key}");
+            let canonical_key = host_operation_canonical_key(host_id, &operation.id);
+            if remote.exists(&canonical_key)? {
+                let remote_operation: OperationExport =
+                    decode_canonical_remote_export(paths, &remote.get(&canonical_key)?)
+                        .with_context(|| {
+                            format!("parse remote operation export {canonical_key}")
+                        })?;
+                if !operation_export_matches(&remote_operation, operation) {
+                    *missing += 1;
+                    eprintln!("host operation export does not match metadata {canonical_key}");
+                }
             }
         }
     }
     Ok(export)
+}
+
+fn snapshot_export_matches(remote: &SnapshotExport, metadata: &SnapshotExport) -> bool {
+    remote.id == metadata.id
+        && remote.parent_id == metadata.parent_id
+        && remote.op_id == metadata.op_id
+        && remote.created_at == metadata.created_at
+        && remote.manifest_key == metadata.manifest_key
+        && remote.manifest_json == metadata.manifest_json
+}
+
+fn operation_export_matches(remote: &OperationExport, metadata: &OperationExport) -> bool {
+    remote.id == metadata.id
+        && remote.parent_op == metadata.parent_op
+        && remote.kind == metadata.kind
+        && remote.actor == metadata.actor
+        && remote.status == metadata.status
+        && remote.before_snapshot == metadata.before_snapshot
+        && remote.after_snapshot == metadata.after_snapshot
+        && remote.created_at == metadata.created_at
+        && remote.message == metadata.message
 }
 
 #[derive(Debug)]

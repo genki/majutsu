@@ -66,6 +66,19 @@ fn assert_canonical_cbor_zstd(path: &std::path::Path) {
     assert!(matches!(value, serde_cbor::Value::Map(_)));
 }
 
+fn rewrite_canonical_cbor_zstd(
+    path: &std::path::Path,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    let compressed = fs::read(path).unwrap();
+    let cbor = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+    let mut value: serde_json::Value = serde_cbor::from_slice(&cbor).unwrap();
+    mutate(&mut value);
+    let cbor = serde_cbor::to_vec(&value).unwrap();
+    let compressed = zstd::stream::encode_all(cbor.as_slice(), 3).unwrap();
+    fs::write(path, compressed).unwrap();
+}
+
 fn count_files_ending(root: &std::path::Path, suffix: &str) -> usize {
     walkdir::WalkDir::new(root)
         .into_iter()
@@ -1320,6 +1333,66 @@ fn remote_fsck_detects_missing_canonical_host_export() {
         .find(|path| path.to_string_lossy().ends_with(".cbor.zst.enc"))
         .unwrap();
     fs::remove_file(canonical_snapshot).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_detects_corrupt_canonical_host_snapshot_export() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let host_dir = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("refs/current").exists())
+        .unwrap();
+    let canonical_snapshot = fs::read_dir(host_dir.join("snapshots"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with(".cbor.zst.enc"))
+        .unwrap();
+    rewrite_canonical_cbor_zstd(&canonical_snapshot, |value| {
+        value["manifest_key"] = serde_json::Value::String("objects/snapshots/corrupt.json".into());
+    });
 
     fails({
         let mut c = mj();
