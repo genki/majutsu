@@ -2670,12 +2670,22 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
             &host_snapshot_key(&config.host.id, &snapshot.id),
             serde_json::to_vec_pretty(snapshot)?,
         )?;
+        enqueue_inline_upload(
+            paths,
+            &host_snapshot_canonical_key(&config.host.id, &snapshot.id),
+            encode_canonical_remote_export(paths, snapshot)?,
+        )?;
     }
     for operation in &export.operations {
         enqueue_inline_upload(
             paths,
             &host_operation_key(&config.host.id, &operation.id),
             serde_json::to_vec_pretty(operation)?,
+        )?;
+        enqueue_inline_upload(
+            paths,
+            &host_operation_canonical_key(&config.host.id, &operation.id),
+            encode_canonical_remote_export(paths, operation)?,
         )?;
     }
     enqueue_inline_upload(
@@ -2781,8 +2791,22 @@ fn host_snapshot_key(host_id: &str, snapshot_id: &str) -> String {
     format!("hosts/{host_id}/snapshots/{snapshot_id}.json")
 }
 
+fn host_snapshot_canonical_key(host_id: &str, snapshot_id: &str) -> String {
+    format!("hosts/{host_id}/snapshots/{snapshot_id}.cbor.zst.enc")
+}
+
 fn host_operation_key(host_id: &str, op_id: &str) -> String {
     format!("hosts/{host_id}/ops/{op_id}.json")
+}
+
+fn host_operation_canonical_key(host_id: &str, op_id: &str) -> String {
+    format!("hosts/{host_id}/ops/{op_id}.cbor.zst.enc")
+}
+
+fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Result<Vec<u8>> {
+    let cbor = serde_cbor::to_vec(value)?;
+    let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
+    encode_object(paths, &compressed)
 }
 
 fn update_remote_host_index(
@@ -2814,22 +2838,34 @@ fn prune_remote_host_exports(
     let live_snapshots = export
         .snapshots
         .iter()
-        .map(|snapshot| host_snapshot_key(host_id, &snapshot.id))
+        .flat_map(|snapshot| {
+            [
+                host_snapshot_key(host_id, &snapshot.id),
+                host_snapshot_canonical_key(host_id, &snapshot.id),
+            ]
+        })
         .collect::<BTreeSet<_>>();
     let live_ops = export
         .operations
         .iter()
-        .map(|operation| host_operation_key(host_id, &operation.id))
+        .flat_map(|operation| {
+            [
+                host_operation_key(host_id, &operation.id),
+                host_operation_canonical_key(host_id, &operation.id),
+            ]
+        })
         .collect::<BTreeSet<_>>();
     let mut removed = 0usize;
     for key in remote.list(&format!("hosts/{host_id}/snapshots/"))? {
-        if key.ends_with(".json") && !live_snapshots.contains(&key) {
+        if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc"))
+            && !live_snapshots.contains(&key)
+        {
             remote.delete(&key)?;
             removed += 1;
         }
     }
     for key in remote.list(&format!("hosts/{host_id}/ops/"))? {
-        if key.ends_with(".json") && !live_ops.contains(&key) {
+        if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc")) && !live_ops.contains(&key) {
             remote.delete(&key)?;
             removed += 1;
         }
@@ -4304,6 +4340,20 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
                         missing += 1;
                         eprintln!("missing remote ref {last_synced_ref_key}");
                     }
+                }
+            }
+            for snapshot in &export.snapshots {
+                let key = host_snapshot_canonical_key(&host.id, &snapshot.id);
+                if !remote.exists(&key)? {
+                    missing += 1;
+                    eprintln!("missing canonical host snapshot export {key}");
+                }
+            }
+            for operation in &export.operations {
+                let key = host_operation_canonical_key(&host.id, &operation.id);
+                if !remote.exists(&key)? {
+                    missing += 1;
+                    eprintln!("missing canonical host operation export {key}");
                 }
             }
         }

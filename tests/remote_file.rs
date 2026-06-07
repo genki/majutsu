@@ -176,6 +176,18 @@ fn file_remote_clone_restores_normal_and_large_files() {
             .is_some()
     );
     assert!(
+        fs::read_dir(host_ref_dirs[0].join("snapshots"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("enc"))
+    );
+    assert!(
+        fs::read_dir(host_ref_dirs[0].join("ops"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("enc"))
+    );
+    assert!(
         host_ref_dirs[0]
             .join("ops")
             .read_dir()
@@ -351,6 +363,63 @@ fn remote_fsck_detects_missing_canonical_object_alias() {
         .find(|path| path.is_file())
         .unwrap();
     fs::remove_file(alias).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_detects_missing_canonical_host_export() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let host_dir = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("refs/current").exists())
+        .unwrap();
+    let canonical_snapshot = fs::read_dir(host_dir.join("snapshots"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with(".cbor.zst.enc"))
+        .unwrap();
+    fs::remove_file(canonical_snapshot).unwrap();
 
     fails({
         let mut c = mj();
@@ -1305,7 +1374,11 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.join("metadata/export.json").exists())
         .unwrap();
-    let before = fs::read_dir(host_dir.join("snapshots")).unwrap().count();
+    let before = fs::read_dir(host_dir.join("snapshots"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
     assert!(before >= 2);
 
     run({
@@ -1326,7 +1399,11 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         c
     });
     assert!(sync.contains("pruned_remote_exports "));
-    let after = fs::read_dir(host_dir.join("snapshots")).unwrap().count();
+    let after = fs::read_dir(host_dir.join("snapshots"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
     assert_eq!(after, 1);
 }
 
