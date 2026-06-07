@@ -4917,6 +4917,7 @@ fn fsck(paths: &Paths) -> Result<()> {
     validate_config_roots(paths, &conn, &config, &mut missing)?;
     validate_local_refs(&conn, &mut missing)?;
     validate_remote_refs(&conn, &config, &mut missing)?;
+    validate_local_history_graph(&export, &mut missing)?;
     validate_local_snapshot_objects(paths, &export, &mut missing)?;
     validate_local_large_manifest_objects(paths, &export, &mut missing)?;
     validate_local_pack_objects(paths, &export, &mut missing)?;
@@ -4929,6 +4930,45 @@ fn fsck(paths: &Paths) -> Result<()> {
         bail!("fsck found {missing} problems");
     }
     println!("fsck ok");
+    Ok(())
+}
+
+fn validate_local_history_graph(export: &MetadataExport, missing: &mut usize) -> Result<()> {
+    let operation_ids = export
+        .operations
+        .iter()
+        .map(|operation| operation.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for snapshot in &export.snapshots {
+        if let Some(parent) = snapshot.parent_id.as_deref() {
+            if parent == snapshot.id {
+                *missing += 1;
+                eprintln!("snapshot {} references itself as parent", snapshot.id);
+            }
+        }
+        if !operation_ids.contains(snapshot.op_id.as_str()) {
+            *missing += 1;
+            eprintln!(
+                "snapshot {} references missing operation {}",
+                snapshot.id, snapshot.op_id
+            );
+        }
+    }
+    for operation in &export.operations {
+        if let Some(parent) = operation.parent_op.as_deref() {
+            if !operation_ids.contains(parent) {
+                *missing += 1;
+                eprintln!(
+                    "operation {} references missing parent operation {parent}",
+                    operation.id
+                );
+            }
+            if parent == operation.id {
+                *missing += 1;
+                eprintln!("operation {} references itself as parent", operation.id);
+            }
+        }
+    }
     Ok(())
 }
 
