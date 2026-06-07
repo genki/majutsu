@@ -2857,6 +2857,7 @@ fn restore_ref_value(conn: &Connection, name: &str, value: Option<&str>) -> Resu
 
 fn delete_operation(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("delete from operations where id=?1", params![id])?;
+    rewrite_local_oplog(conn)?;
     Ok(())
 }
 
@@ -6163,26 +6164,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
         snapshots.push(row?);
     }
 
-    let mut operations = Vec::new();
-    let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations order by created_at",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(OperationExport {
-            id: row.get(0)?,
-            parent_op: row.get(1)?,
-            kind: row.get(2)?,
-            actor: row.get(3)?,
-            status: row.get(4)?,
-            before_snapshot: row.get(5)?,
-            after_snapshot: row.get(6)?,
-            created_at: row.get(7)?,
-            message: row.get(8)?,
-        })
-    })?;
-    for row in rows {
-        operations.push(row?);
-    }
+    let operations = query_operations(conn)?;
 
     let mut refs = BTreeMap::new();
     let mut stmt = conn.prepare("select name, value from refs order by name")?;
@@ -6772,6 +6754,32 @@ fn append_local_oplog(conn: &Connection, op: &OperationExport) -> Result<()> {
     Ok(())
 }
 
+fn rewrite_local_oplog(conn: &Connection) -> Result<()> {
+    let Some(path) = local_oplog_path(conn)? else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let operations = query_operations(conn)?;
+    let tmp = path.with_extension("cborl.tmp");
+    let result = (|| -> Result<()> {
+        let mut file = File::create(&tmp)?;
+        for op in &operations {
+            file.write_all(&serde_cbor::to_vec(op)?)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &path)?;
+        fsync_parent_dir(&path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 fn local_oplog_path(conn: &Connection) -> Result<Option<PathBuf>> {
     let db_path = conn
         .query_row(
@@ -6832,6 +6840,30 @@ fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
     )
     .optional()?
     .ok_or_else(|| anyhow!("unknown operation: {op_id}"))
+}
+
+fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
+    let mut stmt = conn.prepare(
+        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations order by created_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(OperationExport {
+            id: row.get(0)?,
+            parent_op: row.get(1)?,
+            kind: row.get(2)?,
+            actor: row.get(3)?,
+            status: row.get(4)?,
+            before_snapshot: row.get(5)?,
+            after_snapshot: row.get(6)?,
+            created_at: row.get(7)?,
+            message: row.get(8)?,
+        })
+    })?;
+    let mut operations = Vec::new();
+    for row in rows {
+        operations.push(row?);
+    }
+    Ok(operations)
 }
 
 fn read_config(paths: &Paths) -> Result<Config> {

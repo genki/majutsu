@@ -94,6 +94,25 @@ fn db_operation_count(state: &std::path::Path, kind: &str) -> i64 {
     .unwrap()
 }
 
+fn db_total_operation_count(state: &std::path::Path) -> i64 {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.query_row("select count(*) from operations", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn local_oplog_record_count(state: &std::path::Path) -> usize {
+    let bytes = fs::read(state.join("ops/local-oplog.cborl")).unwrap();
+    let mut deserializer = serde_cbor::de::Deserializer::from_slice(&bytes);
+    let mut count = 0usize;
+    while serde::Deserialize::deserialize(&mut deserializer)
+        .map(|_: serde_cbor::Value| ())
+        .is_ok()
+    {
+        count += 1;
+    }
+    count
+}
+
 #[test]
 fn file_remote_clone_restores_normal_and_large_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1142,6 +1161,10 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
 
     assert_eq!(db_ref(&state, "last-synced"), None);
     assert_eq!(db_operation_count(&state, "remote-sync"), 0);
+    assert_eq!(
+        local_oplog_record_count(&state) as i64,
+        db_total_operation_count(&state)
+    );
 
     fs::remove_file(&remote).unwrap();
     fs::create_dir_all(&remote).unwrap();
@@ -1153,6 +1176,10 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
 
     assert!(db_ref(&state, "last-synced").is_some());
     assert_eq!(db_operation_count(&state, "remote-sync"), 1);
+    assert_eq!(
+        local_oplog_record_count(&state) as i64,
+        db_total_operation_count(&state)
+    );
 }
 
 #[test]
