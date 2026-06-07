@@ -30,10 +30,9 @@ use majutsu_restore::{
 };
 use majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
-    RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
-    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
-    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostIndexIssue,
-    RemoteHostSummary, RemoteObjectAvailabilityIssue, canonical_remote_alias,
+    RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexShard as ChunkIndexShard,
+    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex,
+    RemoteHostIndexIssue, RemoteHostSummary, RemoteObjectAvailabilityIssue, canonical_remote_alias,
     canonical_remote_aliases, host_current_ref_key, host_last_synced_ref_key,
     host_legacy_current_key, host_metadata_key, host_operation_canonical_key, host_operation_key,
     host_oplog_canonical_key, host_oplog_key, host_ops_prefix, host_snapshot_canonical_key,
@@ -100,7 +99,9 @@ use db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
-use fsck_runtime::{fsck, validate_remote_gc_records, validate_remote_oplog};
+use fsck_runtime::{
+    fsck, validate_remote_chunk_index, validate_remote_gc_records, validate_remote_oplog,
+};
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
@@ -1514,7 +1515,7 @@ fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Res
     encode_object(paths, &compressed)
 }
 
-fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(
+pub(crate) fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(
     paths: &Paths,
     bytes: &[u8],
 ) -> Result<T> {
@@ -3455,66 +3456,6 @@ fn validate_remote_metadata_references(
             }
             MetadataReferenceIssue::DanglingChunk { oid } => {
                 eprintln!("dangling remote chunk metadata {oid}");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_remote_chunk_index(
-    paths: &Paths,
-    remote: &RemoteStore,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    if export.chunks.is_empty() {
-        return Ok(());
-    }
-    if !remote.exists(REMOTE_CHUNK_INDEX_SHARD_KEY)? {
-        *missing += 1;
-        eprintln!("missing remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}");
-        return Ok(());
-    }
-    let shard: ChunkIndexShard =
-        decode_canonical_remote_export(paths, &remote.get(REMOTE_CHUNK_INDEX_SHARD_KEY)?)
-            .with_context(|| {
-                format!("parse remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}")
-            })?;
-    let expected = export
-        .chunks
-        .iter()
-        .map(|chunk| {
-            let expected_canonical = canonical_remote_alias(&chunk.object_key)
-                .unwrap_or_else(|| chunk.object_key.clone());
-            ChunkIndexEntry::new(
-                chunk.oid.clone(),
-                chunk.size,
-                chunk.object_key.clone(),
-                Some(expected_canonical),
-            )
-        })
-        .collect::<Vec<_>>();
-    for issue in shard.validation_issues(&expected) {
-        *missing += 1;
-        match issue {
-            RemoteChunkIndexIssue::ShardMetadataMismatch => {
-                eprintln!("remote chunk index shard metadata does not match export");
-                return Ok(());
-            }
-            RemoteChunkIndexIssue::DuplicateShardOids => {
-                eprintln!("remote chunk index shard contains duplicate chunk oids");
-            }
-            RemoteChunkIndexIssue::UnexpectedEntry(oid) => {
-                eprintln!("remote chunk index entry has no matching chunk {oid}");
-            }
-            RemoteChunkIndexIssue::DuplicateEntry(oid) => {
-                eprintln!("duplicate remote chunk index entry {oid}");
-            }
-            RemoteChunkIndexIssue::EntryMismatch(oid) => {
-                eprintln!("remote chunk index entry does not match metadata {oid}");
-            }
-            RemoteChunkIndexIssue::MissingEntry(oid) => {
-                eprintln!("chunk missing from remote chunk index {oid}");
             }
         }
     }

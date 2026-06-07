@@ -9543,6 +9543,20 @@ fn daemon_watch_snapshot_survives_sync_retry_and_remote_recovery() {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    for _ in 0..100 {
+        let events = fs::read_dir(state.join("queue/events"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if events.contains("watch-root") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     fs::write(source.join("alpha.txt"), b"daemon retry captured\n").unwrap();
     let mut captured = false;
     for _ in 0..100 {
