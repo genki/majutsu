@@ -4626,11 +4626,110 @@ fn fsck(paths: &Paths) -> Result<()> {
         missing += 1;
         eprintln!("dangling large pin {oid} pinned_at={pinned_at}");
     }
+    validate_local_snapshot_objects(paths, &export, &mut missing)?;
+    validate_local_large_manifest_objects(paths, &export, &mut missing)?;
     validate_local_pack_objects(paths, &export, &mut missing)?;
     if missing > 0 {
         bail!("fsck found {missing} missing objects");
     }
     println!("fsck ok");
+    Ok(())
+}
+
+fn validate_local_snapshot_objects(
+    paths: &Paths,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    for snapshot in &export.snapshots {
+        let metadata_manifest: SnapshotManifest =
+            match serde_json::from_str(&snapshot.manifest_json) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    *missing += 1;
+                    eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
+                    continue;
+                }
+            };
+        match read_object(paths, &snapshot.manifest_key).and_then(|bytes| {
+            serde_json::from_slice::<SnapshotManifest>(&bytes).map_err(Into::into)
+        }) {
+            Ok(local_manifest) => {
+                if !snapshot_manifest_matches(&local_manifest, &metadata_manifest) {
+                    *missing += 1;
+                    eprintln!(
+                        "snapshot manifest object does not match metadata {} {}",
+                        snapshot.id, snapshot.manifest_key
+                    );
+                }
+            }
+            Err(err) => {
+                *missing += 1;
+                eprintln!(
+                    "unreadable snapshot manifest {} {}: {err}",
+                    snapshot.id, snapshot.manifest_key
+                );
+            }
+        }
+        for (root_id, root_tree) in &metadata_manifest.root_trees {
+            match read_object(paths, &root_tree.tree_key).and_then(|bytes| {
+                serde_json::from_slice::<TreeManifest>(&bytes).map_err(Into::into)
+            }) {
+                Ok(tree) => {
+                    if tree.root_id != *root_id
+                        || tree.tree_id != root_tree.tree_id
+                        || tree.entries.len() != root_tree.file_count
+                    {
+                        *missing += 1;
+                        eprintln!(
+                            "tree manifest object does not match snapshot metadata {} {}",
+                            snapshot.id, root_tree.tree_key
+                        );
+                    }
+                }
+                Err(err) => {
+                    *missing += 1;
+                    eprintln!(
+                        "unreadable tree manifest {} {}: {err}",
+                        snapshot.id, root_tree.tree_key
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_large_manifest_objects(
+    paths: &Paths,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    for large in &export.large_objects {
+        match read_object(paths, &large.manifest_key)
+            .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
+        {
+            Ok(manifest) => {
+                if manifest.oid != large.oid
+                    || manifest.size != large.size
+                    || manifest.chunks.len() != large.chunk_count
+                {
+                    *missing += 1;
+                    eprintln!(
+                        "large manifest object does not match metadata {} {}",
+                        large.oid, large.manifest_key
+                    );
+                }
+            }
+            Err(err) => {
+                *missing += 1;
+                eprintln!(
+                    "unreadable large manifest {} {}: {err}",
+                    large.oid, large.manifest_key
+                );
+            }
+        }
+    }
     Ok(())
 }
 

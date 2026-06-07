@@ -3760,6 +3760,173 @@ fn fsck_detects_corrupt_local_pack_index() {
 }
 
 #[test]
+fn fsck_detects_corrupt_local_snapshot_manifest_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let manifest_key: String = conn
+        .query_row("select manifest_key from snapshots limit 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    fs::write(state.join(manifest_key), b"{not valid json").unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn fsck_detects_corrupt_local_tree_manifest_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let manifest_json: String = conn
+        .query_row("select manifest_json from snapshots limit 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap();
+    let mut tree: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join(tree_key)).unwrap()).unwrap();
+    tree["tree_id"] = serde_json::Value::String("tree-corrupt".into());
+    fs::write(
+        state.join(tree_key),
+        serde_json::to_vec_pretty(&tree).unwrap(),
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn fsck_detects_corrupt_local_large_manifest_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.zip"), vec![7u8; 32 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let manifest_key: String = conn
+        .query_row(
+            "select manifest_key from large_objects limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join(&manifest_key)).unwrap()).unwrap();
+    manifest["oid"] = serde_json::Value::String("corrupt-large-oid".into());
+    fs::write(
+        state.join(manifest_key),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_detects_corrupt_canonical_pack_index() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
