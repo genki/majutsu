@@ -3598,6 +3598,77 @@ fn root_remove_detaches_root_and_records_operation() {
 }
 
 #[test]
+fn root_pause_and_resume_control_snapshot_participation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let paused = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("pause")
+            .arg("sample");
+        c
+    });
+    assert!(paused.contains("paused root sample"));
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(roots.contains("sample\tpaused"));
+    let paused_snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(paused_snapshot.contains("files 0, large 0"));
+
+    let resumed = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("resume")
+            .arg("sample");
+        c
+    });
+    assert!(resumed.contains("resumed root sample"));
+    let active_snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(active_snapshot.contains("files 1, large 0"));
+    let ops = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(ops.contains("root-paused"));
+    assert!(ops.contains("root-resumed"));
+}
+
+#[test]
 fn require_mount_root_is_skipped_as_unmounted_without_mass_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
