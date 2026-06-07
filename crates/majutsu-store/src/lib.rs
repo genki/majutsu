@@ -54,6 +54,8 @@ impl RemoteCapabilities {
 
 pub const REMOTE_HOST_INDEX_KEY: &str = "hosts/index.json";
 pub const LEGACY_METADATA_EXPORT_KEY: &str = "metadata/export.json";
+pub const REMOTE_CHUNK_INDEX_SHARD_KEY: &str = "indexes/chunk-index/shard-0000.cbor.zst.enc";
+pub const DEFAULT_CHUNK_INDEX_SHARD: &str = "shard-0000";
 
 pub fn remote_gc_mark_key(host_id: &str) -> String {
     format!("gc/marks/{host_id}.json")
@@ -65,6 +67,54 @@ pub fn remote_gc_tombstone_prefix(host_id: &str) -> String {
 
 pub fn remote_gc_tombstone_key(host_id: &str, tombstone_id: &str) -> String {
     format!("{}{tombstone_id}.json", remote_gc_tombstone_prefix(host_id))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteChunkIndexShard {
+    pub version: u32,
+    pub shard: String,
+    pub updated_at: DateTime<Utc>,
+    pub chunks: Vec<RemoteChunkIndexEntry>,
+}
+
+impl RemoteChunkIndexShard {
+    pub fn new(updated_at: DateTime<Utc>, chunks: Vec<RemoteChunkIndexEntry>) -> Self {
+        Self {
+            version: 1,
+            shard: DEFAULT_CHUNK_INDEX_SHARD.into(),
+            updated_at,
+            chunks,
+        }
+    }
+
+    pub fn has_duplicate_oids(&self) -> bool {
+        let unique = self
+            .chunks
+            .iter()
+            .map(|entry| &entry.oid)
+            .collect::<std::collections::BTreeSet<_>>();
+        unique.len() != self.chunks.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteChunkIndexEntry {
+    pub oid: String,
+    pub size: u64,
+    pub object_key: String,
+    pub canonical_key: String,
+}
+
+impl RemoteChunkIndexEntry {
+    pub fn new(oid: String, size: u64, object_key: String, canonical_key: Option<String>) -> Self {
+        let canonical_key = canonical_key.unwrap_or_else(|| object_key.clone());
+        Self {
+            oid,
+            size,
+            object_key,
+            canonical_key,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,5 +452,51 @@ mod tests {
             )
             .has_valid_deleted_key()
         );
+    }
+
+    #[test]
+    fn remote_chunk_index_shard_shape_and_defaults_are_stable() {
+        let shard = RemoteChunkIndexShard::new(
+            DateTime::<Utc>::UNIX_EPOCH,
+            vec![RemoteChunkIndexEntry::new(
+                "oid-1".into(),
+                42,
+                "objects/chunks/oid-1".into(),
+                Some("objects/by-hash/chunks/oid-1.cbor.zst.enc".into()),
+            )],
+        );
+
+        assert_eq!(
+            REMOTE_CHUNK_INDEX_SHARD_KEY,
+            "indexes/chunk-index/shard-0000.cbor.zst.enc"
+        );
+        assert_eq!(shard.version, 1);
+        assert_eq!(shard.shard, DEFAULT_CHUNK_INDEX_SHARD);
+        assert_eq!(
+            shard.chunks[0].canonical_key,
+            "objects/by-hash/chunks/oid-1.cbor.zst.enc"
+        );
+        assert!(!shard.has_duplicate_oids());
+    }
+
+    #[test]
+    fn remote_chunk_index_entry_defaults_canonical_key_to_object_key() {
+        let entry =
+            RemoteChunkIndexEntry::new("oid-1".into(), 42, "objects/chunks/oid-1".into(), None);
+
+        assert_eq!(entry.canonical_key, "objects/chunks/oid-1");
+    }
+
+    #[test]
+    fn remote_chunk_index_shard_detects_duplicate_oids() {
+        let shard = RemoteChunkIndexShard::new(
+            DateTime::<Utc>::UNIX_EPOCH,
+            vec![
+                RemoteChunkIndexEntry::new("oid-1".into(), 1, "a".into(), None),
+                RemoteChunkIndexEntry::new("oid-1".into(), 1, "b".into(), None),
+            ],
+        );
+
+        assert!(shard.has_duplicate_oids());
     }
 }

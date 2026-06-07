@@ -23,10 +23,12 @@ use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
 };
 use majutsu_store::{
-    LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteCapabilities,
-    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex,
-    RemoteHostIndexIssue, RemoteHostSummary, remote_gc_mark_key, remote_gc_tombstone_key,
-    remote_gc_tombstone_prefix, select_remote_host,
+    DEFAULT_CHUNK_INDEX_SHARD, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY,
+    REMOTE_HOST_INDEX_KEY, RemoteCapabilities, RemoteChunkIndexEntry as ChunkIndexEntry,
+    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
+    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostIndexIssue,
+    RemoteHostSummary, remote_gc_mark_key, remote_gc_tombstone_key, remote_gc_tombstone_prefix,
+    select_remote_host,
 };
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -56,8 +58,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
-const CHUNK_INDEX_SHARD_KEY: &str = "indexes/chunk-index/shard-0000.cbor.zst.enc";
-
 #[derive(Parser)]
 #[command(
     name = "mj",
@@ -712,22 +712,6 @@ struct ChunkExport {
     oid: String,
     size: u64,
     object_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChunkIndexShard {
-    version: u32,
-    shard: String,
-    updated_at: DateTime<Utc>,
-    chunks: Vec<ChunkIndexEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChunkIndexEntry {
-    oid: String,
-    size: u64,
-    object_key: String,
-    canonical_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2753,7 +2737,7 @@ fn enqueue_and_drain_sync(
     }
     enqueue_inline_upload(
         paths,
-        CHUNK_INDEX_SHARD_KEY,
+        REMOTE_CHUNK_INDEX_SHARD_KEY,
         encode_canonical_remote_export(paths, &build_chunk_index_shard(&export))?,
     )?;
 
@@ -2957,20 +2941,16 @@ fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
     let chunks = export
         .chunks
         .iter()
-        .map(|chunk| ChunkIndexEntry {
-            oid: chunk.oid.clone(),
-            size: chunk.size,
-            object_key: chunk.object_key.clone(),
-            canonical_key: canonical_remote_alias(&chunk.object_key)
-                .unwrap_or_else(|| chunk.object_key.clone()),
+        .map(|chunk| {
+            ChunkIndexEntry::new(
+                chunk.oid.clone(),
+                chunk.size,
+                chunk.object_key.clone(),
+                canonical_remote_alias(&chunk.object_key),
+            )
         })
         .collect();
-    ChunkIndexShard {
-        version: 1,
-        shard: "shard-0000".into(),
-        updated_at: Utc::now(),
-        chunks,
-    }
+    ChunkIndexShard::new(Utc::now(), chunks)
 }
 
 fn build_gc_mark_export(config: &Config, export: &MetadataExport) -> GcMarkExport {
@@ -6027,21 +6007,27 @@ fn validate_remote_chunk_index(
     if export.chunks.is_empty() {
         return Ok(());
     }
-    if !remote.exists(CHUNK_INDEX_SHARD_KEY)? {
+    if !remote.exists(REMOTE_CHUNK_INDEX_SHARD_KEY)? {
         *missing += 1;
-        eprintln!("missing remote chunk index shard {CHUNK_INDEX_SHARD_KEY}");
+        eprintln!("missing remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}");
         return Ok(());
     }
     let shard: ChunkIndexShard =
-        decode_canonical_remote_export(paths, &remote.get(CHUNK_INDEX_SHARD_KEY)?)
-            .with_context(|| format!("parse remote chunk index shard {CHUNK_INDEX_SHARD_KEY}"))?;
+        decode_canonical_remote_export(paths, &remote.get(REMOTE_CHUNK_INDEX_SHARD_KEY)?)
+            .with_context(|| {
+                format!("parse remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}")
+            })?;
     if shard.version != 1
-        || shard.shard != "shard-0000"
+        || shard.shard != DEFAULT_CHUNK_INDEX_SHARD
         || shard.chunks.len() != export.chunks.len()
     {
         *missing += 1;
         eprintln!("remote chunk index shard metadata does not match export");
         return Ok(());
+    }
+    if shard.has_duplicate_oids() {
+        *missing += 1;
+        eprintln!("remote chunk index shard contains duplicate chunk oids");
     }
     let expected = export
         .chunks
