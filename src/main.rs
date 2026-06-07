@@ -6828,6 +6828,9 @@ fn path_pattern_match(pattern: &str, rel: &str) -> bool {
     if pattern == "**" || pattern == "*" {
         return true;
     }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return rel == prefix || rel.starts_with(&format!("{prefix}/"));
+    }
     if let Some(ext) = pattern.strip_prefix("*.") {
         return rel
             .rsplit_once('.')

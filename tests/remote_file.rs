@@ -3085,6 +3085,58 @@ fn root_set_updates_filters_and_records_config_change() {
 }
 
 #[test]
+fn root_include_can_select_subtree_patterns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(source.join("docs/nested")).unwrap();
+    fs::create_dir_all(source.join("logs")).unwrap();
+    fs::write(source.join("docs/nested/keep.txt"), b"keep\n").unwrap();
+    fs::write(source.join("logs/skip.txt"), b"skip\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--include")
+            .arg("docs/**");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(restore.join("sample/docs/nested/keep.txt")).unwrap(),
+        b"keep\n"
+    );
+    assert!(!restore.join("sample/logs/skip.txt").exists());
+}
+
+#[test]
 fn root_set_updates_large_policy_for_existing_root() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
