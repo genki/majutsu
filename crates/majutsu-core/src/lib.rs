@@ -95,6 +95,10 @@ pub struct FileRecord {
     pub size: u64,
     pub mode: u32,
     pub modified: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
     #[serde(default)]
     pub xattrs: BTreeMap<String, String>,
     pub payload: Payload,
@@ -308,5 +312,28 @@ mod tests {
         assert_eq!(op.actor, "local");
         assert_eq!(op.status, OperationStatus::Done);
         assert_eq!(op.timestamp, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn file_record_defaults_preserve_legacy_serialized_metadata() {
+        let json = r#"{
+            "root_id": "sample",
+            "path": "alpha.txt",
+            "kind": "file",
+            "size": 5,
+            "mode": 33188,
+            "modified": null,
+            "payload": {
+                "type": "normal-blob",
+                "oid": "oid-1",
+                "object_key": "objects/blobs/oid-1"
+            }
+        }"#;
+
+        let record: FileRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(record.uid, None);
+        assert_eq!(record.gid, None);
+        assert!(record.xattrs.is_empty());
     }
 }

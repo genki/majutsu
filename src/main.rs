@@ -977,6 +977,28 @@ fn file_mode(_: &fs::Metadata) -> u32 {
 }
 
 #[cfg(unix)]
+fn file_uid(meta: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.uid())
+}
+
+#[cfg(not(unix))]
+fn file_uid(_: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn file_gid(meta: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.gid())
+}
+
+#[cfg(not(unix))]
+fn file_gid(_: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
 fn special_file_kind(meta: &fs::Metadata) -> Option<String> {
     use std::os::unix::fs::FileTypeExt;
     let file_type = meta.file_type();
@@ -5669,6 +5691,8 @@ fn build_restore_plan(
                 size: record.size,
                 mode: record.mode,
                 modified: record.modified,
+                uid: record.uid,
+                gid: record.gid,
                 xattrs: record.xattrs.clone(),
                 payload: match &record.payload {
                     Payload::Directory => Payload::Directory,
@@ -6434,6 +6458,7 @@ fn prepare_directory_restore_destination(dest: &Path, force: bool) -> Result<()>
 
 fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
     apply_xattrs(dest, &record.xattrs)?;
+    apply_file_owner(dest, record)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -6444,6 +6469,45 @@ fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
     if let Some(seconds) = record.modified {
         set_path_mtime(dest, seconds)?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_file_owner(dest: &Path, record: &FileRecord) -> Result<()> {
+    let Some(uid) = record.uid else {
+        return Ok(());
+    };
+    let Some(gid) = record.gid else {
+        return Ok(());
+    };
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let raw_path = CString::new(dest.as_os_str().as_bytes())
+        .with_context(|| format!("invalid owner path {}", dest.display()))?;
+    let rc = unsafe {
+        libc::fchownat(
+            libc::AT_FDCWD,
+            raw_path.as_ptr(),
+            uid as libc::uid_t,
+            gid as libc::gid_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+        ) {
+            return Ok(());
+        }
+        return Err(err).with_context(|| format!("set owner {}", dest.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_file_owner(_dest: &Path, _record: &FileRecord) -> Result<()> {
     Ok(())
 }
 
@@ -6596,6 +6660,8 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 size: 0,
                 mode: file_mode(&meta),
                 modified: modified_secs(&meta),
+                uid: file_uid(&meta),
+                gid: file_gid(&meta),
                 xattrs: read_xattrs(entry.path()),
                 payload: Payload::Directory,
             });
@@ -6611,6 +6677,8 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 size: 0,
                 mode: file_mode(&link_meta),
                 modified: modified_secs(&link_meta),
+                uid: file_uid(&link_meta),
+                gid: file_gid(&link_meta),
                 xattrs: BTreeMap::new(),
                 payload: Payload::Symlink { target },
             });
@@ -6624,6 +6692,8 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 size: 0,
                 mode: file_mode(&link_meta),
                 modified: modified_secs(&link_meta),
+                uid: file_uid(&link_meta),
+                gid: file_gid(&link_meta),
                 xattrs: read_xattrs(entry.path()),
                 payload: Payload::Special { special_kind },
             });
@@ -6677,6 +6747,8 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
             size: meta.len(),
             mode: file_mode(&meta),
             modified: modified_secs(&meta),
+            uid: file_uid(&meta),
+            gid: file_gid(&meta),
             xattrs: read_xattrs(entry.path()),
             payload,
         });
@@ -10184,6 +10256,8 @@ mod tests {
             size: payload.len() as u64,
             mode: 0o100644,
             modified: None,
+            uid: None,
+            gid: None,
             xattrs: BTreeMap::new(),
             payload: Payload::NormalBlob { oid, object_key },
         };

@@ -2,7 +2,7 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::Connection;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -1986,8 +1986,11 @@ fn restore_preserves_file_mode_and_mtime() {
 
     let restored = restore.join("sample/mode.txt");
     let metadata = fs::metadata(&restored).unwrap();
+    let original_metadata = fs::metadata(&file).unwrap();
     assert_eq!(fs::read(&restored).unwrap(), b"mode and mtime\n");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+    assert_eq!(metadata.uid(), original_metadata.uid());
+    assert_eq!(metadata.gid(), original_metadata.gid());
     if xattr_supported {
         assert_eq!(
             xattr::get(&restored, "user.majutsu_test").unwrap(),
@@ -2002,6 +2005,29 @@ fn restore_preserves_file_mode_and_mtime() {
             .unwrap()
             .as_secs(),
         1_700_000_000
+    );
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let manifest_json: String = conn
+        .query_row(
+            "select manifest_json from snapshots order by created_at desc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+    let record = manifest["roots"]["sample"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["path"] == "mode.txt")
+        .unwrap();
+    assert_eq!(
+        record["uid"],
+        serde_json::Value::from(original_metadata.uid())
+    );
+    assert_eq!(
+        record["gid"],
+        serde_json::Value::from(original_metadata.gid())
     );
 }
 
