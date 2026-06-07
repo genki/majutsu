@@ -3278,13 +3278,14 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     if paths.home.exists() && paths.home.read_dir()?.next().is_some() {
         bail!("target majutsu home is not empty: {}", paths.home.display());
     }
-    create_layout(paths)?;
     let remote_config = RemoteConfig::from_url(args.remote);
     let remote = open_remote(&remote_config)?;
     let metadata_key = clone_metadata_key(&remote, args.host.as_deref())?;
     let export_bytes = remote.get(&metadata_key)?;
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
+    validate_config(&export.config)?;
+    create_layout(paths)?;
     write_config(paths, &export.config)?;
     fs::write(&paths.host, toml::to_string_pretty(&export.config.host)?)?;
     if remote.exists("keys/recipients.toml")? {
