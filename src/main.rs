@@ -5289,6 +5289,7 @@ fn remote_fsck_export(
     validate_remote_snapshot_objects(paths, remote, &export, missing)?;
     validate_remote_large_manifest_objects(paths, remote, &export, missing)?;
     validate_remote_pack_objects(paths, remote, &export, missing)?;
+    validate_remote_metadata_references(paths, remote, &export, missing)?;
     if let Some(current) = export.refs.get("current") {
         let found = export
             .snapshots
@@ -5349,6 +5350,61 @@ fn remote_fsck_export(
         }
     }
     Ok(export)
+}
+
+fn validate_remote_metadata_references(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    let mut live_blobs = BTreeSet::new();
+    let mut live_large = BTreeSet::new();
+    let mut live_chunks = BTreeSet::new();
+    for snapshot in &export.snapshots {
+        let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        for records in manifest.roots.values() {
+            for record in records {
+                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+                    live_blobs.insert(oid.to_string());
+                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
+                    live_large.insert(oid.to_string());
+                    for bytes in remote_local_object_variants(paths, remote, manifest_key)? {
+                        let large_manifest: LargeManifest =
+                            match serde_json::from_slice(&decode_object(paths, &bytes.bytes)?) {
+                                Ok(manifest) => manifest,
+                                Err(_) => continue,
+                            };
+                        for chunk in large_manifest.chunks {
+                            live_chunks.insert(chunk.oid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for blob in &export.blobs {
+        if !live_blobs.contains(&blob.oid) {
+            *missing += 1;
+            eprintln!("dangling remote blob metadata {}", blob.oid);
+        }
+    }
+    for large in &export.large_objects {
+        if !live_large.contains(&large.oid) {
+            *missing += 1;
+            eprintln!("dangling remote large object metadata {}", large.oid);
+        }
+    }
+    for chunk in &export.chunks {
+        if !live_chunks.contains(&chunk.oid) {
+            *missing += 1;
+            eprintln!("dangling remote chunk metadata {}", chunk.oid);
+        }
+    }
+    Ok(())
 }
 
 fn validate_remote_oplog(
