@@ -70,6 +70,47 @@ pub fn remote_gc_tombstone_key(host_id: &str, tombstone_id: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobExport {
+    pub oid: String,
+    pub size: u64,
+    pub object_key: String,
+    #[serde(default)]
+    pub pack_id: Option<String>,
+    #[serde(default)]
+    pub pack_offset: Option<u64>,
+    #[serde(default)]
+    pub pack_len: Option<u64>,
+}
+
+impl BlobExport {
+    pub fn new(oid: String, size: u64, object_key: String) -> Self {
+        Self {
+            oid,
+            size,
+            object_key,
+            pack_id: None,
+            pack_offset: None,
+            pack_len: None,
+        }
+    }
+
+    pub fn with_pack_location(mut self, pack_id: String, offset: u64, len: u64) -> Self {
+        self.pack_id = Some(pack_id);
+        self.pack_offset = Some(offset);
+        self.pack_len = Some(len);
+        self
+    }
+
+    pub fn is_packed(&self) -> bool {
+        self.pack_id.is_some()
+    }
+
+    pub fn has_complete_pack_location(&self) -> bool {
+        self.pack_id.is_some() && self.pack_offset.is_some() && self.pack_len.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteChunkIndexShard {
     pub version: u32,
     pub shard: String,
@@ -498,5 +539,24 @@ mod tests {
         );
 
         assert!(shard.has_duplicate_oids());
+    }
+
+    #[test]
+    fn blob_export_json_shape_and_pack_location_are_stable() {
+        let loose = BlobExport::new("blob-1".into(), 42, "objects/blobs/blob-1".into());
+        let packed = loose.clone().with_pack_location("pack-1".into(), 128, 42);
+
+        let loose_value = serde_json::to_value(&loose).unwrap();
+        let packed_value = serde_json::to_value(&packed).unwrap();
+
+        assert_eq!(loose_value["oid"], "blob-1");
+        assert_eq!(loose_value["pack_id"], serde_json::Value::Null);
+        assert!(!loose.is_packed());
+        assert!(!loose.has_complete_pack_location());
+        assert!(packed.is_packed());
+        assert!(packed.has_complete_pack_location());
+        assert_eq!(packed_value["pack_id"], "pack-1");
+        assert_eq!(packed_value["pack_offset"], 128);
+        assert_eq!(packed_value["pack_len"], 42);
     }
 }

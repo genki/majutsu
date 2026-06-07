@@ -56,6 +56,27 @@ pub struct LargePinExport {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkExport {
+    pub oid: String,
+    pub size: u64,
+    pub object_key: String,
+}
+
+impl ChunkExport {
+    pub fn new(oid: String, size: u64, object_key: String) -> Self {
+        Self {
+            oid,
+            size,
+            object_key,
+        }
+    }
+
+    pub fn matches_chunk_ref(&self, chunk: &majutsu_core::LargeChunk) -> bool {
+        self.oid == chunk.oid && self.size == chunk.stored_len.unwrap_or(chunk.len)
+    }
+}
+
 impl LargePinExport {
     pub fn new(oid: String, pinned_at: DateTime<Utc>, reason: Option<String>) -> Self {
         Self {
@@ -406,5 +427,26 @@ mod tests {
         };
 
         assert!(pin.pinned_time().is_err());
+    }
+
+    #[test]
+    fn chunk_export_json_shape_and_chunk_ref_match_are_stable() {
+        let export = ChunkExport::new("chunk-1".into(), 64, "objects/large/chunks/chunk-1".into());
+        let chunk = majutsu_core::LargeChunk {
+            index: 0,
+            offset: 0,
+            len: 128,
+            stored_len: Some(64),
+            compression: "zstd".into(),
+            oid: "chunk-1".into(),
+            object_key: "objects/large/chunks/chunk-1".into(),
+        };
+
+        let value = serde_json::to_value(&export).unwrap();
+
+        assert_eq!(value["oid"], "chunk-1");
+        assert_eq!(value["size"], 64);
+        assert_eq!(value["object_key"], "objects/large/chunks/chunk-1");
+        assert!(export.matches_chunk_ref(&chunk));
     }
 }

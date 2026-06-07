@@ -18,18 +18,18 @@ use majutsu_core::{
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
-use majutsu_large::{LargeObjectExport, LargePinExport};
+use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
 use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
 };
 use majutsu_store::{
-    DEFAULT_CHUNK_INDEX_SHARD, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY,
-    REMOTE_HOST_INDEX_KEY, RemoteCapabilities, RemoteChunkIndexEntry as ChunkIndexEntry,
-    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
-    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostIndexIssue,
-    RemoteHostSummary, remote_gc_mark_key, remote_gc_tombstone_key, remote_gc_tombstone_prefix,
-    select_remote_host,
+    BlobExport, DEFAULT_CHUNK_INDEX_SHARD, LEGACY_METADATA_EXPORT_KEY,
+    REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY, RemoteCapabilities,
+    RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexShard as ChunkIndexShard,
+    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex,
+    RemoteHostIndexIssue, RemoteHostSummary, remote_gc_mark_key, remote_gc_tombstone_key,
+    remote_gc_tombstone_prefix, select_remote_host,
 };
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -676,26 +676,6 @@ struct SnapshotExport {
     created_at: String,
     manifest_key: String,
     manifest_json: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct BlobExport {
-    oid: String,
-    size: u64,
-    object_key: String,
-    #[serde(default)]
-    pack_id: Option<String>,
-    #[serde(default)]
-    pack_offset: Option<u64>,
-    #[serde(default)]
-    pack_len: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChunkExport {
-    oid: String,
-    size: u64,
-    object_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
