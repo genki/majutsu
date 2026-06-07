@@ -6,6 +6,10 @@ use majutsu_core::{
 };
 use majutsu_db::{local_ref_issues, remote_ref_issues};
 use majutsu_large::{LargePinIssue, large_chunk_hash_matches, large_pin_issues};
+use majutsu_store::{
+    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, canonical_remote_aliases,
+    remote_gc_mark_key, remote_gc_tombstone_prefix,
+};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -13,6 +17,7 @@ use std::fs;
 use crate::config::{Config, HostConfig, Paths, RootConfig, read_config};
 use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
+use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::{
@@ -354,4 +359,81 @@ fn root_configs_match(left: &RootConfig, right: &RootConfig) -> bool {
         && left.snapshot_source == right.snapshot_source
         && left.application_plugin == right.application_plugin
         && left.large == right.large
+}
+
+pub(crate) fn validate_remote_gc_records(
+    remote: &RemoteStore,
+    host_id: &str,
+    export: &crate::MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    let mark_key = remote_gc_mark_key(host_id);
+    if !remote.exists(&mark_key)? {
+        *missing += 1;
+        eprintln!("missing remote gc mark {mark_key}");
+    } else {
+        let mark: GcMarkExport = match serde_json::from_slice(&remote.get(&mark_key)?) {
+            Ok(mark) => mark,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid remote gc mark {mark_key}: {err}");
+                return validate_remote_gc_tombstones(remote, host_id, missing);
+            }
+        };
+        let expected = expected_gc_mark_object_keys(export);
+        for issue in mark.validation_issues(host_id, export.refs.get("current"), &expected) {
+            *missing += 1;
+            eprintln!("{}", issue.message(&mark_key, host_id));
+        }
+    }
+    validate_remote_gc_tombstones(remote, host_id, missing)
+}
+
+fn expected_gc_mark_object_keys(export: &crate::MetadataExport) -> BTreeSet<String> {
+    let mut object_keys = local_object_keys(export);
+    for key in object_keys.clone() {
+        object_keys.extend(canonical_remote_aliases(&key));
+    }
+    object_keys.into_iter().collect()
+}
+
+fn validate_remote_gc_tombstones(
+    remote: &RemoteStore,
+    host_id: &str,
+    missing: &mut usize,
+) -> Result<()> {
+    let prefix = remote_gc_tombstone_prefix(host_id);
+    let mut seen_keys = BTreeSet::new();
+    for key in remote.list(&prefix)? {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let tombstone: GcTombstoneExport = match serde_json::from_slice(&remote.get(&key)?) {
+            Ok(tombstone) => tombstone,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid remote gc tombstone {key}: {err}");
+                continue;
+            }
+        };
+        for issue in tombstone.validation_issues(host_id) {
+            *missing += 1;
+            eprintln!("{}", issue.message(&key, host_id));
+        }
+        if remote.exists(&tombstone.key)? {
+            *missing += 1;
+            eprintln!(
+                "remote gc tombstone points to existing object {} {}",
+                key, tombstone.key
+            );
+        }
+        if !seen_keys.insert(tombstone.key.clone()) {
+            *missing += 1;
+            eprintln!(
+                "duplicate remote gc tombstone deleted key {}",
+                tombstone.key
+            );
+        }
+    }
+    Ok(())
 }

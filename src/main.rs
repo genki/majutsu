@@ -38,7 +38,7 @@ use majutsu_store::{
     host_legacy_current_key, host_metadata_key, host_operation_canonical_key, host_operation_key,
     host_oplog_canonical_key, host_oplog_key, host_ops_prefix, host_snapshot_canonical_key,
     host_snapshot_key, host_snapshots_prefix, remote_gc_mark_key, remote_gc_tombstone_key,
-    remote_gc_tombstone_prefix, remote_object_availability_issues, select_remote_host,
+    remote_object_availability_issues, select_remote_host,
 };
 #[cfg(test)]
 use reqwest::blocking::Client;
@@ -100,7 +100,7 @@ use db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
-use fsck_runtime::fsck;
+use fsck_runtime::{fsck, validate_remote_gc_records};
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
@@ -3295,83 +3295,6 @@ fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     println!("hosts {}", verified_hosts);
     if has_legacy_export {
         println!("legacy_metadata ok");
-    }
-    Ok(())
-}
-
-fn validate_remote_gc_records(
-    remote: &RemoteStore,
-    host_id: &str,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    let mark_key = remote_gc_mark_key(host_id);
-    if !remote.exists(&mark_key)? {
-        *missing += 1;
-        eprintln!("missing remote gc mark {mark_key}");
-    } else {
-        let mark: GcMarkExport = match serde_json::from_slice(&remote.get(&mark_key)?) {
-            Ok(mark) => mark,
-            Err(err) => {
-                *missing += 1;
-                eprintln!("invalid remote gc mark {mark_key}: {err}");
-                return validate_remote_gc_tombstones(remote, host_id, missing);
-            }
-        };
-        let expected = expected_gc_mark_object_keys(export);
-        for issue in mark.validation_issues(host_id, export.refs.get("current"), &expected) {
-            *missing += 1;
-            eprintln!("{}", issue.message(&mark_key, host_id));
-        }
-    }
-    validate_remote_gc_tombstones(remote, host_id, missing)
-}
-
-fn expected_gc_mark_object_keys(export: &MetadataExport) -> BTreeSet<String> {
-    let mut object_keys = local_object_keys(export);
-    for key in object_keys.clone() {
-        object_keys.extend(canonical_remote_aliases(&key));
-    }
-    object_keys.into_iter().collect()
-}
-
-fn validate_remote_gc_tombstones(
-    remote: &RemoteStore,
-    host_id: &str,
-    missing: &mut usize,
-) -> Result<()> {
-    let prefix = remote_gc_tombstone_prefix(host_id);
-    let mut seen_keys = BTreeSet::new();
-    for key in remote.list(&prefix)? {
-        if !key.ends_with(".json") {
-            continue;
-        }
-        let tombstone: GcTombstoneExport = match serde_json::from_slice(&remote.get(&key)?) {
-            Ok(tombstone) => tombstone,
-            Err(err) => {
-                *missing += 1;
-                eprintln!("invalid remote gc tombstone {key}: {err}");
-                continue;
-            }
-        };
-        for issue in tombstone.validation_issues(host_id) {
-            *missing += 1;
-            eprintln!("{}", issue.message(&key, host_id));
-        }
-        if remote.exists(&tombstone.key)? {
-            *missing += 1;
-            eprintln!(
-                "remote gc tombstone points to existing object {} {}",
-                key, tombstone.key
-            );
-        }
-        if !seen_keys.insert(tombstone.key.clone()) {
-            *missing += 1;
-            eprintln!(
-                "duplicate remote gc tombstone deleted key {}",
-                tombstone.key
-            );
-        }
     }
     Ok(())
 }
