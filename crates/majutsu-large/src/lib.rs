@@ -107,6 +107,13 @@ pub fn chunk_ranges_for_bytes(
     }
 }
 
+pub fn validate_chunking(chunking: &str) -> Result<()> {
+    match chunking {
+        "fixed" | "fastcdc" => Ok(()),
+        _ => anyhow::bail!("large chunking must be fixed or fastcdc"),
+    }
+}
+
 pub fn fixed_ranges(len: usize, chunk_size: usize) -> Vec<(usize, usize)> {
     let chunk_size = chunk_size.max(1);
     let mut ranges = Vec::new();
@@ -354,6 +361,12 @@ mod tests {
         assert_eq!(default_compression_level(), 3);
         assert_eq!(default_compression_sample_bytes(), 1024 * 1024);
         assert_eq!(default_compression_min_gain_ratio(), 0.05);
+        validate_chunking(default_chunking()).unwrap();
+        validate_chunking("fastcdc").unwrap();
+        assert_eq!(
+            validate_chunking("rolling").unwrap_err().to_string(),
+            "large chunking must be fixed or fastcdc"
+        );
     }
 
     #[test]

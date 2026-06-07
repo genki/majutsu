@@ -8410,10 +8410,7 @@ fn encryption_mode(security: &SecurityConfig) -> Result<EncryptionMode> {
 }
 
 fn validate_large_chunking(chunking: &str) -> Result<()> {
-    match chunking {
-        "fixed" | "fastcdc" => Ok(()),
-        _ => bail!("large chunking must be fixed or fastcdc"),
-    }
+    majutsu_large::validate_chunking(chunking)
 }
 
 #[derive(Deserialize)]
