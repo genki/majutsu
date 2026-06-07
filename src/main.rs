@@ -3612,12 +3612,33 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
         ),
     )?;
     let (tx, rx) = mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(
+    #[cfg(target_os = "linux")]
+    if backend_label == "inotify" {
+        let watcher = notify::INotifyWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            NotifyConfig::default(),
+        )?;
+        return watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx);
+    }
+    let watcher = RecommendedWatcher::new(
         move |res| {
             let _ = tx.send(res);
         },
         NotifyConfig::default(),
     )?;
+    watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx)
+}
+
+fn watch_notify_loop<W: Watcher>(
+    paths: &Paths,
+    args: ResolvedWatchArgs,
+    backend_label: &str,
+    active_roots: Vec<RootConfig>,
+    mut watcher: W,
+    rx: mpsc::Receiver<notify::Result<notify::Event>>,
+) -> Result<()> {
     for root in &active_roots {
         watcher.watch(&root.path, RecursiveMode::Recursive)?;
         record_event(
