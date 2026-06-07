@@ -3169,6 +3169,56 @@ fn large_chunks_can_be_compressed_and_restored() {
 }
 
 #[test]
+fn large_verify_checks_referenced_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.bin"), vec![5u8; 64 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 32768");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let verify = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("verify");
+        c
+    });
+    assert!(verify.contains("fsck ok"));
+
+    let chunk = find_file_ending(&state.join("objects/large/chunks/fixed"), "");
+    fs::remove_file(chunk).unwrap();
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("verify");
+        c
+    });
+}
+
+#[test]
 fn large_files_can_use_content_defined_chunking() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
