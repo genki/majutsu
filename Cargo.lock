@@ -1457,6 +1457,7 @@ dependencies = [
  "libc",
  "majutsu-core",
  "majutsu-crypto",
+ "majutsu-daemon",
  "majutsu-large",
  "majutsu-pack",
  "majutsu-policy",
