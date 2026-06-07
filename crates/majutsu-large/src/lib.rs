@@ -128,6 +128,38 @@ impl LargePinExport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LargePinIssue {
+    Dangling { oid: String, pinned_at: String },
+    InvalidTimestamp { oid: String, pinned_at: String },
+}
+
+pub fn large_pin_issues(
+    pins: &[LargePinExport],
+    large_objects: &[LargeObjectExport],
+) -> Vec<LargePinIssue> {
+    let mut issues = Vec::new();
+    for pin in pins {
+        if !pin.references_known_object(large_objects) {
+            issues.push(LargePinIssue::Dangling {
+                oid: pin.oid.clone(),
+                pinned_at: pin.pinned_at.clone(),
+            });
+        }
+        if pin.pinned_time().is_err() {
+            issues.push(LargePinIssue::InvalidTimestamp {
+                oid: pin.oid.clone(),
+                pinned_at: pin.pinned_at.clone(),
+            });
+        }
+    }
+    issues
+}
+
+pub fn large_chunk_hash_matches(chunk: &majutsu_core::LargeChunk, bytes: &[u8]) -> bool {
+    blake3::hash(bytes).to_hex().as_str() == chunk.oid
+}
+
 pub fn chunk_ranges_for_bytes(
     chunking: &str,
     chunk_size: usize,
@@ -519,6 +551,60 @@ mod tests {
         };
 
         assert!(pin.pinned_time().is_err());
+    }
+
+    #[test]
+    fn large_pin_validation_reports_dangling_and_invalid_pins() {
+        let objects = vec![LargeObjectExport {
+            oid: "large-1".into(),
+            size: 1024,
+            chunk_count: 1,
+            manifest_key: "objects/large/manifests/large-1".into(),
+        }];
+        let pins = vec![
+            LargePinExport {
+                oid: "missing".into(),
+                pinned_at: DateTime::<Utc>::UNIX_EPOCH.to_rfc3339(),
+                reason: None,
+            },
+            LargePinExport {
+                oid: "large-1".into(),
+                pinned_at: "not-time".into(),
+                reason: None,
+            },
+        ];
+
+        assert_eq!(
+            large_pin_issues(&pins, &objects),
+            vec![
+                LargePinIssue::Dangling {
+                    oid: "missing".into(),
+                    pinned_at: DateTime::<Utc>::UNIX_EPOCH.to_rfc3339(),
+                },
+                LargePinIssue::InvalidTimestamp {
+                    oid: "large-1".into(),
+                    pinned_at: "not-time".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn large_chunk_hash_validation_uses_decompressed_bytes() {
+        let bytes = b"payload";
+        let oid = blake3::hash(bytes).to_hex().to_string();
+        let chunk = majutsu_core::LargeChunk {
+            index: 0,
+            offset: 0,
+            len: bytes.len() as u64,
+            stored_len: None,
+            compression: "none".into(),
+            oid,
+            object_key: "objects/large/chunks/chunk-1".into(),
+        };
+
+        assert!(large_chunk_hash_matches(&chunk, bytes));
+        assert!(!large_chunk_hash_matches(&chunk, b"changed"));
     }
 
     #[test]

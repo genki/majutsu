@@ -27,7 +27,10 @@ use majutsu_db::{
     RemoteRefIssue, UploadQueueItem, UploadQueueItemIssue, expected_upload_queue_item_id,
     local_ref_issues, remote_ref_issues,
 };
-use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport, large_manifest_issues};
+use majutsu_large::{
+    ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_chunk_hash_matches,
+    large_manifest_issues, large_pin_issues,
+};
 use majutsu_pack::{
     PackEntry, PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackTier,
     PackedBlobMetadata, missing_pack_metadata_ids, pack_index_issues, pack_object_issues,
@@ -4514,7 +4517,7 @@ fn fsck(paths: &Paths) -> Result<()> {
             Ok(manifest) => {
                 for chunk in &manifest.chunks {
                     match read_large_chunk(paths, chunk) {
-                        Ok(bytes) if blake3_hex(&bytes) == chunk.oid => {}
+                        Ok(bytes) if large_chunk_hash_matches(chunk, &bytes) => {}
                         Ok(_) => {
                             missing += 1;
                             eprintln!("large chunk hash mismatch {} {}", oid, chunk.object_key);
@@ -4532,18 +4535,16 @@ fn fsck(paths: &Paths) -> Result<()> {
             }
         }
     }
-    let mut stmt = conn.prepare(
-        "select p.oid, p.pinned_at
-         from large_pins p left join large_objects l on l.oid = p.oid
-         where l.oid is null",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (oid, pinned_at) = row?;
+    for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
         missing += 1;
-        eprintln!("dangling large pin {oid} pinned_at={pinned_at}");
+        match issue {
+            LargePinIssue::Dangling { oid, pinned_at } => {
+                eprintln!("dangling large pin {oid} pinned_at={pinned_at}");
+            }
+            LargePinIssue::InvalidTimestamp { oid, pinned_at } => {
+                eprintln!("invalid large pin timestamp {oid} pinned_at={pinned_at}");
+            }
+        }
     }
     validate_host_file(paths, &config, &mut missing)?;
     validate_config_roots(paths, &conn, &config, &mut missing)?;
@@ -5621,17 +5622,15 @@ fn remote_fsck_export(
 ) -> Result<MetadataExport> {
     let export: MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
-    for pin in &export.large_pins {
-        if !pin.references_known_object(&export.large_objects) {
-            *missing += 1;
-            eprintln!("dangling remote large pin {} in {metadata_key}", pin.oid);
-        }
-        if pin.pinned_time().is_err() {
-            *missing += 1;
-            eprintln!(
-                "invalid remote large pin timestamp {} in {metadata_key}",
-                pin.oid
-            );
+    for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
+        *missing += 1;
+        match issue {
+            LargePinIssue::Dangling { oid, .. } => {
+                eprintln!("dangling remote large pin {oid} in {metadata_key}");
+            }
+            LargePinIssue::InvalidTimestamp { oid, .. } => {
+                eprintln!("invalid remote large pin timestamp {oid} in {metadata_key}");
+            }
         }
     }
     validate_remote_chunk_index(paths, remote, &export, missing)?;
