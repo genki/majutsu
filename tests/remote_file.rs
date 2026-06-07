@@ -150,6 +150,14 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c.arg("--home").arg(&state).arg("remote").arg("fsck");
         c
     });
+    let remote_check = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("check");
+        c
+    });
+    assert!(remote_check.contains("remote file://"));
+    assert!(remote_check.contains("metadata ok"));
+    assert!(remote_check.contains("range_get 1"));
     let capabilities = output({
         let mut c = mj();
         c.arg("--home")
