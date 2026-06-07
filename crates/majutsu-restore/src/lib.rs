@@ -38,6 +38,13 @@ pub struct RestoreQueueItem {
 }
 
 impl RestoreQueueItem {
+    pub fn has_valid_status(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "prepared" | "ready" | "archive-requested" | "done"
+        )
+    }
+
     pub fn is_resumable(&self) -> bool {
         matches!(
             self.status.as_str(),
@@ -62,6 +69,32 @@ impl RestoreQueueItem {
 
     pub fn mark_done(&mut self) {
         self.status = "done".into();
+    }
+
+    pub fn has_duplicate_required_objects(&self) -> bool {
+        let unique = self
+            .required_objects
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        unique.len() != self.required_objects.len()
+    }
+
+    pub fn pending_objects_outside_required(&self) -> Vec<&ObjectKey> {
+        let required = self
+            .required_objects
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        self.archived_objects
+            .iter()
+            .chain(self.missing_objects.iter())
+            .chain(self.archive_requested_objects.iter())
+            .filter(|key| !required.contains(key))
+            .collect()
+    }
+
+    pub fn done_with_pending_objects(&self) -> bool {
+        self.status == "done"
+            && (!self.archived_objects.is_empty() || !self.missing_objects.is_empty())
     }
 }
 
@@ -257,6 +290,69 @@ mod tests {
         job.mark_done();
         assert_eq!(job.status, "done");
         assert!(!job.is_resumable());
+    }
+
+    #[test]
+    fn restore_queue_item_validates_fsck_invariants() {
+        let mut job = RestoreQueueItem {
+            id: "restore-1".into(),
+            snapshot_id: "snap-1".into(),
+            root: Some("sample".into()),
+            path: Some("subtree".into()),
+            target: "/tmp/restore".into(),
+            required_objects: vec!["objects/blobs/aa".into()],
+            archived_objects: vec!["objects/blobs/aa".into()],
+            missing_objects: Vec::new(),
+            archive_requested_objects: Vec::new(),
+            force: false,
+            check_conflicts: true,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            status: "prepared".into(),
+        };
+
+        assert!(job.has_valid_status());
+        assert!(!job.has_duplicate_required_objects());
+        assert!(job.pending_objects_outside_required().is_empty());
+        assert!(!job.done_with_pending_objects());
+
+        job.status = "unknown".into();
+        assert!(!job.has_valid_status());
+
+        job.status = "done".into();
+        assert!(job.done_with_pending_objects());
+
+        job.required_objects.push("objects/blobs/aa".into());
+        assert!(job.has_duplicate_required_objects());
+
+        job.archive_requested_objects = vec!["objects/blobs/bb".into()];
+        let outside = job
+            .pending_objects_outside_required()
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(outside, vec!["objects/blobs/bb"]);
+    }
+
+    #[test]
+    fn restore_queue_item_done_allows_cleared_archives() {
+        let job = RestoreQueueItem {
+            id: "restore-1".into(),
+            snapshot_id: "snap-1".into(),
+            root: Some("sample".into()),
+            path: None,
+            target: "original-roots".into(),
+            required_objects: vec!["objects/blobs/aa".into()],
+            archived_objects: Vec::new(),
+            missing_objects: Vec::new(),
+            archive_requested_objects: vec!["objects/blobs/aa".into()],
+            force: false,
+            check_conflicts: true,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            status: "done".into(),
+        };
+
+        assert!(!job.done_with_pending_objects());
+        assert!(job.pending_objects_outside_required().is_empty());
     }
 
     #[test]

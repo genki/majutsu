@@ -5099,12 +5099,12 @@ fn validate_restore_queue(paths: &Paths, conn: &Connection, missing: &mut usize)
                 job.id, job.snapshot_id
             );
         }
-        match job.status.as_str() {
-            "prepared" | "ready" | "archive-requested" | "done" => {}
-            status => {
-                *missing += 1;
-                eprintln!("restore queue item has invalid status {} {status}", job.id);
-            }
+        if !job.has_valid_status() {
+            *missing += 1;
+            eprintln!(
+                "restore queue item has invalid status {} {}",
+                job.id, job.status
+            );
         }
         if let Some(path_filter) = job.path.as_deref() {
             if let Err(err) =
@@ -5114,31 +5114,21 @@ fn validate_restore_queue(paths: &Paths, conn: &Connection, missing: &mut usize)
                 eprintln!("restore queue item has invalid path {}: {err}", job.id);
             }
         }
-        let required = job.required_objects.iter().collect::<BTreeSet<_>>();
-        if required.len() != job.required_objects.len() {
+        if job.has_duplicate_required_objects() {
             *missing += 1;
             eprintln!(
                 "restore queue item has duplicate required objects {}",
                 job.id
             );
         }
-        for key in job
-            .archived_objects
-            .iter()
-            .chain(job.missing_objects.iter())
-            .chain(job.archive_requested_objects.iter())
-        {
-            if !required.contains(key) {
-                *missing += 1;
-                eprintln!(
-                    "restore queue item references object outside required set {} {}",
-                    job.id, key
-                );
-            }
+        for key in job.pending_objects_outside_required() {
+            *missing += 1;
+            eprintln!(
+                "restore queue item references object outside required set {} {}",
+                job.id, key
+            );
         }
-        if job.status == "done"
-            && (!job.archived_objects.is_empty() || !job.missing_objects.is_empty())
-        {
+        if job.done_with_pending_objects() {
             *missing += 1;
             eprintln!(
                 "completed restore queue item still has pending objects {}",
