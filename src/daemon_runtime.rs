@@ -5,7 +5,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::{Paths, current_snapshot, open_db, pid_alive, read_pid, resolve_paths, roots};
+use crate::process_runtime::{pid_alive, read_pid};
+use crate::{Paths, current_snapshot, open_db, resolve_paths, roots};
 
 pub(crate) fn start_watch_daemon(
     paths: &Paths,

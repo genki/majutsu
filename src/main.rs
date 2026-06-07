@@ -71,7 +71,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -79,9 +79,11 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod daemon_runtime;
+mod process_runtime;
 mod watch_runtime;
 
 use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
+use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use watch_runtime::{
     default_watch_backend, format_notify_event, normalize_watch_backend, recv_watch_event,
 };
@@ -8487,72 +8489,6 @@ impl Default for LargeCompressionConfig {
             skip_extensions: default_large_compression_skip_extensions(),
         }
     }
-}
-
-fn read_pid(path: &Path) -> Result<Option<u32>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(path)?;
-    Ok(Some(text.trim().parse()?))
-}
-
-struct ProcessLock {
-    path: PathBuf,
-}
-
-impl Drop for ProcessLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn acquire_process_lock(path: &Path, name: &str) -> Result<ProcessLock> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let pid = std::process::id();
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            writeln!(file, "{pid}")?;
-            Ok(ProcessLock {
-                path: path.to_path_buf(),
-            })
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = fs::read_to_string(path).unwrap_or_default();
-            if let Ok(existing_pid) = existing.trim().parse::<u32>() {
-                if pid_alive(existing_pid) {
-                    bail!("{name} already running with pid {existing_pid}");
-                }
-            }
-            fs::remove_file(path)?;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)?;
-            writeln!(file, "{pid}")?;
-            Ok(ProcessLock {
-                path: path.to_path_buf(),
-            })
-        }
-        Err(err) => Err(err).with_context(|| format!("acquire {name} lock")),
-    }
-}
-
-fn pid_alive(pid: u32) -> bool {
-    ProcessCommand::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 fn looks_binary(path: &Path) -> Result<bool> {
