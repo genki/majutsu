@@ -7888,6 +7888,91 @@ tier = "Bulk"
         assert_eq!(fs.read_file(&record, 6, 6).unwrap(), b"packed".to_vec());
     }
 
+    #[test]
+    fn fuse_large_read_only_requires_overlapping_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        init(
+            &paths,
+            InitArgs {
+                remote: None,
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let chunks = [(0u64, b"abcd".as_slice()), (4, b"efgh"), (8, b"ijkl")];
+        let mut manifest_chunks = Vec::new();
+        let mut first_chunk_key = String::new();
+        for (index, (offset, bytes)) in chunks.iter().enumerate() {
+            let oid = blake3_hex(bytes);
+            let object_key = store_bytes(&paths, &paths.large_chunks, &oid, bytes).unwrap();
+            if index == 0 {
+                first_chunk_key = object_key.clone();
+            }
+            manifest_chunks.push(LargeChunk {
+                index,
+                offset: *offset,
+                len: bytes.len() as u64,
+                stored_len: Some(bytes.len() as u64),
+                compression: "none".into(),
+                oid,
+                object_key,
+            });
+        }
+        let manifest = LargeManifest {
+            version: 1,
+            oid: blake3_hex(b"abcdefghijkl"),
+            size: 12,
+            media_type: Some("application/octet-stream".into()),
+            binary: true,
+            chunking: "fixed".into(),
+            chunk_size: 4,
+            chunks: manifest_chunks,
+        };
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_oid = blake3_hex(&manifest_json);
+        let manifest_key = store_bytes(
+            &paths,
+            &paths.large_manifests,
+            &manifest_oid,
+            &manifest_json,
+        )
+        .unwrap();
+        fs::remove_file(paths.home.join(&first_chunk_key)).unwrap();
+
+        let fs = MajutsuFuseFs {
+            paths,
+            nodes: BTreeMap::new(),
+        };
+        let record = FileRecord {
+            root_id: "sample".into(),
+            path: "payload.bin".into(),
+            kind: "file".into(),
+            size: 12,
+            mode: 0o100644,
+            modified: None,
+            uid: None,
+            gid: None,
+            xattrs: BTreeMap::new(),
+            payload: Payload::LargeObject {
+                oid: manifest.oid,
+                manifest_key,
+                chunk_count: 3,
+                media_type: Some("application/octet-stream".into()),
+                binary: true,
+                chunking: "fixed".into(),
+                compression: "none".into(),
+                encryption: "none".into(),
+                storage_tier_hint: "hot-manifest-cold-chunks".into(),
+                hydrate_policy: "on-demand".into(),
+            },
+        };
+
+        assert_eq!(fs.read_file(&record, 5, 2).unwrap(), b"fg".to_vec());
+        assert!(fs.read_file(&record, 1, 2).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn stable_metadata_detects_same_size_file_replacement() {
