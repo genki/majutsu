@@ -4630,6 +4630,51 @@ fn mount_creates_lazy_view_and_can_hydrate_large_files() {
 }
 
 #[test]
+fn mount_refuses_non_empty_materialized_mountpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let view = tmp.path().join("view");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&view).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(view.join("existing.txt"), b"existing\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("mount").arg(&view);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(view.join("existing.txt")).unwrap(),
+        "existing\n"
+    );
+    assert!(!view.join("sample/alpha.txt").exists());
+    assert!(!view.join(".majutsu-mount.json").exists());
+}
+
+#[test]
 fn mount_at_uses_historical_snapshot_time() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

@@ -1924,7 +1924,7 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         .to
         .as_ref()
         .ok_or_else(|| anyhow!("mount requires a target directory"))?;
-    fs::create_dir_all(mountpoint)?;
+    prepare_mountpoint(mountpoint)?;
     let lazy_root = mountpoint.join(".majutsu-lazy");
     let mut lazy_files = 0usize;
     let mut hydrated_large = 0usize;
@@ -2052,6 +2052,21 @@ fn unmount_cmd(paths: &Paths, args: UnmountArgs) -> Result<()> {
     )?;
     println!("unmounted {}", args.mountpoint.display());
     println!("snapshot {}", metadata.snapshot_id);
+    Ok(())
+}
+
+fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
+    if !mountpoint.exists() {
+        fs::create_dir_all(mountpoint)?;
+        return Ok(());
+    }
+    let meta = fs::symlink_metadata(mountpoint)?;
+    if !meta.file_type().is_dir() {
+        bail!("mountpoint is not a directory: {}", mountpoint.display());
+    }
+    if fs::read_dir(mountpoint)?.next().is_some() {
+        bail!("mountpoint is not empty: {}", mountpoint.display());
+    }
     Ok(())
 }
 
@@ -2361,7 +2376,7 @@ fn mount_fuse_cmd(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Resul
         .to
         .as_ref()
         .ok_or_else(|| anyhow!("fuse mount requires a target directory"))?;
-    fs::create_dir_all(mountpoint)?;
+    prepare_mountpoint(mountpoint)?;
     let fs = MajutsuFuseFs::from_plan(paths, plan)?;
     record_op(
         conn,
