@@ -80,10 +80,15 @@ use walkdir::WalkDir;
 
 mod daemon_runtime;
 mod process_runtime;
+mod restore_runtime;
 mod watch_runtime;
 
 use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
+use restore_runtime::{
+    ensure_restore_job_has_no_missing_objects, ensure_restore_job_not_blocked,
+    ensure_restore_job_resumable, mark_restore_job_done, read_restore_job, write_restore_job,
+};
 use watch_runtime::{
     default_watch_backend, format_notify_event, normalize_watch_backend, recv_watch_event,
 };
@@ -6368,51 +6373,6 @@ fn read_large_manifest_for_restore(paths: &Paths, manifest_key: &str) -> Result<
             serde_json::from_slice(&decoded).map_err(Into::into)
         }
     }
-}
-
-fn write_restore_job(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
-    let dir = paths.home.join("queue/restores");
-    fs::create_dir_all(&dir)?;
-    fs::write(
-        dir.join(format!("{}.json", job.id)),
-        serde_json::to_vec_pretty(job)?,
-    )?;
-    Ok(())
-}
-
-fn read_restore_job(paths: &Paths, job_id: &str) -> Result<RestoreQueueItem> {
-    let path = paths
-        .home
-        .join("queue/restores")
-        .join(format!("{job_id}.json"));
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
-}
-
-fn ensure_restore_job_resumable(job: &RestoreQueueItem) -> Result<()> {
-    if let Some(message) = job.non_resumable_message() {
-        bail!("{message}");
-    }
-    Ok(())
-}
-
-fn ensure_restore_job_not_blocked(job: &RestoreQueueItem) -> Result<()> {
-    if let Some(message) = job.blocking_resume_message() {
-        bail!("{message}");
-    }
-    Ok(())
-}
-
-fn ensure_restore_job_has_no_missing_objects(job: &RestoreQueueItem) -> Result<()> {
-    if let Some(message) = job.missing_objects_message() {
-        bail!("{message}");
-    }
-    Ok(())
-}
-
-fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {
-    let mut job = read_restore_job(paths, job_id)?;
-    job.mark_done();
-    write_restore_job(paths, &job)
 }
 
 fn apply_restore_plan(
