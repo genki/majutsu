@@ -981,7 +981,7 @@ struct SnapshotManifest {
     roots: BTreeMap<String, Vec<FileRecord>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RootSnapshot {
     tree_id: String,
     tree_key: String,
@@ -1389,6 +1389,10 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let config = read_config(paths)?;
     let conn = open_db(paths)?;
     let parent = current_snapshot(&conn)?;
+    let parent_manifest = parent
+        .as_deref()
+        .map(|id| load_snapshot_by_id(&conn, id))
+        .transpose()?;
     let op_id = new_id("op");
     let snapshot_id = new_id("snap");
     let mut by_root = BTreeMap::new();
@@ -1482,17 +1486,23 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .filter(|r| !matches!(r.payload, Payload::Directory))
             .count();
         let tree = build_tree_manifest(&root.id, records)?;
-        let tree_json = serde_json::to_vec_pretty(&tree)?;
-        let tree_oid = blake3_hex(&tree_json);
-        let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
-        root_trees.insert(
-            root.id.clone(),
+        let root_snapshot = if let Some(previous) = parent_manifest
+            .as_ref()
+            .and_then(|parent| parent.root_trees.get(&root.id))
+            .filter(|previous| previous.tree_id == tree.tree_id)
+        {
+            previous.clone()
+        } else {
+            let tree_json = serde_json::to_vec_pretty(&tree)?;
+            let tree_oid = blake3_hex(&tree_json);
+            let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
             RootSnapshot {
-                tree_id: tree.tree_id,
+                tree_id: tree.tree_id.clone(),
                 tree_key,
                 file_count: tree.entries.len(),
-            },
-        );
+            }
+        };
+        root_trees.insert(root.id.clone(), root_snapshot);
         by_root.insert(root.id, tree.entries.into_values().collect());
     }
     let manifest = SnapshotManifest {

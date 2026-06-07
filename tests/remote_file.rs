@@ -450,6 +450,68 @@ fn remote_fsck_detects_missing_canonical_host_export() {
 }
 
 #[test]
+fn unchanged_root_reuses_previous_tree_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let snapshots = export["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 2);
+    let first_manifest: serde_json::Value =
+        serde_json::from_str(snapshots[0]["manifest_json"].as_str().unwrap()).unwrap();
+    let second_manifest: serde_json::Value =
+        serde_json::from_str(snapshots[1]["manifest_json"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        first_manifest["root_trees"]["sample"]["tree_id"],
+        second_manifest["root_trees"]["sample"]["tree_id"]
+    );
+    assert_eq!(
+        first_manifest["root_trees"]["sample"]["tree_key"],
+        second_manifest["root_trees"]["sample"]["tree_key"]
+    );
+}
+
+#[test]
 fn split_remote_config_supports_file_and_s3_forms() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
