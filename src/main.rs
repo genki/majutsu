@@ -17,6 +17,7 @@ use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_pack::{PackEntry, PackIndex, PackTier};
 use majutsu_restore::{RestoreChangeStats, RestorePathState, count_restore_changes};
+use majutsu_store::RemoteCapabilities;
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
@@ -703,17 +704,6 @@ struct RemoteHostIndex {
     version: u32,
     updated_at: DateTime<Utc>,
     hosts: Vec<RemoteHostSummary>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RemoteCapabilities {
-    lifecycle_rules: bool,
-    object_tags: bool,
-    storage_class_on_put: bool,
-    restore_archived_object: bool,
-    multipart_upload: bool,
-    range_get: bool,
-    conditional_put: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10121,24 +10111,10 @@ impl RemoteStore {
 
     fn capabilities(&self) -> RemoteCapabilities {
         match self {
-            RemoteStore::File(_) => RemoteCapabilities {
-                lifecycle_rules: false,
-                object_tags: false,
-                storage_class_on_put: false,
-                restore_archived_object: true,
-                multipart_upload: false,
-                range_get: true,
-                conditional_put: true,
-            },
-            RemoteStore::S3(remote) => RemoteCapabilities {
-                lifecycle_rules: true,
-                object_tags: !remote.uses_sigv2(),
-                storage_class_on_put: !remote.uses_sigv2(),
-                restore_archived_object: true,
-                multipart_upload: remote.multipart_enabled && !remote.uses_sigv2(),
-                range_get: true,
-                conditional_put: !remote.uses_sigv2(),
-            },
+            RemoteStore::File(_) => RemoteCapabilities::file(),
+            RemoteStore::S3(remote) => {
+                RemoteCapabilities::s3(remote.uses_sigv2(), remote.multipart_enabled)
+            }
         }
     }
 }

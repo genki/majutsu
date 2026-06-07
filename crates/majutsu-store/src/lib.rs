@@ -22,3 +22,78 @@ pub struct RemoteCapabilities {
     pub range_get: bool,
     pub conditional_put: bool,
 }
+
+impl RemoteCapabilities {
+    pub fn file() -> Self {
+        Self {
+            lifecycle_rules: false,
+            object_tags: false,
+            storage_class_on_put: false,
+            restore_archived_object: true,
+            multipart_upload: false,
+            range_get: true,
+            conditional_put: true,
+        }
+    }
+
+    pub fn s3(signature_v2: bool, multipart_enabled: bool) -> Self {
+        Self {
+            lifecycle_rules: true,
+            object_tags: !signature_v2,
+            storage_class_on_put: !signature_v2,
+            restore_archived_object: true,
+            multipart_upload: multipart_enabled && !signature_v2,
+            range_get: true,
+            conditional_put: !signature_v2,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_remote_supports_local_recovery_capabilities() {
+        let capabilities = RemoteCapabilities::file();
+
+        assert!(!capabilities.lifecycle_rules);
+        assert!(!capabilities.object_tags);
+        assert!(!capabilities.storage_class_on_put);
+        assert!(capabilities.restore_archived_object);
+        assert!(!capabilities.multipart_upload);
+        assert!(capabilities.range_get);
+        assert!(capabilities.conditional_put);
+    }
+
+    #[test]
+    fn s3_v4_supports_policy_tags_multipart_and_conditional_put() {
+        let capabilities = RemoteCapabilities::s3(false, true);
+
+        assert!(capabilities.lifecycle_rules);
+        assert!(capabilities.object_tags);
+        assert!(capabilities.storage_class_on_put);
+        assert!(capabilities.restore_archived_object);
+        assert!(capabilities.multipart_upload);
+        assert!(capabilities.range_get);
+        assert!(capabilities.conditional_put);
+    }
+
+    #[test]
+    fn s3_v2_disables_unsigned_capabilities() {
+        let capabilities = RemoteCapabilities::s3(true, true);
+
+        assert!(capabilities.lifecycle_rules);
+        assert!(!capabilities.object_tags);
+        assert!(!capabilities.storage_class_on_put);
+        assert!(capabilities.restore_archived_object);
+        assert!(!capabilities.multipart_upload);
+        assert!(capabilities.range_get);
+        assert!(!capabilities.conditional_put);
+    }
+
+    #[test]
+    fn s3_multipart_follows_large_object_policy() {
+        assert!(!RemoteCapabilities::s3(false, false).multipart_upload);
+    }
+}
