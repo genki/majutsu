@@ -998,6 +998,24 @@ struct FileRecord {
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Payload {
     Directory,
+    InlineSmall {
+        oid: String,
+        object_key: String,
+    },
+    NormalBlob {
+        oid: String,
+        object_key: String,
+    },
+    ChunkedBlob {
+        oid: String,
+        manifest_key: String,
+        chunk_count: usize,
+    },
+    LargeObject {
+        oid: String,
+        manifest_key: String,
+        chunk_count: usize,
+    },
     Blob {
         oid: String,
         object_key: String,
@@ -1013,6 +1031,60 @@ enum Payload {
     Special {
         special_kind: String,
     },
+}
+
+fn payload_blob_ref(payload: &Payload) -> Option<(&str, &str)> {
+    match payload {
+        Payload::InlineSmall { oid, object_key }
+        | Payload::NormalBlob { oid, object_key }
+        | Payload::Blob { oid, object_key } => Some((oid, object_key)),
+        _ => None,
+    }
+}
+
+fn payload_blob_ref_mut(payload: &mut Payload) -> Option<(&str, &mut String)> {
+    match payload {
+        Payload::InlineSmall { oid, object_key } => Some((oid.as_str(), object_key)),
+        Payload::NormalBlob { oid, object_key } => Some((oid.as_str(), object_key)),
+        Payload::Blob { oid, object_key } => Some((oid.as_str(), object_key)),
+        _ => None,
+    }
+}
+
+fn payload_large_ref(payload: &Payload) -> Option<(&str, &str, usize)> {
+    match payload {
+        Payload::ChunkedBlob {
+            oid,
+            manifest_key,
+            chunk_count,
+        }
+        | Payload::LargeObject {
+            oid,
+            manifest_key,
+            chunk_count,
+        }
+        | Payload::Large {
+            oid,
+            manifest_key,
+            chunk_count,
+        } => Some((oid, manifest_key, *chunk_count)),
+        _ => None,
+    }
+}
+
+fn payload_large_ref_mut(payload: &mut Payload) -> Option<(&str, &mut String)> {
+    match payload {
+        Payload::ChunkedBlob {
+            oid, manifest_key, ..
+        } => Some((oid.as_str(), manifest_key)),
+        Payload::LargeObject {
+            oid, manifest_key, ..
+        } => Some((oid.as_str(), manifest_key)),
+        Payload::Large {
+            oid, manifest_key, ..
+        } => Some((oid.as_str(), manifest_key)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1558,7 +1630,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         }
         large_files += records
             .iter()
-            .filter(|r| matches!(r.payload, Payload::Large { .. }))
+            .filter(|r| payload_large_ref(&r.payload).is_some())
             .count();
         total_files += records
             .iter()
@@ -2112,53 +2184,46 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
             Payload::Special { special_kind } => {
                 restore_special_file(&dest, record, special_kind, true)?;
             }
-            Payload::Blob { oid, object_key } => {
-                write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
-                apply_file_metadata(&dest, record)?;
-            }
-            Payload::Large {
-                manifest_key,
-                chunk_count,
-                ..
-            } if args.hydrate_large => {
-                let manifest: LargeManifest =
-                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                write_large_chunks_atomic(paths, &dest, &manifest)?;
-                apply_file_metadata(&dest, record)?;
-                hydrated_large += 1;
-                let _ = chunk_count;
-            }
-            Payload::Large {
-                manifest_key,
-                chunk_count,
-                ..
-            } => {
-                let file = File::create(&dest)?;
-                file.set_len(record.size)?;
-                apply_file_metadata(&dest, record)?;
-                let sidecar = lazy_root
-                    .join(&record.root_id)
-                    .join(format!("{}.json", record.path));
-                if let Some(parent) = sidecar.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let entry = LazyMountEntry {
-                    version: 1,
-                    snapshot_id: plan.snapshot.snapshot_id.clone(),
-                    root_id: record.root_id.clone(),
-                    path: record.path.clone(),
-                    size: record.size,
-                    manifest_key: manifest_key.clone(),
-                    chunk_count: *chunk_count,
-                };
-                fs::write(sidecar, serde_json::to_vec_pretty(&entry)?)?;
-                lazy_files += 1;
-            }
             Payload::Symlink { target } => {
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(target, &dest)?;
                 #[cfg(not(unix))]
                 fs::write(&dest, target)?;
+            }
+            payload => {
+                if let Some((oid, object_key)) = payload_blob_ref(payload) {
+                    write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
+                    apply_file_metadata(&dest, record)?;
+                } else if let Some((_, manifest_key, chunk_count)) = payload_large_ref(payload) {
+                    if args.hydrate_large {
+                        let manifest: LargeManifest =
+                            serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+                        write_large_chunks_atomic(paths, &dest, &manifest)?;
+                        apply_file_metadata(&dest, record)?;
+                        hydrated_large += 1;
+                    } else {
+                        let file = File::create(&dest)?;
+                        file.set_len(record.size)?;
+                        apply_file_metadata(&dest, record)?;
+                        let sidecar = lazy_root
+                            .join(&record.root_id)
+                            .join(format!("{}.json", record.path));
+                        if let Some(parent) = sidecar.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let entry = LazyMountEntry {
+                            version: 1,
+                            snapshot_id: plan.snapshot.snapshot_id.clone(),
+                            root_id: record.root_id.clone(),
+                            path: record.path.clone(),
+                            size: record.size,
+                            manifest_key: manifest_key.to_string(),
+                            chunk_count,
+                        };
+                        fs::write(sidecar, serde_json::to_vec_pretty(&entry)?)?;
+                        lazy_files += 1;
+                    }
+                }
             }
         }
     }
@@ -2396,31 +2461,27 @@ impl MajutsuFuseFs {
             return Ok(Vec::new());
         }
         let end = (start + size as u64).min(record.size);
-        match &record.payload {
-            Payload::Blob { object_key, .. } => {
-                let data = read_object(&self.paths, object_key)?;
-                Ok(data[start as usize..end as usize].to_vec())
-            }
-            Payload::Large { manifest_key, .. } => {
-                let manifest: LargeManifest =
-                    serde_json::from_slice(&read_object(&self.paths, manifest_key)?)?;
-                let mut out = Vec::with_capacity((end - start) as usize);
-                for chunk in manifest.chunks {
-                    let chunk_start = chunk.offset;
-                    let chunk_end = chunk.offset + chunk.len;
-                    if chunk_end <= start || chunk_start >= end {
-                        continue;
-                    }
-                    let data = read_large_chunk(&self.paths, &chunk)?;
-                    let slice_start = start.saturating_sub(chunk_start) as usize;
-                    let slice_end = (end.min(chunk_end) - chunk_start) as usize;
-                    out.extend_from_slice(&data[slice_start..slice_end]);
+        if let Some((_, object_key)) = payload_blob_ref(&record.payload) {
+            let data = read_object(&self.paths, object_key)?;
+            Ok(data[start as usize..end as usize].to_vec())
+        } else if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
+            let manifest: LargeManifest =
+                serde_json::from_slice(&read_object(&self.paths, manifest_key)?)?;
+            let mut out = Vec::with_capacity((end - start) as usize);
+            for chunk in manifest.chunks {
+                let chunk_start = chunk.offset;
+                let chunk_end = chunk.offset + chunk.len;
+                if chunk_end <= start || chunk_start >= end {
+                    continue;
                 }
-                Ok(out)
+                let data = read_large_chunk(&self.paths, &chunk)?;
+                let slice_start = start.saturating_sub(chunk_start) as usize;
+                let slice_end = (end.min(chunk_end) - chunk_start) as usize;
+                out.extend_from_slice(&data[slice_start..slice_end]);
             }
-            Payload::Directory => Ok(Vec::new()),
-            Payload::Symlink { .. } => Ok(Vec::new()),
-            Payload::Special { .. } => Ok(Vec::new()),
+            Ok(out)
+        } else {
+            Ok(Vec::new())
         }
     }
 }
@@ -2749,7 +2810,8 @@ fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
                         continue;
                     }
                     for record in records {
-                        if let Payload::Large { oid, .. } = record.payload {
+                        if let Some((oid, _, _)) = payload_large_ref(&record.payload) {
+                            let oid = oid.to_string();
                             if seen.insert(oid.clone()) {
                                 conn.execute(
                                     "insert or replace into large_pins(oid, pinned_at, reason) values (?1, ?2, ?3)",
@@ -4064,24 +4126,16 @@ fn rewrite_manifest_payload_keys(
 ) -> Result<()> {
     for records in manifest.roots.values_mut() {
         for record in records {
-            match &mut record.payload {
-                Payload::Directory => {}
-                Payload::Special { .. } => {}
-                Payload::Blob { oid, object_key } => {
-                    *object_key = blob_keys
-                        .get(oid)
-                        .ok_or_else(|| anyhow!("missing rotated blob key {oid}"))?
-                        .clone();
-                }
-                Payload::Large {
-                    oid, manifest_key, ..
-                } => {
-                    *manifest_key = large_manifest_keys
-                        .get(oid)
-                        .ok_or_else(|| anyhow!("missing rotated large manifest key {oid}"))?
-                        .clone();
-                }
-                Payload::Symlink { .. } => {}
+            if let Some((oid, object_key)) = payload_blob_ref_mut(&mut record.payload) {
+                *object_key = blob_keys
+                    .get(oid)
+                    .ok_or_else(|| anyhow!("missing rotated blob key {oid}"))?
+                    .clone();
+            } else if let Some((oid, manifest_key)) = payload_large_ref_mut(&mut record.payload) {
+                *manifest_key = large_manifest_keys
+                    .get(oid)
+                    .ok_or_else(|| anyhow!("missing rotated large manifest key {oid}"))?
+                    .clone();
             }
         }
     }
@@ -4440,23 +4494,15 @@ fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<Prune
         let manifest: SnapshotManifest = serde_json::from_str(&row?)?;
         for records in manifest.roots.values() {
             for record in records {
-                match &record.payload {
-                    Payload::Directory => {}
-                    Payload::Special { .. } => {}
-                    Payload::Blob { oid, .. } => {
-                        live_blobs.insert(oid.clone());
+                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+                    live_blobs.insert(oid.to_string());
+                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
+                    live_large.insert(oid.to_string());
+                    let large_manifest: LargeManifest =
+                        serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+                    for chunk in large_manifest.chunks {
+                        live_chunks.insert(chunk.oid);
                     }
-                    Payload::Large {
-                        oid, manifest_key, ..
-                    } => {
-                        live_large.insert(oid.clone());
-                        let large_manifest: LargeManifest =
-                            serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                        for chunk in large_manifest.chunks {
-                            live_chunks.insert(chunk.oid);
-                        }
-                    }
-                    Payload::Symlink { .. } => {}
                 }
             }
         }
@@ -4873,6 +4919,32 @@ fn build_restore_plan(
                 xattrs: record.xattrs.clone(),
                 payload: match &record.payload {
                     Payload::Directory => Payload::Directory,
+                    Payload::InlineSmall { oid, object_key } => Payload::InlineSmall {
+                        oid: oid.clone(),
+                        object_key: object_key.clone(),
+                    },
+                    Payload::NormalBlob { oid, object_key } => Payload::NormalBlob {
+                        oid: oid.clone(),
+                        object_key: object_key.clone(),
+                    },
+                    Payload::ChunkedBlob {
+                        oid,
+                        manifest_key,
+                        chunk_count,
+                    } => Payload::ChunkedBlob {
+                        oid: oid.clone(),
+                        manifest_key: manifest_key.clone(),
+                        chunk_count: *chunk_count,
+                    },
+                    Payload::LargeObject {
+                        oid,
+                        manifest_key,
+                        chunk_count,
+                    } => Payload::LargeObject {
+                        oid: oid.clone(),
+                        manifest_key: manifest_key.clone(),
+                        chunk_count: *chunk_count,
+                    },
                     Payload::Blob { oid, object_key } => Payload::Blob {
                         oid: oid.clone(),
                         object_key: object_key.clone(),
@@ -5014,7 +5086,7 @@ fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> R
     let large = plan
         .files
         .iter()
-        .filter(|r| matches!(r.payload, Payload::Large { .. }))
+        .filter(|r| payload_large_ref(&r.payload).is_some())
         .count();
     let bytes: u64 = plan.files.iter().map(|r| r.size).sum();
     let changes = restore_change_stats(paths, conn, plan)?;
@@ -5118,7 +5190,7 @@ fn restore_object_stats(
 fn required_chunk_count_for_plan(paths: &Paths, plan: &RestorePlan) -> Result<usize> {
     let mut chunks = 0usize;
     for record in &plan.files {
-        if let Payload::Large { manifest_key, .. } = &record.payload {
+        if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
             let manifest: LargeManifest =
                 serde_json::from_slice(&read_object(paths, manifest_key)?)?;
             chunks += manifest.chunks.len();
@@ -5252,43 +5324,37 @@ fn required_object_keys_for_plan(
 ) -> Result<Vec<String>> {
     let mut keys = Vec::new();
     for record in &plan.files {
-        match &record.payload {
-            Payload::Directory => {}
-            Payload::Special { .. } => {}
-            Payload::Blob { oid, object_key } => {
-                let blob = query_blobs(conn)?
-                    .into_iter()
-                    .find(|blob| blob.oid == *oid)
-                    .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
-                if let Some(pack_id) = blob.pack_id {
-                    let pack: PackExport = conn.query_row(
-                        "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",
-                        params![pack_id],
-                        |row| {
-                            Ok(PackExport {
-                                pack_id: row.get(0)?,
-                                pack_key: row.get(1)?,
-                                index_key: row.get(2)?,
-                                object_count: row.get(3)?,
-                                size: row.get(4)?,
-                            })
-                        },
-                    )?;
-                    keys.push(pack.pack_key);
-                    keys.push(pack.index_key);
-                } else {
-                    keys.push(object_key.clone());
-                }
+        if let Some((oid, object_key)) = payload_blob_ref(&record.payload) {
+            let blob = query_blobs(conn)?
+                .into_iter()
+                .find(|blob| blob.oid == oid)
+                .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
+            if let Some(pack_id) = blob.pack_id {
+                let pack: PackExport = conn.query_row(
+                    "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",
+                    params![pack_id],
+                    |row| {
+                        Ok(PackExport {
+                            pack_id: row.get(0)?,
+                            pack_key: row.get(1)?,
+                            index_key: row.get(2)?,
+                            object_count: row.get(3)?,
+                            size: row.get(4)?,
+                        })
+                    },
+                )?;
+                keys.push(pack.pack_key);
+                keys.push(pack.index_key);
+            } else {
+                keys.push(object_key.to_string());
             }
-            Payload::Large { manifest_key, .. } => {
-                keys.push(manifest_key.clone());
-                let manifest: LargeManifest =
-                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                for chunk in manifest.chunks {
-                    keys.push(chunk.object_key);
-                }
+        } else if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
+            keys.push(manifest_key.to_string());
+            let manifest: LargeManifest =
+                serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+            for chunk in manifest.chunks {
+                keys.push(chunk.object_key);
             }
-            Payload::Symlink { .. } => {}
         }
     }
     keys.sort();
@@ -5359,21 +5425,22 @@ fn apply_restore_plan(
             Payload::Special { special_kind } => {
                 restore_special_file(&dest, record, special_kind, force)?;
             }
-            Payload::Blob { oid, object_key } => {
-                write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
-                apply_file_metadata(&dest, record)?;
-            }
-            Payload::Large { manifest_key, .. } => {
-                let manifest: LargeManifest =
-                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                write_large_chunks_atomic(paths, &dest, &manifest)?;
-                apply_file_metadata(&dest, record)?;
-            }
             Payload::Symlink { target } => {
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(target, &dest)?;
                 #[cfg(not(unix))]
                 fs::write(&dest, target)?;
+            }
+            payload => {
+                if let Some((oid, object_key)) = payload_blob_ref(payload) {
+                    write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
+                    apply_file_metadata(&dest, record)?;
+                } else if let Some((_, manifest_key, _)) = payload_large_ref(payload) {
+                    let manifest: LargeManifest =
+                        serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+                    write_large_chunks_atomic(paths, &dest, &manifest)?;
+                    apply_file_metadata(&dest, record)?;
+                }
             }
         }
     }
@@ -5435,29 +5502,6 @@ fn restore_record_matches_path(
     match &record.payload {
         Payload::Directory => Ok(meta.file_type().is_dir()),
         Payload::Special { special_kind } => restore_special_matches(&meta, special_kind),
-        Payload::Blob { oid, object_key } => {
-            if !meta.file_type().is_file() {
-                return Ok(false);
-            }
-            Ok(fs::read(dest)? == read_blob_payload(paths, conn, oid, object_key)?)
-        }
-        Payload::Large { manifest_key, .. } => {
-            if !meta.file_type().is_file() || meta.len() != record.size {
-                return Ok(false);
-            }
-            let manifest: LargeManifest =
-                serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-            let mut current = File::open(dest)?;
-            for chunk in manifest.chunks {
-                let expected = read_large_chunk(paths, &chunk)?;
-                let mut actual = vec![0u8; expected.len()];
-                current.read_exact(&mut actual)?;
-                if actual != expected {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
         Payload::Symlink { target } => {
             #[cfg(unix)]
             {
@@ -5472,6 +5516,32 @@ fn restore_record_matches_path(
                     return Ok(false);
                 }
                 Ok(fs::read_to_string(dest)? == *target)
+            }
+        }
+        payload => {
+            if let Some((oid, object_key)) = payload_blob_ref(payload) {
+                if !meta.file_type().is_file() {
+                    return Ok(false);
+                }
+                Ok(fs::read(dest)? == read_blob_payload(paths, conn, oid, object_key)?)
+            } else if let Some((_, manifest_key, _)) = payload_large_ref(payload) {
+                if !meta.file_type().is_file() || meta.len() != record.size {
+                    return Ok(false);
+                }
+                let manifest: LargeManifest =
+                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+                let mut current = File::open(dest)?;
+                for chunk in manifest.chunks {
+                    let expected = read_large_chunk(paths, &chunk)?;
+                    let mut actual = vec![0u8; expected.len()];
+                    current.read_exact(&mut actual)?;
+                    if actual != expected {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            } else {
+                Ok(false)
             }
         }
     }
@@ -5708,7 +5778,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
         let payload = if large {
             let (oid, manifest_key, chunk_count) =
                 store_large_file(paths, entry.path(), &rel, &large_config)?;
-            Payload::Large {
+            Payload::LargeObject {
                 oid,
                 manifest_key,
                 chunk_count,
@@ -5722,7 +5792,11 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 "insert or ignore into blobs(oid, size, object_key) values (?1, ?2, ?3)",
                 params![oid, bytes.len() as u64, object_key],
             )?;
-            Payload::Blob { oid, object_key }
+            if bytes.len() as u64 <= SMALL_BLOB_MAX_SIZE {
+                Payload::InlineSmall { oid, object_key }
+            } else {
+                Payload::NormalBlob { oid, object_key }
+            }
         };
         records.push(FileRecord {
             root_id: root.id.clone(),

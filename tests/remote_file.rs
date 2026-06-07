@@ -1291,6 +1291,48 @@ fn init_creates_spec_state_layout() {
 }
 
 #[test]
+fn snapshot_manifest_uses_spec_payload_variants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("payload.zip"), vec![7u8; 32 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let tree_path = find_file_ending(&state.join("objects/trees"), "");
+    let tree: serde_json::Value = serde_json::from_slice(&fs::read(tree_path).unwrap()).unwrap();
+    assert_eq!(
+        tree["entries"]["alpha.txt"]["payload"]["type"],
+        "inline-small"
+    );
+    assert_eq!(
+        tree["entries"]["payload.zip"]["payload"]["type"],
+        "large-object"
+    );
+}
+
+#[test]
 fn snapshot_lock_blocks_concurrent_snapshot_and_recovers_stale_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
