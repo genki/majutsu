@@ -41,9 +41,16 @@ pub enum RootStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSnapshot {
+    #[serde(rename = "snapshot_id", alias = "id")]
     pub id: SnapshotId,
     pub parent: Option<SnapshotId>,
+    #[serde(rename = "op_id", alias = "operation")]
     pub operation: OperationId,
+    #[serde(default = "default_operation_timestamp")]
+    pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub root_trees: BTreeMap<RootId, RootSnapshot>,
+    #[serde(default)]
     pub roots: BTreeMap<RootId, RootSnapshot>,
 }
 
@@ -391,6 +398,52 @@ mod tests {
             serde_json::from_value::<RootStatus>(serde_json::Value::String(status.into()))
                 .unwrap_or_else(|err| panic!("root status {status} should deserialize: {err}"));
         }
+    }
+
+    #[test]
+    fn host_snapshot_model_accepts_spec_and_legacy_field_names() {
+        let spec_json = r#"{
+            "snapshot_id": "snap-1",
+            "parent": null,
+            "op_id": "op-1",
+            "timestamp": "2026-06-07T00:00:00Z",
+            "root_trees": {
+                "sample": {
+                    "tree_id": "tree-1",
+                    "tree_key": "objects/trees/aa/bb",
+                    "file_count": 2
+                }
+            },
+            "roots": {
+                "sample": {
+                    "tree_id": "tree-1",
+                    "tree_key": "objects/trees/aa/bb",
+                    "file_count": 2
+                }
+            }
+        }"#;
+
+        let snapshot: HostSnapshot = serde_json::from_str(spec_json).unwrap();
+
+        assert_eq!(snapshot.id, "snap-1");
+        assert_eq!(snapshot.operation, "op-1");
+        assert!(snapshot.root_trees.contains_key("sample"));
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["snapshot_id"],
+            "snap-1"
+        );
+        assert_eq!(serde_json::to_value(&snapshot).unwrap()["op_id"], "op-1");
+
+        let legacy_json = r#"{
+            "id": "snap-legacy",
+            "parent": null,
+            "operation": "op-legacy",
+            "roots": {}
+        }"#;
+        let legacy: HostSnapshot = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.id, "snap-legacy");
+        assert_eq!(legacy.operation, "op-legacy");
+        assert_eq!(legacy.timestamp, DateTime::<Utc>::UNIX_EPOCH);
     }
 
     #[test]
