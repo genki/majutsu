@@ -2623,6 +2623,118 @@ fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
 }
 
 #[test]
+fn op_restore_moves_current_ref_to_operation_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let first_status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    let first_snapshot = first_status
+        .lines()
+        .find_map(|line| line.strip_prefix("current "))
+        .unwrap()
+        .to_string();
+
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let second_status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    let second_snapshot = second_status
+        .lines()
+        .find_map(|line| line.strip_prefix("current "))
+        .unwrap()
+        .to_string();
+    assert_ne!(first_snapshot, second_snapshot);
+
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    let first_snapshot_op = op_log
+        .lines()
+        .filter(|line| line.contains("manual-snapshot"))
+        .find(|line| line.contains(&format!(" -> {first_snapshot}\t")))
+        .and_then(|line| line.split('\t').next())
+        .unwrap()
+        .to_string();
+
+    let restore_out = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("restore")
+            .arg(&first_snapshot_op);
+        c
+    });
+    assert!(restore_out.contains(&format!("current {first_snapshot}")));
+
+    let restored_status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    assert!(restored_status.contains(&format!("current {first_snapshot}")));
+    assert!(!restored_status.contains(&format!("current {second_snapshot}")));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "one\n"
+    );
+
+    let op_log_after_restore = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(op_log_after_restore.contains("op-restore"));
+    assert!(op_log_after_restore.contains(&second_snapshot));
+}
+
+#[test]
 fn lifecycle_policy_uses_tiering_config_rules() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
@@ -4169,6 +4281,7 @@ fn missing_root_is_not_snapshotted_as_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
 
@@ -4208,6 +4321,19 @@ fn missing_root_is_not_snapshotted_as_deletion() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("sample\tmissing"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "alpha\n"
+    );
 }
 
 #[test]
@@ -4434,6 +4560,7 @@ fn require_mount_root_is_skipped_as_unmounted_without_mass_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
 
@@ -4449,7 +4576,21 @@ fn require_mount_root_is_skipped_as_unmounted_without_mass_deletion() {
             .arg("root")
             .arg("add")
             .arg("sample")
-            .arg(&source)
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
             .arg("--require-mount");
         c
     });
@@ -4471,6 +4612,19 @@ fn require_mount_root_is_skipped_as_unmounted_without_mass_deletion() {
         c
     });
     assert!(ops.contains("root-unmounted"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "alpha\n"
+    );
 }
 
 #[cfg(unix)]
@@ -4480,6 +4634,7 @@ fn permission_denied_root_is_skipped_without_mass_deletion() {
     let source = tmp.path().join("source");
     let blocked = source.join("blocked");
     let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
     fs::create_dir_all(&blocked).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
     fs::write(blocked.join("secret.txt"), b"secret\n").unwrap();
@@ -4497,6 +4652,11 @@ fn permission_denied_root_is_skipped_without_mass_deletion() {
             .arg("add")
             .arg("sample")
             .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
         c
     });
     let original_mode = fs::metadata(&blocked).unwrap().permissions().mode();
@@ -4524,6 +4684,19 @@ fn permission_denied_root_is_skipped_without_mass_deletion() {
         c
     });
     assert!(ops.contains("root-permission-denied"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "alpha\n"
+    );
 }
 
 #[test]

@@ -1365,6 +1365,14 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 "root-skipped",
                 &format!("{} status={}", root.id, root.status),
             )?;
+            if root.status != "deleted" {
+                carry_forward_root_snapshot(
+                    parent_manifest.as_ref(),
+                    &root.id,
+                    &mut root_trees,
+                    &mut by_root,
+                );
+            }
             continue;
         }
         if !root.path.exists() {
@@ -1383,6 +1391,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 "root-missing",
                 &format!("{} {}", root.id, root.path.display()),
             )?;
+            carry_forward_root_snapshot(
+                parent_manifest.as_ref(),
+                &root.id,
+                &mut root_trees,
+                &mut by_root,
+            );
             continue;
         }
         if root.require_mount && !is_mount_point(&root.path) {
@@ -1405,6 +1419,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 "root-unmounted",
                 &format!("{} {}", root.id, root.path.display()),
             )?;
+            carry_forward_root_snapshot(
+                parent_manifest.as_ref(),
+                &root.id,
+                &mut root_trees,
+                &mut by_root,
+            );
             continue;
         }
         if let Err(err) = run_pre_snapshot_hook(paths, &root) {
@@ -1443,6 +1463,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                     "root-permission-denied",
                     &format!("{} {}", root.id, root.path.display()),
                 )?;
+                carry_forward_root_snapshot(
+                    parent_manifest.as_ref(),
+                    &root.id,
+                    &mut root_trees,
+                    &mut by_root,
+                );
                 continue;
             }
             Err(err) => {
@@ -6482,6 +6508,23 @@ fn snapshot_file_map(snapshot: &SnapshotManifest) -> Result<BTreeMap<String, &Fi
         }
     }
     Ok(out)
+}
+
+fn carry_forward_root_snapshot(
+    parent: Option<&SnapshotManifest>,
+    root_id: &str,
+    root_trees: &mut BTreeMap<String, RootSnapshot>,
+    by_root: &mut BTreeMap<String, Vec<FileRecord>>,
+) {
+    let Some(parent) = parent else {
+        return;
+    };
+    if let Some(root_tree) = parent.root_trees.get(root_id) {
+        root_trees.insert(root_id.to_string(), root_tree.clone());
+    }
+    if let Some(records) = parent.roots.get(root_id) {
+        by_root.insert(root_id.to_string(), records.clone());
+    }
 }
 
 fn record_op(
