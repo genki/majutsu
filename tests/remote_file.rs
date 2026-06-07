@@ -7673,6 +7673,69 @@ fn large_verify_checks_referenced_chunks() {
 }
 
 #[test]
+fn large_stat_reports_objects_chunks_bytes_and_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    let mut payload = vec![5u8; 32 * 1024];
+    payload.extend(vec![7u8; 32 * 1024]);
+    fs::write(source.join("payload.bin"), payload).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 32768");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("large_objects 1"));
+    assert!(stat.contains("logical_bytes 65536"));
+    assert!(stat.contains("chunks 2"));
+    assert!(stat.contains("pinned 0"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
+    let pinned = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(pinned.contains("large_objects 1"));
+    assert!(pinned.contains("logical_bytes 65536"));
+    assert!(pinned.contains("chunks 2"));
+    assert!(pinned.contains("pinned 1"));
+}
+
+#[test]
 fn large_files_can_use_content_defined_chunking() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
