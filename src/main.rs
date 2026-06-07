@@ -47,9 +47,12 @@ use majutsu_store::{
     RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport, RemoteGcMarkIssue,
     RemoteGcTombstone as GcTombstoneExport, RemoteGcTombstoneIssue, RemoteHostIndex,
     RemoteHostIndexIssue, RemoteHostSummary, RemoteObjectAvailabilityIssue, archive_restore_status,
-    canonical_remote_alias, canonical_remote_aliases, is_content_addressed_remote_key,
-    remote_gc_mark_key, remote_gc_tombstone_key, remote_gc_tombstone_prefix,
-    remote_object_availability_issues, select_remote_host,
+    canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
+    host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
+    host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
+    host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
+    is_content_addressed_remote_key, remote_gc_mark_key, remote_gc_tombstone_key,
+    remote_gc_tombstone_prefix, remote_object_availability_issues, select_remote_host,
 };
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -2599,12 +2602,8 @@ fn enqueue_and_drain_sync(
         "metadata/export.json",
         serde_json::to_vec_pretty(&export)?,
     )?;
-    let host_metadata_key = format!("hosts/{}/metadata/export.json", config.host.id);
-    enqueue_inline_upload(
-        paths,
-        &host_metadata_key,
-        serde_json::to_vec_pretty(&export)?,
-    )?;
+    let host_metadata = host_metadata_key(&config.host.id);
+    enqueue_inline_upload(paths, &host_metadata, serde_json::to_vec_pretty(&export)?)?;
     for snapshot in &export.snapshots {
         enqueue_inline_upload(
             paths,
@@ -2653,23 +2652,23 @@ fn enqueue_and_drain_sync(
         enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
         enqueue_inline_upload(
             paths,
-            &format!("hosts/{}/current", config.host.id),
+            &host_legacy_current_key(&config.host.id),
             current.as_bytes().to_vec(),
         )?;
         enqueue_inline_upload(
             paths,
-            &format!("hosts/{}/refs/current", config.host.id),
+            &host_current_ref_key(&config.host.id),
             current.as_bytes().to_vec(),
         )?;
     }
     if let Some(last_synced) = export.refs.get("last-synced") {
         enqueue_inline_upload(
             paths,
-            &format!("hosts/{}/refs/last-synced", config.host.id),
+            &host_last_synced_ref_key(&config.host.id),
             last_synced.as_bytes().to_vec(),
         )?;
     }
-    let host_index = update_remote_host_index(&remote, &config, &export, &host_metadata_key)?;
+    let host_index = update_remote_host_index(&remote, &config, &export, &host_metadata)?;
     enqueue_inline_upload(
         paths,
         REMOTE_HOST_INDEX_KEY,
@@ -2759,18 +2758,13 @@ fn persist_export_remote_refs(
     refs: &BTreeMap<String, String>,
 ) -> Result<()> {
     if let Some(current) = refs.get("current") {
-        set_remote_ref_value(
-            conn,
-            remote,
-            &format!("hosts/{host_id}/refs/current"),
-            current,
-        )?;
+        set_remote_ref_value(conn, remote, &host_current_ref_key(host_id), current)?;
     }
     if let Some(last_synced) = refs.get("last-synced") {
         set_remote_ref_value(
             conn,
             remote,
-            &format!("hosts/{host_id}/refs/last-synced"),
+            &host_last_synced_ref_key(host_id),
             last_synced,
         )?;
     }
@@ -2786,8 +2780,8 @@ fn delete_operation(conn: &Connection, id: &str) -> Result<()> {
 fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {
     let local_current = current_snapshot(conn)?;
     let config = read_config(paths)?;
-    let canonical_current = format!("hosts/{}/refs/current", config.host.id);
-    let canonical_last_synced = format!("hosts/{}/refs/last-synced", config.host.id);
+    let canonical_current = host_current_ref_key(&config.host.id);
+    let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
     let mut remote_current = remote_ref(remote, &canonical_current)?;
     if remote_current.is_none() {
         remote_current = remote_ref(remote, "hosts/current")?;
@@ -2833,30 +2827,6 @@ fn remote_ref(remote: &RemoteStore, key: &str) -> Result<Option<String>> {
         ));
     }
     Ok(None)
-}
-
-fn host_snapshot_key(host_id: &str, snapshot_id: &str) -> String {
-    format!("hosts/{host_id}/snapshots/{snapshot_id}.json")
-}
-
-fn host_snapshot_canonical_key(host_id: &str, snapshot_id: &str) -> String {
-    format!("hosts/{host_id}/snapshots/{snapshot_id}.cbor.zst.enc")
-}
-
-fn host_operation_key(host_id: &str, op_id: &str) -> String {
-    format!("hosts/{host_id}/ops/{op_id}.json")
-}
-
-fn host_operation_canonical_key(host_id: &str, op_id: &str) -> String {
-    format!("hosts/{host_id}/ops/{op_id}.cbor.zst.enc")
-}
-
-fn host_oplog_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/ops/local-oplog.cborl")
-}
-
-fn host_oplog_canonical_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/ops/local-oplog.cborl.zst.enc")
 }
 
 fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Result<Vec<u8>> {
@@ -2994,7 +2964,7 @@ fn prune_remote_host_exports(
     live_ops.insert(host_oplog_key(host_id));
     live_ops.insert(host_oplog_canonical_key(host_id));
     let mut removed = 0usize;
-    for key in remote.list(&format!("hosts/{host_id}/snapshots/"))? {
+    for key in remote.list(&host_snapshots_prefix(host_id))? {
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc"))
             && !live_snapshots.contains(&key)
         {
@@ -3003,7 +2973,7 @@ fn prune_remote_host_exports(
             removed += 1;
         }
     }
-    for key in remote.list(&format!("hosts/{host_id}/ops/"))? {
+    for key in remote.list(&host_ops_prefix(host_id))? {
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc")) && !live_ops.contains(&key) {
             write_remote_gc_tombstone(remote, host_id, &key)?;
             remote.delete(&key)?;
@@ -5370,7 +5340,7 @@ fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                     host.id
                 );
             }
-            let current_ref_key = format!("hosts/{}/refs/current", host.id);
+            let current_ref_key = host_current_ref_key(&host.id);
             if let Some(current) = current {
                 match remote_ref(remote, &current_ref_key)? {
                     Some(remote_current) if remote_current == *current => {}
@@ -5385,7 +5355,7 @@ fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                         eprintln!("missing remote ref {current_ref_key}");
                     }
                 }
-                let legacy_current_key = format!("hosts/{}/current", host.id);
+                let legacy_current_key = host_legacy_current_key(&host.id);
                 if let Some(legacy_current) = remote_ref(remote, &legacy_current_key)? {
                     if legacy_current != *current {
                         missing += 1;
@@ -5412,7 +5382,7 @@ fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                         eprintln!("invalid metadata last-synced for {}: {err}", host.id);
                     }
                 }
-                let last_synced_ref_key = format!("hosts/{}/refs/last-synced", host.id);
+                let last_synced_ref_key = host_last_synced_ref_key(&host.id);
                 match remote_ref(remote, &last_synced_ref_key)? {
                     Some(remote_last_synced) if remote_last_synced == *last_synced => {}
                     Some(remote_last_synced) => {

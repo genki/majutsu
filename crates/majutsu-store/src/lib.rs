@@ -69,6 +69,58 @@ pub fn remote_gc_tombstone_key(host_id: &str, tombstone_id: &str) -> String {
     format!("{}{tombstone_id}.json", remote_gc_tombstone_prefix(host_id))
 }
 
+pub fn host_metadata_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/metadata/export.json")
+}
+
+pub fn host_legacy_current_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/current")
+}
+
+pub fn host_ref_key(host_id: &str, name: &str) -> String {
+    format!("hosts/{host_id}/refs/{name}")
+}
+
+pub fn host_current_ref_key(host_id: &str) -> String {
+    host_ref_key(host_id, "current")
+}
+
+pub fn host_last_synced_ref_key(host_id: &str) -> String {
+    host_ref_key(host_id, "last-synced")
+}
+
+pub fn host_snapshot_key(host_id: &str, snapshot_id: &str) -> String {
+    format!("hosts/{host_id}/snapshots/{snapshot_id}.json")
+}
+
+pub fn host_snapshots_prefix(host_id: &str) -> String {
+    format!("hosts/{host_id}/snapshots/")
+}
+
+pub fn host_snapshot_canonical_key(host_id: &str, snapshot_id: &str) -> String {
+    format!("hosts/{host_id}/snapshots/{snapshot_id}.cbor.zst.enc")
+}
+
+pub fn host_operation_key(host_id: &str, op_id: &str) -> String {
+    format!("hosts/{host_id}/ops/{op_id}.json")
+}
+
+pub fn host_ops_prefix(host_id: &str) -> String {
+    format!("hosts/{host_id}/ops/")
+}
+
+pub fn host_operation_canonical_key(host_id: &str, op_id: &str) -> String {
+    format!("hosts/{host_id}/ops/{op_id}.cbor.zst.enc")
+}
+
+pub fn host_oplog_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/ops/local-oplog.cborl")
+}
+
+pub fn host_oplog_canonical_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/ops/local-oplog.cborl.zst.enc")
+}
+
 pub fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
     match status {
         200 | 202 | 204 | 409 => Ok(true),
@@ -536,6 +588,46 @@ mod tests {
             "large/chunks/fixed-8m/chunk-1.chunk.enc"
         ));
         assert!(!is_content_addressed_remote_key("queue/uploads/item.json"));
+    }
+
+    #[test]
+    fn host_scoped_remote_keys_are_stable() {
+        assert_eq!(
+            host_metadata_key("host-a"),
+            "hosts/host-a/metadata/export.json"
+        );
+        assert_eq!(host_legacy_current_key("host-a"), "hosts/host-a/current");
+        assert_eq!(host_current_ref_key("host-a"), "hosts/host-a/refs/current");
+        assert_eq!(
+            host_last_synced_ref_key("host-a"),
+            "hosts/host-a/refs/last-synced"
+        );
+        assert_eq!(
+            host_snapshot_key("host-a", "snap-1"),
+            "hosts/host-a/snapshots/snap-1.json"
+        );
+        assert_eq!(host_snapshots_prefix("host-a"), "hosts/host-a/snapshots/");
+        assert_eq!(
+            host_snapshot_canonical_key("host-a", "snap-1"),
+            "hosts/host-a/snapshots/snap-1.cbor.zst.enc"
+        );
+        assert_eq!(
+            host_operation_key("host-a", "op-1"),
+            "hosts/host-a/ops/op-1.json"
+        );
+        assert_eq!(host_ops_prefix("host-a"), "hosts/host-a/ops/");
+        assert_eq!(
+            host_operation_canonical_key("host-a", "op-1"),
+            "hosts/host-a/ops/op-1.cbor.zst.enc"
+        );
+        assert_eq!(
+            host_oplog_key("host-a"),
+            "hosts/host-a/ops/local-oplog.cborl"
+        );
+        assert_eq!(
+            host_oplog_canonical_key("host-a"),
+            "hosts/host-a/ops/local-oplog.cborl.zst.enc"
+        );
     }
 
     #[test]
