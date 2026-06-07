@@ -65,25 +65,62 @@ pub struct Operation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum OperationStatus {
+    #[serde(alias = "Done")]
     #[default]
     Done,
+    #[serde(alias = "Running")]
     Running,
+    #[serde(alias = "Failed")]
     Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum OperationKind {
+    Init,
+    #[serde(alias = "InitialScan")]
     InitialScan,
+    #[serde(alias = "FileEventsBatch")]
     FileEventsBatch,
+    #[serde(alias = "ManualSnapshot")]
     ManualSnapshot,
+    #[serde(alias = "ConfigChange")]
     ConfigChange,
+    #[serde(alias = "RootAdded")]
     RootAdded,
+    RootPaused,
+    RootResumed,
+    #[serde(rename = "root-mark-deleted")]
+    RootMarkedDeleted,
+    RootMissing,
+    RootUnmounted,
+    RootPermissionDenied,
+    #[serde(alias = "RootRemoved")]
     RootRemoved,
+    OpRestore,
+    #[serde(alias = "Restore")]
     Restore,
+    RestorePrepare,
+    RestoreResume,
+    Mount,
+    MountFuse,
+    Unmount,
+    UnmountFuse,
+    Hydrate,
+    LargePin,
+    LargeUnpin,
+    #[serde(alias = "RemoteSync")]
     RemoteSync,
+    Pack,
+    PackCompact,
+    #[serde(alias = "Prune")]
     Prune,
+    Gc,
+    #[serde(alias = "KeyRotation")]
     KeyRotation,
+    #[serde(alias = "Fsck")]
     Fsck,
 }
 
@@ -312,6 +349,75 @@ mod tests {
         assert_eq!(op.actor, "local");
         assert_eq!(op.status, OperationStatus::Done);
         assert_eq!(op.timestamp, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn operation_model_accepts_current_cli_kinds_and_statuses() {
+        let json = r#"{
+            "id": "op-2",
+            "parent": "op-1",
+            "kind": "root-mark-deleted",
+            "timestamp": "2026-06-07T00:00:00Z",
+            "actor": "user@host",
+            "status": "failed",
+            "before_snapshot": "snap-1",
+            "after_snapshot": "snap-1",
+            "message": "sample"
+        }"#;
+
+        let op: Operation = serde_json::from_str(json).unwrap();
+
+        assert_eq!(op.kind, OperationKind::RootMarkedDeleted);
+        assert_eq!(op.status, OperationStatus::Failed);
+        assert_eq!(
+            serde_json::to_value(OperationKind::RootMarkedDeleted).unwrap(),
+            "root-mark-deleted"
+        );
+        assert_eq!(
+            serde_json::to_value(OperationKind::RemoteSync).unwrap(),
+            "remote-sync"
+        );
+        assert_eq!(
+            serde_json::to_value(OperationKind::OpRestore).unwrap(),
+            "op-restore"
+        );
+        assert_eq!(serde_json::to_value(OperationStatus::Done).unwrap(), "done");
+
+        for kind in [
+            "init",
+            "root-added",
+            "config-change",
+            "root-removed",
+            "root-paused",
+            "root-resumed",
+            "root-mark-deleted",
+            "root-missing",
+            "root-unmounted",
+            "root-permission-denied",
+            "manual-snapshot",
+            "file-events-batch",
+            "op-restore",
+            "restore",
+            "restore-prepare",
+            "restore-resume",
+            "mount",
+            "mount-fuse",
+            "unmount",
+            "unmount-fuse",
+            "hydrate",
+            "large-pin",
+            "large-unpin",
+            "remote-sync",
+            "key-rotation",
+            "pack",
+            "pack-compact",
+            "prune",
+            "gc",
+            "fsck",
+        ] {
+            serde_json::from_value::<OperationKind>(serde_json::Value::String(kind.into()))
+                .unwrap_or_else(|err| panic!("operation kind {kind} should deserialize: {err}"));
+        }
     }
 
     #[test]
