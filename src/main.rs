@@ -2242,8 +2242,9 @@ impl MajutsuFuseFs {
             return Ok(Vec::new());
         }
         let end = (start + size as u64).min(record.size);
-        if let Some((_, object_key)) = payload_blob_ref(&record.payload) {
-            let data = read_object(&self.paths, object_key)?;
+        if let Some((oid, object_key)) = payload_blob_ref(&record.payload) {
+            let conn = open_db(&self.paths)?;
+            let data = read_blob_payload(&self.paths, &conn, oid, object_key)?;
             Ok(data[start as usize..end as usize].to_vec())
         } else if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
             let manifest: LargeManifest =
@@ -9313,6 +9314,50 @@ mod tests {
         assert!(remote.put_if_absent("objects/test", b"first").unwrap());
         assert!(!remote.put_if_absent("objects/test", b"second").unwrap());
         assert_eq!(remote.get("objects/test").unwrap(), b"first");
+    }
+
+    #[test]
+    fn fuse_read_file_can_read_packed_blob_without_loose_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        init(
+            &paths,
+            InitArgs {
+                remote: None,
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let payload = b"alpha packed payload\n";
+        let oid = blake3_hex(payload);
+        let object_key = store_bytes(&paths, &paths.objects, &oid, payload).unwrap();
+        let conn = open_db(&paths).unwrap();
+        conn.execute(
+            "insert into blobs(oid, size, object_key) values (?1, ?2, ?3)",
+            params![oid, payload.len() as u64, object_key],
+        )
+        .unwrap();
+        drop(conn);
+        pack_cmd(&paths, PackArgs { compact: false }).unwrap();
+        fs::remove_file(paths.home.join(&object_key)).unwrap();
+
+        let fs = MajutsuFuseFs {
+            paths,
+            nodes: BTreeMap::new(),
+        };
+        let record = FileRecord {
+            root_id: "sample".into(),
+            path: "alpha.txt".into(),
+            kind: "file".into(),
+            size: payload.len() as u64,
+            mode: 0o100644,
+            modified: None,
+            xattrs: BTreeMap::new(),
+            payload: Payload::NormalBlob { oid, object_key },
+        };
+
+        assert_eq!(fs.read_file(&record, 6, 6).unwrap(), b"packed".to_vec());
     }
 
     #[cfg(unix)]
