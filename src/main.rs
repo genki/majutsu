@@ -8488,7 +8488,7 @@ impl S3Remote {
 
     fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<()> {
         let remote_key = self.remote_key(key);
-        let upload_id = self.initiate_multipart(&remote_key)?;
+        let upload_id = self.initiate_multipart(key, &remote_key)?;
         let result = (|| {
             let mut parts = self.upload_multipart_parts(&remote_key, &upload_id, bytes)?;
             parts.sort_by_key(|part| part.part_number);
@@ -8542,10 +8542,14 @@ impl S3Remote {
         Ok(parts)
     }
 
-    fn initiate_multipart(&self, remote_key: &str) -> Result<String> {
+    fn multipart_initiate_headers(&self, key: &str) -> Result<Vec<(String, String)>> {
+        self.put_object_headers(key)
+    }
+
+    fn initiate_multipart(&self, key: &str, remote_key: &str) -> Result<String> {
         let query = "uploads=".to_string();
         let payload_hash = sha256_hex(b"");
-        let extra_headers = self.put_object_headers(remote_key)?;
+        let extra_headers = self.multipart_initiate_headers(key)?;
         let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &extra_headers)?;
         let mut request = self
             .client
@@ -9263,6 +9267,21 @@ mod tests {
         assert!(!remote.should_use_multipart(DEFAULT_MULTIPART_THRESHOLD));
         remote.multipart_enabled = true;
         assert!(remote.should_use_multipart(DEFAULT_MULTIPART_THRESHOLD));
+    }
+
+    #[test]
+    fn s3_multipart_initiate_headers_use_local_object_class() {
+        let remote = test_s3_remote();
+        let remote_key = remote.remote_key("large/chunks/fixed-8m/chunk-1");
+        assert_eq!(s3_object_class(&remote_key), "object");
+
+        let headers = remote
+            .multipart_initiate_headers("large/chunks/fixed-8m/chunk-1")
+            .unwrap();
+        assert!(headers.contains(&(
+            "x-amz-tagging".to_string(),
+            "majutsu-class=large&purpose=backup%20data".to_string()
+        )));
     }
 
     #[test]
