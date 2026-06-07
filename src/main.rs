@@ -26,8 +26,7 @@ use majutsu_pack::{
 };
 use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use majutsu_restore::{
-    RestoreChangeStats, RestorePathState, RestoreQueueItem, classify_restore_object_availability,
-    count_restore_changes, validate_relative_filter_path,
+    RestoreQueueItem, classify_restore_object_availability, validate_relative_filter_path,
 };
 use majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
@@ -126,9 +125,8 @@ use restore_apply::{
 use restore_runtime::{
     RestoreDelete, RestorePlan, apply_restore_plan, ensure_restore_job_has_no_missing_objects,
     ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
-    print_restore_conflicts, read_restore_job, required_object_keys_for_plan, restore_conflicts,
-    restore_destination, restore_object_stats, restore_record_matches_path, restore_root_base,
-    restore_target_label, write_restore_job,
+    print_restore_conflicts, print_restore_plan, read_restore_job, required_object_keys_for_plan,
+    restore_conflicts, restore_root_base, restore_target_label, write_restore_job,
 };
 use root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_config_roots, sync_roots_to_config,
@@ -4039,63 +4037,6 @@ fn build_restore_deletes(
             .then_with(|| a.path.cmp(&b.path))
     });
     Ok(deletes)
-}
-
-fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<()> {
-    let large = plan
-        .files
-        .iter()
-        .filter(|r| payload_large_ref(&r.payload).is_some())
-        .count();
-    let bytes: u64 = plan.files.iter().map(|r| r.size).sum();
-    let changes = restore_change_stats(paths, conn, plan)?;
-    println!("snapshot {}", plan.snapshot.snapshot_id);
-    if let Some(to) = &plan.to {
-        println!("target {}", to.display());
-    } else {
-        println!("target original-roots");
-    }
-    println!(
-        "restore {} files, {} bytes, {} large files",
-        plan.files.len(),
-        bytes,
-        large
-    );
-    println!("delete {} files", plan.deletes.len());
-    println!("restore_files {}", changes.restore_files);
-    println!("modify_files {}", changes.modify_files);
-    println!("keep_files {}", changes.keep_files);
-    println!("delete_files {}", changes.delete_files);
-    let stats = restore_object_stats(paths, conn, plan)?;
-    println!("large_files {large}");
-    println!("required_objects {}", stats.required_objects);
-    println!("required_chunks {}", stats.required_chunks);
-    println!("local_objects {}", stats.local_objects);
-    println!("remote_objects {}", stats.remote_objects);
-    println!("archived_objects {}", stats.archived_objects);
-    println!("missing_objects {}", stats.missing_objects);
-    println!(
-        "archive_or_missing_objects {}",
-        stats.archive_or_missing_objects
-    );
-    Ok(())
-}
-
-fn restore_change_stats(
-    paths: &Paths,
-    conn: &Connection,
-    plan: &RestorePlan,
-) -> Result<RestoreChangeStats> {
-    count_restore_changes(&plan.files, plan.deletes.len(), |record| {
-        let dest = restore_destination(plan, record)?;
-        if !dest.try_exists()? {
-            Ok(RestorePathState::Missing)
-        } else if restore_record_matches_path(paths, conn, record, &dest).unwrap_or(false) {
-            Ok(RestorePathState::Matches)
-        } else {
-            Ok(RestorePathState::Differs)
-        }
-    })
 }
 
 fn build_restore_job(

@@ -3,7 +3,9 @@ use majutsu_core::{
     FileRecord, LargeManifest, Payload, SnapshotManifest, payload_blob_ref, payload_large_ref,
 };
 use majutsu_pack::PackExport;
-use majutsu_restore::RestoreQueueItem;
+use majutsu_restore::{
+    RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -191,6 +193,67 @@ pub(crate) fn print_restore_deletes(plan: &RestorePlan) {
     if plan.deletes.len() > 20 {
         println!("delete\t... {} more", plan.deletes.len() - 20);
     }
+}
+
+pub(crate) fn print_restore_plan(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+) -> Result<()> {
+    let large = plan
+        .files
+        .iter()
+        .filter(|r| payload_large_ref(&r.payload).is_some())
+        .count();
+    let bytes: u64 = plan.files.iter().map(|r| r.size).sum();
+    let changes = restore_change_stats(paths, conn, plan)?;
+    println!("snapshot {}", plan.snapshot.snapshot_id);
+    if let Some(to) = &plan.to {
+        println!("target {}", to.display());
+    } else {
+        println!("target original-roots");
+    }
+    println!(
+        "restore {} files, {} bytes, {} large files",
+        plan.files.len(),
+        bytes,
+        large
+    );
+    println!("delete {} files", plan.deletes.len());
+    println!("restore_files {}", changes.restore_files);
+    println!("modify_files {}", changes.modify_files);
+    println!("keep_files {}", changes.keep_files);
+    println!("delete_files {}", changes.delete_files);
+    let stats = restore_object_stats(paths, conn, plan)?;
+    println!("large_files {large}");
+    println!("required_objects {}", stats.required_objects);
+    println!("required_chunks {}", stats.required_chunks);
+    println!("local_objects {}", stats.local_objects);
+    println!("remote_objects {}", stats.remote_objects);
+    println!("archived_objects {}", stats.archived_objects);
+    println!("missing_objects {}", stats.missing_objects);
+    println!(
+        "archive_or_missing_objects {}",
+        stats.archive_or_missing_objects
+    );
+    Ok(())
+}
+
+fn restore_change_stats(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+) -> Result<RestoreChangeStats> {
+    count_restore_changes(&plan.files, plan.deletes.len(), |record| {
+        let dest = restore_destination(plan, record)?;
+        if !dest.try_exists()? {
+            Ok(RestorePathState::Missing)
+        } else if restore_record_matches_path(paths, conn, record, &dest).unwrap_or(false) {
+            Ok(RestorePathState::Matches)
+        } else {
+            Ok(RestorePathState::Differs)
+        }
+    })
 }
 
 pub(crate) fn restore_object_stats(
