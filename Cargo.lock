@@ -1495,8 +1495,10 @@ dependencies = [
 name = "majutsu-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "serde",
+ "serde_cbor",
  "serde_json",
 ]
 

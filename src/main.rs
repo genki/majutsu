@@ -11,8 +11,10 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
-    FileRecord, LargeChunk, LargeManifest, Payload, RootSnapshot, SnapshotManifest, TreeManifest,
-    payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
+    FileRecord, LargeChunk, LargeManifest, OperationLogEntry as OperationExport, Payload,
+    RootSnapshot, SnapshotManifest, TreeManifest, decode_operation_log, encode_operation_log,
+    operation_log_entry_matches, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
+    payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -693,19 +695,6 @@ struct SnapshotExport {
     created_at: String,
     manifest_key: String,
     manifest_json: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct OperationExport {
-    id: String,
-    parent_op: Option<String>,
-    kind: String,
-    actor: String,
-    status: String,
-    before_snapshot: Option<String>,
-    after_snapshot: Option<String>,
-    created_at: String,
-    message: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2978,14 +2967,6 @@ fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(
     let compressed = decode_object(paths, bytes)?;
     let cbor = zstd::stream::decode_all(compressed.as_slice())?;
     Ok(serde_cbor::from_slice(&cbor)?)
-}
-
-fn encode_operation_log(operations: &[OperationExport]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    for operation in operations {
-        bytes.extend(serde_cbor::to_vec(operation)?);
-    }
-    Ok(bytes)
 }
 
 fn encode_canonical_remote_oplog(paths: &Paths, operations: &[OperationExport]) -> Result<Vec<u8>> {
@@ -5371,7 +5352,7 @@ fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
         return Ok(());
     }
     for (index, (local, metadata)) in actual.iter().zip(expected.iter()).enumerate() {
-        if !operation_export_matches(local, metadata) {
+        if !operation_log_entry_matches(local, metadata) {
             *missing += 1;
             eprintln!(
                 "local operation log entry does not match metadata {} index={index}",
@@ -5380,17 +5361,6 @@ fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn decode_operation_log(bytes: &[u8]) -> Result<Vec<OperationExport>> {
-    let mut operations = Vec::new();
-    let mut stream = serde_cbor::de::Deserializer::from_slice(bytes).into_iter::<OperationExport>();
-    while let Some(record) = stream.next() {
-        let offset = stream.byte_offset();
-        let operation = record.with_context(|| format!("decode CBOR stream at byte {offset}"))?;
-        operations.push(operation);
-    }
-    Ok(operations)
 }
 
 fn validate_local_snapshot_objects(
@@ -5979,7 +5949,7 @@ fn remote_fsck_export(
             } else {
                 let remote_operation: OperationExport = serde_json::from_slice(&remote.get(&key)?)
                     .with_context(|| format!("parse remote operation export {key}"))?;
-                if !operation_export_matches(&remote_operation, operation) {
+                if !operation_log_entry_matches(&remote_operation, operation) {
                     *missing += 1;
                     eprintln!("host operation export does not match metadata {key}");
                 }
@@ -5991,7 +5961,7 @@ fn remote_fsck_export(
                         .with_context(|| {
                             format!("parse remote operation export {canonical_key}")
                         })?;
-                if !operation_export_matches(&remote_operation, operation) {
+                if !operation_log_entry_matches(&remote_operation, operation) {
                     *missing += 1;
                     eprintln!("host operation export does not match metadata {canonical_key}");
                 }
@@ -6098,7 +6068,7 @@ fn validate_remote_oplog_entries(
         return;
     }
     for (index, (remote, metadata)) in actual.iter().zip(expected.iter()).enumerate() {
-        if !operation_export_matches(remote, metadata) {
+        if !operation_log_entry_matches(remote, metadata) {
             *missing += 1;
             eprintln!(
                 "remote operation log entry does not match metadata {key} {} index={index}",
@@ -6421,18 +6391,6 @@ fn snapshot_export_matches(remote: &SnapshotExport, metadata: &SnapshotExport) -
         && remote.created_at == metadata.created_at
         && remote.manifest_key == metadata.manifest_key
         && remote.manifest_json == metadata.manifest_json
-}
-
-fn operation_export_matches(remote: &OperationExport, metadata: &OperationExport) -> bool {
-    remote.id == metadata.id
-        && remote.parent_op == metadata.parent_op
-        && remote.kind == metadata.kind
-        && remote.actor == metadata.actor
-        && remote.status == metadata.status
-        && remote.before_snapshot == metadata.before_snapshot
-        && remote.after_snapshot == metadata.after_snapshot
-        && remote.created_at == metadata.created_at
-        && remote.message == metadata.message
 }
 
 fn snapshot_manifest_matches(remote: &SnapshotManifest, metadata: &SnapshotManifest) -> bool {

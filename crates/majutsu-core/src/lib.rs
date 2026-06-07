@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -151,6 +152,46 @@ pub enum OperationKind {
     KeyRotation,
     #[serde(alias = "Fsck")]
     Fsck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationLogEntry {
+    pub id: String,
+    pub parent_op: Option<String>,
+    pub kind: String,
+    pub actor: String,
+    pub status: String,
+    pub before_snapshot: Option<String>,
+    pub after_snapshot: Option<String>,
+    pub created_at: String,
+    pub message: Option<String>,
+}
+
+pub fn encode_operation_log(operations: &[OperationLogEntry]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for operation in operations {
+        bytes.extend(serde_cbor::to_vec(operation)?);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_operation_log(bytes: &[u8]) -> Result<Vec<OperationLogEntry>> {
+    let mut operations = Vec::new();
+    let mut stream =
+        serde_cbor::de::Deserializer::from_slice(bytes).into_iter::<OperationLogEntry>();
+    while let Some(record) = stream.next() {
+        let offset = stream.byte_offset();
+        let operation = record.with_context(|| format!("decode CBOR stream at byte {offset}"))?;
+        operations.push(operation);
+    }
+    Ok(operations)
+}
+
+pub fn operation_log_entry_matches(
+    actual: &OperationLogEntry,
+    expected: &OperationLogEntry,
+) -> bool {
+    actual == expected
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -548,6 +589,40 @@ mod tests {
             serde_json::from_value::<OperationKind>(serde_json::Value::String(kind.into()))
                 .unwrap_or_else(|err| panic!("operation kind {kind} should deserialize: {err}"));
         }
+    }
+
+    #[test]
+    fn operation_log_entries_round_trip_cbor_streams() {
+        let operations = vec![
+            OperationLogEntry {
+                id: "op-1".into(),
+                parent_op: None,
+                kind: "init".into(),
+                actor: "alice@host".into(),
+                status: "done".into(),
+                before_snapshot: None,
+                after_snapshot: Some("snap-1".into()),
+                created_at: "2026-06-07T00:00:00Z".into(),
+                message: Some("initialized".into()),
+            },
+            OperationLogEntry {
+                id: "op-2".into(),
+                parent_op: Some("op-1".into()),
+                kind: "manual-snapshot".into(),
+                actor: "alice@host".into(),
+                status: "failed".into(),
+                before_snapshot: Some("snap-1".into()),
+                after_snapshot: None,
+                created_at: "2026-06-07T00:01:00Z".into(),
+                message: Some("snapshot failed".into()),
+            },
+        ];
+
+        let encoded = encode_operation_log(&operations).unwrap();
+        let decoded = decode_operation_log(&encoded).unwrap();
+
+        assert_eq!(decoded, operations);
+        assert!(operation_log_entry_matches(&decoded[0], &operations[0]));
     }
 
     #[test]
