@@ -621,7 +621,7 @@ mj restore resume restore-job-id
 
 Prepared jobs are stored under `$MAJUTSU_HOME/queue/restores`. Resume applies
 the prepared snapshot and target once no required objects are pending archive
-hydration.
+hydration. Completed jobs are marked `done` and cannot be resumed again.
 
 Restored regular and large files preserve stored Unix mode bits, extended
 attributes, and modified time. Symlink metadata is left unchanged so restore

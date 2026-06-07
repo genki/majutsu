@@ -1862,6 +1862,7 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
         }
         RestoreCommand::Resume { job_id } => {
             let mut job = read_restore_job(paths, &job_id)?;
+            ensure_restore_job_resumable(&job)?;
             if !job.missing_objects.is_empty() {
                 bail!(
                     "restore job {} has missing objects: {}",
@@ -5320,6 +5321,13 @@ fn read_restore_job(paths: &Paths, job_id: &str) -> Result<RestoreQueueItem> {
         .join("queue/restores")
         .join(format!("{job_id}.json"));
     Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn ensure_restore_job_resumable(job: &RestoreQueueItem) -> Result<()> {
+    match job.status.as_str() {
+        "prepared" | "ready" | "archive-requested" => Ok(()),
+        other => bail!("restore job {} is not resumable: status {other}", job.id),
+    }
 }
 
 fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {

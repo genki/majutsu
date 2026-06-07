@@ -3720,6 +3720,16 @@ fn restore_prepare_resume_preserves_root_path_and_target_filters() {
     );
     assert!(!restore.join("docs/skip.txt").exists());
     assert!(!restore.join("photos/photo.txt").exists());
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id);
+        c
+    });
 }
 
 #[test]
