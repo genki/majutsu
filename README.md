@@ -30,7 +30,7 @@ large object handling.
 - Safe `prune --dry-run` and local loose-object `gc`
 - Persistent upload queue with retry on the next `mj sync`
 - Event journal records for snapshot/watch/root availability observations
-- Optional ChaCha20-Poly1305 object encryption
+- Optional age object encryption with legacy ChaCha20-Poly1305 compatibility
 - Master key export/import for remote disaster recovery
 - Root snapshot modes: `default`, `strict`, and `transactional`
 - Transactional pre/post snapshot hooks
@@ -369,8 +369,9 @@ mj key rotate --new-key <64-hex-key>
 mj sync
 ```
 
-Rotation currently supports unpacked encrypted objects. Run it before packing
-normal blobs.
+Rotation rewrites encrypted blobs, chunks, large manifests, and snapshot/tree
+metadata. Packed blobs are unpacked during rotation so their object keys can be
+derived from the new master key.
 
 To recover from remote storage into a fresh state, provide the master key with an
 environment variable during clone, or import it before verifying/restoring:

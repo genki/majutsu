@@ -5523,6 +5523,15 @@ fn restore_prepare_requests_archive_for_missing_local_objects() {
     .unwrap();
     assert!(job.contains("\"status\": \"done\""));
     assert!(job.contains("\"archived_objects\": []"));
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id);
+        c
+    });
 }
 
 #[test]
