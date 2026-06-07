@@ -5564,6 +5564,19 @@ fn store_large_file(
     config: &LargeConfig,
     binary: bool,
 ) -> Result<(String, String, usize)> {
+    if config.default_chunking == "fixed" {
+        return store_large_file_fixed_streaming(paths, path, rel, config, binary);
+    }
+    store_large_file_buffered(paths, path, rel, config, binary)
+}
+
+fn store_large_file_buffered(
+    paths: &Paths,
+    path: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+) -> Result<(String, String, usize)> {
     let bytes = stable_read(path, "strict")?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes);
@@ -5613,6 +5626,100 @@ fn store_large_file(
     conn.execute(
         "insert or ignore into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
         params![oid, bytes.len() as u64, manifest.chunks.len(), manifest_key],
+    )?;
+    Ok((oid, manifest_key, manifest.chunks.len()))
+}
+
+fn store_large_file_fixed_streaming(
+    paths: &Paths,
+    path: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+) -> Result<(String, String, usize)> {
+    let attempts = 8;
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match store_large_file_fixed_streaming_once(paths, path, rel, config, binary) {
+            Ok(result) => return Ok(result),
+            Err(err) if is_file_changed_error(&err) => {
+                last_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("file changed while reading: {}", path.display())))
+}
+
+fn store_large_file_fixed_streaming_once(
+    paths: &Paths,
+    path: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+) -> Result<(String, String, usize)> {
+    let before = fs::metadata(path)?;
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunks = Vec::new();
+    let mut buffer = vec![0u8; config.chunk_size.max(1)];
+    let mut offset = 0u64;
+    let mut index = 0usize;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buffer[..n];
+        hasher.update(chunk);
+        let chunk_oid = blake3_hex(chunk);
+        let stored = compress_large_chunk(config, rel, chunk)?;
+        let object_key = store_bytes(
+            paths,
+            &large_chunk_base(paths, &config.default_chunking),
+            &chunk_oid,
+            &stored.bytes,
+        )?;
+        chunks.push(LargeChunk {
+            index,
+            offset,
+            len: n as u64,
+            stored_len: Some(stored.bytes.len() as u64),
+            compression: stored.compression,
+            oid: chunk_oid,
+            object_key,
+        });
+        offset += n as u64;
+        index += 1;
+    }
+    let after = fs::metadata(path)?;
+    if !stable_metadata_matches(&before, &after) {
+        bail!("file changed while reading: {}", path.display());
+    }
+    let oid = hasher.finalize().to_hex().to_string();
+    let manifest = LargeManifest {
+        version: 1,
+        oid: oid.clone(),
+        size: offset,
+        media_type: media_type_for_path(rel),
+        binary,
+        chunking: config.default_chunking.clone(),
+        chunk_size: config.chunk_size,
+        chunks,
+    };
+    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+    let manifest_oid = blake3_hex(&manifest_json);
+    let manifest_key = store_bytes(paths, &paths.large_manifests, &manifest_oid, &manifest_json)?;
+    let conn = open_db(paths)?;
+    for chunk in &manifest.chunks {
+        conn.execute(
+            "insert or ignore into chunks(oid, size, object_key) values (?1, ?2, ?3)",
+            params![chunk.oid, chunk.len, chunk.object_key],
+        )?;
+    }
+    conn.execute(
+        "insert or ignore into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
+        params![oid, manifest.size, manifest.chunks.len(), manifest_key],
     )?;
     Ok((oid, manifest_key, manifest.chunks.len()))
 }
@@ -7273,6 +7380,10 @@ fn stable_read(path: &Path, mode: &str) -> Result<Vec<u8>> {
         std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1) as u64));
     }
     Err(last_error.unwrap_or_else(|| anyhow!("file did not become stable: {}", path.display())))
+}
+
+fn is_file_changed_error(err: &anyhow::Error) -> bool {
+    err.to_string().starts_with("file changed while reading:")
 }
 
 fn stable_metadata_matches(before: &fs::Metadata, after: &fs::Metadata) -> bool {
