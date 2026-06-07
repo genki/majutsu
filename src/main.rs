@@ -5288,9 +5288,11 @@ fn apply_restore_plan(
             }
             payload => {
                 if let Some((oid, object_key)) = payload_blob_ref(payload) {
+                    prepare_file_restore_destination(&dest, force)?;
                     write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
                     apply_file_metadata(&dest, record)?;
                 } else if let Some((_, manifest_key, _)) = payload_large_ref(payload) {
+                    prepare_file_restore_destination(&dest, force)?;
                     let manifest: LargeManifest =
                         serde_json::from_slice(&read_object(paths, manifest_key)?)?;
                     write_large_chunks_atomic(paths, &dest, &manifest)?;
@@ -5436,6 +5438,20 @@ fn restore_symlink(dest: &Path, target: &str, force: bool) -> Result<()> {
     std::os::unix::fs::symlink(target, dest)?;
     #[cfg(not(unix))]
     fs::write(dest, target)?;
+    Ok(())
+}
+
+fn prepare_file_restore_destination(dest: &Path, force: bool) -> Result<()> {
+    if fs::symlink_metadata(dest)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        if !force {
+            bail!("restore target is a directory: {}", dest.display());
+        }
+        fs::remove_dir(dest)
+            .with_context(|| format!("remove empty restore target directory {}", dest.display()))?;
+    }
     Ok(())
 }
 
@@ -7651,6 +7667,12 @@ fn write_atomic_with<F>(dest: &Path, write_contents: F) -> Result<()>
 where
     F: FnOnce(&mut File) -> Result<()>,
 {
+    if fs::symlink_metadata(dest)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        bail!("restore target is a directory: {}", dest.display());
+    }
     let (tmp, mut file) = create_atomic_temp(dest)?;
     let result = (|| -> Result<()> {
         write_contents(&mut file)?;

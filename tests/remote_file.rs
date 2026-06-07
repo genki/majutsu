@@ -1503,6 +1503,71 @@ fn restore_force_can_replace_file_with_symlink() {
 }
 
 #[test]
+fn restore_force_can_replace_empty_directory_with_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let conflicting_dir = restore.join("sample/alpha.txt");
+    fs::create_dir_all(&conflicting_dir).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--path")
+            .arg("alpha.txt")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(conflicting_dir.is_dir());
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--path")
+            .arg("alpha.txt")
+            .arg("--to")
+            .arg(&restore)
+            .arg("--force");
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "alpha\n"
+    );
+}
+
+#[test]
 fn encrypted_file_remote_clone_restores_with_exported_key() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
