@@ -1,6 +1,6 @@
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -707,6 +707,76 @@ fn restore_preserves_empty_directory_metadata() {
             .unwrap()
             .as_secs(),
         1_710_000_000
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_preserves_fifo_special_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    let fifo = source.join("pipe");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+
+    let mut perms = fs::symlink_metadata(&fifo).unwrap().permissions();
+    perms.set_mode(0o620);
+    fs::set_permissions(&fifo, perms).unwrap();
+    let status = Command::new("touch")
+        .arg("-d")
+        .arg("@1720000000")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(snapshot.contains("files 1, large 0"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    let restored = restore.join("sample/pipe");
+    let metadata = fs::symlink_metadata(&restored).unwrap();
+    assert!(metadata.file_type().is_fifo());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o620);
+    assert_eq!(
+        metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        1_720_000_000
     );
 }
 

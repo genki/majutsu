@@ -964,6 +964,9 @@ enum Payload {
     Symlink {
         target: String,
     },
+    Special {
+        special_kind: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1027,6 +1030,28 @@ fn file_mode(meta: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn file_mode(_: &fs::Metadata) -> u32 {
     0
+}
+
+#[cfg(unix)]
+fn special_file_kind(meta: &fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = meta.file_type();
+    if file_type.is_fifo() {
+        Some("fifo".into())
+    } else if file_type.is_socket() {
+        Some("socket".into())
+    } else if file_type.is_block_device() {
+        Some("block-device".into())
+    } else if file_type.is_char_device() {
+        Some("char-device".into())
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn special_file_kind(_: &fs::Metadata) -> Option<String> {
+    None
 }
 
 fn main() -> Result<()> {
@@ -1965,6 +1990,9 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
                 fs::create_dir_all(&dest)?;
                 directory_metadata.push((dest, record));
             }
+            Payload::Special { special_kind } => {
+                restore_special_file(&dest, record, special_kind, true)?;
+            }
             Payload::Blob { oid, object_key } => {
                 write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
                 apply_file_metadata(&dest, record)?;
@@ -2164,15 +2192,14 @@ impl MajutsuFuseFs {
                 Payload::Symlink { target } => FuseNodeKind::Symlink {
                     target: target.clone(),
                 },
+                Payload::Special { .. } => FuseNodeKind::File {
+                    record: record.clone(),
+                },
                 _ => FuseNodeKind::File {
                     record: record.clone(),
                 },
             };
-            let file_type = match kind {
-                FuseNodeKind::Directory { .. } => FileType::Directory,
-                FuseNodeKind::Symlink { .. } => FileType::Symlink,
-                _ => FileType::RegularFile,
-            };
+            let file_type = fuse_record_file_type(record, &kind);
             fs.nodes.insert(
                 ino,
                 FuseNode {
@@ -2274,6 +2301,7 @@ impl MajutsuFuseFs {
             }
             Payload::Directory => Ok(Vec::new()),
             Payload::Symlink { .. } => Ok(Vec::new()),
+            Payload::Special { .. } => Ok(Vec::new()),
         }
     }
 }
@@ -2451,6 +2479,23 @@ fn fuse_file_perm(mode: u32, kind: FileType) -> u16 {
     }
     let perm = (mode & 0o777) as u16;
     if perm == 0 { 0o644 } else { perm }
+}
+
+fn fuse_record_file_type(record: &FileRecord, kind: &FuseNodeKind) -> FileType {
+    match &record.payload {
+        Payload::Special { special_kind } => match special_kind.as_str() {
+            "fifo" => FileType::NamedPipe,
+            "socket" => FileType::Socket,
+            "block-device" => FileType::BlockDevice,
+            "char-device" => FileType::CharDevice,
+            _ => FileType::RegularFile,
+        },
+        _ => match kind {
+            FuseNodeKind::Directory { .. } => FileType::Directory,
+            FuseNodeKind::Symlink { .. } => FileType::Symlink,
+            FuseNodeKind::File { .. } => FileType::RegularFile,
+        },
+    }
 }
 
 fn is_mountpoint(path: &Path) -> Result<bool> {
@@ -3817,6 +3862,7 @@ fn rewrite_manifest_payload_keys(
         for record in records {
             match &mut record.payload {
                 Payload::Directory => {}
+                Payload::Special { .. } => {}
                 Payload::Blob { oid, object_key } => {
                     *object_key = blob_keys
                         .get(oid)
@@ -4152,6 +4198,7 @@ fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<Prune
             for record in records {
                 match &record.payload {
                     Payload::Directory => {}
+                    Payload::Special { .. } => {}
                     Payload::Blob { oid, .. } => {
                         live_blobs.insert(oid.clone());
                     }
@@ -4594,6 +4641,9 @@ fn build_restore_plan(
                     Payload::Symlink { target } => Payload::Symlink {
                         target: target.clone(),
                     },
+                    Payload::Special { special_kind } => Payload::Special {
+                        special_kind: special_kind.clone(),
+                    },
                 },
             });
         }
@@ -4956,6 +5006,7 @@ fn required_object_keys_for_plan(
     for record in &plan.files {
         match &record.payload {
             Payload::Directory => {}
+            Payload::Special { .. } => {}
             Payload::Blob { oid, object_key } => {
                 let blob = query_blobs(conn)?
                     .into_iter()
@@ -5057,6 +5108,9 @@ fn apply_restore_plan(
                 fs::create_dir_all(&dest)?;
                 directory_metadata.push((dest, record));
             }
+            Payload::Special { special_kind } => {
+                restore_special_file(&dest, record, special_kind, force)?;
+            }
             Payload::Blob { oid, object_key } => {
                 write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
                 apply_file_metadata(&dest, record)?;
@@ -5132,6 +5186,7 @@ fn restore_record_matches_path(
     let meta = fs::symlink_metadata(dest)?;
     match &record.payload {
         Payload::Directory => Ok(meta.file_type().is_dir()),
+        Payload::Special { special_kind } => restore_special_matches(&meta, special_kind),
         Payload::Blob { oid, object_key } => {
             if !meta.file_type().is_file() {
                 return Ok(false);
@@ -5204,9 +5259,97 @@ fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
         }
     }
     if let Some(seconds) = record.modified {
-        filetime::set_file_mtime(dest, filetime::FileTime::from_unix_time(seconds, 0))?;
+        set_path_mtime(dest, seconds)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_path_mtime(path: &Path, seconds: i64) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let raw_path = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("invalid mtime path {}", path.display()))?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: seconds as libc::time_t,
+            tv_nsec: 0,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, raw_path.as_ptr(), times.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("set mtime {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_path_mtime(path: &Path, seconds: i64) -> Result<()> {
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_special_file(
+    dest: &Path,
+    record: &FileRecord,
+    special_kind: &str,
+    force: bool,
+) -> Result<()> {
+    if special_kind != "fifo" {
+        bail!(
+            "restore of special file kind {special_kind} is not supported: {}",
+            dest.display()
+        );
+    }
+    if let Ok(meta) = fs::symlink_metadata(dest) {
+        if restore_special_matches(&meta, special_kind)? {
+            apply_file_metadata(dest, record)?;
+            return Ok(());
+        }
+        if force {
+            fs::remove_file(dest)?;
+        } else {
+            bail!("special file restore target exists: {}", dest.display());
+        }
+    }
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let raw_path = CString::new(dest.as_os_str().as_bytes())
+        .with_context(|| format!("invalid fifo path {}", dest.display()))?;
+    let mode = if record.mode == 0 {
+        0o666
+    } else {
+        record.mode & 0o7777
+    };
+    let rc = unsafe { libc::mkfifo(raw_path.as_ptr(), mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("create fifo {}", dest.display()));
+    }
+    apply_file_metadata(dest, record)
+}
+
+#[cfg(not(unix))]
+fn restore_special_file(
+    dest: &Path,
+    _record: &FileRecord,
+    special_kind: &str,
+    _force: bool,
+) -> Result<()> {
+    bail!(
+        "restore of special file kind {special_kind} is not supported on this platform: {}",
+        dest.display()
+    )
+}
+
+fn restore_special_matches(meta: &fs::Metadata, special_kind: &str) -> Result<bool> {
+    Ok(special_file_kind(meta).as_deref() == Some(special_kind))
 }
 
 fn read_xattrs(path: &Path) -> BTreeMap<String, String> {
@@ -5287,6 +5430,19 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 modified: modified_secs(&link_meta),
                 xattrs: BTreeMap::new(),
                 payload: Payload::Symlink { target },
+            });
+            continue;
+        }
+        if let Some(special_kind) = special_file_kind(&link_meta) {
+            records.push(FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s,
+                kind: "special".into(),
+                size: 0,
+                mode: file_mode(&link_meta),
+                modified: modified_secs(&link_meta),
+                xattrs: read_xattrs(entry.path()),
+                payload: Payload::Special { special_kind },
             });
             continue;
         }
