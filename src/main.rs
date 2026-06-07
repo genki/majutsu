@@ -23,9 +23,8 @@ use majutsu_core::{
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_db::{
-    EventJournalRecord, EventJournalRecordIssue, LocalRefIssue, RemoteObjectKeyIssue,
-    RemoteRefIssue, UploadQueueItem, UploadQueueItemIssue, expected_upload_queue_item_id,
-    local_ref_issues, remote_ref_issues,
+    EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
+    UploadQueueItemIssue, expected_upload_queue_item_id, local_ref_issues, remote_ref_issues,
 };
 use majutsu_large::{
     ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_chunk_hash_matches,
@@ -4576,34 +4575,7 @@ fn validate_remote_refs(conn: &Connection, config: &Config, missing: &mut usize)
     let refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     for issue in remote_ref_issues(refs, &config.host.id, &snapshot_ids) {
         *missing += 1;
-        match issue {
-            RemoteRefIssue::EmptyRemote { name } => {
-                eprintln!("remote ref has empty remote for {name}");
-            }
-            RemoteRefIssue::InvalidObservedAt { name, value, error } => {
-                eprintln!("remote ref {name} has invalid observed_at {value}: {error}");
-            }
-            RemoteRefIssue::UnsupportedName { name } => {
-                eprintln!("remote ref has unsupported name {name}");
-            }
-            RemoteRefIssue::HostMismatch {
-                host_id,
-                config_host_id,
-            } => {
-                eprintln!(
-                    "remote ref host id {host_id} does not match config host id {config_host_id}"
-                );
-            }
-            RemoteRefIssue::MissingSnapshot { name, value } => {
-                eprintln!("remote ref {name} points to missing snapshot {value}");
-            }
-            RemoteRefIssue::InvalidLastSynced { name, value, error } => {
-                eprintln!("remote ref {name} has invalid last-synced {value}: {error}");
-            }
-            RemoteRefIssue::UnsupportedRefName { name } => {
-                eprintln!("remote ref has unsupported ref name {name}");
-            }
-        }
+        eprintln!("{}", issue.message());
     }
     Ok(())
 }
@@ -4621,20 +4593,7 @@ fn validate_local_refs(conn: &Connection, missing: &mut usize) -> Result<()> {
     let refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     for issue in local_ref_issues(refs, &snapshot_ids) {
         *missing += 1;
-        match issue {
-            LocalRefIssue::Duplicate { name } => {
-                eprintln!("duplicate local ref {name}");
-            }
-            LocalRefIssue::MissingSnapshot { name, value } => {
-                eprintln!("local ref {name} points to missing snapshot {value}");
-            }
-            LocalRefIssue::InvalidLastSynced { value, error } => {
-                eprintln!("local ref last-synced has invalid timestamp {value}: {error}");
-            }
-            LocalRefIssue::Unknown { name } => {
-                eprintln!("unknown local ref {name}");
-            }
-        }
+        eprintln!("{}", issue.message());
     }
     Ok(())
 }

@@ -238,6 +238,21 @@ pub enum LocalRefIssue {
     Unknown { name: String },
 }
 
+impl LocalRefIssue {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Duplicate { name } => format!("duplicate local ref {name}"),
+            Self::MissingSnapshot { name, value } => {
+                format!("local ref {name} points to missing snapshot {value}")
+            }
+            Self::InvalidLastSynced { value, error } => {
+                format!("local ref last-synced has invalid timestamp {value}: {error}")
+            }
+            Self::Unknown { name } => format!("unknown local ref {name}"),
+        }
+    }
+}
+
 pub fn local_ref_issues<I>(refs: I, snapshot_ids: &BTreeSet<String>) -> Vec<LocalRefIssue>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -297,6 +312,39 @@ pub enum RemoteRefIssue {
     UnsupportedRefName {
         name: String,
     },
+}
+
+impl RemoteRefIssue {
+    pub fn message(&self) -> String {
+        match self {
+            Self::EmptyRemote { name } => {
+                format!("remote ref has empty remote for {name}")
+            }
+            Self::InvalidObservedAt { name, value, error } => {
+                format!("remote ref {name} has invalid observed_at {value}: {error}")
+            }
+            Self::UnsupportedName { name } => {
+                format!("remote ref has unsupported name {name}")
+            }
+            Self::HostMismatch {
+                host_id,
+                config_host_id,
+            } => {
+                format!(
+                    "remote ref host id {host_id} does not match config host id {config_host_id}"
+                )
+            }
+            Self::MissingSnapshot { name, value } => {
+                format!("remote ref {name} points to missing snapshot {value}")
+            }
+            Self::InvalidLastSynced { name, value, error } => {
+                format!("remote ref {name} has invalid last-synced {value}: {error}")
+            }
+            Self::UnsupportedRefName { name } => {
+                format!("remote ref has unsupported ref name {name}")
+            }
+        }
+    }
 }
 
 pub fn remote_ref_issues<I>(
@@ -633,6 +681,40 @@ mod tests {
     }
 
     #[test]
+    fn local_ref_issue_messages_are_stable() {
+        assert_eq!(
+            LocalRefIssue::Duplicate {
+                name: "current".into()
+            }
+            .message(),
+            "duplicate local ref current"
+        );
+        assert_eq!(
+            LocalRefIssue::MissingSnapshot {
+                name: "current".into(),
+                value: "missing-snap".into(),
+            }
+            .message(),
+            "local ref current points to missing snapshot missing-snap"
+        );
+        assert_eq!(
+            LocalRefIssue::InvalidLastSynced {
+                value: "bad-time".into(),
+                error: "premature end of input".into(),
+            }
+            .message(),
+            "local ref last-synced has invalid timestamp bad-time: premature end of input"
+        );
+        assert_eq!(
+            LocalRefIssue::Unknown {
+                name: "legacy".into()
+            }
+            .message(),
+            "unknown local ref legacy"
+        );
+    }
+
+    #[test]
     fn remote_ref_validation_reports_cache_invariants() {
         let issues = remote_ref_issues(
             [
@@ -696,6 +778,65 @@ mod tests {
                     name: "legacy/current".into(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn remote_ref_issue_messages_are_stable() {
+        assert_eq!(
+            RemoteRefIssue::EmptyRemote {
+                name: "hosts/host-a/refs/current".into(),
+            }
+            .message(),
+            "remote ref has empty remote for hosts/host-a/refs/current"
+        );
+        assert_eq!(
+            RemoteRefIssue::InvalidObservedAt {
+                name: "hosts/host-a/refs/current".into(),
+                value: "bad-time".into(),
+                error: "premature end of input".into(),
+            }
+            .message(),
+            "remote ref hosts/host-a/refs/current has invalid observed_at bad-time: premature end of input"
+        );
+        assert_eq!(
+            RemoteRefIssue::UnsupportedName {
+                name: "legacy/current".into(),
+            }
+            .message(),
+            "remote ref has unsupported name legacy/current"
+        );
+        assert_eq!(
+            RemoteRefIssue::HostMismatch {
+                host_id: "other".into(),
+                config_host_id: "host-a".into(),
+            }
+            .message(),
+            "remote ref host id other does not match config host id host-a"
+        );
+        assert_eq!(
+            RemoteRefIssue::MissingSnapshot {
+                name: "hosts/host-a/refs/current".into(),
+                value: "missing-snap".into(),
+            }
+            .message(),
+            "remote ref hosts/host-a/refs/current points to missing snapshot missing-snap"
+        );
+        assert_eq!(
+            RemoteRefIssue::InvalidLastSynced {
+                name: "hosts/host-a/refs/last-synced".into(),
+                value: "bad-time".into(),
+                error: "premature end of input".into(),
+            }
+            .message(),
+            "remote ref hosts/host-a/refs/last-synced has invalid last-synced bad-time: premature end of input"
+        );
+        assert_eq!(
+            RemoteRefIssue::UnsupportedRefName {
+                name: "hosts/host-a/refs/legacy".into(),
+            }
+            .message(),
+            "remote ref has unsupported ref name hosts/host-a/refs/legacy"
         );
     }
 }
