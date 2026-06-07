@@ -12,9 +12,9 @@ use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
     FileRecord, LargeChunk, LargeManifest, OperationLogEntry as OperationExport, Payload,
-    RootSnapshot, SnapshotManifest, TreeManifest, decode_operation_log, encode_operation_log,
-    operation_log_entry_matches, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
-    payload_large_ref_mut,
+    RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
+    encode_operation_log, operation_log_entry_matches, payload_blob_ref, payload_blob_ref_mut,
+    payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -666,16 +666,6 @@ struct MountViewMetadata {
     files: usize,
     lazy_large_files: usize,
     hydrated_large_files: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SnapshotExport {
-    id: String,
-    parent_id: Option<String>,
-    op_id: String,
-    created_at: String,
-    manifest_key: String,
-    manifest_json: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6252,15 +6242,6 @@ fn validate_remote_pack_objects(
         }
     }
     Ok(())
-}
-
-fn snapshot_export_matches(remote: &SnapshotExport, metadata: &SnapshotExport) -> bool {
-    remote.id == metadata.id
-        && remote.parent_id == metadata.parent_id
-        && remote.op_id == metadata.op_id
-        && remote.created_at == metadata.created_at
-        && remote.manifest_key == metadata.manifest_key
-        && remote.manifest_json == metadata.manifest_json
 }
 
 fn snapshot_manifest_matches(remote: &SnapshotManifest, metadata: &SnapshotManifest) -> bool {

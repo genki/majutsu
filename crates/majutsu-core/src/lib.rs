@@ -63,6 +63,20 @@ pub struct RootSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotExport {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub op_id: String,
+    pub created_at: String,
+    pub manifest_key: String,
+    pub manifest_json: String,
+}
+
+pub fn snapshot_export_matches(actual: &SnapshotExport, expected: &SnapshotExport) -> bool {
+    actual == expected
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
     #[serde(rename = "op_id", alias = "id")]
     pub id: OperationId,
@@ -502,6 +516,27 @@ mod tests {
         assert_eq!(legacy.id, "snap-legacy");
         assert_eq!(legacy.operation, "op-legacy");
         assert_eq!(legacy.timestamp, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn snapshot_export_json_shape_is_stable() {
+        let export = SnapshotExport {
+            id: "snap-1".into(),
+            parent_id: Some("snap-0".into()),
+            op_id: "op-1".into(),
+            created_at: "2026-06-07T00:00:00Z".into(),
+            manifest_key: "objects/snapshots/snap-1.json".into(),
+            manifest_json: "{}".into(),
+        };
+
+        let value = serde_json::to_value(&export).unwrap();
+
+        assert_eq!(value["id"], "snap-1");
+        assert_eq!(value["parent_id"], "snap-0");
+        assert_eq!(value["op_id"], "op-1");
+        assert_eq!(value["manifest_key"], "objects/snapshots/snap-1.json");
+        assert_eq!(value["manifest_json"], "{}");
+        assert!(snapshot_export_matches(&export, &export));
     }
 
     #[test]
