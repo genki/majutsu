@@ -2654,7 +2654,14 @@ fn large_files_can_use_content_defined_chunking() {
     )
     .unwrap();
     assert!(manifest.contains("\"chunking\": \"fastcdc\""));
+    assert!(manifest.contains("objects/large/chunks/fastcdc/"));
     assert!(manifest.matches("\"index\"").count() > 1);
+    assert!(
+        fs::read_dir(state.join("objects/large/chunks/fastcdc"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().is_dir())
+    );
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("fsck");
@@ -2663,6 +2670,12 @@ fn large_files_can_use_content_defined_chunking() {
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(remote.join("large/chunks/fastcdc").exists());
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
         c
     });
     run({

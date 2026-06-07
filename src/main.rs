@@ -3631,7 +3631,7 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
     for chunk in &chunks {
         let key = store_bytes(
             paths,
-            &paths.large_chunks,
+            &large_chunk_base_for_key(paths, &chunk.object_key),
             &chunk.oid,
             &chunk_payloads[&chunk.oid],
         )?;
@@ -5250,7 +5250,12 @@ fn store_large_file(
         let chunk = &bytes[start..end];
         let chunk_oid = blake3_hex(chunk);
         let stored = compress_large_chunk(config, rel, chunk)?;
-        let object_key = store_bytes(paths, &paths.large_chunks, &chunk_oid, &stored.bytes)?;
+        let object_key = store_bytes(
+            paths,
+            &large_chunk_base(paths, &config.default_chunking),
+            &chunk_oid,
+            &stored.bytes,
+        )?;
         chunks.push(LargeChunk {
             index,
             offset: start as u64,
@@ -5394,6 +5399,7 @@ fn create_layout(paths: &Paths) -> Result<()> {
     fs::create_dir_all(&paths.objects)?;
     fs::create_dir_all(&paths.trees)?;
     fs::create_dir_all(&paths.large_chunks)?;
+    fs::create_dir_all(paths.home.join("objects/large/chunks/fastcdc"))?;
     fs::create_dir_all(&paths.large_manifests)?;
     fs::create_dir_all(&paths.packs)?;
     fs::create_dir_all(&paths.pack_indexes)?;
@@ -5765,6 +5771,21 @@ fn canonical_remote_aliases(key: &str) -> Vec<String> {
     }
 }
 
+fn large_chunk_base(paths: &Paths, chunking: &str) -> PathBuf {
+    match chunking {
+        "fastcdc" => paths.home.join("objects/large/chunks/fastcdc"),
+        _ => paths.large_chunks.clone(),
+    }
+}
+
+fn large_chunk_base_for_key(paths: &Paths, key: &str) -> PathBuf {
+    if key.starts_with("objects/large/chunks/fastcdc/") {
+        large_chunk_base(paths, "fastcdc")
+    } else {
+        large_chunk_base(paths, "fixed")
+    }
+}
+
 fn canonical_remote_alias(key: &str) -> Option<String> {
     if let Some(rest) = key.strip_prefix("objects/trees/") {
         Some(format!("trees/{rest}"))
@@ -5776,9 +5797,11 @@ fn canonical_remote_alias(key: &str) -> Option<String> {
         Some(format!("indexes/pack-index/{rest}"))
     } else if let Some(rest) = key.strip_prefix("objects/large/manifests/") {
         Some(format!("large/manifests/{rest}"))
+    } else if let Some(rest) = key.strip_prefix("objects/large/chunks/fixed/") {
+        Some(format!("large/chunks/fixed-8m/{rest}"))
     } else {
-        key.strip_prefix("objects/large/chunks/fixed/")
-            .map(|rest| format!("large/chunks/fixed-8m/{rest}"))
+        key.strip_prefix("objects/large/chunks/fastcdc/")
+            .map(|rest| format!("large/chunks/fastcdc/{rest}"))
     }
 }
 
@@ -6613,8 +6636,14 @@ fn default_tiering_rules() -> Vec<TieringRule> {
             storage: Some("infrequent".into()),
         },
         TieringRule {
-            name: "large-chunks-to-archive".into(),
+            name: "fixed-large-chunks-to-archive".into(),
             prefix: "large/chunks/fixed-8m/".into(),
+            after: Some("180d".into()),
+            storage: Some("archive".into()),
+        },
+        TieringRule {
+            name: "fastcdc-large-chunks-to-archive".into(),
+            prefix: "large/chunks/fastcdc/".into(),
             after: Some("180d".into()),
             storage: Some("archive".into()),
         },

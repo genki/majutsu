@@ -138,6 +138,7 @@ large extensions, exceed `large.min_size`, or are binary and exceed
 ```text
 $MAJUTSU_HOME/objects/large/manifests
 $MAJUTSU_HOME/objects/large/chunks/fixed
+$MAJUTSU_HOME/objects/large/chunks/fastcdc
 ```
 
 Use:
@@ -231,6 +232,7 @@ packs/normal/...
 indexes/pack-index/...
 large/manifests/...
 large/chunks/fixed-8m/...
+large/chunks/fastcdc/...
 ```
 
 This is the critical path for host-disk-loss recovery: a fresh state directory
@@ -590,8 +592,14 @@ after = "30d"
 transition_to = "infrequent"
 
 [[tiering.rules]]
-name = "large-chunks-to-archive"
+name = "fixed-large-chunks-to-archive"
 prefix = "large/chunks/fixed-8m/"
+after = "180d"
+storage = "archive"
+
+[[tiering.rules]]
+name = "fastcdc-large-chunks-to-archive"
+prefix = "large/chunks/fastcdc/"
 after = "180d"
 storage = "archive"
 ```
