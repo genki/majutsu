@@ -2463,15 +2463,23 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
 fn encrypted_key_rotation_rewrites_packed_blobs() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
     let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
     let restore = tmp.path().join("restore");
+    let clone_restore = tmp.path().join("clone-restore");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("secret.txt"), b"secret\n").unwrap();
     fs::write(source.join("note.txt"), b"note\n").unwrap();
 
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("init").arg("--encrypt");
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--encrypt")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
         c
     });
     run({
@@ -2549,6 +2557,38 @@ fn encrypted_key_rotation_rewrites_packed_blobs() {
     assert_eq!(
         fs::read(source.join("note.txt")).unwrap(),
         fs::read(restore.join("sample/note.txt")).unwrap()
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&clone_restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("secret.txt")).unwrap(),
+        fs::read(clone_restore.join("sample/secret.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("note.txt")).unwrap(),
+        fs::read(clone_restore.join("sample/note.txt")).unwrap()
     );
 }
 

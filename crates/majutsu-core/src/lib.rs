@@ -52,8 +52,24 @@ pub struct Operation {
     pub id: OperationId,
     pub parent: Option<OperationId>,
     pub kind: OperationKind,
+    #[serde(default = "default_operation_timestamp")]
+    pub timestamp: DateTime<Utc>,
+    #[serde(default = "default_operation_actor")]
+    pub actor: String,
+    #[serde(default)]
+    pub status: OperationStatus,
     pub before_snapshot: Option<SnapshotId>,
     pub after_snapshot: Option<SnapshotId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OperationStatus {
+    #[default]
+    Done,
+    Running,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,4 +279,34 @@ fn default_large_hydrate_policy() -> String {
 
 fn default_chunk_compression() -> String {
     "none".into()
+}
+
+fn default_operation_timestamp() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
+}
+
+fn default_operation_actor() -> String {
+    "local".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_defaults_preserve_legacy_serialized_operations() {
+        let json = r#"{
+            "id": "op-1",
+            "parent": null,
+            "kind": "ManualSnapshot",
+            "before_snapshot": null,
+            "after_snapshot": "snap-1"
+        }"#;
+
+        let op: Operation = serde_json::from_str(json).unwrap();
+
+        assert_eq!(op.actor, "local");
+        assert_eq!(op.status, OperationStatus::Done);
+        assert_eq!(op.timestamp, DateTime::<Utc>::UNIX_EPOCH);
+    }
 }
