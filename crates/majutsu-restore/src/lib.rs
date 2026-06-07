@@ -17,6 +17,41 @@ pub struct RestorePlanSummary {
     pub archived_objects: Vec<ObjectKey>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreObjectAvailability {
+    pub required_objects: Vec<ObjectKey>,
+    pub archived_objects: Vec<ObjectKey>,
+    pub missing_objects: Vec<ObjectKey>,
+}
+
+pub fn classify_restore_object_availability<F, G, E>(
+    required_objects: Vec<ObjectKey>,
+    mut local_exists: F,
+    mut remote_available: G,
+) -> Result<RestoreObjectAvailability, E>
+where
+    F: FnMut(&ObjectKey) -> Result<bool, E>,
+    G: FnMut(&ObjectKey) -> Result<bool, E>,
+{
+    let mut archived_objects = Vec::new();
+    let mut missing_objects = Vec::new();
+    for key in &required_objects {
+        if local_exists(key)? {
+            continue;
+        }
+        if remote_available(key)? {
+            archived_objects.push(key.clone());
+        } else {
+            missing_objects.push(key.clone());
+        }
+    }
+    Ok(RestoreObjectAvailability {
+        required_objects,
+        archived_objects,
+        missing_objects,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreQueueItem {
     pub id: String,
@@ -229,9 +264,9 @@ pub fn parse_duration_ago(input: &str, now: DateTime<Utc>) -> Result<DateTime<Ut
 #[cfg(test)]
 mod tests {
     use super::{
-        RestorePathState, RestoreQueueItem, count_restore_changes, parse_db_time,
-        parse_duration_ago, parse_relative_ago, parse_restore_time, parse_restore_time_rfc3339,
-        validate_relative_filter_path,
+        RestorePathState, RestoreQueueItem, classify_restore_object_availability,
+        count_restore_changes, parse_db_time, parse_duration_ago, parse_relative_ago,
+        parse_restore_time, parse_restore_time_rfc3339, validate_relative_filter_path,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use std::path::Path;
@@ -254,6 +289,38 @@ mod tests {
         assert_eq!(stats.keep_files, 1);
         assert_eq!(stats.modify_files, 2);
         assert_eq!(stats.delete_files, 3);
+    }
+
+    #[test]
+    fn classifies_restore_object_availability_without_losing_required_order() {
+        let required = vec![
+            "objects/a".to_string(),
+            "objects/b".to_string(),
+            "objects/c".to_string(),
+        ];
+        let availability = classify_restore_object_availability(
+            required.clone(),
+            |key| -> anyhow::Result<bool> { Ok(key == "objects/a") },
+            |key| -> anyhow::Result<bool> { Ok(key == "objects/b") },
+        )
+        .unwrap();
+
+        assert_eq!(availability.required_objects, required);
+        assert_eq!(availability.archived_objects, vec!["objects/b"]);
+        assert_eq!(availability.missing_objects, vec!["objects/c"]);
+    }
+
+    #[test]
+    fn classify_restore_object_availability_propagates_lookup_errors() {
+        let err = classify_restore_object_availability(
+            vec!["objects/a".to_string()],
+            |_| -> anyhow::Result<bool> { Ok(false) },
+            |_| -> anyhow::Result<bool> { anyhow::bail!("remote unavailable") },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("remote unavailable"));
     }
 
     #[test]

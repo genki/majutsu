@@ -37,9 +37,10 @@ use majutsu_pack::{
 };
 use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use majutsu_restore::{
-    RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
-    parse_db_time as restore_parse_db_time, parse_duration_ago as restore_parse_duration_ago,
-    parse_restore_time_rfc3339, validate_relative_filter_path,
+    RestoreChangeStats, RestorePathState, RestoreQueueItem, classify_restore_object_availability,
+    count_restore_changes, parse_db_time as restore_parse_db_time,
+    parse_duration_ago as restore_parse_duration_ago, parse_restore_time_rfc3339,
+    validate_relative_filter_path,
 };
 use majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
@@ -6382,22 +6383,16 @@ fn build_restore_job(
     let remote = read_config(paths)
         .ok()
         .and_then(|config| config.remote.and_then(|remote| open_remote(&remote).ok()));
-    let mut archived_objects = Vec::new();
-    let mut missing_objects = Vec::new();
-    for key in &required_objects {
-        if paths.home.join(key).exists() {
-            continue;
-        }
-        if remote
-            .as_ref()
-            .and_then(|remote| remote_object_available(remote, key).ok())
-            .unwrap_or(false)
-        {
-            archived_objects.push(key.clone());
-        } else {
-            missing_objects.push(key.clone());
-        }
-    }
+    let availability = classify_restore_object_availability(
+        required_objects,
+        |key| -> Result<bool> { Ok(paths.home.join(key).exists()) },
+        |key| -> Result<bool> {
+            Ok(remote
+                .as_ref()
+                .and_then(|remote| remote_object_available(remote, key).ok())
+                .unwrap_or(false))
+        },
+    )?;
     Ok(RestoreQueueItem {
         id: new_id("restore"),
         snapshot_id: plan.snapshot.snapshot_id.clone(),
@@ -6408,9 +6403,9 @@ fn build_restore_job(
             .as_ref()
             .map(|to| to.display().to_string())
             .unwrap_or_else(|| "original-roots".into()),
-        required_objects,
-        archived_objects,
-        missing_objects,
+        required_objects: availability.required_objects,
+        archived_objects: availability.archived_objects,
+        missing_objects: availability.missing_objects,
         archive_requested_objects: Vec::new(),
         force: args.force,
         check_conflicts: args.check_conflicts,
