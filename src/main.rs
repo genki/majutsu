@@ -100,7 +100,7 @@ use db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
-use fsck_runtime::{fsck, validate_remote_gc_records};
+use fsck_runtime::{fsck, validate_remote_gc_records, validate_remote_oplog};
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
@@ -1529,7 +1529,10 @@ fn encode_canonical_remote_oplog(paths: &Paths, operations: &[OperationExport]) 
     encode_object(paths, &compressed)
 }
 
-fn decode_canonical_remote_oplog(paths: &Paths, bytes: &[u8]) -> Result<Vec<OperationExport>> {
+pub(crate) fn decode_canonical_remote_oplog(
+    paths: &Paths,
+    bytes: &[u8],
+) -> Result<Vec<OperationExport>> {
     let compressed = decode_object(paths, bytes)?;
     let cborl = zstd::stream::decode_all(compressed.as_slice())?;
     decode_operation_log(&cborl)
@@ -3456,57 +3459,6 @@ fn validate_remote_metadata_references(
         }
     }
     Ok(())
-}
-
-fn validate_remote_oplog(
-    paths: &Paths,
-    remote: &RemoteStore,
-    host_id: &str,
-    expected: &[OperationExport],
-    missing: &mut usize,
-) -> Result<()> {
-    let canonical_key = host_oplog_canonical_key(host_id);
-    if !remote.exists(&canonical_key)? {
-        *missing += 1;
-        eprintln!("missing canonical host operation log {canonical_key}");
-    } else {
-        let operations = decode_canonical_remote_oplog(paths, &remote.get(&canonical_key)?)
-            .with_context(|| format!("parse remote operation log {canonical_key}"))?;
-        validate_remote_oplog_entries(&canonical_key, &operations, expected, missing);
-    }
-
-    let legacy_key = host_oplog_key(host_id);
-    if remote.exists(&legacy_key)? {
-        let operations = decode_operation_log(&remote.get(&legacy_key)?)
-            .with_context(|| format!("parse remote operation log {legacy_key}"))?;
-        validate_remote_oplog_entries(&legacy_key, &operations, expected, missing);
-    }
-    Ok(())
-}
-
-fn validate_remote_oplog_entries(
-    key: &str,
-    actual: &[OperationExport],
-    expected: &[OperationExport],
-    missing: &mut usize,
-) {
-    for issue in operation_log_comparison_issues(actual, expected) {
-        *missing += 1;
-        match issue {
-            OperationLogComparisonIssue::CountMismatch { expected, actual } => {
-                eprintln!(
-                    "remote operation log count mismatch {key} expected={} actual={}",
-                    expected, actual
-                );
-                return;
-            }
-            OperationLogComparisonIssue::EntryMismatch { index, id } => {
-                eprintln!(
-                    "remote operation log entry does not match metadata {key} {id} index={index}"
-                );
-            }
-        }
-    }
 }
 
 fn validate_remote_chunk_index(

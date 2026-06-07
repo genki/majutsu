@@ -1,14 +1,14 @@
 use anyhow::{Result, bail};
 use majutsu_core::{
-    ConfigRootIssue, HistoryGraphIssue, HostFileIssue, LargeManifest,
+    ConfigRootIssue, HistoryGraphIssue, HostFileIssue, LargeManifest, OperationLogComparisonIssue,
     OperationLogEntry as OperationExport, OperationLogEntryIssue, config_root_consistency_issues,
-    history_graph_issues, host_file_issues,
+    decode_operation_log, history_graph_issues, host_file_issues, operation_log_comparison_issues,
 };
 use majutsu_db::{local_ref_issues, remote_ref_issues};
 use majutsu_large::{LargePinIssue, large_chunk_hash_matches, large_pin_issues};
 use majutsu_store::{
     RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, canonical_remote_aliases,
-    remote_gc_mark_key, remote_gc_tombstone_prefix,
+    host_oplog_canonical_key, host_oplog_key, remote_gc_mark_key, remote_gc_tombstone_prefix,
 };
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,8 +21,8 @@ use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::{
-    export_metadata, open_db, read_blob_payload, read_large_chunk, read_object,
-    validate_event_queue, validate_local_large_manifest_objects,
+    decode_canonical_remote_oplog, export_metadata, open_db, read_blob_payload, read_large_chunk,
+    read_object, validate_event_queue, validate_local_large_manifest_objects,
     validate_local_metadata_references, validate_local_oplog, validate_local_pack_objects,
     validate_local_snapshot_objects, validate_restore_queue, validate_upload_queue,
 };
@@ -436,4 +436,55 @@ fn validate_remote_gc_tombstones(
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_remote_oplog(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+    expected: &[OperationExport],
+    missing: &mut usize,
+) -> Result<()> {
+    let canonical_key = host_oplog_canonical_key(host_id);
+    if !remote.exists(&canonical_key)? {
+        *missing += 1;
+        eprintln!("missing canonical host operation log {canonical_key}");
+    } else {
+        let operations = decode_canonical_remote_oplog(paths, &remote.get(&canonical_key)?)
+            .map_err(|err| anyhow::anyhow!("parse remote operation log {canonical_key}: {err}"))?;
+        validate_remote_oplog_entries(&canonical_key, &operations, expected, missing);
+    }
+
+    let legacy_key = host_oplog_key(host_id);
+    if remote.exists(&legacy_key)? {
+        let operations = decode_operation_log(&remote.get(&legacy_key)?)
+            .map_err(|err| anyhow::anyhow!("parse remote operation log {legacy_key}: {err}"))?;
+        validate_remote_oplog_entries(&legacy_key, &operations, expected, missing);
+    }
+    Ok(())
+}
+
+fn validate_remote_oplog_entries(
+    key: &str,
+    actual: &[OperationExport],
+    expected: &[OperationExport],
+    missing: &mut usize,
+) {
+    for issue in operation_log_comparison_issues(actual, expected) {
+        *missing += 1;
+        match issue {
+            OperationLogComparisonIssue::CountMismatch { expected, actual } => {
+                eprintln!(
+                    "remote operation log count mismatch {key} expected={} actual={}",
+                    expected, actual
+                );
+                return;
+            }
+            OperationLogComparisonIssue::EntryMismatch { index, id } => {
+                eprintln!(
+                    "remote operation log entry does not match metadata {key} {id} index={index}"
+                );
+            }
+        }
+    }
 }
