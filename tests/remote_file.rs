@@ -3648,6 +3648,64 @@ fn pack_gc_and_remote_clone_restore_packed_blobs() {
 }
 
 #[test]
+fn fsck_detects_corrupt_local_pack_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let index_path = find_file_ending(&state.join("objects/indexes/pack"), ".json");
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    index["entries"][0]["offset"] = serde_json::Value::from(999_999u64);
+    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_detects_corrupt_canonical_pack_index() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
