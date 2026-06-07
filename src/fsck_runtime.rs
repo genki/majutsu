@@ -1,18 +1,25 @@
 use anyhow::{Result, bail};
-use majutsu_core::LargeManifest;
+use majutsu_core::{
+    ConfigRootIssue, HistoryGraphIssue, HostFileIssue, LargeManifest,
+    OperationLogEntry as OperationExport, OperationLogEntryIssue, config_root_consistency_issues,
+    history_graph_issues, host_file_issues,
+};
+use majutsu_db::{local_ref_issues, remote_ref_issues};
 use majutsu_large::{LargePinIssue, large_chunk_hash_matches, large_pin_issues};
+use rusqlite::Connection;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 
-use crate::config::{Paths, read_config};
+use crate::config::{Config, HostConfig, Paths, RootConfig, read_config};
 use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
+use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::{
     export_metadata, open_db, read_blob_payload, read_large_chunk, read_object,
-    validate_config_roots, validate_event_queue, validate_host_file, validate_local_history_graph,
-    validate_local_large_manifest_objects, validate_local_metadata_references,
-    validate_local_oplog, validate_local_pack_objects, validate_local_refs,
-    validate_local_snapshot_objects, validate_remote_refs, validate_restore_queue,
-    validate_upload_queue,
+    validate_event_queue, validate_local_large_manifest_objects,
+    validate_local_metadata_references, validate_local_oplog, validate_local_pack_objects,
+    validate_local_snapshot_objects, validate_restore_queue, validate_upload_queue,
 };
 
 pub(crate) fn fsck(paths: &Paths) -> Result<()> {
@@ -135,4 +142,216 @@ pub(crate) fn fsck(paths: &Paths) -> Result<()> {
     )?;
     println!("fsck ok");
     Ok(())
+}
+
+fn validate_local_history_graph(export: &crate::MetadataExport, missing: &mut usize) -> Result<()> {
+    for operation in &export.operations {
+        validate_operation_entry(operation, missing);
+    }
+    for issue in history_graph_issues(&export.snapshots, &export.operations) {
+        *missing += 1;
+        match issue {
+            HistoryGraphIssue::SnapshotSelfParent { snapshot_id } => {
+                eprintln!("snapshot {snapshot_id} references itself as parent");
+            }
+            HistoryGraphIssue::SnapshotMissingOperation {
+                snapshot_id,
+                operation_id,
+            } => {
+                eprintln!("snapshot {snapshot_id} references missing operation {operation_id}");
+            }
+            HistoryGraphIssue::OperationMissingParent {
+                operation_id,
+                parent_id,
+            } => {
+                eprintln!(
+                    "operation {operation_id} references missing parent operation {parent_id}"
+                );
+            }
+            HistoryGraphIssue::OperationSelfParent { operation_id } => {
+                eprintln!("operation {operation_id} references itself as parent");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_entry(operation: &OperationExport, missing: &mut usize) {
+    for issue in operation.validation_issues() {
+        *missing += 1;
+        match issue {
+            OperationLogEntryIssue::InvalidId => {
+                eprintln!("operation {} has invalid id", operation.id);
+            }
+            OperationLogEntryIssue::InvalidKind(kind) => {
+                eprintln!("operation {} has invalid kind {kind}", operation.id);
+            }
+            OperationLogEntryIssue::InvalidStatus(status) => {
+                eprintln!("operation {} has invalid status {status}", operation.id);
+            }
+            OperationLogEntryIssue::EmptyActor => {
+                eprintln!("operation {} has empty actor", operation.id);
+            }
+            OperationLogEntryIssue::InvalidCreatedAt { value, error } => {
+                eprintln!(
+                    "operation {} has invalid created_at {value}: {error}",
+                    operation.id
+                );
+            }
+        }
+    }
+}
+
+fn validate_remote_refs(conn: &Connection, config: &Config, missing: &mut usize) -> Result<()> {
+    let snapshot_ids = {
+        let mut stmt = conn.prepare("select id from snapshots")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?
+    };
+    let mut stmt = conn.prepare(
+        "select remote, name, value, observed_at from remote_refs order by remote, name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for issue in remote_ref_issues(refs, &config.host.id, &snapshot_ids) {
+        *missing += 1;
+        eprintln!("{}", issue.message());
+    }
+    Ok(())
+}
+
+fn validate_local_refs(conn: &Connection, missing: &mut usize) -> Result<()> {
+    let snapshot_ids = {
+        let mut stmt = conn.prepare("select id from snapshots")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?
+    };
+    let mut stmt = conn.prepare("select name, value from refs order by name")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for issue in local_ref_issues(refs, &snapshot_ids) {
+        *missing += 1;
+        eprintln!("{}", issue.message());
+    }
+    Ok(())
+}
+
+fn validate_host_file(paths: &Paths, config: &Config, missing: &mut usize) -> Result<()> {
+    if !paths.host.exists() {
+        *missing += 1;
+        eprintln!("missing host file {}", paths.host.display());
+        return Ok(());
+    }
+    let host: HostConfig = match toml::from_str(&fs::read_to_string(&paths.host)?) {
+        Ok(host) => host,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("invalid host file {}: {err}", paths.host.display());
+            return Ok(());
+        }
+    };
+    for issue in host_file_issues(&host.id, &host.name, &config.host.id, &config.host.name) {
+        *missing += 1;
+        match issue {
+            HostFileIssue::IdMismatch {
+                host_id,
+                config_host_id,
+            } => {
+                eprintln!("host file id {host_id} does not match config host id {config_host_id}");
+            }
+            HostFileIssue::NameMismatch {
+                host_name,
+                config_host_name,
+            } => {
+                eprintln!(
+                    "host file name {host_name} does not match config host name {config_host_name}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_config_roots(
+    paths: &Paths,
+    conn: &Connection,
+    config: &Config,
+    missing: &mut usize,
+) -> Result<()> {
+    let db_roots = roots(conn)?
+        .into_iter()
+        .map(|root| (root.id.clone(), root))
+        .collect::<BTreeMap<_, _>>();
+    let mut config_roots = BTreeMap::new();
+    for config_root in &config.roots {
+        if config_roots.contains_key(&config_root.id) {
+            continue;
+        }
+        let existing = db_roots.get(&config_root.id);
+        let root = match config_root.to_root_config(paths, existing) {
+            Ok(root) => root,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid config root {}: {err}", config_root.id);
+                continue;
+            }
+        };
+        config_roots.insert(config_root.id.clone(), root);
+    }
+    let mismatched_root_ids = db_roots
+        .iter()
+        .filter_map(|(id, db_root)| {
+            let config_root = config_roots.get(id)?;
+            (!root_configs_match(db_root, config_root)).then_some(id.as_str())
+        })
+        .collect::<Vec<_>>();
+    for issue in config_root_consistency_issues(
+        config.roots.iter().map(|root| root.id.as_str()),
+        config_roots.keys().map(String::as_str),
+        db_roots.keys().map(String::as_str),
+        mismatched_root_ids,
+    ) {
+        *missing += 1;
+        match issue {
+            ConfigRootIssue::DuplicateRootId { id } => {
+                eprintln!("duplicate root id in config {id}");
+            }
+            ConfigRootIssue::DatabaseMissingConfig { id } => {
+                eprintln!("root exists in database but not config {id}");
+            }
+            ConfigRootIssue::ConfigMissingDatabase { id } => {
+                eprintln!("root exists in config but not database {id}");
+            }
+            ConfigRootIssue::ConfigMismatch { id } => {
+                eprintln!("root config does not match database {id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn root_configs_match(left: &RootConfig, right: &RootConfig) -> bool {
+    left.id == right.id
+        && left.name == right.name
+        && left.path == right.path
+        && left.include == right.include
+        && left.exclude == right.exclude
+        && left.follow_symlinks == right.follow_symlinks
+        && left.require_mount == right.require_mount
+        && left.status == right.status
+        && left.snapshot_mode == right.snapshot_mode
+        && left.pre_snapshot == right.pre_snapshot
+        && left.post_snapshot == right.post_snapshot
+        && left.snapshot_source == right.snapshot_source
+        && left.application_plugin == right.application_plugin
+        && left.large == right.large
 }
