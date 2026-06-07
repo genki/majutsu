@@ -2954,7 +2954,8 @@ fn large_config_accepts_spec_size_strings() {
         .replace("binary_min_size = 16777216", "binary_min_size = \"16 MiB\"")
         .replace("chunk_size = 8388608", "target_chunk_size = \"4 B\"")
         .replace("max_parallel_uploads = 8", "max_parallel_uploads = 3")
-        .replace("multipart = true", "multipart = false");
+        .replace("multipart = true", "multipart = false")
+        .replace("sample_bytes = 1048576", "sample_bytes = \"1 KiB\"");
     fs::write(&config_path, config).unwrap();
     run({
         let mut c = mj();
@@ -2988,6 +2989,10 @@ fn large_config_accepts_spec_size_strings() {
     assert_eq!(export["config"]["large"]["chunk_size"], 4);
     assert_eq!(export["config"]["large"]["max_parallel_uploads"], 3);
     assert_eq!(export["config"]["large"]["multipart"], false);
+    assert_eq!(
+        export["config"]["large"]["compression"]["sample_bytes"],
+        1024
+    );
 }
 
 #[test]

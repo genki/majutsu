@@ -906,6 +906,11 @@ struct LargeCompressionConfig {
     algorithm: String,
     #[serde(default = "default_large_compression_level")]
     level: i32,
+    #[serde(
+        default = "default_large_compression_sample_bytes",
+        deserialize_with = "deserialize_usize_bytes"
+    )]
+    sample_bytes: usize,
     #[serde(default = "default_large_compression_min_gain_ratio")]
     min_gain_ratio: f64,
     #[serde(default = "default_large_compression_skip_extensions")]
@@ -5594,6 +5599,7 @@ fn compress_large_chunk(
         config.compression.enabled,
         &config.compression.algorithm,
         config.compression.level,
+        config.compression.sample_bytes,
         config.compression.min_gain_ratio,
         &config.compression.skip_extensions,
         name,
@@ -6854,6 +6860,10 @@ fn default_large_compression_level() -> i32 {
     3
 }
 
+fn default_large_compression_sample_bytes() -> usize {
+    1024 * 1024
+}
+
 fn default_large_compression_min_gain_ratio() -> f64 {
     0.05
 }
@@ -7069,6 +7079,7 @@ impl Default for LargeCompressionConfig {
             enabled: true,
             algorithm: default_large_compression_algorithm(),
             level: default_large_compression_level(),
+            sample_bytes: default_large_compression_sample_bytes(),
             min_gain_ratio: default_large_compression_min_gain_ratio(),
             skip_extensions: default_large_compression_skip_extensions(),
         }

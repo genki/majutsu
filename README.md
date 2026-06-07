@@ -167,6 +167,7 @@ fsck can verify the original plaintext chunk identity.
 enabled = true
 algorithm = "zstd"
 level = 3
+sample_bytes = "1 MiB"
 min_gain_ratio = 0.05
 skip_extensions = ["*.jpg", "*.png", "*.mp4", "*.zip", "*.zst", "*.gz"]
 ```

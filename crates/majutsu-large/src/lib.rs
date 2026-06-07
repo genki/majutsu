@@ -91,6 +91,7 @@ pub fn compress_chunk_if_useful(
     enabled: bool,
     algorithm: &str,
     level: i32,
+    sample_bytes: usize,
     min_gain_ratio: f64,
     skip_extensions: &[String],
     file_name: &str,
@@ -101,8 +102,20 @@ pub fn compress_chunk_if_useful(
             compression: "none".into(),
         });
     }
+    let sample_len = sample_bytes.min(bytes.len());
+    if sample_len > 0 && sample_len < bytes.len() {
+        let sample = &bytes[..sample_len];
+        let compressed_sample = zstd::stream::encode_all(sample, level)?;
+        let sample_gain = compression_gain(sample.len(), compressed_sample.len());
+        if sample_gain < min_gain_ratio {
+            return Ok(StoredLargeChunk {
+                bytes: bytes.to_vec(),
+                compression: "none".into(),
+            });
+        }
+    }
     let compressed = zstd::stream::encode_all(bytes, level)?;
-    let gain = 1.0 - (compressed.len() as f64 / bytes.len().max(1) as f64);
+    let gain = compression_gain(bytes.len(), compressed.len());
     if gain >= min_gain_ratio {
         Ok(StoredLargeChunk {
             bytes: compressed,
@@ -114,6 +127,10 @@ pub fn compress_chunk_if_useful(
             compression: "none".into(),
         })
     }
+}
+
+fn compression_gain(original_len: usize, stored_len: usize) -> f64 {
+    1.0 - (stored_len as f64 / original_len.max(1) as f64)
 }
 
 pub fn should_compress(
@@ -140,4 +157,41 @@ fn glob_match(pattern: &str, name: &str) -> bool {
         return name.starts_with(prefix);
     }
     pattern == name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compress_chunk_if_useful;
+
+    #[test]
+    fn compression_sample_can_skip_full_chunk_compression() {
+        let mut bytes = Vec::new();
+        let mut value = 0x1234_5678u64;
+        for _ in 0..2048 {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            bytes.push((value & 0xff) as u8);
+        }
+        bytes.extend(std::iter::repeat_n(b'a', 32 * 1024));
+
+        let stored =
+            compress_chunk_if_useful(&bytes, true, "zstd", 3, 2048, 0.05, &[], "payload.dat")
+                .unwrap();
+
+        assert_eq!(stored.compression, "none");
+        assert_eq!(stored.bytes, bytes);
+    }
+
+    #[test]
+    fn compression_sample_allows_useful_full_chunk_compression() {
+        let bytes = vec![b'a'; 32 * 1024];
+
+        let stored =
+            compress_chunk_if_useful(&bytes, true, "zstd", 3, 2048, 0.05, &[], "payload.dat")
+                .unwrap();
+
+        assert_eq!(stored.compression, "zstd");
+        assert!(stored.bytes.len() < bytes.len());
+    }
 }
