@@ -9484,19 +9484,25 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    run({
-        let mut c = mj();
-        c.arg("--home").arg(&state).arg("daemon").arg("stop");
-        c
-    });
     assert!(
         captured,
         "daemon did not create a snapshot for the file event"
     );
-
+    let mut synced = false;
+    for _ in 0..100 {
+        let queue_empty = fs::read_dir(state.join("queue/uploads"))
+            .map(|entries| entries.count() == 0)
+            .unwrap_or(true);
+        if remote.join("metadata/export.json").exists() && queue_empty {
+            synced = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(synced, "daemon did not sync the captured snapshot");
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
         c
     });
     run({
@@ -9599,31 +9605,30 @@ fn daemon_watch_snapshot_survives_sync_retry_and_remote_recovery() {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    assert!(
+        captured,
+        "daemon did not create a snapshot for the file event"
+    );
+    let mut queued = Vec::new();
+    for _ in 0..100 {
+        queued = fs::read_dir(state.join("queue/uploads"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>();
+        if queued.iter().any(|item| item.contains("\"attempts\": 1")) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(queued.iter().any(|item| item.contains("\"attempts\": 1")));
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("daemon").arg("stop");
         c
     });
-    assert!(
-        captured,
-        "daemon did not create a snapshot for the file event"
-    );
-
-    fails({
-        let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
-        c
-    });
-    fails({
-        let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
-        c
-    });
-    let queued = fs::read_dir(state.join("queue/uploads"))
-        .unwrap()
-        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
-        .collect::<Vec<_>>();
-    assert!(queued.iter().any(|item| item.contains("\"attempts\": 2")));
 
     fs::remove_file(&remote).unwrap();
     fs::create_dir_all(&remote).unwrap();

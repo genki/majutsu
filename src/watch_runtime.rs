@@ -9,7 +9,9 @@ use crate::daemon_runtime::{start_daemon_ipc, start_watch_daemon};
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::record_event;
 use crate::root_state::roots;
-use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
+use crate::{
+    ensure_ready, open_db, replay_pending_journal_events, snapshot, sync_current_if_remote,
+};
 
 pub fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
     majutsu_watch::WatchBackend::normalize(backend)
@@ -78,7 +80,7 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
         ),
     )?;
     loop {
-        snapshot(
+        snapshot_and_maybe_sync(
             paths,
             SnapshotArgs {
                 message: Some("watch snapshot".into()),
@@ -163,7 +165,7 @@ fn watch_notify_loop<W: Watcher>(
                     "periodic-rescan",
                     &format!("interval_secs={}", args.periodic_rescan_secs),
                 )?;
-                snapshot(
+                snapshot_and_maybe_sync(
                     paths,
                     SnapshotArgs {
                         message: Some("watch periodic rescan".into()),
@@ -178,7 +180,7 @@ fn watch_notify_loop<W: Watcher>(
         let detail = format_notify_event(&event);
         record_event(paths, "fs-event", &detail)?;
         if args.mode == "strict" {
-            snapshot(
+            snapshot_and_maybe_sync(
                 paths,
                 SnapshotArgs {
                     message: Some("watch strict event snapshot".into()),
@@ -218,7 +220,7 @@ fn watch_notify_loop<W: Watcher>(
                 }
             }
         }
-        snapshot(
+        snapshot_and_maybe_sync(
             paths,
             SnapshotArgs {
                 message: Some("watch event snapshot".into()),
@@ -233,6 +235,16 @@ fn watch_notify_loop<W: Watcher>(
         "watch-stop",
         &format!("foreground {backend_label} watch stopped"),
     )?;
+    Ok(())
+}
+
+fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
+    snapshot(paths, args)?;
+    match sync_current_if_remote(paths) {
+        Ok(true) => record_event(paths, "watch-sync", "synced current snapshot to remote")?,
+        Ok(false) => {}
+        Err(err) => record_event(paths, "watch-sync-error", &format!("{err:#}"))?,
+    }
     Ok(())
 }
 

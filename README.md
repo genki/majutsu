@@ -520,6 +520,11 @@ The daemon is a process wrapper around foreground watch. It uses the native
 watch backend by default (`inotify` on Linux), records filesystem events in the
 event journal, and exposes a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock`
 for status IPC.
+When a remote is configured, foreground watch and the background daemon attempt
+`mj sync` after each watch-created snapshot. Sync failures are recorded as
+`watch-sync-error` journal entries and leave upload queue retry state intact, so
+the next daemon snapshot or manual `mj sync` can continue after the remote
+recovers.
 `mj daemon status` reports the daemon pid, current snapshot, root status counts,
 event journal counts, whether replay is pending, queued upload retry/backpressure
 state, and active restore jobs. Those backlog fields are intended to make crash

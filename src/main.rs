@@ -1283,6 +1283,7 @@ fn parse_pin_since(input: &str) -> Result<DateTime<Utc>> {
 fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
+    let conn = open_db(paths)?;
     let remote = open_remote_with_upload_policy(
         config
             .remote
@@ -1291,10 +1292,33 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         config.large.multipart,
         config.large.max_parallel_uploads,
     )?;
-    let conn = open_db(paths)?;
     if let Some(SyncCommand::Status) = command {
         return sync_status(paths, &conn, &remote);
     }
+    sync_configured_remote(paths, &conn, &config, &remote)
+}
+
+pub(crate) fn sync_current_if_remote(paths: &Paths) -> Result<bool> {
+    let config = read_config(paths)?;
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(false);
+    };
+    let remote = open_remote_with_upload_policy(
+        remote_config,
+        config.large.multipart,
+        config.large.max_parallel_uploads,
+    )?;
+    let conn = open_db(paths)?;
+    sync_configured_remote(paths, &conn, &config, &remote)?;
+    Ok(true)
+}
+
+fn sync_configured_remote(
+    paths: &Paths,
+    conn: &Connection,
+    config: &Config,
+    remote: &RemoteStore,
+) -> Result<()> {
     let current = current_snapshot(&conn)?;
     let previous_last_synced = ref_value(&conn, "last-synced")?;
     let synced_at = Utc::now().to_rfc3339();
