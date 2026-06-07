@@ -77,6 +77,7 @@ mod operation_log;
 mod process_runtime;
 mod queue_runtime;
 mod remote_store;
+mod restore_apply;
 mod restore_runtime;
 mod root_state;
 mod snapshot_rules;
@@ -105,9 +106,7 @@ use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
 use db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
-use fs_meta::{
-    apply_xattrs, file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind,
-};
+use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
 };
@@ -125,6 +124,10 @@ use remote_store::{
     DEFAULT_MULTIPART_THRESHOLD, FileRemote, MIN_MULTIPART_PART_SIZE, S3Remote, s3_object_class,
 };
 use remote_store::{RemoteStore, open_remote, open_remote_with_upload_policy};
+use restore_apply::{
+    apply_file_metadata, prepare_directory_restore_destination, prepare_file_restore_destination,
+    restore_special_file, restore_special_matches, restore_symlink,
+};
 use restore_runtime::{
     RestoreDelete, RestorePlan, ensure_restore_job_has_no_missing_objects,
     ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
@@ -5484,194 +5487,6 @@ fn restore_record_matches_path(
             }
         }
     }
-}
-
-fn restore_symlink(dest: &Path, target: &str, force: bool) -> Result<()> {
-    if let Ok(meta) = fs::symlink_metadata(dest) {
-        if !force {
-            bail!("symlink restore target exists: {}", dest.display());
-        }
-        if meta.file_type().is_dir() {
-            bail!("symlink restore target is a directory: {}", dest.display());
-        }
-        fs::remove_file(dest)?;
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, dest)?;
-    #[cfg(not(unix))]
-    fs::write(dest, target)?;
-    Ok(())
-}
-
-fn prepare_file_restore_destination(dest: &Path, force: bool) -> Result<()> {
-    if fs::symlink_metadata(dest)
-        .map(|meta| meta.file_type().is_dir())
-        .unwrap_or(false)
-    {
-        if !force {
-            bail!("restore target is a directory: {}", dest.display());
-        }
-        fs::remove_dir(dest)
-            .with_context(|| format!("remove empty restore target directory {}", dest.display()))?;
-    }
-    Ok(())
-}
-
-fn prepare_directory_restore_destination(dest: &Path, force: bool) -> Result<()> {
-    let Ok(meta) = fs::symlink_metadata(dest) else {
-        return Ok(());
-    };
-    if meta.file_type().is_dir() {
-        return Ok(());
-    }
-    if !force {
-        bail!("directory restore target exists: {}", dest.display());
-    }
-    fs::remove_file(dest)?;
-    Ok(())
-}
-
-fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
-    apply_xattrs(dest, &record.xattrs)?;
-    apply_file_owner(dest, record)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if record.mode != 0 {
-            fs::set_permissions(dest, fs::Permissions::from_mode(record.mode & 0o7777))?;
-        }
-    }
-    if let Some(seconds) = record.modified {
-        set_path_mtime(dest, seconds)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn apply_file_owner(dest: &Path, record: &FileRecord) -> Result<()> {
-    let Some(uid) = record.uid else {
-        return Ok(());
-    };
-    let Some(gid) = record.gid else {
-        return Ok(());
-    };
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let raw_path = CString::new(dest.as_os_str().as_bytes())
-        .with_context(|| format!("invalid owner path {}", dest.display()))?;
-    let rc = unsafe {
-        libc::fchownat(
-            libc::AT_FDCWD,
-            raw_path.as_ptr(),
-            uid as libc::uid_t,
-            gid as libc::gid_t,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if matches!(
-            err.kind(),
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-        ) {
-            return Ok(());
-        }
-        return Err(err).with_context(|| format!("set owner {}", dest.display()));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn apply_file_owner(_dest: &Path, _record: &FileRecord) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_path_mtime(path: &Path, seconds: i64) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let raw_path = CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("invalid mtime path {}", path.display()))?;
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: seconds as libc::time_t,
-            tv_nsec: 0,
-        },
-    ];
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, raw_path.as_ptr(), times.as_ptr(), 0) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("set mtime {}", path.display()));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_path_mtime(path: &Path, seconds: i64) -> Result<()> {
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restore_special_file(
-    dest: &Path,
-    record: &FileRecord,
-    special_kind: &str,
-    force: bool,
-) -> Result<()> {
-    if special_kind != "fifo" {
-        bail!(
-            "restore of special file kind {special_kind} is not supported: {}",
-            dest.display()
-        );
-    }
-    if let Ok(meta) = fs::symlink_metadata(dest) {
-        if restore_special_matches(&meta, special_kind)? {
-            apply_file_metadata(dest, record)?;
-            return Ok(());
-        }
-        if force {
-            fs::remove_file(dest)?;
-        } else {
-            bail!("special file restore target exists: {}", dest.display());
-        }
-    }
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let raw_path = CString::new(dest.as_os_str().as_bytes())
-        .with_context(|| format!("invalid fifo path {}", dest.display()))?;
-    let mode = if record.mode == 0 {
-        0o666
-    } else {
-        record.mode & 0o7777
-    };
-    let rc = unsafe { libc::mkfifo(raw_path.as_ptr(), mode as libc::mode_t) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("create fifo {}", dest.display()));
-    }
-    apply_file_metadata(dest, record)
-}
-
-#[cfg(not(unix))]
-fn restore_special_file(
-    dest: &Path,
-    _record: &FileRecord,
-    special_kind: &str,
-    _force: bool,
-) -> Result<()> {
-    bail!(
-        "restore of special file kind {special_kind} is not supported on this platform: {}",
-        dest.display()
-    )
-}
-
-fn restore_special_matches(meta: &fs::Metadata, special_kind: &str) -> Result<bool> {
-    Ok(special_file_kind(meta).as_deref() == Some(special_kind))
 }
 
 fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<FileRecord>> {
