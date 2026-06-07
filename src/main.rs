@@ -3307,17 +3307,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     create_layout(paths)?;
     let remote_config = RemoteConfig::from_url(args.remote);
     let remote = open_remote(&remote_config)?;
-    let metadata_key = if let Some(host_id) = args.host.as_ref() {
-        let index = remote_host_index_with_legacy(&remote)?;
-        index
-            .hosts
-            .into_iter()
-            .find(|host| host.id == *host_id || host.name == *host_id)
-            .map(|host| host.metadata_key)
-            .ok_or_else(|| anyhow!("remote host not found: {host_id}"))?
-    } else {
-        "metadata/export.json".into()
-    };
+    let metadata_key = clone_metadata_key(&remote, args.host.as_deref())?;
     let export_bytes = remote.get(&metadata_key)?;
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
@@ -3349,6 +3339,29 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
     Ok(())
+}
+
+fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String> {
+    if let Some(host_id) = host {
+        let index = remote_host_index_with_legacy(remote)?;
+        return index
+            .hosts
+            .into_iter()
+            .find(|host| host.id == host_id || host.name == host_id)
+            .map(|host| host.metadata_key)
+            .ok_or_else(|| anyhow!("remote host not found: {host_id}"));
+    }
+    if remote.exists("metadata/export.json")? {
+        return Ok("metadata/export.json".into());
+    }
+    let index = remote_host_index_with_legacy(remote)?;
+    match index.hosts.as_slice() {
+        [host] => Ok(host.metadata_key.clone()),
+        [] => {
+            bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")
+        }
+        _ => bail!("remote contains multiple hosts; rerun clone with --host"),
+    }
 }
 
 fn download_local_object_from_remote(

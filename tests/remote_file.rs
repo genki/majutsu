@@ -553,6 +553,166 @@ fn remote_check_accepts_host_index_metadata() {
 }
 
 #[test]
+fn clone_can_use_single_host_index_when_legacy_metadata_is_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--host-name")
+            .arg("only-host")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fs::remove_file(remote.join("metadata/export.json")).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "alpha\n"
+    );
+}
+
+#[test]
+fn clone_requires_host_for_multi_host_index_without_legacy_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source_a = tmp.path().join("source-a");
+    let source_b = tmp.path().join("source-b");
+    let state_a = tmp.path().join("state-a");
+    let state_b = tmp.path().join("state-b");
+    let clone_without_host = tmp.path().join("clone-without-host");
+    let clone_b = tmp.path().join("clone-b");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source_a).unwrap();
+    fs::create_dir_all(&source_b).unwrap();
+    fs::write(source_a.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source_b.join("beta.txt"), b"beta\n").unwrap();
+
+    for (state, host_name, source, root) in [
+        (&state_a, "host-a", &source_a, "a"),
+        (&state_b, "host-b", &source_b, "b"),
+    ] {
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("init")
+                .arg("--host-name")
+                .arg(host_name)
+                .arg("--remote")
+                .arg(format!("file://{}", remote.display()));
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("root")
+                .arg("add")
+                .arg(root)
+                .arg(source);
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("snapshot");
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("sync");
+            c
+        });
+    }
+    fs::remove_file(remote.join("metadata/export.json")).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_without_host)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_b)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()))
+            .arg("--host")
+            .arg("host-b");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_b)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("b/beta.txt")).unwrap(),
+        "beta\n"
+    );
+    assert!(!restore.join("a/alpha.txt").exists());
+}
+
+#[test]
 fn remote_fsck_detects_missing_canonical_object_alias() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
