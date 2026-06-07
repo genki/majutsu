@@ -4842,6 +4842,8 @@ fn remote_fsck_export(
             eprintln!("missing canonical remote object alias for {key}");
         }
     }
+    validate_remote_snapshot_objects(paths, remote, &export, missing)?;
+    validate_remote_large_manifest_objects(paths, remote, &export, missing)?;
     if let Some(current) = export.refs.get("current") {
         let found = export
             .snapshots
@@ -4903,6 +4905,130 @@ fn remote_fsck_export(
     Ok(export)
 }
 
+fn validate_remote_snapshot_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    for snapshot in &export.snapshots {
+        let metadata_manifest: SnapshotManifest =
+            match serde_json::from_str(&snapshot.manifest_json) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    *missing += 1;
+                    eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
+                    continue;
+                }
+            };
+        for bytes in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
+            let remote_manifest: SnapshotManifest =
+                serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
+                    || {
+                        format!(
+                            "parse snapshot manifest {} from {}",
+                            snapshot.manifest_key, bytes.remote_key
+                        )
+                    },
+                )?;
+            if !snapshot_manifest_matches(&remote_manifest, &metadata_manifest) {
+                *missing += 1;
+                eprintln!(
+                    "snapshot manifest object does not match metadata {} {}",
+                    snapshot.id, bytes.remote_key
+                );
+            }
+        }
+        for (root_id, root_tree) in &metadata_manifest.root_trees {
+            for bytes in remote_local_object_variants(paths, remote, &root_tree.tree_key)? {
+                let tree: TreeManifest =
+                    serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
+                        || {
+                            format!(
+                                "parse tree manifest {} from {}",
+                                root_tree.tree_key, bytes.remote_key
+                            )
+                        },
+                    )?;
+                if tree.root_id != *root_id
+                    || tree.tree_id != root_tree.tree_id
+                    || tree.entries.len() != root_tree.file_count
+                {
+                    *missing += 1;
+                    eprintln!(
+                        "tree manifest object does not match snapshot metadata {} {}",
+                        snapshot.id, bytes.remote_key
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct RemoteObjectVariant {
+    remote_key: String,
+    bytes: Vec<u8>,
+}
+
+fn remote_local_object_variants(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+) -> Result<Vec<RemoteObjectVariant>> {
+    let mut variants = Vec::new();
+    if remote.exists(key)? {
+        variants.push(RemoteObjectVariant {
+            remote_key: key.to_string(),
+            bytes: remote.get(key).with_context(|| format!("download {key}"))?,
+        });
+    }
+    for alias in canonical_remote_aliases(key) {
+        if remote.exists(&alias)? {
+            let bytes = remote
+                .get(&alias)
+                .with_context(|| format!("download {key} via canonical alias {alias}"))?;
+            variants.push(RemoteObjectVariant {
+                remote_key: alias,
+                bytes: canonical_remote_object_to_local_bytes(paths, key, &bytes)?,
+            });
+        }
+    }
+    Ok(variants)
+}
+
+fn validate_remote_large_manifest_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    for large in &export.large_objects {
+        for bytes in remote_local_object_variants(paths, remote, &large.manifest_key)? {
+            let manifest: LargeManifest =
+                serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
+                    || {
+                        format!(
+                            "parse large manifest {} from {}",
+                            large.manifest_key, bytes.remote_key
+                        )
+                    },
+                )?;
+            if manifest.oid != large.oid
+                || manifest.size != large.size
+                || manifest.chunks.len() != large.chunk_count
+            {
+                *missing += 1;
+                eprintln!(
+                    "large manifest object does not match metadata {} {}",
+                    large.oid, bytes.remote_key
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_export_matches(remote: &SnapshotExport, metadata: &SnapshotExport) -> bool {
     remote.id == metadata.id
         && remote.parent_id == metadata.parent_id
@@ -4922,6 +5048,10 @@ fn operation_export_matches(remote: &OperationExport, metadata: &OperationExport
         && remote.after_snapshot == metadata.after_snapshot
         && remote.created_at == metadata.created_at
         && remote.message == metadata.message
+}
+
+fn snapshot_manifest_matches(remote: &SnapshotManifest, metadata: &SnapshotManifest) -> bool {
+    serde_json::to_value(remote).ok() == serde_json::to_value(metadata).ok()
 }
 
 #[derive(Debug)]
