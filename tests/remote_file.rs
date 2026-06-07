@@ -5014,6 +5014,59 @@ fn operations_are_appended_to_local_oplog() {
 }
 
 #[test]
+fn fsck_detects_corrupt_local_oplog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert_eq!(
+        local_oplog_record_count(&state) as i64,
+        db_total_operation_count(&state)
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    fs::write(state.join("ops/local-oplog.cborl"), b"not-cbor").unwrap();
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    fs::write(state.join("ops/local-oplog.cborl"), b"").unwrap();
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn large_pin_unpin_is_persisted_in_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

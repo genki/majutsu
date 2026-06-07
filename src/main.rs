@@ -4629,10 +4629,67 @@ fn fsck(paths: &Paths) -> Result<()> {
     validate_local_snapshot_objects(paths, &export, &mut missing)?;
     validate_local_large_manifest_objects(paths, &export, &mut missing)?;
     validate_local_pack_objects(paths, &export, &mut missing)?;
+    validate_local_oplog(&conn, &mut missing)?;
     if missing > 0 {
-        bail!("fsck found {missing} missing objects");
+        bail!("fsck found {missing} problems");
     }
     println!("fsck ok");
+    Ok(())
+}
+
+fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
+    let expected = query_operations(conn)?;
+    let Some(path) = local_oplog_path(conn)? else {
+        if !expected.is_empty() {
+            *missing += 1;
+            eprintln!("missing local operation log path");
+        }
+        return Ok(());
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("unreadable local operation log {}: {err}", path.display());
+            return Ok(());
+        }
+    };
+    let mut actual = Vec::new();
+    let mut stream =
+        serde_cbor::de::Deserializer::from_slice(&bytes).into_iter::<OperationExport>();
+    while let Some(record) = stream.next() {
+        match record {
+            Ok(operation) => actual.push(operation),
+            Err(err) => {
+                *missing += 1;
+                eprintln!(
+                    "invalid local operation log {} at byte {}: {err}",
+                    path.display(),
+                    stream.byte_offset()
+                );
+                return Ok(());
+            }
+        }
+    }
+    if actual.len() != expected.len() {
+        *missing += 1;
+        eprintln!(
+            "local operation log count mismatch {} expected={} actual={}",
+            path.display(),
+            expected.len(),
+            actual.len()
+        );
+        return Ok(());
+    }
+    for (index, (local, metadata)) in actual.iter().zip(expected.iter()).enumerate() {
+        if !operation_export_matches(local, metadata) {
+            *missing += 1;
+            eprintln!(
+                "local operation log entry does not match metadata {} index={index}",
+                local.id
+            );
+        }
+    }
     Ok(())
 }
 
