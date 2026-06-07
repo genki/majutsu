@@ -1221,6 +1221,62 @@ fn restore_atomic_writes_do_not_clobber_legacy_temp_names() {
     );
 }
 
+#[test]
+fn restore_rejects_unsafe_path_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--path")
+            .arg("../outside")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--path")
+            .arg("/tmp")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn follow_symlinks_controls_snapshot_payload_kind() {

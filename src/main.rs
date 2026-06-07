@@ -2463,6 +2463,9 @@ fn unmount_fuse(path: &Path) -> Result<()> {
 
 fn hydrate_cmd(paths: &Paths, args: HydrateArgs) -> Result<()> {
     ensure_ready(paths)?;
+    if let Some(path) = &args.path {
+        validate_relative_filter_path(path, "hydrate --path")?;
+    }
     let conn = open_db(paths)?;
     let lazy_root = args.view.join(".majutsu-lazy");
     if !lazy_root.exists() {
@@ -4706,6 +4709,9 @@ fn build_restore_plan(
     conn: &Connection,
     args: &RestoreArgs,
 ) -> Result<RestorePlan> {
+    if let Some(path) = &args.path {
+        validate_relative_filter_path(path, "restore --path")?;
+    }
     let snapshot = load_snapshot(conn, args)?;
     let root_paths = roots(conn)?
         .into_iter()
@@ -4911,6 +4917,23 @@ fn restore_target_label(plan: &RestorePlan) -> String {
         .as_ref()
         .map(|to| to.display().to_string())
         .unwrap_or_else(|| "original-roots".into())
+}
+
+fn validate_relative_filter_path(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!("{label} must be a relative path inside the selected root");
+    }
+    let mut has_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => has_component = true,
+            _ => bail!("{label} must not contain '.', '..', prefixes, or root separators"),
+        }
+    }
+    if !has_component {
+        bail!("{label} must not be empty");
+    }
+    Ok(())
 }
 
 fn print_restore_plan(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<()> {
