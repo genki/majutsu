@@ -3943,9 +3943,6 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
         bail!("key rotation requires encrypted state");
     }
     let conn = open_db(paths)?;
-    if !query_packs(&conn)?.is_empty() {
-        bail!("key rotation with pack files is not supported yet; run before packing");
-    }
     let old_key = read_master_key(paths)?;
     let new_key = new_key.unwrap_or(random_key_hex()?);
     validate_key_hex(&new_key)?;
@@ -3958,7 +3955,10 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
     let large_objects = query_large_objects(&conn)?;
     let mut blob_payloads = BTreeMap::new();
     for blob in &blobs {
-        blob_payloads.insert(blob.oid.clone(), read_object(paths, &blob.object_key)?);
+        blob_payloads.insert(
+            blob.oid.clone(),
+            read_blob_payload(paths, &conn, &blob.oid, &blob.object_key)?,
+        );
     }
     let mut chunk_payloads = BTreeMap::new();
     for chunk in &chunks {
@@ -3986,12 +3986,13 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
     for blob in &blobs {
         let key = store_bytes(paths, &paths.objects, &blob.oid, &blob_payloads[&blob.oid])?;
         conn.execute(
-            "update blobs set object_key=?2 where oid=?1",
+            "update blobs set object_key=?2, pack_id=null, pack_offset=null, pack_len=null where oid=?1",
             params![blob.oid, key],
         )?;
         blob_keys.insert(blob.oid.clone(), key);
         objects += 1;
     }
+    conn.execute("delete from packs", [])?;
     let mut chunk_keys = BTreeMap::new();
     for chunk in &chunks {
         let key = store_bytes(

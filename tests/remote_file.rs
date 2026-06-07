@@ -2460,6 +2460,99 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
 }
 
 #[test]
+fn encrypted_key_rotation_rewrites_packed_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("secret.txt"), b"secret\n").unwrap();
+    fs::write(source.join("note.txt"), b"note\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init").arg("--encrypt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    assert!(find_file_ending(&state.join("objects/packs"), ".mpack").exists());
+
+    let new_key = "2222222222222222222222222222222222222222222222222222222222222222";
+    let rotated = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("key")
+            .arg("rotate")
+            .arg("--new-key")
+            .arg(new_key);
+        c
+    });
+    assert!(rotated.contains("rotated master key"));
+    assert!(rotated.contains("objects_rewritten "));
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let packed_blobs: i64 = conn
+        .query_row(
+            "select count(*) from blobs where pack_id is not null",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let packs: i64 = conn
+        .query_row("select count(*) from packs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(packed_blobs, 0);
+    assert_eq!(packs, 0);
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("secret.txt")).unwrap(),
+        fs::read(restore.join("sample/secret.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("note.txt")).unwrap(),
+        fs::read(restore.join("sample/note.txt")).unwrap()
+    );
+}
+
+#[test]
 fn init_creates_spec_state_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
