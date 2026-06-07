@@ -19,8 +19,8 @@ use majutsu_db::{
     UploadQueueItemIssue, local_ref_issues, remote_ref_issues,
 };
 use majutsu_large::{
-    ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_chunk_hash_matches,
-    large_manifest_issues, large_pin_issues,
+    ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_manifest_issues,
+    large_pin_issues,
 };
 use majutsu_pack::{
     PackEntry, PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackTier,
@@ -67,6 +67,7 @@ mod config;
 mod daemon_runtime;
 mod db_refs;
 mod fs_meta;
+mod fsck_runtime;
 mod fuse_mount;
 mod object_paths;
 mod operation_log;
@@ -103,6 +104,7 @@ use db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
+use fsck_runtime::fsck;
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
@@ -2855,128 +2857,6 @@ fn gc_cmd(paths: &Paths) -> Result<()> {
         Some(&format!("removed {removed} unreferenced objects")),
     )?;
     println!("removed_unreferenced_objects {removed}");
-    Ok(())
-}
-
-fn fsck(paths: &Paths) -> Result<()> {
-    ensure_ready(paths)?;
-    let conn = open_db(paths)?;
-    let mut missing = 0usize;
-    let config = read_config(paths)?;
-    let export = export_metadata(&conn, &config)?;
-    for key in local_object_keys(&export) {
-        let full = paths.home.join(&key);
-        if !full.exists() {
-            missing += 1;
-            eprintln!("missing object {key}");
-        } else if let Err(err) = read_object(paths, &key) {
-            missing += 1;
-            eprintln!("unreadable object {key}: {err}");
-        }
-    }
-    let mut stmt = conn.prepare("select oid, object_key, pack_id from blobs")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (oid, key, pack_id) = row?;
-        if pack_id.is_some() {
-            if let Err(err) = read_blob_payload(paths, &conn, &oid, &key) {
-                missing += 1;
-                eprintln!("unreadable packed blob {oid}: {err}");
-            }
-        } else if !paths.home.join(&key).exists() {
-            missing += 1;
-            eprintln!("missing blob {oid} {key}");
-        } else if let Err(err) = read_object(paths, &key) {
-            missing += 1;
-            eprintln!("unreadable blob {oid} {key}: {err}");
-        }
-    }
-    let mut stmt = conn.prepare("select oid, object_key from chunks")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (oid, key) = row?;
-        if !paths.home.join(&key).exists() {
-            missing += 1;
-            eprintln!("missing chunk {oid} {key}");
-        } else if let Err(err) = read_object(paths, &key) {
-            missing += 1;
-            eprintln!("unreadable chunk {oid} {key}: {err}");
-        }
-    }
-    let mut stmt = conn.prepare("select oid, manifest_key from large_objects")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (oid, manifest_key) = row?;
-        match read_object(paths, &manifest_key)
-            .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
-        {
-            Ok(manifest) => {
-                for chunk in &manifest.chunks {
-                    match read_large_chunk(paths, chunk) {
-                        Ok(bytes) if large_chunk_hash_matches(chunk, &bytes) => {}
-                        Ok(_) => {
-                            missing += 1;
-                            eprintln!("large chunk hash mismatch {} {}", oid, chunk.object_key);
-                        }
-                        Err(err) => {
-                            missing += 1;
-                            eprintln!("unreadable large chunk {} {}: {err}", oid, chunk.object_key);
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                missing += 1;
-                eprintln!("unreadable large manifest {oid} {manifest_key}: {err}");
-            }
-        }
-    }
-    for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
-        missing += 1;
-        match issue {
-            LargePinIssue::Dangling { oid, pinned_at } => {
-                eprintln!("dangling large pin {oid} pinned_at={pinned_at}");
-            }
-            LargePinIssue::InvalidTimestamp { oid, pinned_at } => {
-                eprintln!("invalid large pin timestamp {oid} pinned_at={pinned_at}");
-            }
-        }
-    }
-    validate_host_file(paths, &config, &mut missing)?;
-    validate_config_roots(paths, &conn, &config, &mut missing)?;
-    validate_local_refs(&conn, &mut missing)?;
-    validate_remote_refs(&conn, &config, &mut missing)?;
-    validate_local_history_graph(&export, &mut missing)?;
-    validate_local_snapshot_objects(paths, &export, &mut missing)?;
-    validate_local_large_manifest_objects(paths, &export, &mut missing)?;
-    validate_local_pack_objects(paths, &export, &mut missing)?;
-    validate_local_metadata_references(paths, &export, &mut missing)?;
-    validate_local_oplog(&conn, &mut missing)?;
-    validate_upload_queue(paths, &mut missing)?;
-    validate_event_queue(paths, &mut missing)?;
-    validate_restore_queue(paths, &conn, &mut missing)?;
-    if missing > 0 {
-        bail!("fsck found {missing} problems");
-    }
-    let current = current_snapshot(&conn)?;
-    record_op(
-        &conn,
-        "fsck",
-        current.as_deref(),
-        current.as_deref(),
-        Some("checked local state"),
-    )?;
-    println!("fsck ok");
     Ok(())
 }
 
