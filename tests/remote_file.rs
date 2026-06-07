@@ -1568,6 +1568,67 @@ fn restore_force_can_replace_empty_directory_with_file() {
 }
 
 #[test]
+fn restore_force_can_replace_file_with_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(source.join("empty")).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::create_dir_all(restore.join("sample")).unwrap();
+    fs::write(restore.join("sample/empty"), b"existing file\n").unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--path")
+            .arg("empty")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(restore.join("sample/empty").is_file());
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--path")
+            .arg("empty")
+            .arg("--to")
+            .arg(&restore)
+            .arg("--force");
+        c
+    });
+    assert!(restore.join("sample/empty").is_dir());
+}
+
+#[test]
 fn encrypted_file_remote_clone_restores_with_exported_key() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

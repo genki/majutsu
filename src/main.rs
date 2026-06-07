@@ -1936,6 +1936,7 @@ fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
         }
         match &record.payload {
             Payload::Directory => {
+                prepare_directory_restore_destination(&dest, false)?;
                 fs::create_dir_all(&dest)?;
                 directory_metadata.push((dest, record));
             }
@@ -5277,6 +5278,7 @@ fn apply_restore_plan(
         }
         match &record.payload {
             Payload::Directory => {
+                prepare_directory_restore_destination(&dest, force)?;
                 fs::create_dir_all(&dest)?;
                 directory_metadata.push((dest, record));
             }
@@ -5452,6 +5454,20 @@ fn prepare_file_restore_destination(dest: &Path, force: bool) -> Result<()> {
         fs::remove_dir(dest)
             .with_context(|| format!("remove empty restore target directory {}", dest.display()))?;
     }
+    Ok(())
+}
+
+fn prepare_directory_restore_destination(dest: &Path, force: bool) -> Result<()> {
+    let Ok(meta) = fs::symlink_metadata(dest) else {
+        return Ok(());
+    };
+    if meta.file_type().is_dir() {
+        return Ok(());
+    }
+    if !force {
+        bail!("directory restore target exists: {}", dest.display());
+    }
+    fs::remove_file(dest)?;
     Ok(())
 }
 
