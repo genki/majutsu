@@ -11,12 +11,12 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
-    FileRecord, LargeChunk, LargeManifest, OperationLogComparisonIssue,
+    FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, OperationLogComparisonIssue,
     OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload, RootSnapshot,
     SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest, decode_operation_log,
-    encode_operation_log, operation_log_comparison_issues, operation_log_entry_matches,
-    payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
-    snapshot_export_matches,
+    encode_operation_log, history_graph_issues, operation_log_comparison_issues,
+    operation_log_entry_matches, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
+    payload_large_ref_mut, snapshot_export_matches,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -4565,39 +4565,31 @@ fn fsck(paths: &Paths) -> Result<()> {
 }
 
 fn validate_local_history_graph(export: &MetadataExport, missing: &mut usize) -> Result<()> {
-    let operation_ids = export
-        .operations
-        .iter()
-        .map(|operation| operation.id.as_str())
-        .collect::<BTreeSet<_>>();
-    for snapshot in &export.snapshots {
-        if let Some(parent) = snapshot.parent_id.as_deref() {
-            if parent == snapshot.id {
-                *missing += 1;
-                eprintln!("snapshot {} references itself as parent", snapshot.id);
-            }
-        }
-        if !operation_ids.contains(snapshot.op_id.as_str()) {
-            *missing += 1;
-            eprintln!(
-                "snapshot {} references missing operation {}",
-                snapshot.id, snapshot.op_id
-            );
-        }
-    }
     for operation in &export.operations {
         validate_operation_entry(operation, missing);
-        if let Some(parent) = operation.parent_op.as_deref() {
-            if !operation_ids.contains(parent) {
-                *missing += 1;
+    }
+    for issue in history_graph_issues(&export.snapshots, &export.operations) {
+        *missing += 1;
+        match issue {
+            HistoryGraphIssue::SnapshotSelfParent { snapshot_id } => {
+                eprintln!("snapshot {snapshot_id} references itself as parent");
+            }
+            HistoryGraphIssue::SnapshotMissingOperation {
+                snapshot_id,
+                operation_id,
+            } => {
+                eprintln!("snapshot {snapshot_id} references missing operation {operation_id}");
+            }
+            HistoryGraphIssue::OperationMissingParent {
+                operation_id,
+                parent_id,
+            } => {
                 eprintln!(
-                    "operation {} references missing parent operation {parent}",
-                    operation.id
+                    "operation {operation_id} references missing parent operation {parent_id}"
                 );
             }
-            if parent == operation.id {
-                *missing += 1;
-                eprintln!("operation {} references itself as parent", operation.id);
+            HistoryGraphIssue::OperationSelfParent { operation_id } => {
+                eprintln!("operation {operation_id} references itself as parent");
             }
         }
     }

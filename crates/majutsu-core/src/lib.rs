@@ -102,6 +102,64 @@ pub fn snapshot_export_matches(actual: &SnapshotExport, expected: &SnapshotExpor
     actual == expected
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryGraphIssue {
+    SnapshotSelfParent {
+        snapshot_id: String,
+    },
+    SnapshotMissingOperation {
+        snapshot_id: String,
+        operation_id: String,
+    },
+    OperationMissingParent {
+        operation_id: String,
+        parent_id: String,
+    },
+    OperationSelfParent {
+        operation_id: String,
+    },
+}
+
+pub fn history_graph_issues(
+    snapshots: &[SnapshotExport],
+    operations: &[OperationLogEntry],
+) -> Vec<HistoryGraphIssue> {
+    let operation_ids = operations
+        .iter()
+        .map(|operation| operation.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut issues = Vec::new();
+    for snapshot in snapshots {
+        if snapshot.parent_id.as_deref() == Some(snapshot.id.as_str()) {
+            issues.push(HistoryGraphIssue::SnapshotSelfParent {
+                snapshot_id: snapshot.id.clone(),
+            });
+        }
+        if !operation_ids.contains(snapshot.op_id.as_str()) {
+            issues.push(HistoryGraphIssue::SnapshotMissingOperation {
+                snapshot_id: snapshot.id.clone(),
+                operation_id: snapshot.op_id.clone(),
+            });
+        }
+    }
+    for operation in operations {
+        if let Some(parent) = operation.parent_op.as_deref() {
+            if !operation_ids.contains(parent) {
+                issues.push(HistoryGraphIssue::OperationMissingParent {
+                    operation_id: operation.id.clone(),
+                    parent_id: parent.to_string(),
+                });
+            }
+            if parent == operation.id {
+                issues.push(HistoryGraphIssue::OperationSelfParent {
+                    operation_id: operation.id.clone(),
+                });
+            }
+        }
+    }
+    issues
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
     #[serde(rename = "op_id", alias = "id")]
@@ -686,6 +744,97 @@ mod tests {
         assert_eq!(value["manifest_key"], "objects/snapshots/snap-1.json");
         assert_eq!(value["manifest_json"], "{}");
         assert!(snapshot_export_matches(&export, &export));
+    }
+
+    #[test]
+    fn history_graph_validation_reports_snapshot_and_operation_edges() {
+        let snapshots = vec![
+            SnapshotExport {
+                id: "snap-1".into(),
+                parent_id: Some("snap-1".into()),
+                op_id: "op-missing".into(),
+                created_at: "2026-06-07T00:00:00Z".into(),
+                manifest_key: "objects/snapshots/snap-1.json".into(),
+                manifest_json: "{}".into(),
+            },
+            SnapshotExport {
+                id: "snap-2".into(),
+                parent_id: Some("snap-1".into()),
+                op_id: "op-1".into(),
+                created_at: "2026-06-07T00:01:00Z".into(),
+                manifest_key: "objects/snapshots/snap-2.json".into(),
+                manifest_json: "{}".into(),
+            },
+        ];
+        let operations = vec![
+            OperationLogEntry {
+                id: "op-1".into(),
+                parent_op: Some("op-2".into()),
+                kind: "init".into(),
+                actor: "alice@host".into(),
+                status: "done".into(),
+                before_snapshot: None,
+                after_snapshot: Some("snap-1".into()),
+                created_at: "2026-06-07T00:00:00Z".into(),
+                message: None,
+            },
+            OperationLogEntry {
+                id: "op-self".into(),
+                parent_op: Some("op-self".into()),
+                kind: "manual-snapshot".into(),
+                actor: "alice@host".into(),
+                status: "done".into(),
+                before_snapshot: Some("snap-1".into()),
+                after_snapshot: Some("snap-2".into()),
+                created_at: "2026-06-07T00:01:00Z".into(),
+                message: None,
+            },
+        ];
+
+        assert_eq!(
+            history_graph_issues(&snapshots, &operations),
+            vec![
+                HistoryGraphIssue::SnapshotSelfParent {
+                    snapshot_id: "snap-1".into(),
+                },
+                HistoryGraphIssue::SnapshotMissingOperation {
+                    snapshot_id: "snap-1".into(),
+                    operation_id: "op-missing".into(),
+                },
+                HistoryGraphIssue::OperationMissingParent {
+                    operation_id: "op-1".into(),
+                    parent_id: "op-2".into(),
+                },
+                HistoryGraphIssue::OperationSelfParent {
+                    operation_id: "op-self".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn history_graph_validation_accepts_linked_history() {
+        let snapshots = vec![SnapshotExport {
+            id: "snap-1".into(),
+            parent_id: None,
+            op_id: "op-1".into(),
+            created_at: "2026-06-07T00:00:00Z".into(),
+            manifest_key: "objects/snapshots/snap-1.json".into(),
+            manifest_json: "{}".into(),
+        }];
+        let operations = vec![OperationLogEntry {
+            id: "op-1".into(),
+            parent_op: None,
+            kind: "init".into(),
+            actor: "alice@host".into(),
+            status: "done".into(),
+            before_snapshot: None,
+            after_snapshot: Some("snap-1".into()),
+            created_at: "2026-06-07T00:00:00Z".into(),
+            message: None,
+        }];
+
+        assert!(history_graph_issues(&snapshots, &operations).is_empty());
     }
 
     #[test]
