@@ -3,7 +3,7 @@ use majutsu_core::FileRecord;
 use majutsu_restore::RestoreQueueItem;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{Paths, RestoreDelete, RestorePlan};
 
@@ -94,6 +94,34 @@ pub(crate) fn restore_target_label(plan: &RestorePlan) -> String {
         .as_ref()
         .map(|to| to.display().to_string())
         .unwrap_or_else(|| "original-roots".into())
+}
+
+pub(crate) fn remove_empty_restore_parents(
+    plan: &RestorePlan,
+    delete: &RestoreDelete,
+    path: &Path,
+) -> Result<()> {
+    let Some(mut current) = path.parent().map(Path::to_path_buf) else {
+        return Ok(());
+    };
+    let stop = if let Some(to) = &plan.to {
+        to.join(&delete.root_id)
+    } else {
+        plan.root_paths
+            .get(&delete.root_id)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/"))
+    };
+    while current.starts_with(&stop) && current != stop {
+        if fs::remove_dir(&current).is_err() {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    Ok(())
 }
 
 pub(crate) fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {

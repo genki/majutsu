@@ -88,8 +88,9 @@ use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use restore_runtime::{
     ensure_restore_job_has_no_missing_objects, ensure_restore_job_not_blocked,
     ensure_restore_job_resumable, mark_restore_job_done, print_restore_conflicts,
-    print_restore_deletes, read_restore_job, restore_delete_destination, restore_destination,
-    restore_root_base, restore_target_label, write_restore_job,
+    print_restore_deletes, read_restore_job, remove_empty_restore_parents,
+    restore_delete_destination, restore_destination, restore_root_base, restore_target_label,
+    write_restore_job,
 };
 use watch_runtime::{
     default_watch_backend, format_notify_event, normalize_watch_backend, recv_watch_event,
@@ -6390,34 +6391,6 @@ fn apply_restore_plan(
     }
     for (dest, record) in directory_metadata {
         apply_file_metadata(&dest, record)?;
-    }
-    Ok(())
-}
-
-fn remove_empty_restore_parents(
-    plan: &RestorePlan,
-    delete: &RestoreDelete,
-    path: &Path,
-) -> Result<()> {
-    let Some(mut current) = path.parent().map(Path::to_path_buf) else {
-        return Ok(());
-    };
-    let stop = if let Some(to) = &plan.to {
-        to.join(&delete.root_id)
-    } else {
-        plan.root_paths
-            .get(&delete.root_id)
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("/"))
-    };
-    while current.starts_with(&stop) && current != stop {
-        if fs::remove_dir(&current).is_err() {
-            break;
-        }
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        current = parent.to_path_buf();
     }
     Ok(())
 }
