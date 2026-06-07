@@ -1,4 +1,4 @@
-use chrono::{SecondsFormat, Utc};
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use rusqlite::Connection;
 use std::fs;
 #[cfg(unix)]
@@ -4221,6 +4221,87 @@ fn restore_at_accepts_spec_datetime_formats() {
     assert_eq!(
         fs::read(restore_date.join("sample/alpha.txt")).unwrap(),
         b"alpha\n"
+    );
+}
+
+#[test]
+fn relative_time_arguments_work_for_diff_and_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let first_snapshot = db_ref(&state, "current").unwrap();
+    let old_created_at = (Utc::now() - ChronoDuration::minutes(20)).to_rfc3339();
+    Connection::open(state.join("db/majutsu.sqlite"))
+        .unwrap()
+        .execute(
+            "update snapshots set created_at=?2 where id=?1",
+            rusqlite::params![first_snapshot, old_created_at],
+        )
+        .unwrap();
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let diff = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("diff")
+            .arg("--at")
+            .arg("10 minutes ago");
+        c
+    });
+    assert!(diff.contains("M\tsample/alpha.txt"));
+    assert!(diff.contains("A\tsample/beta.txt"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--at")
+            .arg("now")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"changed\n"
+    );
+    assert_eq!(
+        fs::read(restore.join("sample/beta.txt")).unwrap(),
+        b"beta\n"
     );
 }
 
