@@ -1457,6 +1457,7 @@ dependencies = [
  "libc",
  "majutsu-core",
  "majutsu-crypto",
+ "majutsu-pack",
  "majutsu-policy",
  "notify",
  "quick-xml",
@@ -1520,7 +1521,9 @@ dependencies = [
 name = "majutsu-pack"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "majutsu-core",
+ "serde",
 ]
 
 [[package]]

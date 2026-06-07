@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
@@ -14,6 +14,7 @@ use majutsu_core::{
     payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
+use majutsu_pack::{PackEntry, PackIndex, PackTier};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -44,7 +45,6 @@ const DEFAULT_LARGE_BINARY_MIN_SIZE: u64 = 16 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
-const SMALL_BLOB_MAX_SIZE: u64 = 128 * 1024;
 const CHUNK_INDEX_SHARD_KEY: &str = "indexes/chunk-index/shard-0000.cbor.zst.enc";
 
 #[derive(Parser)]
@@ -613,21 +613,6 @@ struct PackExport {
     index_key: String,
     object_count: usize,
     size: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PackIndex {
-    version: u32,
-    pack_id: String,
-    pack_key: String,
-    entries: Vec<PackEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PackEntry {
-    oid: String,
-    offset: u64,
-    len: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3905,7 +3890,7 @@ fn write_blob_packs<F>(
     paths: &Paths,
     conn: &Connection,
     blobs: &[BlobExport],
-    tier: &str,
+    tier: PackTier,
     target_size: u64,
     mut payload_for: F,
 ) -> Result<Vec<PackIndex>>
@@ -3915,9 +3900,9 @@ where
     let target_size = target_size.max(1);
     let mut indexes = Vec::new();
     let mut pack_id = new_id("pack");
-    let (pack_prefix, index_prefix) = pack_date_prefixes(tier);
-    let mut pack_key = format!("{pack_prefix}/{pack_id}.mpack");
-    let mut index_key = format!("{index_prefix}/{pack_id}.json");
+    let prefixes = majutsu_pack::date_prefixes(tier, Utc::now());
+    let mut pack_key = majutsu_pack::pack_key(&prefixes.pack_prefix, &pack_id);
+    let mut index_key = majutsu_pack::index_key(&prefixes.index_prefix, &pack_id);
     let mut pack_bytes = Vec::new();
     let mut entries = Vec::new();
     let mut object_count = 0usize;
@@ -3937,8 +3922,8 @@ where
                 object_count,
             )?);
             pack_id = new_id("pack");
-            pack_key = format!("{pack_prefix}/{pack_id}.mpack");
-            index_key = format!("{index_prefix}/{pack_id}.json");
+            pack_key = majutsu_pack::pack_key(&prefixes.pack_prefix, &pack_id);
+            index_key = majutsu_pack::index_key(&prefixes.index_prefix, &pack_id);
             pack_bytes = Vec::new();
             entries = Vec::new();
             object_count = 0;
@@ -3981,13 +3966,13 @@ where
     let (small_blobs, normal_blobs): (Vec<_>, Vec<_>) = blobs
         .iter()
         .cloned()
-        .partition(|blob| blob.size <= SMALL_BLOB_MAX_SIZE);
+        .partition(|blob| majutsu_pack::tier_for_blob(blob.size) == PackTier::Small);
     let mut indexes = Vec::new();
     indexes.extend(write_blob_packs(
         paths,
         conn,
         &small_blobs,
-        "small",
+        PackTier::Small,
         config.small_pack_target,
         |blob| payload_for(blob),
     )?);
@@ -3995,25 +3980,11 @@ where
         paths,
         conn,
         &normal_blobs,
-        "normal",
+        PackTier::Normal,
         config.normal_pack_target,
         |blob| payload_for(blob),
     )?);
     Ok(indexes)
-}
-
-fn pack_date_prefixes(tier: &str) -> (String, String) {
-    let now = Utc::now();
-    (
-        format!(
-            "objects/packs/{}/{:04}/{:02}/{:02}",
-            tier,
-            now.year(),
-            now.month(),
-            now.day()
-        ),
-        format!("objects/indexes/pack/{:04}/{:02}", now.year(), now.month()),
-    )
 }
 
 fn finish_pack(
@@ -5514,7 +5485,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 "insert or ignore into blobs(oid, size, object_key) values (?1, ?2, ?3)",
                 params![oid, bytes.len() as u64, object_key],
             )?;
-            if bytes.len() as u64 <= SMALL_BLOB_MAX_SIZE {
+            if bytes.len() as u64 <= majutsu_pack::SMALL_BLOB_MAX_SIZE {
                 Payload::InlineSmall { oid, object_key }
             } else {
                 Payload::NormalBlob { oid, object_key }
