@@ -4740,6 +4740,7 @@ fn fsck(paths: &Paths) -> Result<()> {
     validate_local_pack_objects(paths, &export, &mut missing)?;
     validate_local_metadata_references(paths, &export, &mut missing)?;
     validate_local_oplog(&conn, &mut missing)?;
+    validate_restore_queue(paths, &conn, &mut missing)?;
     if missing > 0 {
         bail!("fsck found {missing} problems");
     }
@@ -4795,6 +4796,95 @@ fn validate_local_metadata_references(
         if !live_chunks.contains(&chunk.oid) {
             *missing += 1;
             eprintln!("dangling chunk metadata {}", chunk.oid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_restore_queue(paths: &Paths, conn: &Connection, missing: &mut usize) -> Result<()> {
+    let dir = paths.home.join("queue/restores");
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("select id from snapshots")?;
+    let snapshot_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let job: RestoreQueueItem = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(job) => job,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid restore queue item {}: {err}", path.display());
+                continue;
+            }
+        };
+        if path.file_stem().and_then(OsStr::to_str) != Some(job.id.as_str()) {
+            *missing += 1;
+            eprintln!(
+                "restore queue filename does not match job id {}",
+                path.display()
+            );
+        }
+        if !snapshot_ids.contains(&job.snapshot_id) {
+            *missing += 1;
+            eprintln!(
+                "restore queue item references missing snapshot {} {}",
+                job.id, job.snapshot_id
+            );
+        }
+        match job.status.as_str() {
+            "prepared" | "ready" | "archive-requested" | "done" => {}
+            status => {
+                *missing += 1;
+                eprintln!("restore queue item has invalid status {} {status}", job.id);
+            }
+        }
+        if let Some(path_filter) = job.path.as_deref() {
+            if let Err(err) =
+                validate_relative_filter_path(Path::new(path_filter), "restore job path")
+            {
+                *missing += 1;
+                eprintln!("restore queue item has invalid path {}: {err}", job.id);
+            }
+        }
+        let required = job.required_objects.iter().collect::<BTreeSet<_>>();
+        if required.len() != job.required_objects.len() {
+            *missing += 1;
+            eprintln!(
+                "restore queue item has duplicate required objects {}",
+                job.id
+            );
+        }
+        for key in job
+            .archived_objects
+            .iter()
+            .chain(job.missing_objects.iter())
+            .chain(job.archive_requested_objects.iter())
+        {
+            if !required.contains(key) {
+                *missing += 1;
+                eprintln!(
+                    "restore queue item references object outside required set {} {}",
+                    job.id, key
+                );
+            }
+        }
+        if job.status == "done"
+            && (!job.archived_objects.is_empty() || !job.missing_objects.is_empty())
+        {
+            *missing += 1;
+            eprintln!(
+                "completed restore queue item still has pending objects {}",
+                job.id
+            );
         }
     }
     Ok(())
