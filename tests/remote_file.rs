@@ -805,13 +805,14 @@ fn clone_can_use_single_host_index_when_legacy_metadata_is_absent() {
 }
 
 #[test]
-fn clone_requires_host_for_multi_host_index_without_legacy_metadata() {
+fn clone_requires_host_for_multi_host_index_even_with_legacy_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let remote = tmp.path().join("remote");
     let source_a = tmp.path().join("source-a");
     let source_b = tmp.path().join("source-b");
     let state_a = tmp.path().join("state-a");
     let state_b = tmp.path().join("state-b");
+    let clone_without_host_legacy = tmp.path().join("clone-without-host-legacy");
     let clone_without_host = tmp.path().join("clone-without-host");
     let clone_b = tmp.path().join("clone-b");
     let restore = tmp.path().join("restore");
@@ -856,6 +857,16 @@ fn clone_requires_host_for_multi_host_index_without_legacy_metadata() {
             c
         });
     }
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_without_host_legacy)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
     fs::remove_file(remote.join("metadata/export.json")).unwrap();
 
     fails({

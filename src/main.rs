@@ -3412,12 +3412,10 @@ fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String
             .map(|host| host.metadata_key)
             .ok_or_else(|| anyhow!("remote host not found: {host_id}"));
     }
-    if remote.exists("metadata/export.json")? {
-        return Ok("metadata/export.json".into());
-    }
     let index = remote_host_index_with_legacy(remote)?;
     match index.hosts.as_slice() {
         [host] => Ok(host.metadata_key.clone()),
+        [] if remote.exists("metadata/export.json")? => Ok("metadata/export.json".into()),
         [] => {
             bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")
         }
