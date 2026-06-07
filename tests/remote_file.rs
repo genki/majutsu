@@ -1806,7 +1806,9 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
             .arg(&state_a)
             .arg("remote")
             .arg("host")
-            .arg(&host_b_id);
+            .arg(&host_b_id)
+            .arg("--snapshots")
+            .arg("--operations");
         c
     });
     assert!(host_b.contains(&format!("id {host_b_id}")));
@@ -1814,6 +1816,11 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
     assert!(host_b.contains("roots 1"));
     assert!(host_b.contains("snapshots 1"));
     assert!(host_b.contains("operations "));
+    assert!(host_b.contains("snapshot_id\tcreated_at\tparent\top_id"));
+    assert!(host_b.contains("op_id\tcreated_at\tkind\tstatus\tbefore\tafter\tmessage"));
+    assert!(host_b.contains("manual-snapshot"));
+    assert!(host_b.contains("\tdone\t"));
+    assert!(host_b.contains("root-added"));
 
     run({
         let mut c = mj();

@@ -308,7 +308,13 @@ pub(crate) enum RemoteCommand {
     Fsck,
     Capabilities,
     Hosts,
-    Host { id: String },
+    Host {
+        id: String,
+        #[arg(long)]
+        snapshots: bool,
+        #[arg(long, alias = "ops")]
+        operations: bool,
+    },
 }
 
 #[derive(Subcommand)]

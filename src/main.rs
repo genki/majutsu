@@ -1920,7 +1920,11 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 );
             }
         }
-        RemoteCommand::Host { id } => {
+        RemoteCommand::Host {
+            id,
+            snapshots,
+            operations,
+        } => {
             let index = remote_host_index_with_legacy(&remote)?;
             let host = select_remote_host(index.hosts, &id)?;
             let export: MetadataExport = serde_json::from_slice(&remote.get(&host.metadata_key)?)?;
@@ -1935,9 +1939,44 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             println!("roots {}", export.roots.len());
             println!("snapshots {}", export.snapshots.len());
             println!("operations {}", export.operations.len());
+            if snapshots {
+                print_remote_host_snapshots(&export);
+            }
+            if operations {
+                print_remote_host_operations(&export);
+            }
         }
     }
     Ok(())
+}
+
+fn print_remote_host_snapshots(export: &MetadataExport) {
+    println!("snapshot_id\tcreated_at\tparent\top_id");
+    for snapshot in &export.snapshots {
+        println!(
+            "{}\t{}\t{}\t{}",
+            snapshot.id,
+            snapshot.created_at,
+            snapshot.parent_id.as_deref().unwrap_or("-"),
+            snapshot.op_id
+        );
+    }
+}
+
+fn print_remote_host_operations(export: &MetadataExport) {
+    println!("op_id\tcreated_at\tkind\tstatus\tbefore\tafter\tmessage");
+    for operation in &export.operations {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            operation.id,
+            operation.created_at,
+            operation.kind,
+            operation.status,
+            operation.before_snapshot.as_deref().unwrap_or("-"),
+            operation.after_snapshot.as_deref().unwrap_or("-"),
+            operation.message.as_deref().unwrap_or("")
+        );
+    }
 }
 
 fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {

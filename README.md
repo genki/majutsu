@@ -264,6 +264,7 @@ mj remote check
 mj remote capabilities
 mj remote hosts
 mj remote host test-host
+mj remote host test-host --snapshots --operations
 mj remote fsck
 ```
 
@@ -309,7 +310,9 @@ Duplicate host ids or metadata keys in `hosts/index.json` are treated as remote
 metadata corruption and are rejected by `mj remote fsck`.
 `metadata/export.json` remains the legacy/current-host bootstrap path.
 `hosts/index.json` and `hosts/<host-id>/metadata/export.json` allow browsing and
-recovering a specific host timeline from a shared remote prefix.
+recovering a specific host timeline from a shared remote prefix. Use
+`mj remote host <host-or-name> --snapshots --operations` to list that remote
+host's snapshot and operation history without cloning it first.
 After local prune removes snapshot metadata, the next `mj sync` removes stale
 per-host snapshot/operation export JSON files for the current host. It does not
 delete referenced object payloads; lifecycle tiering remains the storage
