@@ -1447,7 +1447,17 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             )?;
             continue;
         }
-        run_pre_snapshot_hook(paths, &root)?;
+        if let Err(err) = run_pre_snapshot_hook(paths, &root) {
+            record_snapshot_failure(
+                &conn,
+                &op_id,
+                snapshot_operation_kind(args.message.as_deref()),
+                parent.as_deref(),
+                &root.id,
+                &err,
+            )?;
+            return Err(err);
+        }
         let scan_root_config = snapshot_scan_root(paths, &root)?;
         let records_result = scan_root(paths, &config, &scan_root_config);
         let post_result = run_post_snapshot_hook(paths, &root);
@@ -1474,9 +1484,29 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 )?;
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                record_snapshot_failure(
+                    &conn,
+                    &op_id,
+                    snapshot_operation_kind(args.message.as_deref()),
+                    parent.as_deref(),
+                    &root.id,
+                    &err,
+                )?;
+                return Err(err);
+            }
         };
-        post_result?;
+        if let Err(err) = post_result {
+            record_snapshot_failure(
+                &conn,
+                &op_id,
+                snapshot_operation_kind(args.message.as_deref()),
+                parent.as_deref(),
+                &root.id,
+                &err,
+            )?;
+            return Err(err);
+        }
         large_files += records
             .iter()
             .filter(|r| matches!(r.payload, Payload::Large { .. }))
@@ -1536,7 +1566,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     record_op_with_id(
         &conn,
         &op_id,
-        "manual-snapshot",
+        snapshot_operation_kind(args.message.as_deref()),
         manifest.parent.as_deref(),
         Some(&manifest.snapshot_id),
         args.message.as_deref(),
@@ -1545,6 +1575,36 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     println!("files {total_files}, large {large_files}");
     record_event(paths, "snapshot-finish", &manifest.snapshot_id)?;
     Ok(())
+}
+
+fn snapshot_operation_kind(message: Option<&str>) -> &'static str {
+    if message
+        .map(|message| message.starts_with("watch "))
+        .unwrap_or(false)
+    {
+        "file-events-batch"
+    } else {
+        "manual-snapshot"
+    }
+}
+
+fn record_snapshot_failure(
+    conn: &Connection,
+    op_id: &str,
+    kind: &str,
+    parent: Option<&str>,
+    root_id: &str,
+    err: &anyhow::Error,
+) -> Result<()> {
+    record_op_with_id_and_status(
+        conn,
+        op_id,
+        kind,
+        parent,
+        parent,
+        "failed",
+        Some(&format!("snapshot failed for root {root_id}: {err:#}")),
+    )
 }
 
 fn status(paths: &Paths) -> Result<()> {
@@ -6341,10 +6401,21 @@ fn record_op_with_id(
     after: Option<&str>,
     message: Option<&str>,
 ) -> Result<()> {
+    record_op_with_id_and_status(conn, id, kind, before, after, "done", message)
+}
+
+fn record_op_with_id_and_status(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+    status: &str,
+    message: Option<&str>,
+) -> Result<()> {
     let created_at = Utc::now().to_rfc3339();
     let parent_op = current_operation(conn)?;
     let actor = operation_actor();
-    let status = "done";
     conn.execute(
         "insert into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message)
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
