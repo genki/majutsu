@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
@@ -42,6 +42,7 @@ const DEFAULT_LARGE_BINARY_MIN_SIZE: u64 = 16 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
+const SMALL_BLOB_MAX_SIZE: u64 = 128 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -737,7 +738,7 @@ struct OperationExport {
     message: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct BlobExport {
     oid: String,
     size: u64,
@@ -3973,13 +3974,9 @@ fn pack_loose_blobs(paths: &Paths) -> Result<()> {
         println!("packed 0 objects");
         return Ok(());
     }
-    let packed = write_blob_packs(
-        paths,
-        &conn,
-        &blobs,
-        config.pack.normal_pack_target,
-        |blob| read_object(paths, &blob.object_key),
-    )?;
+    let packed = write_tiered_blob_packs(paths, &conn, &config.pack, &blobs, |blob| {
+        read_object(paths, &blob.object_key)
+    })?;
     record_op(
         &conn,
         "pack",
@@ -3999,6 +3996,7 @@ fn write_blob_packs<F>(
     paths: &Paths,
     conn: &Connection,
     blobs: &[BlobExport],
+    tier: &str,
     target_size: u64,
     mut payload_for: F,
 ) -> Result<Vec<PackIndex>>
@@ -4008,8 +4006,9 @@ where
     let target_size = target_size.max(1);
     let mut indexes = Vec::new();
     let mut pack_id = new_id("pack");
-    let mut pack_key = format!("objects/packs/normal/{}.mpack", pack_id);
-    let mut index_key = format!("objects/indexes/pack/{}.json", pack_id);
+    let (pack_prefix, index_prefix) = pack_date_prefixes(tier);
+    let mut pack_key = format!("{pack_prefix}/{pack_id}.mpack");
+    let mut index_key = format!("{index_prefix}/{pack_id}.json");
     let mut pack_bytes = Vec::new();
     let mut entries = Vec::new();
     let mut object_count = 0usize;
@@ -4029,8 +4028,8 @@ where
                 object_count,
             )?);
             pack_id = new_id("pack");
-            pack_key = format!("objects/packs/normal/{}.mpack", pack_id);
-            index_key = format!("objects/indexes/pack/{}.json", pack_id);
+            pack_key = format!("{pack_prefix}/{pack_id}.mpack");
+            index_key = format!("{index_prefix}/{pack_id}.json");
             pack_bytes = Vec::new();
             entries = Vec::new();
             object_count = 0;
@@ -4058,6 +4057,54 @@ where
         )?);
     }
     Ok(indexes)
+}
+
+fn write_tiered_blob_packs<F>(
+    paths: &Paths,
+    conn: &Connection,
+    config: &PackConfig,
+    blobs: &[BlobExport],
+    mut payload_for: F,
+) -> Result<Vec<PackIndex>>
+where
+    F: FnMut(&BlobExport) -> Result<Vec<u8>>,
+{
+    let (small_blobs, normal_blobs): (Vec<_>, Vec<_>) = blobs
+        .iter()
+        .cloned()
+        .partition(|blob| blob.size <= SMALL_BLOB_MAX_SIZE);
+    let mut indexes = Vec::new();
+    indexes.extend(write_blob_packs(
+        paths,
+        conn,
+        &small_blobs,
+        "small",
+        config.small_pack_target,
+        |blob| payload_for(blob),
+    )?);
+    indexes.extend(write_blob_packs(
+        paths,
+        conn,
+        &normal_blobs,
+        "normal",
+        config.normal_pack_target,
+        |blob| payload_for(blob),
+    )?);
+    Ok(indexes)
+}
+
+fn pack_date_prefixes(tier: &str) -> (String, String) {
+    let now = Utc::now();
+    (
+        format!(
+            "objects/packs/{}/{:04}/{:02}/{:02}",
+            tier,
+            now.year(),
+            now.month(),
+            now.day()
+        ),
+        format!("objects/indexes/pack/{:04}/{:02}", now.year(), now.month()),
+    )
 }
 
 fn finish_pack(
@@ -4120,18 +4167,12 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
             read_blob_payload(paths, &conn, &blob.oid, &blob.object_key)?,
         );
     }
-    let indexes = write_blob_packs(
-        paths,
-        &conn,
-        &blobs,
-        config.pack.normal_pack_target,
-        |blob| {
-            payloads
-                .get(&blob.oid)
-                .cloned()
-                .ok_or_else(|| anyhow!("missing compact payload {}", blob.oid))
-        },
-    )?;
+    let indexes = write_tiered_blob_packs(paths, &conn, &config.pack, &blobs, |blob| {
+        payloads
+            .get(&blob.oid)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing compact payload {}", blob.oid))
+    })?;
     let new_pack_ids = indexes
         .iter()
         .map(|index| index.pack_id.clone())
@@ -5761,6 +5802,7 @@ fn create_layout(paths: &Paths) -> Result<()> {
     fs::create_dir_all(paths.home.join("objects/large/chunks/fastcdc"))?;
     fs::create_dir_all(&paths.large_manifests)?;
     fs::create_dir_all(&paths.packs)?;
+    fs::create_dir_all(paths.home.join("objects/packs/small"))?;
     fs::create_dir_all(&paths.pack_indexes)?;
     fs::create_dir_all(&paths.logs)?;
     for dir in [
@@ -6157,6 +6199,8 @@ fn canonical_remote_alias(key: &str) -> Option<String> {
         Some(format!("trees/{rest}.cbor.zst.enc"))
     } else if let Some(rest) = key.strip_prefix("objects/blobs/") {
         Some(format!("blobs/loose/{rest}.blob.enc"))
+    } else if let Some(rest) = key.strip_prefix("objects/packs/small/") {
+        Some(format!("packs/small/{rest}"))
     } else if let Some(rest) = key.strip_prefix("objects/packs/normal/") {
         Some(format!("packs/normal/{rest}"))
     } else if let Some(rest) = key.strip_prefix("objects/indexes/pack/") {

@@ -64,6 +64,16 @@ fn assert_canonical_cbor_zstd(path: &std::path::Path) {
     assert!(matches!(value, serde_cbor::Value::Map(_)));
 }
 
+fn count_files_ending(root: &std::path::Path, suffix: &str) -> usize {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file() && entry.path().to_string_lossy().ends_with(suffix)
+        })
+        .count()
+}
+
 #[test]
 fn file_remote_clone_restores_normal_and_large_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1775,19 +1785,17 @@ fn pack_gc_and_remote_clone_restore_packed_blobs() {
         c.arg("--home").arg(&state).arg("pack");
         c
     });
+    assert!(
+        find_file_ending(&state.join("objects/packs/small"), ".mpack")
+            .to_string_lossy()
+            .contains("objects/packs/small/")
+    );
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("gc");
         c
     });
-    assert!(
-        state
-            .join("objects/packs/normal")
-            .read_dir()
-            .unwrap()
-            .next()
-            .is_some()
-    );
+    assert!(find_file_ending(&state.join("objects/packs"), ".mpack").exists());
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("fsck");
@@ -1798,6 +1806,7 @@ fn pack_gc_and_remote_clone_restore_packed_blobs() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
+    assert!(find_file_ending(&remote.join("packs/small"), ".mpack").exists());
     run({
         let mut c = mj();
         c.arg("--home")
@@ -1878,15 +1887,7 @@ fn pack_compaction_rewrites_existing_packs() {
         c.arg("--home").arg(&state).arg("pack");
         c
     });
-    assert!(
-        state
-            .join("objects/packs/normal")
-            .read_dir()
-            .unwrap()
-            .filter_map(Result::ok)
-            .count()
-            >= 2
-    );
+    assert!(count_files_ending(&state.join("objects/packs"), ".mpack") >= 2);
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("pack").arg("--compact");
@@ -1898,12 +1899,7 @@ fn pack_compaction_rewrites_existing_packs() {
         c
     });
     assert_eq!(
-        state
-            .join("objects/packs/normal")
-            .read_dir()
-            .unwrap()
-            .filter_map(Result::ok)
-            .count(),
+        count_files_ending(&state.join("objects/packs"), ".mpack"),
         1
     );
     run({
@@ -1998,11 +1994,7 @@ fn pack_respects_configured_normal_pack_target() {
         c
     });
     assert!(pack_output.contains("pack(s)"));
-    let pack_count = fs::read_dir(state.join("objects/packs/normal"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("mpack"))
-        .count();
+    let pack_count = count_files_ending(&state.join("objects/packs"), ".mpack");
     assert!(pack_count > 1);
     run({
         let mut c = mj();
