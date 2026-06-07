@@ -16,7 +16,9 @@ use majutsu_core::{
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_pack::{PackEntry, PackIndex, PackTier};
-use majutsu_restore::{RestoreChangeStats, RestorePathState, count_restore_changes};
+use majutsu_restore::{
+    RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
+};
 use majutsu_store::RemoteCapabilities;
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -645,27 +647,6 @@ struct EventJournalRecord {
     kind: String,
     observed_at: DateTime<Utc>,
     detail: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RestoreQueueItem {
-    id: String,
-    snapshot_id: String,
-    root: Option<String>,
-    path: Option<String>,
-    target: String,
-    required_objects: Vec<String>,
-    archived_objects: Vec<String>,
-    #[serde(default)]
-    missing_objects: Vec<String>,
-    #[serde(default)]
-    archive_requested_objects: Vec<String>,
-    #[serde(default)]
-    force: bool,
-    #[serde(default = "default_true")]
-    check_conflicts: bool,
-    created_at: DateTime<Utc>,
-    status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6933,10 +6914,7 @@ fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) ->
             requested.push(key.clone());
         }
     }
-    if !requested.is_empty() {
-        job.status = "archive-requested".into();
-        job.archive_requested_objects = requested;
-    }
+    job.mark_archive_requested(requested);
     Ok(())
 }
 
@@ -6973,11 +6951,7 @@ fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Res
         }
     }
     job.archived_objects = still_pending;
-    job.archive_requested_objects
-        .retain(|key| job.archived_objects.contains(key));
-    if job.archived_objects.is_empty() {
-        job.status = "ready".into();
-    }
+    job.mark_ready_if_archives_hydrated();
     write_restore_job(paths, job)?;
     if !hydrated.is_empty() {
         record_event(
@@ -7082,15 +7056,20 @@ fn read_restore_job(paths: &Paths, job_id: &str) -> Result<RestoreQueueItem> {
 }
 
 fn ensure_restore_job_resumable(job: &RestoreQueueItem) -> Result<()> {
-    match job.status.as_str() {
-        "prepared" | "ready" | "archive-requested" => Ok(()),
-        other => bail!("restore job {} is not resumable: status {other}", job.id),
+    if job.is_resumable() {
+        Ok(())
+    } else {
+        bail!(
+            "restore job {} is not resumable: status {}",
+            job.id,
+            job.status
+        )
     }
 }
 
 fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {
     let mut job = read_restore_job(paths, job_id)?;
-    job.status = "done".into();
+    job.mark_done();
     write_restore_job(paths, &job)
 }
 

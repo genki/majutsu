@@ -1547,7 +1547,10 @@ dependencies = [
 name = "majutsu-restore"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "majutsu-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
