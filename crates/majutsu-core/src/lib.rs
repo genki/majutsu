@@ -63,10 +63,12 @@ pub struct RootSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
+    #[serde(rename = "op_id", alias = "id")]
     pub id: OperationId,
+    #[serde(rename = "parent_op", alias = "parent")]
     pub parent: Option<OperationId>,
     pub kind: OperationKind,
-    #[serde(default = "default_operation_timestamp")]
+    #[serde(default = "default_operation_timestamp", alias = "created_at")]
     pub timestamp: DateTime<Utc>,
     #[serde(default = "default_operation_actor")]
     pub actor: String,
@@ -76,6 +78,10 @@ pub struct Operation {
     pub after_snapshot: Option<SnapshotId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_sync_state: Option<RemoteSyncState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -87,6 +93,15 @@ pub enum OperationStatus {
     #[serde(alias = "Running")]
     Running,
     #[serde(alias = "Failed")]
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteSyncState {
+    NotSynced,
+    Queued,
+    Synced,
     Failed,
 }
 
@@ -363,6 +378,8 @@ mod tests {
         assert_eq!(op.actor, "local");
         assert_eq!(op.status, OperationStatus::Done);
         assert_eq!(op.timestamp, DateTime::<Utc>::UNIX_EPOCH);
+        assert!(op.error.is_none());
+        assert!(op.remote_sync_state.is_none());
     }
 
     #[test]
@@ -452,18 +469,36 @@ mod tests {
             "id": "op-2",
             "parent": "op-1",
             "kind": "root-mark-deleted",
-            "timestamp": "2026-06-07T00:00:00Z",
+            "created_at": "2026-06-07T00:00:00Z",
             "actor": "user@host",
             "status": "failed",
             "before_snapshot": "snap-1",
             "after_snapshot": "snap-1",
-            "message": "sample"
+            "message": "sample",
+            "error": "snapshot failed",
+            "remote_sync_state": "failed"
         }"#;
 
         let op: Operation = serde_json::from_str(json).unwrap();
 
+        assert_eq!(op.id, "op-2");
+        assert_eq!(op.parent.as_deref(), Some("op-1"));
         assert_eq!(op.kind, OperationKind::RootMarkedDeleted);
         assert_eq!(op.status, OperationStatus::Failed);
+        assert_eq!(op.error.as_deref(), Some("snapshot failed"));
+        assert_eq!(op.remote_sync_state, Some(RemoteSyncState::Failed));
+        assert_eq!(serde_json::to_value(&op).unwrap()["op_id"], "op-2");
+        assert_eq!(serde_json::to_value(&op).unwrap()["parent_op"], "op-1");
+        assert!(
+            serde_json::to_value(&op)
+                .unwrap()
+                .get("created_at")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(&op).unwrap()["remote_sync_state"],
+            "failed"
+        );
         assert_eq!(
             serde_json::to_value(OperationKind::RootMarkedDeleted).unwrap(),
             "root-mark-deleted"
