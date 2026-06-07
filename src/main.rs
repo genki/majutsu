@@ -3066,6 +3066,16 @@ fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Result<()> {
 fn write_upload_item(paths: &Paths, item: UploadQueueItem) -> Result<()> {
     fs::create_dir_all(&paths.upload_queue)?;
     let path = paths.upload_queue.join(format!("{}.json", item.id));
+    let item = if path.exists() {
+        let existing: UploadQueueItem = serde_json::from_slice(&fs::read(&path)?)?;
+        UploadQueueItem {
+            attempts: existing.attempts,
+            created_at: existing.created_at,
+            ..item
+        }
+    } else {
+        item
+    };
     fs::write(path, serde_json::to_vec_pretty(&item)?)?;
     Ok(())
 }

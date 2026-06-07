@@ -777,6 +777,71 @@ fn unchanged_root_reuses_previous_tree_object() {
 }
 
 #[test]
+fn sync_retry_queue_preserves_attempt_count_across_reenqueue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote-file");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(&remote, b"not a directory\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let queued = fs::read_dir(state.join("queue/uploads"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(queued.iter().any(|item| item.contains("\"attempts\": 2")));
+
+    fs::remove_file(&remote).unwrap();
+    fs::create_dir_all(&remote).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert_eq!(
+        fs::read_dir(state.join("queue/uploads")).unwrap().count(),
+        0
+    );
+    assert!(remote.join("metadata/export.json").exists());
+}
+
+#[test]
 fn split_remote_config_supports_file_and_s3_forms() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -3052,6 +3117,97 @@ fn restore_prepare_can_hydrate_from_canonical_aliases() {
         fs::read(restore.join("sample/alpha.txt")).unwrap(),
         b"alpha\n"
     );
+}
+
+#[test]
+fn restore_prepare_resume_preserves_root_path_and_target_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs");
+    let photos = tmp.path().join("photos");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(&photos).unwrap();
+    fs::write(docs.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(docs.join("skip.txt"), b"skip\n").unwrap();
+    fs::write(photos.join("photo.txt"), b"photo\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("docs")
+            .arg(&docs);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("photos")
+            .arg(&photos);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--root")
+            .arg("docs")
+            .arg("--path")
+            .arg("keep.txt")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    let job_id = prepare
+        .lines()
+        .find_map(|line| line.strip_prefix("restore_job "))
+        .unwrap()
+        .to_string();
+    let job_path = fs::read_dir(state.join("queue/restores"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let job = fs::read_to_string(&job_path).unwrap();
+    assert!(job.contains("\"root\": \"docs\""));
+    assert!(job.contains("\"path\": \"keep.txt\""));
+    assert!(job.contains(&format!("\"target\": \"{}\"", restore.display())));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("docs/keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(!restore.join("docs/skip.txt").exists());
+    assert!(!restore.join("photos/photo.txt").exists());
 }
 
 #[test]
