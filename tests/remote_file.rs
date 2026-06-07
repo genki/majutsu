@@ -2638,6 +2638,66 @@ fn large_config_accepts_spec_size_strings() {
 }
 
 #[test]
+fn config_roots_are_synced_into_runtime_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.bin"), vec![b'Q'; 2048]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        r#"
+[[roots]]
+id = "cfg"
+path = "{}"
+exclude = ["**/.git/**"]
+
+[roots.large]
+min_size = "1 KiB"
+"#,
+        source.display()
+    ));
+    fs::write(&config_path, config).unwrap();
+
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(roots.contains("cfg\tactive\tcfg\t"));
+    assert!(roots.contains(&source.display().to_string()));
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(snapshot.contains("files 1, large 1"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("pause")
+            .arg("cfg");
+        c
+    });
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(roots.contains("cfg\tpaused\tcfg\t"));
+}
+
+#[test]
 fn large_chunks_can_be_compressed_and_restored() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
