@@ -5921,6 +5921,14 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
                 storage_tier_hint: "hot-manifest-cold-chunks".into(),
                 hydrate_policy: "on-demand".into(),
             }
+        } else if large_config.enabled && meta.len() >= large_config.binary_min_size {
+            let (oid, manifest_key, chunk_count) =
+                store_large_file(paths, entry.path(), &rel, &large_config, binary)?;
+            Payload::ChunkedBlob {
+                oid,
+                manifest_key,
+                chunk_count,
+            }
         } else {
             let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
             let oid = blake3_hex(&bytes);

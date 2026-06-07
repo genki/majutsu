@@ -3707,8 +3707,14 @@ fn snapshot_manifest_uses_spec_payload_variants() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    let mut chunked = Vec::new();
+    for i in 0..256 * 1024 {
+        chunked.push(b'a' + (i % 26) as u8);
+    }
+    fs::write(source.join("medium.log"), &chunked).unwrap();
     fs::write(source.join("payload.zip"), vec![7u8; 32 * 1024]).unwrap();
 
     run({
@@ -3716,6 +3722,12 @@ fn snapshot_manifest_uses_spec_payload_variants() {
         c.arg("--home").arg(&state).arg("init");
         c
     });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("binary_min_size = 16777216", "binary_min_size = 131072")
+        .replace("chunk_size = 8388608", "chunk_size = 65536");
+    fs::write(&config_path, config).unwrap();
     run({
         let mut c = mj();
         c.arg("--home")
@@ -3737,6 +3749,14 @@ fn snapshot_manifest_uses_spec_payload_variants() {
     assert_eq!(
         tree["entries"]["alpha.txt"]["payload"]["type"],
         "inline-small"
+    );
+    assert_eq!(
+        tree["entries"]["medium.log"]["payload"]["type"],
+        "chunked-blob"
+    );
+    assert_eq!(
+        tree["entries"]["medium.log"]["payload"]["chunk_count"],
+        serde_json::Value::from(4)
     );
     assert_eq!(
         tree["entries"]["payload.zip"]["payload"]["type"],
@@ -3765,6 +3785,20 @@ fn snapshot_manifest_uses_spec_payload_variants() {
     assert_eq!(
         tree["entries"]["payload.zip"]["payload"]["hydrate_policy"],
         "on-demand"
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/medium.log")).unwrap(),
+        chunked
     );
 }
 
