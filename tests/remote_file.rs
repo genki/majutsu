@@ -1575,6 +1575,76 @@ fn restore_without_to_can_write_back_to_original_root() {
 }
 
 #[test]
+fn restore_can_explicitly_skip_conflict_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let first = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    fs::write(source.join("beta.txt"), b"extra\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--root")
+            .arg("sample");
+        c
+    });
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--root")
+            .arg("sample")
+            .arg("--check-conflicts=false");
+        c
+    });
+
+    assert_eq!(fs::read(source.join("alpha.txt")).unwrap(), b"one\n");
+    assert!(!source.join("beta.txt").exists());
+}
+
+#[test]
 fn restore_without_subcommand_applies_plan() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
