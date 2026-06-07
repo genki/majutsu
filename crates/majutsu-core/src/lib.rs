@@ -207,6 +207,80 @@ pub struct OperationLogEntry {
     pub message: Option<String>,
 }
 
+impl OperationLogEntry {
+    pub fn validation_issues(&self) -> Vec<OperationLogEntryIssue> {
+        let mut issues = Vec::new();
+        if !self.id.starts_with("op-") {
+            issues.push(OperationLogEntryIssue::InvalidId);
+        }
+        if !valid_operation_kind_label(&self.kind) {
+            issues.push(OperationLogEntryIssue::InvalidKind(self.kind.clone()));
+        }
+        if !valid_operation_status_label(&self.status) {
+            issues.push(OperationLogEntryIssue::InvalidStatus(self.status.clone()));
+        }
+        if self.actor.trim().is_empty() {
+            issues.push(OperationLogEntryIssue::EmptyActor);
+        }
+        if let Err(err) = DateTime::parse_from_rfc3339(&self.created_at) {
+            issues.push(OperationLogEntryIssue::InvalidCreatedAt {
+                value: self.created_at.clone(),
+                error: err.to_string(),
+            });
+        }
+        issues
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationLogEntryIssue {
+    InvalidId,
+    InvalidKind(String),
+    InvalidStatus(String),
+    EmptyActor,
+    InvalidCreatedAt { value: String, error: String },
+}
+
+pub fn valid_operation_kind_label(kind: &str) -> bool {
+    matches!(
+        kind,
+        "init"
+            | "root-added"
+            | "config-change"
+            | "root-removed"
+            | "root-paused"
+            | "root-resumed"
+            | "root-mark-deleted"
+            | "root-missing"
+            | "root-unmounted"
+            | "root-permission-denied"
+            | "manual-snapshot"
+            | "file-events-batch"
+            | "op-restore"
+            | "restore"
+            | "restore-prepare"
+            | "restore-resume"
+            | "mount"
+            | "mount-fuse"
+            | "unmount"
+            | "unmount-fuse"
+            | "hydrate"
+            | "large-pin"
+            | "large-unpin"
+            | "remote-sync"
+            | "key-rotation"
+            | "pack"
+            | "pack-compact"
+            | "prune"
+            | "gc"
+            | "fsck"
+    )
+}
+
+pub fn valid_operation_status_label(status: &str) -> bool {
+    matches!(status, "done" | "running" | "failed")
+}
+
 pub fn encode_operation_log(operations: &[OperationLogEntry]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     for operation in operations {
@@ -232,6 +306,37 @@ pub fn operation_log_entry_matches(
     expected: &OperationLogEntry,
 ) -> bool {
     actual == expected
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationLogComparisonIssue {
+    CountMismatch { expected: usize, actual: usize },
+    EntryMismatch { index: usize, id: String },
+}
+
+pub fn operation_log_comparison_issues(
+    actual: &[OperationLogEntry],
+    expected: &[OperationLogEntry],
+) -> Vec<OperationLogComparisonIssue> {
+    if actual.len() != expected.len() {
+        return vec![OperationLogComparisonIssue::CountMismatch {
+            expected: expected.len(),
+            actual: actual.len(),
+        }];
+    }
+    actual
+        .iter()
+        .zip(expected.iter())
+        .enumerate()
+        .filter_map(|(index, (actual, expected))| {
+            (!operation_log_entry_matches(actual, expected)).then(|| {
+                OperationLogComparisonIssue::EntryMismatch {
+                    index,
+                    id: actual.id.clone(),
+                }
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -702,6 +807,84 @@ mod tests {
 
         assert_eq!(decoded, operations);
         assert!(operation_log_entry_matches(&decoded[0], &operations[0]));
+    }
+
+    #[test]
+    fn operation_log_entry_validation_reports_fsck_issues() {
+        let entry = OperationLogEntry {
+            id: "bad-1".into(),
+            parent_op: None,
+            kind: "unknown".into(),
+            actor: "  ".into(),
+            status: "stuck".into(),
+            before_snapshot: None,
+            after_snapshot: None,
+            created_at: "not-time".into(),
+            message: None,
+        };
+
+        let issues = entry.validation_issues();
+
+        assert_eq!(issues.len(), 5);
+        assert!(issues.contains(&OperationLogEntryIssue::InvalidId));
+        assert!(issues.contains(&OperationLogEntryIssue::InvalidKind("unknown".into())));
+        assert!(issues.contains(&OperationLogEntryIssue::InvalidStatus("stuck".into())));
+        assert!(issues.contains(&OperationLogEntryIssue::EmptyActor));
+        assert!(issues.iter().any(|issue| matches!(
+            issue,
+            OperationLogEntryIssue::InvalidCreatedAt { value, .. } if value == "not-time"
+        )));
+    }
+
+    #[test]
+    fn operation_log_entry_validation_accepts_current_labels() {
+        let entry = OperationLogEntry {
+            id: "op-1".into(),
+            parent_op: None,
+            kind: "manual-snapshot".into(),
+            actor: "alice@host".into(),
+            status: "done".into(),
+            before_snapshot: None,
+            after_snapshot: Some("snap-1".into()),
+            created_at: "2026-06-07T00:00:00Z".into(),
+            message: None,
+        };
+
+        assert!(entry.validation_issues().is_empty());
+        assert!(valid_operation_kind_label("root-permission-denied"));
+        assert!(valid_operation_status_label("failed"));
+    }
+
+    #[test]
+    fn operation_log_comparison_reports_count_and_entry_mismatches() {
+        let expected = vec![OperationLogEntry {
+            id: "op-1".into(),
+            parent_op: None,
+            kind: "init".into(),
+            actor: "alice@host".into(),
+            status: "done".into(),
+            before_snapshot: None,
+            after_snapshot: Some("snap-1".into()),
+            created_at: "2026-06-07T00:00:00Z".into(),
+            message: None,
+        }];
+        let mut actual = expected.clone();
+        actual[0].status = "failed".into();
+
+        assert_eq!(
+            operation_log_comparison_issues(&actual, &expected),
+            vec![OperationLogComparisonIssue::EntryMismatch {
+                index: 0,
+                id: "op-1".into(),
+            }]
+        );
+        assert_eq!(
+            operation_log_comparison_issues(&[], &expected),
+            vec![OperationLogComparisonIssue::CountMismatch {
+                expected: 1,
+                actual: 0,
+            }]
+        );
     }
 
     #[test]

@@ -11,10 +11,12 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
-    FileRecord, LargeChunk, LargeManifest, OperationLogEntry as OperationExport, Payload,
-    RootSnapshot, SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest,
-    decode_operation_log, encode_operation_log, operation_log_entry_matches, payload_blob_ref,
-    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
+    FileRecord, LargeChunk, LargeManifest, OperationLogComparisonIssue,
+    OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload, RootSnapshot,
+    SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest, decode_operation_log,
+    encode_operation_log, operation_log_comparison_issues, operation_log_entry_matches,
+    payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
+    snapshot_export_matches,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -4603,71 +4605,29 @@ fn validate_local_history_graph(export: &MetadataExport, missing: &mut usize) ->
 }
 
 fn validate_operation_entry(operation: &OperationExport, missing: &mut usize) {
-    if !operation.id.starts_with("op-") {
+    for issue in operation.validation_issues() {
         *missing += 1;
-        eprintln!("operation {} has invalid id", operation.id);
+        match issue {
+            OperationLogEntryIssue::InvalidId => {
+                eprintln!("operation {} has invalid id", operation.id);
+            }
+            OperationLogEntryIssue::InvalidKind(kind) => {
+                eprintln!("operation {} has invalid kind {kind}", operation.id);
+            }
+            OperationLogEntryIssue::InvalidStatus(status) => {
+                eprintln!("operation {} has invalid status {status}", operation.id);
+            }
+            OperationLogEntryIssue::EmptyActor => {
+                eprintln!("operation {} has empty actor", operation.id);
+            }
+            OperationLogEntryIssue::InvalidCreatedAt { value, error } => {
+                eprintln!(
+                    "operation {} has invalid created_at {value}: {error}",
+                    operation.id
+                );
+            }
+        }
     }
-    if !valid_operation_kind(&operation.kind) {
-        *missing += 1;
-        eprintln!(
-            "operation {} has invalid kind {}",
-            operation.id, operation.kind
-        );
-    }
-    if !matches!(operation.status.as_str(), "done" | "running" | "failed") {
-        *missing += 1;
-        eprintln!(
-            "operation {} has invalid status {}",
-            operation.id, operation.status
-        );
-    }
-    if operation.actor.trim().is_empty() {
-        *missing += 1;
-        eprintln!("operation {} has empty actor", operation.id);
-    }
-    if let Err(err) = parse_db_time(&operation.created_at) {
-        *missing += 1;
-        eprintln!(
-            "operation {} has invalid created_at {}: {err}",
-            operation.id, operation.created_at
-        );
-    }
-}
-
-fn valid_operation_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "init"
-            | "root-added"
-            | "config-change"
-            | "root-removed"
-            | "root-paused"
-            | "root-resumed"
-            | "root-mark-deleted"
-            | "root-missing"
-            | "root-unmounted"
-            | "root-permission-denied"
-            | "manual-snapshot"
-            | "file-events-batch"
-            | "op-restore"
-            | "restore"
-            | "restore-prepare"
-            | "restore-resume"
-            | "mount"
-            | "mount-fuse"
-            | "unmount"
-            | "unmount-fuse"
-            | "hydrate"
-            | "large-pin"
-            | "large-unpin"
-            | "remote-sync"
-            | "key-rotation"
-            | "pack"
-            | "pack-compact"
-            | "prune"
-            | "gc"
-            | "fsck"
-    )
 }
 
 fn validate_remote_refs(conn: &Connection, config: &Config, missing: &mut usize) -> Result<()> {
@@ -5164,23 +5124,21 @@ fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
             return Ok(());
         }
     };
-    if actual.len() != expected.len() {
+    for issue in operation_log_comparison_issues(&actual, &expected) {
         *missing += 1;
-        eprintln!(
-            "local operation log count mismatch {} expected={} actual={}",
-            path.display(),
-            expected.len(),
-            actual.len()
-        );
-        return Ok(());
-    }
-    for (index, (local, metadata)) in actual.iter().zip(expected.iter()).enumerate() {
-        if !operation_log_entry_matches(local, metadata) {
-            *missing += 1;
-            eprintln!(
-                "local operation log entry does not match metadata {} index={index}",
-                local.id
-            );
+        match issue {
+            OperationLogComparisonIssue::CountMismatch { expected, actual } => {
+                eprintln!(
+                    "local operation log count mismatch {} expected={} actual={}",
+                    path.display(),
+                    expected,
+                    actual
+                );
+                return Ok(());
+            }
+            OperationLogComparisonIssue::EntryMismatch { index, id } => {
+                eprintln!("local operation log entry does not match metadata {id} index={index}");
+            }
         }
     }
     Ok(())
@@ -5866,22 +5824,21 @@ fn validate_remote_oplog_entries(
     expected: &[OperationExport],
     missing: &mut usize,
 ) {
-    if actual.len() != expected.len() {
+    for issue in operation_log_comparison_issues(actual, expected) {
         *missing += 1;
-        eprintln!(
-            "remote operation log count mismatch {key} expected={} actual={}",
-            expected.len(),
-            actual.len()
-        );
-        return;
-    }
-    for (index, (remote, metadata)) in actual.iter().zip(expected.iter()).enumerate() {
-        if !operation_log_entry_matches(remote, metadata) {
-            *missing += 1;
-            eprintln!(
-                "remote operation log entry does not match metadata {key} {} index={index}",
-                remote.id
-            );
+        match issue {
+            OperationLogComparisonIssue::CountMismatch { expected, actual } => {
+                eprintln!(
+                    "remote operation log count mismatch {key} expected={} actual={}",
+                    expected, actual
+                );
+                return;
+            }
+            OperationLogComparisonIssue::EntryMismatch { index, id } => {
+                eprintln!(
+                    "remote operation log entry does not match metadata {key} {id} index={index}"
+                );
+            }
         }
     }
 }
