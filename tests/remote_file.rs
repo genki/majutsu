@@ -1,3 +1,4 @@
+use chrono::{SecondsFormat, Utc};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -3385,6 +3386,63 @@ fn mount_creates_lazy_view_and_can_hydrate_large_files() {
     });
     assert!(unmounted.contains("unmounted"));
     assert!(!lazy_view.exists());
+}
+
+#[test]
+fn mount_at_uses_historical_snapshot_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let historical_view = tmp.path().join("historical-view");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"v1\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    thread::sleep(Duration::from_millis(20));
+    let at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    thread::sleep(Duration::from_millis(20));
+    fs::write(source.join("alpha.txt"), b"v2\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let mounted = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("mount")
+            .arg("--at")
+            .arg(&at)
+            .arg(&historical_view);
+        c
+    });
+
+    assert!(mounted.contains("mounted"));
+    assert_eq!(
+        fs::read(historical_view.join("sample/alpha.txt")).unwrap(),
+        b"v1\n"
+    );
 }
 
 #[test]
