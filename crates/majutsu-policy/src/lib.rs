@@ -94,7 +94,7 @@ fn transition_tiering_rules(tiering: &PolicyConfig) -> Result<Vec<TransitionRule
         let Some(storage) = &rule.storage else {
             continue;
         };
-        if is_hot_storage(storage) {
+        if is_hot_storage(storage) || is_hot_metadata_prefix(&rule.prefix) {
             continue;
         }
         out.push(TransitionRule {

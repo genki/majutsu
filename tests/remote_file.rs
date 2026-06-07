@@ -2645,7 +2645,14 @@ enabled = true
 [[tiering.rules]]
 name = "keep-hosts-hot"
 prefix = "hosts/"
-storage = "standard"
+after = "1d"
+storage = "deep-archive"
+
+[[tiering.rules]]
+name = "keep-trees-hot"
+prefix = "trees/"
+after = "1d"
+transition_to = "archive"
 
 [[tiering.rules]]
 name = "custom-packs-to-ia"
@@ -2679,6 +2686,7 @@ storage = "deep-archive"
     assert!(s3_policy.contains("\"Days\": 365"));
     assert!(s3_policy.contains("\"StorageClass\": \"DEEP_ARCHIVE\""));
     assert!(!s3_policy.contains("\"Prefix\": \"hosts/\""));
+    assert!(!s3_policy.contains("\"Prefix\": \"trees/\""));
 
     let gcs_policy = output({
         let mut c = mj();
@@ -2695,6 +2703,7 @@ storage = "deep-archive"
     assert!(gcs_policy.contains("\"age\": 365"));
     assert!(gcs_policy.contains("\"storageClass\": \"ARCHIVE\""));
     assert!(!gcs_policy.contains("\"hosts/\""));
+    assert!(!gcs_policy.contains("\"trees/\""));
 }
 
 #[test]
