@@ -2751,7 +2751,15 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         if local.exists() {
             enqueue_file_upload(paths, &key, &local)?;
             for alias in canonical_remote_aliases(&key) {
-                enqueue_file_upload(paths, &alias, &local)?;
+                if canonical_alias_uses_structured_encoding(&key) {
+                    enqueue_inline_upload(
+                        paths,
+                        &alias,
+                        encode_canonical_local_object(paths, &key)?,
+                    )?;
+                } else {
+                    enqueue_file_upload(paths, &alias, &local)?;
+                }
             }
         }
     }
@@ -2828,6 +2836,25 @@ fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Res
     let cbor = serde_cbor::to_vec(value)?;
     let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
     encode_object(paths, &compressed)
+}
+
+fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
+    let bytes = read_object(paths, key)?;
+    if key.starts_with("objects/trees/") {
+        let manifest: TreeManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode tree manifest {key}"))?;
+        encode_canonical_remote_export(paths, &manifest)
+    } else if key.starts_with("objects/large/manifests/") {
+        let manifest: LargeManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode large manifest {key}"))?;
+        encode_canonical_remote_export(paths, &manifest)
+    } else {
+        encode_object(paths, &bytes)
+    }
+}
+
+fn canonical_alias_uses_structured_encoding(key: &str) -> bool {
+    key.starts_with("objects/trees/") || key.starts_with("objects/large/manifests/")
 }
 
 fn update_remote_host_index(
@@ -5860,20 +5887,20 @@ fn large_chunk_base_for_key(paths: &Paths, key: &str) -> PathBuf {
 
 fn canonical_remote_alias(key: &str) -> Option<String> {
     if let Some(rest) = key.strip_prefix("objects/trees/") {
-        Some(format!("trees/{rest}"))
+        Some(format!("trees/{rest}.cbor.zst.enc"))
     } else if let Some(rest) = key.strip_prefix("objects/blobs/") {
-        Some(format!("blobs/loose/{rest}"))
+        Some(format!("blobs/loose/{rest}.blob.enc"))
     } else if let Some(rest) = key.strip_prefix("objects/packs/normal/") {
         Some(format!("packs/normal/{rest}"))
     } else if let Some(rest) = key.strip_prefix("objects/indexes/pack/") {
         Some(format!("indexes/pack-index/{rest}"))
     } else if let Some(rest) = key.strip_prefix("objects/large/manifests/") {
-        Some(format!("large/manifests/{rest}"))
+        Some(format!("large/manifests/{rest}.cbor.zst.enc"))
     } else if let Some(rest) = key.strip_prefix("objects/large/chunks/fixed/") {
-        Some(format!("large/chunks/fixed-8m/{rest}"))
+        Some(format!("large/chunks/fixed-8m/{rest}.chunk.enc"))
     } else {
         key.strip_prefix("objects/large/chunks/fastcdc/")
-            .map(|rest| format!("large/chunks/fastcdc/{rest}"))
+            .map(|rest| format!("large/chunks/fastcdc/{rest}.chunk.enc"))
     }
 }
 

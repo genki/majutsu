@@ -46,6 +46,24 @@ fn fails(mut command: Command) {
     );
 }
 
+fn find_file_ending(root: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_type().is_file() && entry.path().to_string_lossy().ends_with(suffix)
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .unwrap_or_else(|| panic!("missing file ending with {suffix} under {}", root.display()))
+}
+
+fn assert_canonical_cbor_zstd(path: &std::path::Path) {
+    let compressed = fs::read(path).unwrap();
+    let cbor = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+    let value: serde_cbor::Value = serde_cbor::from_slice(&cbor).unwrap();
+    assert!(matches!(value, serde_cbor::Value::Map(_)));
+}
+
 #[test]
 fn file_remote_clone_restores_normal_and_large_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -151,10 +169,13 @@ fn file_remote_clone_restores_normal_and_large_files() {
     assert!(host.contains("roots 1"));
     assert!(host.contains("snapshots 1"));
     assert!(remote.join("objects/trees").exists());
-    assert!(remote.join("trees").exists());
-    assert!(remote.join("blobs/loose").exists());
-    assert!(remote.join("large/manifests").exists());
-    assert!(remote.join("large/chunks/fixed-8m").exists());
+    assert_canonical_cbor_zstd(&find_file_ending(&remote.join("trees"), ".cbor.zst.enc"));
+    assert!(find_file_ending(&remote.join("blobs/loose"), ".blob.enc").exists());
+    assert_canonical_cbor_zstd(&find_file_ending(
+        &remote.join("large/manifests"),
+        ".cbor.zst.enc",
+    ));
+    assert!(find_file_ending(&remote.join("large/chunks/fixed-8m"), ".chunk.enc").exists());
     let host_ref_dirs = fs::read_dir(remote.join("hosts"))
         .unwrap()
         .filter_map(|entry| {
