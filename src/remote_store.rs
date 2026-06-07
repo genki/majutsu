@@ -280,7 +280,7 @@ impl S3Remote {
         Ok(true)
     }
 
-    fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<()> {
         let remote_key = self.remote_key(key);
         let upload_id = self.initiate_multipart(key, &remote_key)?;
         let result = (|| {

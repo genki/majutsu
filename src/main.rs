@@ -100,7 +100,9 @@ use fs_meta::{
 };
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 #[cfg(test)]
-use remote_store::{DEFAULT_MULTIPART_THRESHOLD, FileRemote, S3Remote, s3_object_class};
+use remote_store::{
+    DEFAULT_MULTIPART_THRESHOLD, FileRemote, MIN_MULTIPART_PART_SIZE, S3Remote, s3_object_class,
+};
 use remote_store::{RemoteStore, open_remote, open_remote_with_upload_policy};
 use restore_runtime::{
     RestoreDelete, RestorePlan, ensure_restore_job_has_no_missing_objects,
@@ -7364,6 +7366,124 @@ mod tests {
             "x-amz-tagging".to_string(),
             "majutsu-class=large&purpose=backup%20data".to_string()
         )));
+    }
+
+    #[test]
+    fn s3_multipart_upload_sends_parts_and_complete_manifest() {
+        fn read_http_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 8192];
+            let header_end = loop {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before sending headers");
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim())
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while bytes.len() < header_end + content_length {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before sending body");
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            (
+                headers.lines().next().unwrap_or_default().to_string(),
+                bytes[header_end..header_end + content_length].to_vec(),
+            )
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut observed = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (request_line, body) = read_http_request(&mut stream);
+                if request_line.contains("?uploads=") {
+                    let body = "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>";
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                } else if request_line.contains("partNumber=") {
+                    let etag = if request_line.contains("partNumber=1") {
+                        "etag-1"
+                    } else {
+                        "etag-2"
+                    };
+                    stream
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: 0\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .unwrap();
+                } else if request_line.contains("?uploadId=upload-1") {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                } else {
+                    panic!("unexpected multipart request: {request_line}");
+                }
+                observed.push((request_line, body));
+            }
+            tx.send(observed).unwrap();
+        });
+
+        let mut remote = test_s3_remote();
+        remote.endpoint = endpoint;
+        remote.prefix = "majutsu/v1".into();
+        remote.max_parallel_uploads = 2;
+        let mut payload = vec![1u8; MIN_MULTIPART_PART_SIZE];
+        payload.extend(vec![2u8; 3]);
+        remote
+            .put_multipart("large/chunks/fixed-8m/chunk-1", &payload)
+            .unwrap();
+        server.join().unwrap();
+
+        let observed = rx.recv().unwrap();
+        assert!(
+            observed[0]
+                .0
+                .starts_with("POST /bucket/majutsu/v1/large/chunks/fixed-8m/chunk-1?uploads=")
+        );
+        let part_bodies = observed
+            .iter()
+            .filter(|(line, _)| line.contains("partNumber="))
+            .map(|(line, body)| (line.clone(), body.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(part_bodies.len(), 2);
+        assert!(part_bodies.iter().any(|(line, body)| {
+            line.contains("partNumber=1") && body == &vec![1u8; MIN_MULTIPART_PART_SIZE]
+        }));
+        assert!(
+            part_bodies
+                .iter()
+                .any(|(line, body)| line.contains("partNumber=2") && body == &vec![2u8; 3])
+        );
+        let complete_body = observed
+            .iter()
+            .find(|(line, _)| line.starts_with("POST ") && line.contains("?uploadId=upload-1"))
+            .map(|(_, body)| String::from_utf8_lossy(body).to_string())
+            .unwrap();
+        assert!(complete_body.contains("<PartNumber>1</PartNumber><ETag>etag-1</ETag>"));
+        assert!(complete_body.contains("<PartNumber>2</PartNumber><ETag>etag-2</ETag>"));
     }
 
     #[test]
