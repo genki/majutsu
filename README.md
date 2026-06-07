@@ -606,7 +606,17 @@ Generate provider lifecycle policy templates:
 ```sh
 mj lifecycle policy --provider gcs
 mj lifecycle policy --provider s3
+mj lifecycle status
+mj lifecycle apply --provider s3
+mj lifecycle apply --provider s3 --dry-run=false
 ```
+
+`lifecycle status` reports whether the configured remote advertises lifecycle
+support and how many provider rules will be generated. `lifecycle apply` is a
+dry run by default: it prints the policy and a provider-specific apply hint.
+With `--dry-run=false`, majutsu stores the desired policy artifact under
+`lifecycle/policy-<provider>.json` and records `lifecycle/status.json` on the
+remote so provider automation can apply the same versioned policy.
 
 The generated rules are derived from `[tiering]` in `config.toml`. Rules without
 `after`, or rules whose storage is `standard`, are treated as keep-hot policy

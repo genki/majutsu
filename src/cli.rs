@@ -324,6 +324,13 @@ pub(crate) enum LifecycleCommand {
         #[arg(long, default_value = "gcs")]
         provider: String,
     },
+    Status,
+    Apply {
+        #[arg(long, default_value = "s3")]
+        provider: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Args)]

@@ -5665,10 +5665,15 @@ fn op_restore_moves_current_ref_to_operation_snapshot() {
 fn lifecycle_policy_uses_tiering_config_rules() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
 
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("init");
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
         c
     });
     let config_path = state.join("config.toml");
@@ -5743,6 +5748,52 @@ storage = "deep-archive"
     assert!(gcs_policy.contains("\"storageClass\": \"ARCHIVE\""));
     assert!(!gcs_policy.contains("\"hosts/\""));
     assert!(!gcs_policy.contains("\"trees/\""));
+
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("lifecycle").arg("status");
+        c
+    });
+    assert!(status.contains("remote file://"));
+    assert!(status.contains("lifecycle_rules false"));
+    assert!(status.contains("policy_rules_s3 2"));
+    assert!(status.contains("policy_rules_gcs 2"));
+
+    let dry_run = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("apply")
+            .arg("--provider")
+            .arg("s3");
+        c
+    });
+    assert!(dry_run.contains("dry_run true"));
+    assert!(dry_run.contains("apply_hint aws s3api put-bucket-lifecycle-configuration"));
+    assert!(dry_run.contains("apply_warning remote does not advertise lifecycle rule support"));
+
+    let applied = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("apply")
+            .arg("--provider")
+            .arg("s3")
+            .arg("--dry-run")
+            .arg("false");
+        c
+    });
+    assert!(applied.contains("applied true"));
+    assert!(remote.join("lifecycle/policy-s3.json").exists());
+    assert!(remote.join("lifecycle/status.json").exists());
+    let applied_policy = fs::read_to_string(remote.join("lifecycle/policy-s3.json")).unwrap();
+    assert!(applied_policy.contains("\"ID\": \"custom-packs-to-ia\""));
+    let applied_status: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("lifecycle/status.json")).unwrap()).unwrap();
+    assert_eq!(applied_status["provider"], "s3");
+    assert_eq!(applied_status["policy_key"], "lifecycle/policy-s3.json");
 }
 
 #[test]
