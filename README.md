@@ -302,7 +302,8 @@ mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 ```
 
 When `hosts/index.json` contains multiple hosts, clone requires `--host` even
-if the legacy `metadata/export.json` bootstrap file is still present.
+if the legacy `metadata/export.json` bootstrap file is still present. If a host
+name matches multiple entries, use the host id shown by `mj remote hosts`.
 `metadata/export.json` remains the legacy/current-host bootstrap path.
 `hosts/index.json` and `hosts/<host-id>/metadata/export.json` allow browsing and
 recovering a specific host timeline from a shared remote prefix.

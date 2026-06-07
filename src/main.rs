@@ -3339,11 +3339,7 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         }
         RemoteCommand::Host { id } => {
             let index = remote_host_index_with_legacy(&remote)?;
-            let host = index
-                .hosts
-                .into_iter()
-                .find(|host| host.id == id || host.name == id)
-                .ok_or_else(|| anyhow!("remote host not found: {id}"))?;
+            let host = select_remote_host(index.hosts, &id)?;
             let export: MetadataExport = serde_json::from_slice(&remote.get(&host.metadata_key)?)?;
             println!("id {}", host.id);
             println!("name {}", host.name);
@@ -3405,12 +3401,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
 fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String> {
     if let Some(host_id) = host {
         let index = remote_host_index_with_legacy(remote)?;
-        return index
-            .hosts
-            .into_iter()
-            .find(|host| host.id == host_id || host.name == host_id)
-            .map(|host| host.metadata_key)
-            .ok_or_else(|| anyhow!("remote host not found: {host_id}"));
+        return Ok(select_remote_host(index.hosts, host_id)?.metadata_key);
     }
     let index = remote_host_index_with_legacy(remote)?;
     match index.hosts.as_slice() {
@@ -3420,6 +3411,21 @@ fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String
             bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")
         }
         _ => bail!("remote contains multiple hosts; rerun clone with --host"),
+    }
+}
+
+fn select_remote_host(hosts: Vec<RemoteHostSummary>, selector: &str) -> Result<RemoteHostSummary> {
+    if let Some(host) = hosts.iter().find(|host| host.id == selector) {
+        return Ok(host.clone());
+    }
+    let mut by_name = hosts
+        .into_iter()
+        .filter(|host| host.name == selector)
+        .collect::<Vec<_>>();
+    match by_name.len() {
+        0 => bail!("remote host not found: {selector}"),
+        1 => Ok(by_name.remove(0)),
+        _ => bail!("remote host name is ambiguous: {selector}; use the host id"),
     }
 }
 

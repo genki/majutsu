@@ -915,6 +915,125 @@ fn clone_requires_host_for_multi_host_index_even_with_legacy_metadata() {
 }
 
 #[test]
+fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source_a = tmp.path().join("source-a");
+    let source_b = tmp.path().join("source-b");
+    let state_a = tmp.path().join("state-a");
+    let state_b = tmp.path().join("state-b");
+    let clone_by_name = tmp.path().join("clone-by-name");
+    let clone_by_id = tmp.path().join("clone-by-id");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source_a).unwrap();
+    fs::create_dir_all(&source_b).unwrap();
+    fs::write(source_a.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source_b.join("beta.txt"), b"beta\n").unwrap();
+
+    for (state, source, root) in [(&state_a, &source_a, "a"), (&state_b, &source_b, "b")] {
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("init")
+                .arg("--host-name")
+                .arg("shared")
+                .arg("--remote")
+                .arg(format!("file://{}", remote.display()));
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("root")
+                .arg("add")
+                .arg(root)
+                .arg(source);
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("snapshot");
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("sync");
+            c
+        });
+    }
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_by_name)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()))
+            .arg("--host")
+            .arg("shared");
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state_a)
+            .arg("remote")
+            .arg("host")
+            .arg("shared");
+        c
+    });
+
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
+    let host_b_id = index["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|host| {
+            let id = host["id"].as_str().unwrap();
+            let metadata_key = host["metadata_key"].as_str().unwrap();
+            if fs::read_to_string(remote.join(metadata_key))
+                .unwrap()
+                .contains("\"id\": \"b\"")
+            {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_by_id)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()))
+            .arg("--host")
+            .arg(&host_b_id);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_by_id)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("b/beta.txt")).unwrap(),
+        "beta\n"
+    );
+    assert!(!restore.join("a/alpha.txt").exists());
+}
+
+#[test]
 fn remote_fsck_detects_missing_canonical_object_alias() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
