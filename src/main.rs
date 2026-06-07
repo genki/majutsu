@@ -12,13 +12,13 @@ use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
     ConfigRootIssue, FileRecord, HistoryGraphIssue, HostFileIssue, LargeChunk, LargeManifest,
-    MetadataReferenceIssue, OperationLogComparisonIssue, OperationLogEntry as OperationExport,
-    OperationLogEntryIssue, Payload, RootSnapshot, SnapshotExport, SnapshotManifest, SnapshotMode,
-    TreeManifest, config_root_consistency_issues, decode_operation_log, encode_operation_log,
-    history_graph_issues, host_file_issues, metadata_reference_issues,
-    operation_log_comparison_issues, operation_log_entry_matches, payload_blob_ref,
-    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
-    snapshot_manifest_matches, tree_manifest_issues,
+    LiveMetadataReferences, MetadataReferenceIssue, OperationLogComparisonIssue,
+    OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload, RootSnapshot,
+    SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest, config_root_consistency_issues,
+    decode_operation_log, encode_operation_log, history_graph_issues, host_file_issues,
+    metadata_reference_issues, operation_log_comparison_issues, operation_log_entry_matches,
+    payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
+    snapshot_export_matches, snapshot_manifest_matches, tree_manifest_issues,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -4343,32 +4343,21 @@ fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrune
 }
 
 fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<PrunedMetadata> {
-    let mut live_blobs = std::collections::BTreeSet::new();
-    let mut live_large = std::collections::BTreeSet::new();
-    let mut live_chunks = std::collections::BTreeSet::new();
+    let mut live = LiveMetadataReferences::default();
     let mut stmt = conn.prepare("select manifest_json from snapshots")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     for row in rows {
         let manifest: SnapshotManifest = serde_json::from_str(&row?)?;
-        for records in manifest.roots.values() {
-            for record in records {
-                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
-                    live_blobs.insert(oid.to_string());
-                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
-                    live_large.insert(oid.to_string());
-                    let large_manifest: LargeManifest =
-                        serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                    for chunk in large_manifest.chunks {
-                        live_chunks.insert(chunk.oid);
-                    }
-                }
-            }
+        for manifest_key in live.add_snapshot_manifest(&manifest) {
+            let large_manifest: LargeManifest =
+                serde_json::from_slice(&read_object(paths, &manifest_key)?)?;
+            live.add_large_manifest(large_manifest);
         }
     }
-    let blobs = delete_rows_not_in(conn, "blobs", "oid", &live_blobs)?;
-    let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live_large)?;
-    let chunks = delete_rows_not_in(conn, "chunks", "oid", &live_chunks)?;
-    let large_pins = delete_rows_not_in(conn, "large_pins", "oid", &live_large)?;
+    let blobs = delete_rows_not_in(conn, "blobs", "oid", &live.blobs)?;
+    let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live.large_objects)?;
+    let chunks = delete_rows_not_in(conn, "chunks", "oid", &live.chunks)?;
+    let large_pins = delete_rows_not_in(conn, "large_pins", "oid", &live.large_objects)?;
     Ok(PrunedMetadata {
         blobs,
         large_objects,
@@ -4804,40 +4793,29 @@ fn validate_local_metadata_references(
     export: &MetadataExport,
     missing: &mut usize,
 ) -> Result<()> {
-    let mut live_blobs = BTreeSet::new();
-    let mut live_large = BTreeSet::new();
-    let mut live_chunks = BTreeSet::new();
+    let mut live = LiveMetadataReferences::default();
     for snapshot in &export.snapshots {
         let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
             Ok(manifest) => manifest,
             Err(_) => continue,
         };
-        for records in manifest.roots.values() {
-            for record in records {
-                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
-                    live_blobs.insert(oid.to_string());
-                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
-                    live_large.insert(oid.to_string());
-                    let Ok(bytes) = read_object(paths, manifest_key) else {
-                        continue;
-                    };
-                    let Ok(large_manifest) = serde_json::from_slice::<LargeManifest>(&bytes) else {
-                        continue;
-                    };
-                    for chunk in large_manifest.chunks {
-                        live_chunks.insert(chunk.oid);
-                    }
-                }
-            }
+        for manifest_key in live.add_snapshot_manifest(&manifest) {
+            let Ok(bytes) = read_object(paths, &manifest_key) else {
+                continue;
+            };
+            let Ok(large_manifest) = serde_json::from_slice::<LargeManifest>(&bytes) else {
+                continue;
+            };
+            live.add_large_manifest(large_manifest);
         }
     }
     for issue in metadata_reference_issues(
         export.blobs.iter().map(|blob| blob.oid.as_str()),
         export.large_objects.iter().map(|large| large.oid.as_str()),
         export.chunks.iter().map(|chunk| chunk.oid.as_str()),
-        &live_blobs,
-        &live_large,
-        &live_chunks,
+        &live.blobs,
+        &live.large_objects,
+        &live.chunks,
     ) {
         *missing += 1;
         match issue {
@@ -5697,31 +5675,20 @@ fn validate_remote_metadata_references(
     export: &MetadataExport,
     missing: &mut usize,
 ) -> Result<()> {
-    let mut live_blobs = BTreeSet::new();
-    let mut live_large = BTreeSet::new();
-    let mut live_chunks = BTreeSet::new();
+    let mut live = LiveMetadataReferences::default();
     for snapshot in &export.snapshots {
         let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
             Ok(manifest) => manifest,
             Err(_) => continue,
         };
-        for records in manifest.roots.values() {
-            for record in records {
-                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
-                    live_blobs.insert(oid.to_string());
-                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
-                    live_large.insert(oid.to_string());
-                    for bytes in remote_local_object_variants(paths, remote, manifest_key)? {
-                        let large_manifest: LargeManifest =
-                            match serde_json::from_slice(&decode_object(paths, &bytes.bytes)?) {
-                                Ok(manifest) => manifest,
-                                Err(_) => continue,
-                            };
-                        for chunk in large_manifest.chunks {
-                            live_chunks.insert(chunk.oid);
-                        }
-                    }
-                }
+        for manifest_key in live.add_snapshot_manifest(&manifest) {
+            for bytes in remote_local_object_variants(paths, remote, &manifest_key)? {
+                let large_manifest: LargeManifest =
+                    match serde_json::from_slice(&decode_object(paths, &bytes.bytes)?) {
+                        Ok(manifest) => manifest,
+                        Err(_) => continue,
+                    };
+                live.add_large_manifest(large_manifest);
             }
         }
     }
@@ -5729,9 +5696,9 @@ fn validate_remote_metadata_references(
         export.blobs.iter().map(|blob| blob.oid.as_str()),
         export.large_objects.iter().map(|large| large.oid.as_str()),
         export.chunks.iter().map(|chunk| chunk.oid.as_str()),
-        &live_blobs,
-        &live_large,
-        &live_chunks,
+        &live.blobs,
+        &live.large_objects,
+        &live.chunks,
     ) {
         *missing += 1;
         match issue {

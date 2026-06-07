@@ -211,6 +211,36 @@ where
     issues
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveMetadataReferences {
+    pub blobs: BTreeSet<String>,
+    pub large_objects: BTreeSet<String>,
+    pub chunks: BTreeSet<String>,
+}
+
+impl LiveMetadataReferences {
+    pub fn add_snapshot_manifest(&mut self, manifest: &SnapshotManifest) -> Vec<String> {
+        let mut large_manifest_keys = Vec::new();
+        for records in manifest.roots.values() {
+            for record in records {
+                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+                    self.blobs.insert(oid.to_string());
+                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
+                    self.large_objects.insert(oid.to_string());
+                    large_manifest_keys.push(manifest_key.to_string());
+                }
+            }
+        }
+        large_manifest_keys
+    }
+
+    pub fn add_large_manifest(&mut self, manifest: LargeManifest) {
+        for chunk in manifest.chunks {
+            self.chunks.insert(chunk.oid);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostFileIssue {
     IdMismatch {
@@ -902,6 +932,86 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn live_metadata_references_track_snapshot_and_large_manifest_objects() {
+        let mut refs = LiveMetadataReferences::default();
+        let manifest = SnapshotManifest {
+            snapshot_id: "snap-1".into(),
+            parent: None,
+            op_id: "op-1".into(),
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            root_trees: BTreeMap::new(),
+            roots: BTreeMap::from([(
+                "root-a".into(),
+                vec![
+                    FileRecord {
+                        root_id: "root-a".into(),
+                        path: "small.txt".into(),
+                        kind: "file".into(),
+                        size: 5,
+                        mode: 0,
+                        modified: None,
+                        uid: None,
+                        gid: None,
+                        xattrs: BTreeMap::new(),
+                        payload: Payload::NormalBlob {
+                            oid: "blob-1".into(),
+                            object_key: "objects/blobs/blob-1".into(),
+                        },
+                    },
+                    FileRecord {
+                        root_id: "root-a".into(),
+                        path: "large.bin".into(),
+                        kind: "file".into(),
+                        size: 10,
+                        mode: 0,
+                        modified: None,
+                        uid: None,
+                        gid: None,
+                        xattrs: BTreeMap::new(),
+                        payload: Payload::LargeObject {
+                            oid: "large-1".into(),
+                            manifest_key: "objects/large/large-1.json".into(),
+                            chunk_count: 1,
+                            media_type: None,
+                            binary: true,
+                            chunking: "fixed".into(),
+                            compression: "none".into(),
+                            encryption: "none".into(),
+                            storage_tier_hint: "standard".into(),
+                            hydrate_policy: "on-demand".into(),
+                        },
+                    },
+                ],
+            )]),
+        };
+
+        let manifest_keys = refs.add_snapshot_manifest(&manifest);
+        refs.add_large_manifest(LargeManifest {
+            version: 1,
+            oid: "large-1".into(),
+            size: 10,
+            media_type: None,
+            binary: true,
+            chunking: "fixed".into(),
+            chunk_size: 10,
+            chunks: vec![LargeChunk {
+                index: 0,
+                offset: 0,
+                len: 10,
+                stored_len: None,
+                compression: "none".into(),
+                oid: "chunk-1".into(),
+                object_key: "objects/large/chunks/chunk-1".into(),
+            }],
+        });
+
+        assert_eq!(manifest_keys, vec!["objects/large/large-1.json"]);
+        assert!(refs.blobs.contains("blob-1"));
+        assert!(refs.large_objects.contains("large-1"));
+        assert!(refs.chunks.contains("chunk-1"));
     }
 
     #[test]
