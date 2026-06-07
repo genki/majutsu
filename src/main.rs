@@ -72,6 +72,7 @@ mod daemon_runtime;
 mod db_refs;
 mod fs_meta;
 mod object_paths;
+mod operation_log;
 mod process_runtime;
 mod queue_runtime;
 mod remote_store;
@@ -105,6 +106,10 @@ use fs_meta::{
 };
 use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
+};
+use operation_log::{
+    local_oplog_path, query_operation, query_operations, record_op, record_op_with_id,
+    record_op_with_id_and_status, rewrite_local_oplog,
 };
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use queue_runtime::{
@@ -6522,214 +6527,6 @@ fn carry_forward_root_snapshot(
     }
 }
 
-fn record_op(
-    conn: &Connection,
-    kind: &str,
-    before: Option<&str>,
-    after: Option<&str>,
-    message: Option<&str>,
-) -> Result<String> {
-    let id = new_id("op");
-    record_op_with_id(conn, &id, kind, before, after, message)?;
-    Ok(id)
-}
-
-fn record_op_with_id(
-    conn: &Connection,
-    id: &str,
-    kind: &str,
-    before: Option<&str>,
-    after: Option<&str>,
-    message: Option<&str>,
-) -> Result<()> {
-    record_op_with_id_and_status(conn, id, kind, before, after, "done", message)
-}
-
-fn record_op_with_id_and_status(
-    conn: &Connection,
-    id: &str,
-    kind: &str,
-    before: Option<&str>,
-    after: Option<&str>,
-    status: &str,
-    message: Option<&str>,
-) -> Result<()> {
-    let created_at = Utc::now().to_rfc3339();
-    let parent_op = current_operation(conn)?;
-    let actor = operation_actor();
-    conn.execute(
-        "insert into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            id, parent_op, kind, actor, status, before, after, created_at, message
-        ],
-    )?;
-    let op = OperationExport {
-        id: id.to_string(),
-        parent_op,
-        kind: kind.to_string(),
-        actor,
-        status: status.to_string(),
-        before_snapshot: before.map(str::to_string),
-        after_snapshot: after.map(str::to_string),
-        created_at,
-        message: message.map(str::to_string),
-    };
-    append_local_oplog(conn, &op)?;
-    append_operation_audit_log(conn, &op)?;
-    Ok(())
-}
-
-fn append_local_oplog(conn: &Connection, op: &OperationExport) -> Result<()> {
-    let Some(path) = local_oplog_path(conn)? else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    let bytes = serde_cbor::to_vec(op)?;
-    file.write_all(&bytes)?;
-    Ok(())
-}
-
-fn rewrite_local_oplog(conn: &Connection) -> Result<()> {
-    let Some(path) = local_oplog_path(conn)? else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let operations = query_operations(conn)?;
-    let tmp = path.with_extension("cborl.tmp");
-    let result = (|| -> Result<()> {
-        let mut file = File::create(&tmp)?;
-        for op in &operations {
-            file.write_all(&serde_cbor::to_vec(op)?)?;
-        }
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &path)?;
-        fsync_parent_dir(&path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
-fn local_oplog_path(conn: &Connection) -> Result<Option<PathBuf>> {
-    let db_path = conn
-        .query_row(
-            "select file from pragma_database_list where name='main'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let Some(db_path) = db_path.filter(|path| !path.is_empty()) else {
-        return Ok(None);
-    };
-    let db_path = PathBuf::from(db_path);
-    let Some(home) = db_path
-        .parent()
-        .and_then(|parent| parent.parent())
-        .map(Path::to_path_buf)
-    else {
-        return Ok(None);
-    };
-    Ok(Some(home.join("ops/local-oplog.cborl")))
-}
-
-fn append_operation_audit_log(conn: &Connection, op: &OperationExport) -> Result<()> {
-    let Some(oplog) = local_oplog_path(conn)? else {
-        return Ok(());
-    };
-    let Some(home) = oplog
-        .parent()
-        .and_then(|parent| parent.parent())
-        .map(Path::to_path_buf)
-    else {
-        return Ok(());
-    };
-    let log_dir = home.join("logs");
-    fs::create_dir_all(&log_dir)?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("majutsu.log"))?;
-    file.write_all(&serde_json::to_vec(op)?)?;
-    file.write_all(b"\n")?;
-    Ok(())
-}
-
-fn current_operation(conn: &Connection) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "select id from operations order by rowid desc limit 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?)
-}
-
-fn operation_actor() -> String {
-    let user = env::var("USER")
-        .or_else(|_| env::var("LOGNAME"))
-        .unwrap_or_else(|_| "local".into());
-    let host = env::var("HOSTNAME").unwrap_or_else(|_| "host".into());
-    format!("{user}@{host}")
-}
-
-fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
-    conn.query_row(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations where id=?1",
-        params![op_id],
-        |row| {
-            Ok(OperationExport {
-                id: row.get(0)?,
-                parent_op: row.get(1)?,
-                kind: row.get(2)?,
-                actor: row.get(3)?,
-                status: row.get(4)?,
-                before_snapshot: row.get(5)?,
-                after_snapshot: row.get(6)?,
-                created_at: row.get(7)?,
-                message: row.get(8)?,
-            })
-        },
-    )
-    .optional()?
-    .ok_or_else(|| anyhow!("unknown operation: {op_id}"))
-}
-
-fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
-    let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations order by created_at",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(OperationExport {
-            id: row.get(0)?,
-            parent_op: row.get(1)?,
-            kind: row.get(2)?,
-            actor: row.get(3)?,
-            status: row.get(4)?,
-            before_snapshot: row.get(5)?,
-            after_snapshot: row.get(6)?,
-            created_at: row.get(7)?,
-            message: row.get(8)?,
-        })
-    })?;
-    let mut operations = Vec::new();
-    for row in rows {
-        operations.push(row?);
-    }
-    Ok(operations)
-}
-
 fn run_pre_snapshot_hook(paths: &Paths, root: &RootConfig) -> Result<()> {
     if root.snapshot_mode == "transactional" {
         run_application_plugin(paths, root, "pre")?;
@@ -6942,7 +6739,7 @@ fn atomic_temp_path(dest: &Path) -> PathBuf {
     parent.join(tmp_name)
 }
 
-fn fsync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn fsync_parent_dir(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
