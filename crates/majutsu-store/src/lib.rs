@@ -335,6 +335,46 @@ impl RemoteGcMark {
             .collect::<std::collections::BTreeSet<_>>();
         unique.len() != self.object_keys.len()
     }
+
+    pub fn validation_issues(
+        &self,
+        host_id: &str,
+        current_snapshot: Option<&String>,
+        expected_object_keys: &std::collections::BTreeSet<String>,
+    ) -> Vec<RemoteGcMarkIssue> {
+        let mut issues = Vec::new();
+        if self.version != 1 {
+            issues.push(RemoteGcMarkIssue::UnsupportedVersion);
+        }
+        if self.host_id != host_id {
+            issues.push(RemoteGcMarkIssue::HostMismatch(self.host_id.clone()));
+        }
+        if self.current_snapshot.as_ref() != current_snapshot {
+            issues.push(RemoteGcMarkIssue::CurrentSnapshotMismatch);
+        }
+        if self.has_duplicate_object_keys() {
+            issues.push(RemoteGcMarkIssue::DuplicateObjectKeys);
+        }
+        let actual = self
+            .object_keys
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for key in expected_object_keys {
+            if !actual.contains(key) {
+                issues.push(RemoteGcMarkIssue::MissingLiveObject(key.clone()));
+            }
+        }
+        issues
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteGcMarkIssue {
+    UnsupportedVersion,
+    HostMismatch(String),
+    CurrentSnapshotMismatch,
+    DuplicateObjectKeys,
+    MissingLiveObject(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +398,27 @@ impl RemoteGcTombstone {
     pub fn has_valid_deleted_key(&self) -> bool {
         !self.key.is_empty() && !self.key.starts_with('/') && !self.key.contains("..")
     }
+
+    pub fn validation_issues(&self, host_id: &str) -> Vec<RemoteGcTombstoneIssue> {
+        let mut issues = Vec::new();
+        if self.version != 1 {
+            issues.push(RemoteGcTombstoneIssue::UnsupportedVersion);
+        }
+        if self.host_id != host_id {
+            issues.push(RemoteGcTombstoneIssue::HostMismatch(self.host_id.clone()));
+        }
+        if !self.has_valid_deleted_key() {
+            issues.push(RemoteGcTombstoneIssue::InvalidDeletedKey);
+        }
+        issues
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteGcTombstoneIssue {
+    UnsupportedVersion,
+    HostMismatch(String),
+    InvalidDeletedKey,
 }
 
 #[cfg(test)]
@@ -544,6 +605,49 @@ mod tests {
     }
 
     #[test]
+    fn remote_gc_mark_validation_reports_metadata_issues() {
+        let mark = RemoteGcMark {
+            version: 2,
+            host_id: "wrong-host".into(),
+            marked_at: DateTime::<Utc>::UNIX_EPOCH,
+            current_snapshot: Some("old-snap".into()),
+            object_keys: vec!["objects/a".into(), "objects/a".into()],
+        };
+        let expected = ["objects/a".to_string(), "objects/b".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            mark.validation_issues("host-a", Some(&"snap-1".to_string()), &expected),
+            vec![
+                RemoteGcMarkIssue::UnsupportedVersion,
+                RemoteGcMarkIssue::HostMismatch("wrong-host".into()),
+                RemoteGcMarkIssue::CurrentSnapshotMismatch,
+                RemoteGcMarkIssue::DuplicateObjectKeys,
+                RemoteGcMarkIssue::MissingLiveObject("objects/b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_gc_mark_validation_accepts_matching_mark() {
+        let expected = ["objects/a".to_string(), "objects/b".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mark = RemoteGcMark::new(
+            "host-a".into(),
+            DateTime::<Utc>::UNIX_EPOCH,
+            Some("snap-1".into()),
+            expected.iter().cloned().collect(),
+        );
+
+        assert!(
+            mark.validation_issues("host-a", Some(&"snap-1".to_string()), &expected)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn remote_gc_tombstone_keys_and_deleted_key_validation_are_stable() {
         let tombstone = RemoteGcTombstone::new(
             "host-a".into(),
@@ -568,6 +672,25 @@ mod tests {
                 "../bad".into()
             )
             .has_valid_deleted_key()
+        );
+    }
+
+    #[test]
+    fn remote_gc_tombstone_validation_reports_metadata_issues() {
+        let tombstone = RemoteGcTombstone {
+            version: 2,
+            host_id: "wrong-host".into(),
+            deleted_at: DateTime::<Utc>::UNIX_EPOCH,
+            key: "../bad".into(),
+        };
+
+        assert_eq!(
+            tombstone.validation_issues("host-a"),
+            vec![
+                RemoteGcTombstoneIssue::UnsupportedVersion,
+                RemoteGcTombstoneIssue::HostMismatch("wrong-host".into()),
+                RemoteGcTombstoneIssue::InvalidDeletedKey,
+            ]
         );
     }
 
