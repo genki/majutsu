@@ -1457,6 +1457,7 @@ dependencies = [
  "libc",
  "majutsu-core",
  "majutsu-crypto",
+ "majutsu-large",
  "majutsu-pack",
  "majutsu-policy",
  "notify",
@@ -1514,7 +1515,9 @@ version = "0.1.0"
 name = "majutsu-large"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "majutsu-core",
+ "zstd",
 ]
 
 [[package]]

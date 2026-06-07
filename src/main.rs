@@ -5549,7 +5549,8 @@ fn store_large_file(
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes);
     let mut chunks = Vec::new();
-    let ranges = large_chunk_ranges_for_bytes(config, &bytes);
+    let ranges =
+        majutsu_large::chunk_ranges_for_bytes(&config.default_chunking, config.chunk_size, &bytes);
     for (index, (start, end)) in ranges.into_iter().enumerate() {
         let chunk = &bytes[start..end];
         let chunk_oid = blake3_hex(chunk);
@@ -5595,98 +5596,21 @@ fn store_large_file(
     Ok((oid, manifest_key, manifest.chunks.len()))
 }
 
-fn large_chunk_ranges_for_bytes(config: &LargeConfig, bytes: &[u8]) -> Vec<(usize, usize)> {
-    if config.default_chunking == "fastcdc" {
-        content_defined_ranges(bytes, config.chunk_size)
-    } else {
-        fixed_ranges(bytes.len(), config.chunk_size)
-    }
-}
-
-fn fixed_ranges(len: usize, chunk_size: usize) -> Vec<(usize, usize)> {
-    let chunk_size = chunk_size.max(1);
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    while start < len {
-        let end = (start + chunk_size).min(len);
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
-fn content_defined_ranges(bytes: &[u8], target: usize) -> Vec<(usize, usize)> {
-    let len = bytes.len();
-    let target = target.max(1024);
-    let min = (target / 4).max(1024).min(target);
-    let max = (target * 4).max(min + 1);
-    let mask = target.next_power_of_two().saturating_sub(1).max(1);
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    let mut rolling = 0u64;
-    while start < len {
-        let hard_end = (start + max).min(len);
-        let mut end = hard_end;
-        let mut i = start;
-        while i < hard_end {
-            rolling = rolling
-                .rotate_left(1)
-                .wrapping_add(bytes[i] as u64)
-                .wrapping_mul(0x9E37_79B1_85EB_CA87);
-            let current_len = i + 1 - start;
-            if current_len >= min && ((rolling as usize) & mask) == 0 {
-                end = i + 1;
-                break;
-            }
-            i += 1;
-        }
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
-struct StoredLargeChunk {
-    bytes: Vec<u8>,
-    compression: String,
-}
-
 fn compress_large_chunk(
     config: &LargeConfig,
     rel: &Path,
     bytes: &[u8],
-) -> Result<StoredLargeChunk> {
-    if !should_compress_large(config, rel) {
-        return Ok(StoredLargeChunk {
-            bytes: bytes.to_vec(),
-            compression: "none".into(),
-        });
-    }
-    let compressed = zstd::stream::encode_all(bytes, config.compression.level)?;
-    let gain = 1.0 - (compressed.len() as f64 / bytes.len().max(1) as f64);
-    if gain >= config.compression.min_gain_ratio {
-        Ok(StoredLargeChunk {
-            bytes: compressed,
-            compression: "zstd".into(),
-        })
-    } else {
-        Ok(StoredLargeChunk {
-            bytes: bytes.to_vec(),
-            compression: "none".into(),
-        })
-    }
-}
-
-fn should_compress_large(config: &LargeConfig, rel: &Path) -> bool {
-    if !config.compression.enabled || config.compression.algorithm != "zstd" {
-        return false;
-    }
+) -> Result<majutsu_large::StoredLargeChunk> {
     let name = rel.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    !config
-        .compression
-        .skip_extensions
-        .iter()
-        .any(|pattern| glob_match(pattern, name))
+    Ok(majutsu_large::compress_chunk_if_useful(
+        bytes,
+        config.compression.enabled,
+        &config.compression.algorithm,
+        config.compression.level,
+        config.compression.min_gain_ratio,
+        &config.compression.skip_extensions,
+        name,
+    )?)
 }
 
 fn read_large_chunk(paths: &Paths, chunk: &LargeChunk) -> Result<Vec<u8>> {
