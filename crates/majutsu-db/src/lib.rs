@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const ROOTS_TABLE: &str = "roots";
 pub const SNAPSHOTS_TABLE: &str = "snapshots";
@@ -227,6 +228,135 @@ pub fn has_pending_journal_events(records: &[EventJournalRecord]) -> bool {
                 .map(|finished_at| event.observed_at > finished_at)
                 .unwrap_or(true)
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalRefIssue {
+    Duplicate { name: String },
+    MissingSnapshot { name: String, value: String },
+    InvalidLastSynced { value: String, error: String },
+    Unknown { name: String },
+}
+
+pub fn local_ref_issues<I>(refs: I, snapshot_ids: &BTreeSet<String>) -> Vec<LocalRefIssue>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut issues = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (name, value) in refs {
+        if !seen.insert(name.clone()) {
+            issues.push(LocalRefIssue::Duplicate { name: name.clone() });
+        }
+        match name.as_str() {
+            "current" => {
+                if !snapshot_ids.contains(&value) {
+                    issues.push(LocalRefIssue::MissingSnapshot { name, value });
+                }
+            }
+            "last-synced" => {
+                if let Err(err) = DateTime::parse_from_rfc3339(&value) {
+                    issues.push(LocalRefIssue::InvalidLastSynced {
+                        value,
+                        error: err.to_string(),
+                    });
+                }
+            }
+            _ => issues.push(LocalRefIssue::Unknown { name }),
+        }
+    }
+    issues
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteRefIssue {
+    EmptyRemote {
+        name: String,
+    },
+    InvalidObservedAt {
+        name: String,
+        value: String,
+        error: String,
+    },
+    UnsupportedName {
+        name: String,
+    },
+    HostMismatch {
+        host_id: String,
+        config_host_id: String,
+    },
+    MissingSnapshot {
+        name: String,
+        value: String,
+    },
+    InvalidLastSynced {
+        name: String,
+        value: String,
+        error: String,
+    },
+    UnsupportedRefName {
+        name: String,
+    },
+}
+
+pub fn remote_ref_issues<I>(
+    refs: I,
+    config_host_id: &str,
+    snapshot_ids: &BTreeSet<String>,
+) -> Vec<RemoteRefIssue>
+where
+    I: IntoIterator<Item = (String, String, String, String)>,
+{
+    let mut issues = Vec::new();
+    for (remote, name, value, observed_at) in refs {
+        if remote.trim().is_empty() {
+            issues.push(RemoteRefIssue::EmptyRemote { name: name.clone() });
+        }
+        if let Err(err) = DateTime::parse_from_rfc3339(&observed_at) {
+            issues.push(RemoteRefIssue::InvalidObservedAt {
+                name: name.clone(),
+                value: observed_at,
+                error: err.to_string(),
+            });
+        }
+        let Some((host_id, ref_name)) = parse_canonical_host_ref_name(&name) else {
+            issues.push(RemoteRefIssue::UnsupportedName { name });
+            continue;
+        };
+        if host_id != config_host_id {
+            issues.push(RemoteRefIssue::HostMismatch {
+                host_id: host_id.to_string(),
+                config_host_id: config_host_id.to_string(),
+            });
+        }
+        match ref_name {
+            "current" => {
+                if !snapshot_ids.contains(&value) {
+                    issues.push(RemoteRefIssue::MissingSnapshot { name, value });
+                }
+            }
+            "last-synced" => {
+                if let Err(err) = DateTime::parse_from_rfc3339(&value) {
+                    issues.push(RemoteRefIssue::InvalidLastSynced {
+                        name,
+                        value,
+                        error: err.to_string(),
+                    });
+                }
+            }
+            _ => issues.push(RemoteRefIssue::UnsupportedRefName { name }),
+        }
+    }
+    issues
+}
+
+pub fn parse_canonical_host_ref_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("hosts/")?;
+    let (host_id, rest) = rest.split_once("/refs/")?;
+    if host_id.is_empty() || rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some((host_id, rest))
 }
 
 #[cfg(test)]
@@ -461,6 +591,110 @@ mod tests {
                 EventJournalRecordIssue::EmptyEventId,
                 EventJournalRecordIssue::EmptyKind,
                 EventJournalRecordIssue::EmptyDetail,
+            ]
+        );
+    }
+
+    #[test]
+    fn local_ref_validation_reports_unknown_and_broken_refs() {
+        let issues = local_ref_issues(
+            [
+                ("current".to_string(), "missing-snap".to_string()),
+                ("last-synced".to_string(), "not-time".to_string()),
+                ("last-synced".to_string(), "also-not-time".to_string()),
+                ("legacy".to_string(), "value".to_string()),
+            ],
+            &BTreeSet::from(["snap-1".to_string()]),
+        );
+
+        assert_eq!(
+            issues,
+            vec![
+                LocalRefIssue::MissingSnapshot {
+                    name: "current".into(),
+                    value: "missing-snap".into(),
+                },
+                LocalRefIssue::InvalidLastSynced {
+                    value: "not-time".into(),
+                    error: "premature end of input".into(),
+                },
+                LocalRefIssue::Duplicate {
+                    name: "last-synced".into(),
+                },
+                LocalRefIssue::InvalidLastSynced {
+                    value: "also-not-time".into(),
+                    error: "premature end of input".into(),
+                },
+                LocalRefIssue::Unknown {
+                    name: "legacy".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_ref_validation_reports_cache_invariants() {
+        let issues = remote_ref_issues(
+            [
+                (
+                    "".to_string(),
+                    "hosts/other/refs/current".to_string(),
+                    "missing-snap".to_string(),
+                    "not-time".to_string(),
+                ),
+                (
+                    "file://remote".to_string(),
+                    "hosts/host-a/refs/last-synced".to_string(),
+                    "bad-time".to_string(),
+                    "2026-06-07T00:00:00Z".to_string(),
+                ),
+                (
+                    "file://remote".to_string(),
+                    "hosts/host-a/refs/legacy".to_string(),
+                    "value".to_string(),
+                    "2026-06-07T00:00:00Z".to_string(),
+                ),
+                (
+                    "file://remote".to_string(),
+                    "legacy/current".to_string(),
+                    "snap-1".to_string(),
+                    "2026-06-07T00:00:00Z".to_string(),
+                ),
+            ],
+            "host-a",
+            &BTreeSet::from(["snap-1".to_string()]),
+        );
+
+        assert_eq!(
+            issues,
+            vec![
+                RemoteRefIssue::EmptyRemote {
+                    name: "hosts/other/refs/current".into(),
+                },
+                RemoteRefIssue::InvalidObservedAt {
+                    name: "hosts/other/refs/current".into(),
+                    value: "not-time".into(),
+                    error: "premature end of input".into(),
+                },
+                RemoteRefIssue::HostMismatch {
+                    host_id: "other".into(),
+                    config_host_id: "host-a".into(),
+                },
+                RemoteRefIssue::MissingSnapshot {
+                    name: "hosts/other/refs/current".into(),
+                    value: "missing-snap".into(),
+                },
+                RemoteRefIssue::InvalidLastSynced {
+                    name: "hosts/host-a/refs/last-synced".into(),
+                    value: "bad-time".into(),
+                    error: "premature end of input".into(),
+                },
+                RemoteRefIssue::UnsupportedRefName {
+                    name: "hosts/host-a/refs/legacy".into(),
+                },
+                RemoteRefIssue::UnsupportedName {
+                    name: "legacy/current".into(),
+                },
             ]
         );
     }

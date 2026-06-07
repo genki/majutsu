@@ -21,8 +21,9 @@ use majutsu_core::{
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_db::{
-    EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
-    UploadQueueItemIssue, expected_upload_queue_item_id,
+    EventJournalRecord, EventJournalRecordIssue, LocalRefIssue, RemoteObjectKeyIssue,
+    RemoteRefIssue, UploadQueueItem, UploadQueueItemIssue, expected_upload_queue_item_id,
+    local_ref_issues, remote_ref_issues,
 };
 use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
 use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
@@ -4642,57 +4643,39 @@ fn validate_remote_refs(conn: &Connection, config: &Config, missing: &mut usize)
             row.get::<_, String>(3)?,
         ))
     })?;
-    for row in rows {
-        let (remote, name, value, observed_at) = row?;
-        if remote.trim().is_empty() {
-            *missing += 1;
-            eprintln!("remote ref has empty remote for {name}");
-        }
-        if let Err(err) = parse_db_time(&observed_at) {
-            *missing += 1;
-            eprintln!("remote ref {name} has invalid observed_at {observed_at}: {err}");
-        }
-        let Some((host_id, ref_name)) = parse_canonical_host_ref_name(&name) else {
-            *missing += 1;
-            eprintln!("remote ref has unsupported name {name}");
-            continue;
-        };
-        if host_id != config.host.id {
-            *missing += 1;
-            eprintln!(
-                "remote ref host id {host_id} does not match config host id {}",
-                config.host.id
-            );
-        }
-        match ref_name {
-            "current" => {
-                if !snapshot_ids.contains(&value) {
-                    *missing += 1;
-                    eprintln!("remote ref {name} points to missing snapshot {value}");
-                }
+    let refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for issue in remote_ref_issues(refs, &config.host.id, &snapshot_ids) {
+        *missing += 1;
+        match issue {
+            RemoteRefIssue::EmptyRemote { name } => {
+                eprintln!("remote ref has empty remote for {name}");
             }
-            "last-synced" => {
-                if let Err(err) = parse_db_time(&value) {
-                    *missing += 1;
-                    eprintln!("remote ref {name} has invalid last-synced {value}: {err}");
-                }
+            RemoteRefIssue::InvalidObservedAt { name, value, error } => {
+                eprintln!("remote ref {name} has invalid observed_at {value}: {error}");
             }
-            _ => {
-                *missing += 1;
+            RemoteRefIssue::UnsupportedName { name } => {
+                eprintln!("remote ref has unsupported name {name}");
+            }
+            RemoteRefIssue::HostMismatch {
+                host_id,
+                config_host_id,
+            } => {
+                eprintln!(
+                    "remote ref host id {host_id} does not match config host id {config_host_id}"
+                );
+            }
+            RemoteRefIssue::MissingSnapshot { name, value } => {
+                eprintln!("remote ref {name} points to missing snapshot {value}");
+            }
+            RemoteRefIssue::InvalidLastSynced { name, value, error } => {
+                eprintln!("remote ref {name} has invalid last-synced {value}: {error}");
+            }
+            RemoteRefIssue::UnsupportedRefName { name } => {
                 eprintln!("remote ref has unsupported ref name {name}");
             }
         }
     }
     Ok(())
-}
-
-fn parse_canonical_host_ref_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix("hosts/")?;
-    let (host_id, rest) = rest.split_once("/refs/")?;
-    if host_id.is_empty() || rest.is_empty() || rest.contains('/') {
-        return None;
-    }
-    Some((host_id, rest))
 }
 
 fn validate_local_refs(conn: &Connection, missing: &mut usize) -> Result<()> {
@@ -4701,32 +4684,24 @@ fn validate_local_refs(conn: &Connection, missing: &mut usize) -> Result<()> {
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<BTreeSet<_>>>()?
     };
-    let mut seen = BTreeSet::new();
     let mut stmt = conn.prepare("select name, value from refs order by name")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    for row in rows {
-        let (name, value) = row?;
-        if !seen.insert(name.clone()) {
-            *missing += 1;
-            eprintln!("duplicate local ref {name}");
-        }
-        match name.as_str() {
-            "current" => {
-                if !snapshot_ids.contains(&value) {
-                    *missing += 1;
-                    eprintln!("local ref {name} points to missing snapshot {value}");
-                }
+    let refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for issue in local_ref_issues(refs, &snapshot_ids) {
+        *missing += 1;
+        match issue {
+            LocalRefIssue::Duplicate { name } => {
+                eprintln!("duplicate local ref {name}");
             }
-            "last-synced" => {
-                if let Err(err) = parse_db_time(&value) {
-                    *missing += 1;
-                    eprintln!("local ref last-synced has invalid timestamp {value}: {err}");
-                }
+            LocalRefIssue::MissingSnapshot { name, value } => {
+                eprintln!("local ref {name} points to missing snapshot {value}");
             }
-            _ => {
-                *missing += 1;
+            LocalRefIssue::InvalidLastSynced { value, error } => {
+                eprintln!("local ref last-synced has invalid timestamp {value}: {error}");
+            }
+            LocalRefIssue::Unknown { name } => {
                 eprintln!("unknown local ref {name}");
             }
         }
