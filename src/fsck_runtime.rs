@@ -7,7 +7,10 @@ use majutsu_core::{
     metadata_reference_issues, operation_log_comparison_issues, operation_log_entry_matches,
     snapshot_export_matches, snapshot_manifest_matches, tree_manifest_issues,
 };
-use majutsu_db::{local_ref_issues, remote_ref_issues};
+use majutsu_db::{
+    EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
+    UploadQueueItemIssue, local_ref_issues, remote_ref_issues,
+};
 use majutsu_large::{
     LargePinIssue, large_chunk_hash_matches, large_manifest_issues, large_pin_issues,
 };
@@ -15,6 +18,7 @@ use majutsu_pack::{
     PackIndex, PackIndexIssue, PackObjectIssue, missing_pack_metadata_ids, pack_index_issues,
     pack_object_issues,
 };
+use majutsu_restore::{RestoreQueueItem, validate_relative_filter_path};
 use majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
     RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
@@ -28,11 +32,13 @@ use majutsu_store::{
 };
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
+use std::path::Path;
 
 use crate::config::{Config, HostConfig, Paths, RootConfig, read_config, validate_config};
 use crate::object_paths::local_object_keys;
-use crate::operation_log::record_op;
+use crate::operation_log::{local_oplog_path, query_operations, record_op};
 use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
@@ -40,8 +46,7 @@ use crate::util::parse_db_time;
 use crate::{
     decode_canonical_remote_export, decode_canonical_remote_oplog, decode_object, export_metadata,
     open_db, packed_blob_metadata, read_blob_payload, read_large_chunk, read_object,
-    read_remote_host_index, remote_local_object_variants, remote_ref, validate_event_queue,
-    validate_local_oplog, validate_restore_queue, validate_upload_queue,
+    read_remote_host_index, remote_local_object_variants, remote_ref,
 };
 
 pub(crate) fn fsck(paths: &Paths) -> Result<()> {
@@ -617,6 +622,256 @@ fn validate_local_pack_objects(
     ) {
         *missing += 1;
         eprintln!("packed blob references missing pack metadata {pack_id}");
+    }
+    Ok(())
+}
+
+fn validate_event_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
+    let dir = &paths.event_queue;
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut seen = BTreeSet::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let event: EventJournalRecord = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(event) => event,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid event journal item {}: {err}", path.display());
+                continue;
+            }
+        };
+        if path.file_stem().and_then(OsStr::to_str) != Some(event.event_id.as_str()) {
+            *missing += 1;
+            eprintln!(
+                "event journal filename does not match event id {}",
+                path.display()
+            );
+        }
+        for issue in event.validation_issues() {
+            *missing += 1;
+            match issue {
+                EventJournalRecordIssue::EmptyEventId => {
+                    eprintln!("event journal item has empty event id {}", path.display());
+                }
+                EventJournalRecordIssue::EmptyKind => {
+                    eprintln!("event journal item has empty kind {}", event.event_id);
+                }
+                EventJournalRecordIssue::EmptyDetail => {
+                    eprintln!("event journal item has empty detail {}", event.event_id);
+                }
+            }
+        }
+        if !seen.insert(event.event_id.clone()) {
+            *missing += 1;
+            eprintln!("duplicate event journal id {}", event.event_id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_upload_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
+    let dir = &paths.upload_queue;
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let item: UploadQueueItem = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(item) => item,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid upload queue item {}: {err}", path.display());
+                continue;
+            }
+        };
+        if path.file_stem().and_then(OsStr::to_str) != Some(item.id.as_str()) {
+            *missing += 1;
+            eprintln!(
+                "upload queue filename does not match item id {}",
+                path.display()
+            );
+        }
+        let mut missing_source = None;
+        if let (Some(source), None) = (&item.source, &item.inline)
+            && !Path::new(source).exists()
+        {
+            missing_source = Some(source.as_str());
+        }
+        for issue in item.validation_issues() {
+            *missing += 1;
+            match issue {
+                UploadQueueItemIssue::IdDoesNotMatchKey { expected } => {
+                    eprintln!(
+                        "upload queue item id does not match key {} expected {}",
+                        item.id, expected
+                    );
+                }
+                UploadQueueItemIssue::InvalidKey { reason } => {
+                    let reason = match reason {
+                        RemoteObjectKeyIssue::NotRelativeSlashPath => {
+                            "remote object key must be a relative slash path"
+                        }
+                        RemoteObjectKeyIssue::UnsafeComponent => {
+                            "remote object key must not contain empty, '.', or '..' components"
+                        }
+                    };
+                    eprintln!("upload queue item has invalid key {}: {reason}", item.id);
+                }
+                UploadQueueItemIssue::BothSourceAndInline => {
+                    eprintln!(
+                        "upload queue item has both source and inline payload {}",
+                        item.id
+                    );
+                }
+                UploadQueueItemIssue::MissingPayload => {
+                    eprintln!(
+                        "upload queue item has neither source nor inline payload {}",
+                        item.id
+                    );
+                }
+            }
+        }
+        if let Some(source) = missing_source {
+            *missing += 1;
+            eprintln!("upload queue item source is missing {} {source}", item.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_restore_queue(paths: &Paths, conn: &Connection, missing: &mut usize) -> Result<()> {
+    let dir = paths.home.join("queue/restores");
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("select id from snapshots")?;
+    let snapshot_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let job: RestoreQueueItem = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(job) => job,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid restore queue item {}: {err}", path.display());
+                continue;
+            }
+        };
+        if path.file_stem().and_then(OsStr::to_str) != Some(job.id.as_str()) {
+            *missing += 1;
+            eprintln!(
+                "restore queue filename does not match job id {}",
+                path.display()
+            );
+        }
+        if !snapshot_ids.contains(&job.snapshot_id) {
+            *missing += 1;
+            eprintln!(
+                "restore queue item references missing snapshot {} {}",
+                job.id, job.snapshot_id
+            );
+        }
+        if !job.has_valid_status() {
+            *missing += 1;
+            eprintln!(
+                "restore queue item has invalid status {} {}",
+                job.id, job.status
+            );
+        }
+        if let Some(path_filter) = job.path.as_deref()
+            && let Err(err) =
+                validate_relative_filter_path(Path::new(path_filter), "restore job path")
+        {
+            *missing += 1;
+            eprintln!("restore queue item has invalid path {}: {err}", job.id);
+        }
+        if job.has_duplicate_required_objects() {
+            *missing += 1;
+            eprintln!(
+                "restore queue item has duplicate required objects {}",
+                job.id
+            );
+        }
+        for key in job.pending_objects_outside_required() {
+            *missing += 1;
+            eprintln!(
+                "restore queue item references object outside required set {} {}",
+                job.id, key
+            );
+        }
+        if job.done_with_pending_objects() {
+            *missing += 1;
+            eprintln!(
+                "completed restore queue item still has pending objects {}",
+                job.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
+    let expected = query_operations(conn)?;
+    let Some(path) = local_oplog_path(conn)? else {
+        if !expected.is_empty() {
+            *missing += 1;
+            eprintln!("missing local operation log path");
+        }
+        return Ok(());
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("unreadable local operation log {}: {err}", path.display());
+            return Ok(());
+        }
+    };
+    let actual = match decode_operation_log(&bytes) {
+        Ok(actual) => actual,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("invalid local operation log {}: {err}", path.display());
+            return Ok(());
+        }
+    };
+    for issue in operation_log_comparison_issues(&actual, &expected) {
+        *missing += 1;
+        match issue {
+            OperationLogComparisonIssue::CountMismatch { expected, actual } => {
+                eprintln!(
+                    "local operation log count mismatch {} expected={} actual={}",
+                    path.display(),
+                    expected,
+                    actual
+                );
+                return Ok(());
+            }
+            OperationLogComparisonIssue::EntryMismatch { index, id } => {
+                eprintln!("local operation log entry does not match metadata {id} index={index}");
+            }
+        }
     }
     Ok(())
 }

@@ -3,17 +3,13 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use majutsu_core::{
-    FileRecord, LargeChunk, LargeManifest, LiveMetadataReferences, OperationLogComparisonIssue,
+    FileRecord, LargeChunk, LargeManifest, LiveMetadataReferences,
     OperationLogEntry as OperationExport, Payload, RootSnapshot, SnapshotExport, SnapshotManifest,
-    TreeManifest, decode_operation_log, encode_operation_log, operation_log_comparison_issues,
-    payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
+    TreeManifest, decode_operation_log, encode_operation_log, payload_blob_ref,
+    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
-use majutsu_db::{
-    EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
-    UploadQueueItemIssue,
-};
 use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
 use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier, PackedBlobMetadata};
 use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
@@ -96,8 +92,8 @@ use object_paths::{
     all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
 };
 use operation_log::{
-    local_oplog_path, query_operation, query_operations, record_op, record_op_with_id,
-    record_op_with_id_and_status, rewrite_local_oplog,
+    query_operation, query_operations, record_op, record_op_with_id, record_op_with_id_and_status,
+    rewrite_local_oplog,
 };
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use queue_runtime::{
@@ -2616,260 +2612,6 @@ fn gc_cmd(paths: &Paths) -> Result<()> {
         Some(&format!("removed {removed} unreferenced objects")),
     )?;
     println!("removed_unreferenced_objects {removed}");
-    Ok(())
-}
-
-fn validate_event_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
-    let dir = &paths.event_queue;
-    if !dir.exists() {
-        return Ok(());
-    }
-    let mut seen = BTreeSet::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file()
-            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
-        {
-            continue;
-        }
-        let path = entry.path();
-        let event: EventJournalRecord = match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(event) => event,
-            Err(err) => {
-                *missing += 1;
-                eprintln!("invalid event journal item {}: {err}", path.display());
-                continue;
-            }
-        };
-        if path.file_stem().and_then(OsStr::to_str) != Some(event.event_id.as_str()) {
-            *missing += 1;
-            eprintln!(
-                "event journal filename does not match event id {}",
-                path.display()
-            );
-        }
-        for issue in event.validation_issues() {
-            *missing += 1;
-            match issue {
-                EventJournalRecordIssue::EmptyEventId => {
-                    eprintln!("event journal item has empty event id {}", path.display());
-                }
-                EventJournalRecordIssue::EmptyKind => {
-                    eprintln!("event journal item has empty kind {}", event.event_id);
-                }
-                EventJournalRecordIssue::EmptyDetail => {
-                    eprintln!("event journal item has empty detail {}", event.event_id);
-                }
-            }
-        }
-        if !seen.insert(event.event_id.clone()) {
-            *missing += 1;
-            eprintln!("duplicate event journal id {}", event.event_id);
-        }
-    }
-    Ok(())
-}
-
-fn validate_upload_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
-    let dir = &paths.upload_queue;
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file()
-            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
-        {
-            continue;
-        }
-        let path = entry.path();
-        let item: UploadQueueItem = match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(item) => item,
-            Err(err) => {
-                *missing += 1;
-                eprintln!("invalid upload queue item {}: {err}", path.display());
-                continue;
-            }
-        };
-        if path.file_stem().and_then(OsStr::to_str) != Some(item.id.as_str()) {
-            *missing += 1;
-            eprintln!(
-                "upload queue filename does not match item id {}",
-                path.display()
-            );
-        }
-        let mut missing_source = None;
-        match (&item.source, &item.inline) {
-            (Some(source), None) => {
-                if !Path::new(source).exists() {
-                    missing_source = Some(source.as_str());
-                }
-            }
-            _ => {}
-        }
-        for issue in item.validation_issues() {
-            *missing += 1;
-            match issue {
-                UploadQueueItemIssue::IdDoesNotMatchKey { expected } => {
-                    eprintln!(
-                        "upload queue item id does not match key {} expected {}",
-                        item.id, expected
-                    );
-                }
-                UploadQueueItemIssue::InvalidKey { reason } => {
-                    let reason = match reason {
-                        RemoteObjectKeyIssue::NotRelativeSlashPath => {
-                            "remote object key must be a relative slash path"
-                        }
-                        RemoteObjectKeyIssue::UnsafeComponent => {
-                            "remote object key must not contain empty, '.', or '..' components"
-                        }
-                    };
-                    eprintln!("upload queue item has invalid key {}: {reason}", item.id);
-                }
-                UploadQueueItemIssue::BothSourceAndInline => {
-                    eprintln!(
-                        "upload queue item has both source and inline payload {}",
-                        item.id
-                    );
-                }
-                UploadQueueItemIssue::MissingPayload => {
-                    eprintln!(
-                        "upload queue item has neither source nor inline payload {}",
-                        item.id
-                    );
-                }
-            }
-        }
-        if let Some(source) = missing_source {
-            *missing += 1;
-            eprintln!("upload queue item source is missing {} {source}", item.id);
-        }
-    }
-    Ok(())
-}
-
-fn validate_restore_queue(paths: &Paths, conn: &Connection, missing: &mut usize) -> Result<()> {
-    let dir = paths.home.join("queue/restores");
-    if !dir.exists() {
-        return Ok(());
-    }
-    let mut stmt = conn.prepare("select id from snapshots")?;
-    let snapshot_ids = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file()
-            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
-        {
-            continue;
-        }
-        let path = entry.path();
-        let job: RestoreQueueItem = match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(job) => job,
-            Err(err) => {
-                *missing += 1;
-                eprintln!("invalid restore queue item {}: {err}", path.display());
-                continue;
-            }
-        };
-        if path.file_stem().and_then(OsStr::to_str) != Some(job.id.as_str()) {
-            *missing += 1;
-            eprintln!(
-                "restore queue filename does not match job id {}",
-                path.display()
-            );
-        }
-        if !snapshot_ids.contains(&job.snapshot_id) {
-            *missing += 1;
-            eprintln!(
-                "restore queue item references missing snapshot {} {}",
-                job.id, job.snapshot_id
-            );
-        }
-        if !job.has_valid_status() {
-            *missing += 1;
-            eprintln!(
-                "restore queue item has invalid status {} {}",
-                job.id, job.status
-            );
-        }
-        if let Some(path_filter) = job.path.as_deref() {
-            if let Err(err) =
-                validate_relative_filter_path(Path::new(path_filter), "restore job path")
-            {
-                *missing += 1;
-                eprintln!("restore queue item has invalid path {}: {err}", job.id);
-            }
-        }
-        if job.has_duplicate_required_objects() {
-            *missing += 1;
-            eprintln!(
-                "restore queue item has duplicate required objects {}",
-                job.id
-            );
-        }
-        for key in job.pending_objects_outside_required() {
-            *missing += 1;
-            eprintln!(
-                "restore queue item references object outside required set {} {}",
-                job.id, key
-            );
-        }
-        if job.done_with_pending_objects() {
-            *missing += 1;
-            eprintln!(
-                "completed restore queue item still has pending objects {}",
-                job.id
-            );
-        }
-    }
-    Ok(())
-}
-
-fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
-    let expected = query_operations(conn)?;
-    let Some(path) = local_oplog_path(conn)? else {
-        if !expected.is_empty() {
-            *missing += 1;
-            eprintln!("missing local operation log path");
-        }
-        return Ok(());
-    };
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            *missing += 1;
-            eprintln!("unreadable local operation log {}: {err}", path.display());
-            return Ok(());
-        }
-    };
-    let actual = match decode_operation_log(&bytes) {
-        Ok(actual) => actual,
-        Err(err) => {
-            *missing += 1;
-            eprintln!("invalid local operation log {}: {err}", path.display());
-            return Ok(());
-        }
-    };
-    for issue in operation_log_comparison_issues(&actual, &expected) {
-        *missing += 1;
-        match issue {
-            OperationLogComparisonIssue::CountMismatch { expected, actual } => {
-                eprintln!(
-                    "local operation log count mismatch {} expected={} actual={}",
-                    path.display(),
-                    expected,
-                    actual
-                );
-                return Ok(());
-            }
-            OperationLogComparisonIssue::EntryMismatch { index, id } => {
-                eprintln!("local operation log entry does not match metadata {id} index={index}");
-            }
-        }
-    }
     Ok(())
 }
 
