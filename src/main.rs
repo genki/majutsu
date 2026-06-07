@@ -121,15 +121,14 @@ use remote_store::{
 };
 use remote_store::{RemoteStore, open_remote, open_remote_with_upload_policy};
 use restore_apply::{
-    apply_file_metadata, prepare_directory_restore_destination, prepare_file_restore_destination,
-    restore_special_file, restore_special_matches, restore_symlink,
+    apply_file_metadata, prepare_directory_restore_destination, restore_special_file,
 };
 use restore_runtime::{
-    RestoreDelete, RestorePlan, ensure_restore_job_has_no_missing_objects,
+    RestoreDelete, RestorePlan, apply_restore_plan, ensure_restore_job_has_no_missing_objects,
     ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
-    print_restore_conflicts, print_restore_deletes, read_restore_job, remove_empty_restore_parents,
-    required_object_keys_for_plan, restore_delete_destination, restore_destination,
-    restore_object_stats, restore_root_base, restore_target_label, write_restore_job,
+    print_restore_conflicts, read_restore_job, required_object_keys_for_plan, restore_conflicts,
+    restore_destination, restore_object_stats, restore_record_matches_path, restore_root_base,
+    restore_target_label, write_restore_job,
 };
 use root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_config_roots, sync_roots_to_config,
@@ -4208,139 +4207,6 @@ fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Res
         )?;
     }
     Ok(())
-}
-
-fn apply_restore_plan(
-    paths: &Paths,
-    plan: &RestorePlan,
-    force: bool,
-    check_conflicts: bool,
-) -> Result<()> {
-    let conn = open_db(paths)?;
-    if check_conflicts && !force {
-        let conflicts = restore_conflicts(paths, &conn, plan)?;
-        if !conflicts.is_empty() {
-            print_restore_conflicts(&conflicts);
-            bail!("restore has conflicts; rerun with --force to overwrite");
-        }
-        if !plan.deletes.is_empty() {
-            print_restore_deletes(plan);
-            bail!("restore would delete extra files; rerun with --force to delete them");
-        }
-    }
-    for delete in &plan.deletes {
-        let dest = restore_delete_destination(plan, delete)?;
-        if fs::symlink_metadata(&dest).is_ok() {
-            fs::remove_file(&dest)?;
-            remove_empty_restore_parents(plan, delete, &dest)?;
-        }
-    }
-    let mut directory_metadata = Vec::new();
-    for record in &plan.files {
-        let dest = restore_destination(plan, record)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match &record.payload {
-            Payload::Directory => {
-                prepare_directory_restore_destination(&dest, force)?;
-                fs::create_dir_all(&dest)?;
-                directory_metadata.push((dest, record));
-            }
-            Payload::Special { special_kind } => {
-                restore_special_file(&dest, record, special_kind, force)?;
-            }
-            Payload::Symlink { target } => {
-                restore_symlink(&dest, target, force)?;
-            }
-            payload => {
-                if let Some((oid, object_key)) = payload_blob_ref(payload) {
-                    prepare_file_restore_destination(&dest, force)?;
-                    write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
-                    apply_file_metadata(&dest, record)?;
-                } else if let Some((_, manifest_key, _)) = payload_large_ref(payload) {
-                    prepare_file_restore_destination(&dest, force)?;
-                    let manifest: LargeManifest =
-                        serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                    write_large_chunks_atomic(paths, &dest, &manifest)?;
-                    apply_file_metadata(&dest, record)?;
-                }
-            }
-        }
-    }
-    for (dest, record) in directory_metadata {
-        apply_file_metadata(&dest, record)?;
-    }
-    Ok(())
-}
-
-fn restore_conflicts(paths: &Paths, conn: &Connection, plan: &RestorePlan) -> Result<Vec<String>> {
-    let mut conflicts = Vec::new();
-    for record in &plan.files {
-        let dest = restore_destination(plan, record)?;
-        if !dest.try_exists()? {
-            continue;
-        }
-        if !restore_record_matches_path(paths, conn, record, &dest)? {
-            conflicts.push(format!("{}\t{}", record.root_id, record.path));
-        }
-    }
-    Ok(conflicts)
-}
-
-fn restore_record_matches_path(
-    paths: &Paths,
-    conn: &Connection,
-    record: &FileRecord,
-    dest: &Path,
-) -> Result<bool> {
-    let meta = fs::symlink_metadata(dest)?;
-    match &record.payload {
-        Payload::Directory => Ok(meta.file_type().is_dir()),
-        Payload::Special { special_kind } => restore_special_matches(&meta, special_kind),
-        Payload::Symlink { target } => {
-            #[cfg(unix)]
-            {
-                if !meta.file_type().is_symlink() {
-                    return Ok(false);
-                }
-                Ok(fs::read_link(dest)?.as_os_str() == OsStr::new(target))
-            }
-            #[cfg(not(unix))]
-            {
-                if !meta.file_type().is_file() {
-                    return Ok(false);
-                }
-                Ok(fs::read_to_string(dest)? == *target)
-            }
-        }
-        payload => {
-            if let Some((oid, object_key)) = payload_blob_ref(payload) {
-                if !meta.file_type().is_file() {
-                    return Ok(false);
-                }
-                Ok(fs::read(dest)? == read_blob_payload(paths, conn, oid, object_key)?)
-            } else if let Some((_, manifest_key, _)) = payload_large_ref(payload) {
-                if !meta.file_type().is_file() || meta.len() != record.size {
-                    return Ok(false);
-                }
-                let manifest: LargeManifest =
-                    serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                let mut current = File::open(dest)?;
-                for chunk in manifest.chunks {
-                    let expected = read_large_chunk(paths, &chunk)?;
-                    let mut actual = vec![0u8; expected.len()];
-                    current.read_exact(&mut actual)?;
-                    if actual != expected {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
-    }
 }
 
 fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<FileRecord>> {
