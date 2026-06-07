@@ -4918,6 +4918,7 @@ fn fsck(paths: &Paths) -> Result<()> {
     validate_local_pack_objects(paths, &export, &mut missing)?;
     validate_local_metadata_references(paths, &export, &mut missing)?;
     validate_local_oplog(&conn, &mut missing)?;
+    validate_upload_queue(paths, &mut missing)?;
     validate_restore_queue(paths, &conn, &mut missing)?;
     if missing > 0 {
         bail!("fsck found {missing} problems");
@@ -4974,6 +4975,85 @@ fn validate_local_metadata_references(
         if !live_chunks.contains(&chunk.oid) {
             *missing += 1;
             eprintln!("dangling chunk metadata {}", chunk.oid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_upload_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
+    let dir = &paths.upload_queue;
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let item: UploadQueueItem = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(item) => item,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid upload queue item {}: {err}", path.display());
+                continue;
+            }
+        };
+        if path.file_stem().and_then(OsStr::to_str) != Some(item.id.as_str()) {
+            *missing += 1;
+            eprintln!(
+                "upload queue filename does not match item id {}",
+                path.display()
+            );
+        }
+        let expected_id = format!("upload-{}", blake3_hex(item.key.as_bytes()));
+        if item.id != expected_id {
+            *missing += 1;
+            eprintln!(
+                "upload queue item id does not match key {} expected {}",
+                item.id, expected_id
+            );
+        }
+        if let Err(err) = validate_remote_object_key(&item.key) {
+            *missing += 1;
+            eprintln!("upload queue item has invalid key {}: {err}", item.id);
+        }
+        match (&item.source, &item.inline) {
+            (Some(source), None) => {
+                if !Path::new(source).exists() {
+                    *missing += 1;
+                    eprintln!("upload queue item source is missing {} {source}", item.id);
+                }
+            }
+            (None, Some(_)) => {}
+            (Some(_), Some(_)) => {
+                *missing += 1;
+                eprintln!(
+                    "upload queue item has both source and inline payload {}",
+                    item.id
+                );
+            }
+            (None, None) => {
+                *missing += 1;
+                eprintln!(
+                    "upload queue item has neither source nor inline payload {}",
+                    item.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_object_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.starts_with('/') || key.ends_with('/') || key.contains('\\') {
+        bail!("remote object key must be a relative slash path");
+    }
+    for part in key.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            bail!("remote object key must not contain empty, '.', or '..' components");
         }
     }
     Ok(())
