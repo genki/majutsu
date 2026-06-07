@@ -1591,6 +1591,13 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
 
     let index: serde_json::Value =
         serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
+    let hosts = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state_a).arg("remote").arg("hosts");
+        c
+    });
+    assert!(hosts.contains("hosts 2"));
+    assert_eq!(hosts.matches("\tshared\t").count(), 2);
     let host_b_id = index["hosts"]
         .as_array()
         .unwrap()
@@ -1608,6 +1615,22 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
             }
         })
         .unwrap();
+    assert!(hosts.contains(&host_b_id));
+
+    let host_b = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state_a)
+            .arg("remote")
+            .arg("host")
+            .arg(&host_b_id);
+        c
+    });
+    assert!(host_b.contains(&format!("id {host_b_id}")));
+    assert!(host_b.contains("name shared"));
+    assert!(host_b.contains("roots 1"));
+    assert!(host_b.contains("snapshots 1"));
+    assert!(host_b.contains("operations "));
 
     run({
         let mut c = mj();
