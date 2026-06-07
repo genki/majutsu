@@ -1309,6 +1309,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             }
         }
         RootCommand::Remove { id } => {
+            let _ = root_by_id(&conn, &id)?;
             conn.execute("delete from roots where id=?1", params![id])?;
             sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "root-removed", None, None, Some(&id))?;
@@ -4660,15 +4661,21 @@ fn remote_fsck_export(
         eprintln!("missing remote chunk index shard {CHUNK_INDEX_SHARD_KEY}");
     }
     for key in local_object_keys(&export) {
-        if !remote.exists(&key)? {
+        let legacy_exists = remote.exists(&key)?;
+        let aliases = canonical_remote_aliases(&key);
+        let alias_exists = aliases
+            .iter()
+            .map(|alias| remote.exists(alias))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .any(|exists| exists);
+        if !legacy_exists && !alias_exists {
             *missing += 1;
-            eprintln!("missing remote object {key}");
+            eprintln!("missing remote object {key} or canonical alias");
         }
-        for alias in canonical_remote_aliases(&key) {
-            if !remote.exists(&alias)? {
-                *missing += 1;
-                eprintln!("missing canonical remote object alias {alias}");
-            }
+        if legacy_exists && !aliases.is_empty() && !alias_exists {
+            *missing += 1;
+            eprintln!("missing canonical remote object alias for {key}");
         }
     }
     if let Some(current) = export.refs.get("current") {
@@ -4685,8 +4692,6 @@ fn remote_fsck_export(
         for snapshot in &export.snapshots {
             let key = host_snapshot_key(host_id, &snapshot.id);
             if !remote.exists(&key)? {
-                *missing += 1;
-                eprintln!("missing host snapshot export {key}");
                 continue;
             }
             let remote_snapshot: SnapshotExport = serde_json::from_slice(&remote.get(&key)?)
@@ -4702,8 +4707,6 @@ fn remote_fsck_export(
         for operation in &export.operations {
             let key = host_operation_key(host_id, &operation.id);
             if !remote.exists(&key)? {
-                *missing += 1;
-                eprintln!("missing host operation export {key}");
                 continue;
             }
             let remote_operation: OperationExport = serde_json::from_slice(&remote.get(&key)?)

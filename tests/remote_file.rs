@@ -559,6 +559,79 @@ fn remote_check_accepts_host_index_metadata() {
 }
 
 #[test]
+fn remote_fsck_accepts_canonical_only_payloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::remove_file(remote.join("metadata/export.json")).unwrap();
+    fs::remove_dir_all(remote.join("objects")).unwrap();
+    for entry in fs::read_dir(remote.join("hosts")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            let snapshots = path.join("snapshots");
+            if snapshots.exists() {
+                for export in fs::read_dir(snapshots).unwrap() {
+                    let export = export.unwrap().path();
+                    if export.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                        fs::remove_file(export).unwrap();
+                    }
+                }
+            }
+            let ops = path.join("ops");
+            if ops.exists() {
+                for export in fs::read_dir(ops).unwrap() {
+                    let export = export.unwrap().path();
+                    if export.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                        fs::remove_file(export).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    let fsck = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+    assert!(fsck.contains("remote fsck ok"));
+}
+
+#[test]
 fn clone_can_use_single_host_index_when_legacy_metadata_is_absent() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -5061,6 +5134,33 @@ fn root_remove_detaches_root_and_records_operation() {
         c
     });
     assert!(ops.contains("root-removed"));
+}
+
+#[test]
+fn root_remove_unknown_root_fails_without_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("remove")
+            .arg("missing");
+        c
+    });
+    let ops = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(!ops.contains("root-removed"));
 }
 
 #[test]

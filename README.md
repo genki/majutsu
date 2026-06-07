@@ -241,7 +241,8 @@ can be reconstructed from remote metadata.
 Metadata keeps the local object keys for backward-compatible restore and clone,
 while `mj sync` also writes canonical remote-layout aliases matching the spec's
 `trees/`, `blobs/loose/`, `packs/`, `indexes/`, and `large/` prefixes. `mj
-remote fsck` verifies both the metadata keys and these canonical aliases.
+remote fsck` accepts canonical-only payload storage and also validates legacy
+compatibility keys when they are present.
 
 For S3-compatible storage:
 
@@ -283,9 +284,11 @@ type = "file"
 path = "/tmp/majutsu-remote"
 ```
 
-`mj remote fsck` verifies the legacy bootstrap metadata, canonical
-`hosts/index.json`, each host metadata export, canonical `hosts/<host>/refs/*`
-values, per-host snapshot/operation exports, and every referenced object key.
+`mj remote fsck` verifies canonical `hosts/index.json`, each host metadata
+export, canonical `hosts/<host>/refs/*` values, canonical per-host
+snapshot/operation exports, and every referenced object through either its
+canonical remote key or its legacy compatibility key. Legacy bootstrap metadata
+and JSON per-host exports are checked when present.
 
 To rebuild an empty state directory from remote:
 
