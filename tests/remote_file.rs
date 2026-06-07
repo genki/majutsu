@@ -3512,6 +3512,7 @@ fn watch_uses_configured_timing_defaults() {
     let config_path = state.join("config.toml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
+        .replace("backend = \"inotify\"", "backend = \"notify\"")
         .replace("debounce = 1500", "debounce = \"25ms\"")
         .replace("settle = 500", "settle = \"15ms\"")
         .replace("periodic_rescan = 3600", "periodic_rescan = \"0s\"");
@@ -3531,8 +3532,6 @@ fn watch_uses_configured_timing_defaults() {
         .arg(&state)
         .arg("watch")
         .arg("--once")
-        .arg("--backend")
-        .arg("notify")
         .spawn()
         .unwrap();
     thread::sleep(Duration::from_millis(300));
@@ -3544,6 +3543,7 @@ fn watch_uses_configured_timing_defaults() {
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
         .collect::<Vec<_>>()
         .join("\n");
+    assert!(events.contains("backend=notify"));
     assert!(events.contains("debounce_ms=25"));
     assert!(events.contains("settle_ms=15"));
     assert!(events.contains("periodic_rescan_secs=0"));
@@ -3630,6 +3630,8 @@ fn linux_inotify_backend_records_native_events() {
         c.arg("--home").arg(&state).arg("init");
         c
     });
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    assert!(config.contains("backend = \"inotify\""));
     run({
         let mut c = mj();
         c.arg("--home")

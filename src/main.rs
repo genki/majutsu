@@ -403,7 +403,7 @@ struct ResolvedWatchArgs {
     debounce_ms: u64,
     settle_ms: u64,
     periodic_rescan_secs: u64,
-    backend: Option<String>,
+    backend: String,
     once: bool,
 }
 
@@ -820,6 +820,8 @@ struct PackConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct WatchConfig {
+    #[serde(default = "default_watch_backend")]
+    backend: String,
     #[serde(default = "default_watch_mode")]
     mode: String,
     #[serde(
@@ -3366,8 +3368,7 @@ fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
     let args = resolve_watch_args(args, &config.watch);
-    let backend =
-        normalize_watch_backend(args.backend.as_deref().unwrap_or(default_daemon_backend()))?;
+    let backend = normalize_watch_backend(&args.backend)?;
     if !args.foreground {
         let pid = start_watch_daemon(
             paths,
@@ -3413,7 +3414,7 @@ fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> ResolvedWatchArg
         debounce_ms: args.debounce_ms.unwrap_or(config.debounce),
         settle_ms: args.settle_ms.unwrap_or(config.settle),
         periodic_rescan_secs: args.periodic_rescan_secs.unwrap_or(config.periodic_rescan),
-        backend: args.backend,
+        backend: args.backend.unwrap_or_else(|| config.backend.clone()),
         once: args.once,
     }
 }
@@ -3424,6 +3425,10 @@ fn default_daemon_backend() -> &'static str {
     } else {
         "notify"
     }
+}
+
+fn default_watch_backend() -> String {
+    default_daemon_backend().into()
 }
 
 fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
@@ -3656,9 +3661,10 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             settle_ms,
             periodic_rescan_secs,
         } => {
+            let backend = normalize_watch_backend(&config.watch.backend)?;
             let pid = start_watch_daemon(
                 paths,
-                default_daemon_backend(),
+                backend,
                 interval_secs.unwrap_or(config.watch.interval),
                 config.watch.debounce,
                 settle_ms.unwrap_or(config.watch.settle),
@@ -6568,6 +6574,7 @@ fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
 
 fn read_config(paths: &Paths) -> Result<Config> {
     let config: Config = toml::from_str(&fs::read_to_string(&paths.config)?)?;
+    normalize_watch_backend(&config.watch.backend)?;
     validate_watch_mode(&config.watch.mode)?;
     validate_security_config(&config.security)?;
     Ok(config)
@@ -7104,6 +7111,7 @@ fn default_security_hash() -> String {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
+            backend: default_watch_backend(),
             mode: default_watch_mode(),
             debounce: default_watch_debounce_ms(),
             settle: default_watch_settle_ms(),
