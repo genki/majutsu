@@ -2981,6 +2981,10 @@ fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
         let manifest: TreeManifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode tree manifest {key}"))?;
         encode_canonical_remote_export(paths, &manifest)
+    } else if key.starts_with("objects/indexes/pack/") {
+        let index: PackIndex =
+            serde_json::from_slice(&bytes).with_context(|| format!("decode pack index {key}"))?;
+        encode_canonical_remote_export(paths, &index)
     } else if key.starts_with("objects/large/manifests/") {
         let manifest: LargeManifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode large manifest {key}"))?;
@@ -2991,7 +2995,9 @@ fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
 }
 
 fn canonical_alias_uses_structured_encoding(key: &str) -> bool {
-    key.starts_with("objects/trees/") || key.starts_with("objects/large/manifests/")
+    key.starts_with("objects/trees/")
+        || key.starts_with("objects/indexes/pack/")
+        || key.starts_with("objects/large/manifests/")
 }
 
 fn update_remote_host_index(
@@ -6214,7 +6220,8 @@ fn canonical_remote_alias(key: &str) -> Option<String> {
     } else if let Some(rest) = key.strip_prefix("objects/packs/normal/") {
         Some(format!("packs/normal/{rest}"))
     } else if let Some(rest) = key.strip_prefix("objects/indexes/pack/") {
-        Some(format!("indexes/pack-index/{rest}"))
+        let rest = rest.strip_suffix(".json").unwrap_or(rest);
+        Some(format!("indexes/pack-index/{rest}.cbor.zst.enc"))
     } else if let Some(rest) = key.strip_prefix("objects/large/manifests/") {
         Some(format!("large/manifests/{rest}.cbor.zst.enc"))
     } else if let Some(rest) = key.strip_prefix("objects/large/chunks/fixed/") {

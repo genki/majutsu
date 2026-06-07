@@ -1838,6 +1838,9 @@ fn pack_gc_and_remote_clone_restore_packed_blobs() {
         c
     });
     assert!(find_file_ending(&remote.join("packs/small"), ".mpack").exists());
+    let pack_index = find_file_ending(&remote.join("indexes/pack-index"), ".cbor.zst.enc");
+    assert_canonical_cbor_zstd(&pack_index);
+    assert!(!pack_index.to_string_lossy().ends_with(".json"));
     run({
         let mut c = mj();
         c.arg("--home")
