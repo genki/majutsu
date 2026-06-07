@@ -9783,6 +9783,93 @@ fn transactional_snapshot_can_scan_snapshot_source() {
 }
 
 #[test]
+fn transactional_snapshot_source_sync_clone_restore_preserves_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let snapshot_source = tmp.path().join("snapshot-source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("live.txt"), b"live\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let pre = format!(
+        "rm -rf '{}' && mkdir -p '{}' && cp live.txt '{}/live.txt' && printf checkpoint > '{}/checkpoint.txt'",
+        snapshot_source.display(),
+        snapshot_source.display(),
+        snapshot_source.display(),
+        snapshot_source.display()
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--snapshot-mode")
+            .arg("transactional")
+            .arg("--snapshot-source")
+            .arg(&snapshot_source)
+            .arg("--pre-snapshot")
+            .arg(pre)
+            .arg("--post-snapshot")
+            .arg("printf post > post.txt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/checkpoint.txt")).unwrap(),
+        "checkpoint"
+    );
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/live.txt")).unwrap(),
+        "live\n"
+    );
+    assert!(!restore.join("sample/post.txt").exists());
+}
+
+#[test]
 fn transactional_snapshot_runs_application_plugin_phases() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
