@@ -44,9 +44,9 @@ use majutsu_restore::{
 use majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
     RemoteCapabilities, RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
-    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport, RemoteGcMarkIssue,
-    RemoteGcTombstone as GcTombstoneExport, RemoteGcTombstoneIssue, RemoteHostIndex,
-    RemoteHostIndexIssue, RemoteHostSummary, RemoteObjectAvailabilityIssue, archive_restore_status,
+    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
+    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostIndexIssue,
+    RemoteHostSummary, RemoteObjectAvailabilityIssue, archive_restore_status,
     canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
     host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
     host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
@@ -5455,23 +5455,7 @@ fn validate_remote_gc_records(
         let expected = expected_gc_mark_object_keys(export);
         for issue in mark.validation_issues(host_id, export.refs.get("current"), &expected) {
             *missing += 1;
-            match issue {
-                RemoteGcMarkIssue::UnsupportedVersion => {
-                    eprintln!("unsupported remote gc mark version {mark_key}");
-                }
-                RemoteGcMarkIssue::HostMismatch(actual) => {
-                    eprintln!("remote gc mark host id {actual} does not match {host_id}");
-                }
-                RemoteGcMarkIssue::CurrentSnapshotMismatch => {
-                    eprintln!("remote gc mark current snapshot does not match metadata {mark_key}");
-                }
-                RemoteGcMarkIssue::DuplicateObjectKeys => {
-                    eprintln!("remote gc mark contains duplicate object keys {mark_key}");
-                }
-                RemoteGcMarkIssue::MissingLiveObject(key) => {
-                    eprintln!("remote gc mark is missing live object {mark_key} {key}");
-                }
-            }
+            eprintln!("{}", issue.message(&mark_key, host_id));
         }
     }
     validate_remote_gc_tombstones(remote, host_id, missing)
@@ -5506,17 +5490,7 @@ fn validate_remote_gc_tombstones(
         };
         for issue in tombstone.validation_issues(host_id) {
             *missing += 1;
-            match issue {
-                RemoteGcTombstoneIssue::UnsupportedVersion => {
-                    eprintln!("unsupported remote gc tombstone version {key}");
-                }
-                RemoteGcTombstoneIssue::HostMismatch(actual) => {
-                    eprintln!("remote gc tombstone host id {actual} does not match {host_id}");
-                }
-                RemoteGcTombstoneIssue::InvalidDeletedKey => {
-                    eprintln!("remote gc tombstone has invalid deleted key {key}");
-                }
-            }
+            eprintln!("{}", issue.message(&key, host_id));
         }
         if remote.exists(&tombstone.key)? {
             *missing += 1;

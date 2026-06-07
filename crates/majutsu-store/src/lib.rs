@@ -492,6 +492,28 @@ pub enum RemoteGcMarkIssue {
     MissingLiveObject(String),
 }
 
+impl RemoteGcMarkIssue {
+    pub fn message(&self, mark_key: &str, expected_host_id: &str) -> String {
+        match self {
+            Self::UnsupportedVersion => {
+                format!("unsupported remote gc mark version {mark_key}")
+            }
+            Self::HostMismatch(actual) => {
+                format!("remote gc mark host id {actual} does not match {expected_host_id}")
+            }
+            Self::CurrentSnapshotMismatch => {
+                format!("remote gc mark current snapshot does not match metadata {mark_key}")
+            }
+            Self::DuplicateObjectKeys => {
+                format!("remote gc mark contains duplicate object keys {mark_key}")
+            }
+            Self::MissingLiveObject(key) => {
+                format!("remote gc mark is missing live object {mark_key} {key}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteGcTombstone {
     pub version: u32,
@@ -534,6 +556,22 @@ pub enum RemoteGcTombstoneIssue {
     UnsupportedVersion,
     HostMismatch(String),
     InvalidDeletedKey,
+}
+
+impl RemoteGcTombstoneIssue {
+    pub fn message(&self, tombstone_key: &str, expected_host_id: &str) -> String {
+        match self {
+            Self::UnsupportedVersion => {
+                format!("unsupported remote gc tombstone version {tombstone_key}")
+            }
+            Self::HostMismatch(actual) => {
+                format!("remote gc tombstone host id {actual} does not match {expected_host_id}")
+            }
+            Self::InvalidDeletedKey => {
+                format!("remote gc tombstone has invalid deleted key {tombstone_key}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +874,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_gc_mark_issue_messages_are_stable() {
+        assert_eq!(
+            RemoteGcMarkIssue::UnsupportedVersion.message("gc/marks/host-a.json", "host-a"),
+            "unsupported remote gc mark version gc/marks/host-a.json"
+        );
+        assert_eq!(
+            RemoteGcMarkIssue::HostMismatch("wrong-host".into())
+                .message("gc/marks/host-a.json", "host-a"),
+            "remote gc mark host id wrong-host does not match host-a"
+        );
+        assert_eq!(
+            RemoteGcMarkIssue::CurrentSnapshotMismatch.message("gc/marks/host-a.json", "host-a"),
+            "remote gc mark current snapshot does not match metadata gc/marks/host-a.json"
+        );
+        assert_eq!(
+            RemoteGcMarkIssue::DuplicateObjectKeys.message("gc/marks/host-a.json", "host-a"),
+            "remote gc mark contains duplicate object keys gc/marks/host-a.json"
+        );
+        assert_eq!(
+            RemoteGcMarkIssue::MissingLiveObject("objects/a".into())
+                .message("gc/marks/host-a.json", "host-a"),
+            "remote gc mark is missing live object gc/marks/host-a.json objects/a"
+        );
+    }
+
+    #[test]
     fn remote_gc_mark_validation_accepts_matching_mark() {
         let expected = ["objects/a".to_string(), "objects/b".to_string()]
             .into_iter()
@@ -897,6 +961,25 @@ mod tests {
                 RemoteGcTombstoneIssue::HostMismatch("wrong-host".into()),
                 RemoteGcTombstoneIssue::InvalidDeletedKey,
             ]
+        );
+    }
+
+    #[test]
+    fn remote_gc_tombstone_issue_messages_are_stable() {
+        assert_eq!(
+            RemoteGcTombstoneIssue::UnsupportedVersion
+                .message("gc/tombstones/host-a/tombstone-1.json", "host-a"),
+            "unsupported remote gc tombstone version gc/tombstones/host-a/tombstone-1.json"
+        );
+        assert_eq!(
+            RemoteGcTombstoneIssue::HostMismatch("wrong-host".into())
+                .message("gc/tombstones/host-a/tombstone-1.json", "host-a"),
+            "remote gc tombstone host id wrong-host does not match host-a"
+        );
+        assert_eq!(
+            RemoteGcTombstoneIssue::InvalidDeletedKey
+                .message("gc/tombstones/host-a/tombstone-1.json", "host-a"),
+            "remote gc tombstone has invalid deleted key gc/tombstones/host-a/tombstone-1.json"
         );
     }
 
