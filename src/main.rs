@@ -3,12 +3,10 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use majutsu_core::{
-    FileRecord, LargeChunk, LargeManifest, LiveMetadataReferences, MetadataReferenceIssue,
-    OperationLogComparisonIssue, OperationLogEntry as OperationExport, Payload, RootSnapshot,
-    SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log, encode_operation_log,
-    metadata_reference_issues, operation_log_comparison_issues, payload_blob_ref,
-    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_manifest_matches,
-    tree_manifest_issues,
+    FileRecord, LargeChunk, LargeManifest, LiveMetadataReferences, OperationLogComparisonIssue,
+    OperationLogEntry as OperationExport, Payload, RootSnapshot, SnapshotExport, SnapshotManifest,
+    TreeManifest, decode_operation_log, encode_operation_log, operation_log_comparison_issues,
+    payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -16,11 +14,8 @@ use majutsu_db::{
     EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
     UploadQueueItemIssue,
 };
-use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport, large_manifest_issues};
-use majutsu_pack::{
-    PackEntry, PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackTier,
-    PackedBlobMetadata, missing_pack_metadata_ids, pack_index_issues, pack_object_issues,
-};
+use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
+use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier, PackedBlobMetadata};
 use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use majutsu_restore::{
     RestoreQueueItem, classify_restore_object_availability, validate_relative_filter_path,
@@ -2624,51 +2619,6 @@ fn gc_cmd(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn validate_local_metadata_references(
-    paths: &Paths,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    let mut live = LiveMetadataReferences::default();
-    for snapshot in &export.snapshots {
-        let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
-            Ok(manifest) => manifest,
-            Err(_) => continue,
-        };
-        for manifest_key in live.add_snapshot_manifest(&manifest) {
-            let Ok(bytes) = read_object(paths, &manifest_key) else {
-                continue;
-            };
-            let Ok(large_manifest) = serde_json::from_slice::<LargeManifest>(&bytes) else {
-                continue;
-            };
-            live.add_large_manifest(large_manifest);
-        }
-    }
-    for issue in metadata_reference_issues(
-        export.blobs.iter().map(|blob| blob.oid.as_str()),
-        export.large_objects.iter().map(|large| large.oid.as_str()),
-        export.chunks.iter().map(|chunk| chunk.oid.as_str()),
-        &live.blobs,
-        &live.large_objects,
-        &live.chunks,
-    ) {
-        *missing += 1;
-        match issue {
-            MetadataReferenceIssue::DanglingBlob { oid } => {
-                eprintln!("dangling blob metadata {oid}");
-            }
-            MetadataReferenceIssue::DanglingLargeObject { oid } => {
-                eprintln!("dangling large object metadata {oid}");
-            }
-            MetadataReferenceIssue::DanglingChunk { oid } => {
-                eprintln!("dangling chunk metadata {oid}");
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_event_queue(paths: &Paths, missing: &mut usize) -> Result<()> {
     let dir = &paths.event_queue;
     if !dir.exists() {
@@ -2919,204 +2869,6 @@ fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
                 eprintln!("local operation log entry does not match metadata {id} index={index}");
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_local_snapshot_objects(
-    paths: &Paths,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    for snapshot in &export.snapshots {
-        let metadata_manifest: SnapshotManifest =
-            match serde_json::from_str(&snapshot.manifest_json) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    *missing += 1;
-                    eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
-                    continue;
-                }
-            };
-        match read_object(paths, &snapshot.manifest_key).and_then(|bytes| {
-            serde_json::from_slice::<SnapshotManifest>(&bytes).map_err(Into::into)
-        }) {
-            Ok(local_manifest) => {
-                if !snapshot_manifest_matches(&local_manifest, &metadata_manifest) {
-                    *missing += 1;
-                    eprintln!(
-                        "snapshot manifest object does not match metadata {} {}",
-                        snapshot.id, snapshot.manifest_key
-                    );
-                }
-            }
-            Err(err) => {
-                *missing += 1;
-                eprintln!(
-                    "unreadable snapshot manifest {} {}: {err}",
-                    snapshot.id, snapshot.manifest_key
-                );
-            }
-        }
-        for (root_id, root_tree) in &metadata_manifest.root_trees {
-            match read_object(paths, &root_tree.tree_key).and_then(|bytes| {
-                serde_json::from_slice::<TreeManifest>(&bytes).map_err(Into::into)
-            }) {
-                Ok(tree) => {
-                    if !tree_manifest_issues(&tree, root_id, root_tree).is_empty() {
-                        *missing += 1;
-                        eprintln!(
-                            "tree manifest object does not match snapshot metadata {} {}",
-                            snapshot.id, root_tree.tree_key
-                        );
-                    }
-                }
-                Err(err) => {
-                    *missing += 1;
-                    eprintln!(
-                        "unreadable tree manifest {} {}: {err}",
-                        snapshot.id, root_tree.tree_key
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_local_large_manifest_objects(
-    paths: &Paths,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    for large in &export.large_objects {
-        match read_object(paths, &large.manifest_key)
-            .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
-        {
-            Ok(manifest) => {
-                if !large_manifest_issues(&manifest, large).is_empty() {
-                    *missing += 1;
-                    eprintln!(
-                        "large manifest object does not match metadata {} {}",
-                        large.oid, large.manifest_key
-                    );
-                }
-            }
-            Err(err) => {
-                *missing += 1;
-                eprintln!(
-                    "unreadable large manifest {} {}: {err}",
-                    large.oid, large.manifest_key
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_local_pack_objects(
-    paths: &Paths,
-    export: &MetadataExport,
-    missing: &mut usize,
-) -> Result<()> {
-    let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
-    for blob in &export.blobs {
-        if let Some(pack_id) = blob.pack_id.as_deref() {
-            blobs_by_pack
-                .entry(pack_id)
-                .or_default()
-                .insert(blob.oid.as_str(), blob);
-        }
-    }
-    for pack in &export.packs {
-        let expected_blobs = blobs_by_pack
-            .get(pack.pack_id.as_str())
-            .cloned()
-            .unwrap_or_default();
-        let expected_blob_metadata = packed_blob_metadata(&expected_blobs);
-        match read_object(paths, &pack.index_key)
-            .and_then(|bytes| serde_json::from_slice::<PackIndex>(&bytes).map_err(Into::into))
-        {
-            Ok(index) => {
-                for issue in pack_index_issues(pack, &index, &expected_blob_metadata) {
-                    *missing += 1;
-                    match issue {
-                        PackIndexIssue::PackMetadataMismatch => {
-                            eprintln!("pack index does not match metadata {}", pack.pack_id);
-                        }
-                        PackIndexIssue::EntryWithoutBlobMetadata { oid } => {
-                            eprintln!(
-                                "pack index entry has no matching blob metadata {} {}",
-                                pack.pack_id, oid
-                            );
-                        }
-                        PackIndexIssue::EntryOffsetMismatch { oid } => {
-                            eprintln!(
-                                "pack index entry does not match blob offset metadata {} {}",
-                                pack.pack_id, oid
-                            );
-                        }
-                        PackIndexIssue::MissingBlobEntry { oid } => {
-                            eprintln!(
-                                "packed blob missing from pack index {} {}",
-                                pack.pack_id, oid
-                            );
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                *missing += 1;
-                eprintln!(
-                    "unreadable pack index {} {}: {err}",
-                    pack.pack_id, pack.index_key
-                );
-            }
-        }
-        match fs::read(paths.home.join(&pack.pack_key)) {
-            Ok(bytes) => {
-                for issue in pack_object_issues(pack, bytes.len() as u64, &expected_blob_metadata) {
-                    *missing += 1;
-                    match issue {
-                        PackObjectIssue::SizeMismatch => {
-                            eprintln!("pack object size does not match metadata {}", pack.pack_id);
-                        }
-                        PackObjectIssue::MissingBlobOffset { oid } => {
-                            eprintln!(
-                                "packed blob missing offset metadata {} {}",
-                                pack.pack_id, oid
-                            );
-                        }
-                        PackObjectIssue::MissingBlobLength { oid } => {
-                            eprintln!(
-                                "packed blob missing length metadata {} {}",
-                                pack.pack_id, oid
-                            );
-                        }
-                        PackObjectIssue::BlobRangeOutOfBounds { oid } => {
-                            eprintln!(
-                                "packed blob range out of pack bounds {} {}",
-                                pack.pack_id, oid
-                            );
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                *missing += 1;
-                eprintln!(
-                    "unreadable pack object {} {}: {err}",
-                    pack.pack_id, pack.pack_key
-                );
-            }
-        }
-    }
-    for pack_id in missing_pack_metadata_ids(
-        blobs_by_pack.keys().copied(),
-        export.packs.iter().map(|pack| pack.pack_id.as_str()),
-    ) {
-        *missing += 1;
-        eprintln!("packed blob references missing pack metadata {pack_id}");
     }
     Ok(())
 }
