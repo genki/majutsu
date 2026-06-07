@@ -3289,10 +3289,10 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             let keys = remote.list("")?;
             println!("remote {}", remote.describe());
             println!("objects {}", keys.len());
-            let metadata_key = if remote.exists("metadata/export.json")? {
-                "metadata/export.json"
-            } else if remote.exists("hosts/index.json")? {
+            let metadata_key = if remote.exists("hosts/index.json")? {
                 "hosts/index.json"
+            } else if remote.exists("metadata/export.json")? {
+                "metadata/export.json"
             } else {
                 bail!(
                     "remote metadata is missing: metadata/export.json and hosts/index.json not found"

@@ -584,8 +584,16 @@ fn remote_check_accepts_host_index_metadata() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    fs::remove_file(remote.join("metadata/export.json")).unwrap();
+    let check = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("check");
+        c
+    });
+    assert!(check.contains("metadata ok"));
+    assert!(check.contains("metadata_key hosts/index.json"));
+    assert!(check.contains("range_get 1"));
 
+    fs::remove_file(remote.join("metadata/export.json")).unwrap();
     let check = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("remote").arg("check");
