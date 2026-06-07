@@ -38,6 +38,59 @@ pub struct PolicyRule {
     pub storage: Option<String>,
 }
 
+pub fn default_tiering_rules() -> Vec<PolicyRule> {
+    vec![
+        PolicyRule {
+            name: "keep-host-metadata-hot".into(),
+            prefix: "hosts/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        PolicyRule {
+            name: "keep-bootstrap-metadata-hot".into(),
+            prefix: "metadata/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        PolicyRule {
+            name: "keep-trees-hot".into(),
+            prefix: "trees/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        PolicyRule {
+            name: "keep-large-manifests-hot".into(),
+            prefix: "large/manifests/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        PolicyRule {
+            name: "keep-indexes-hot".into(),
+            prefix: "indexes/".into(),
+            after: None,
+            storage: Some("standard".into()),
+        },
+        PolicyRule {
+            name: "packs-to-ia".into(),
+            prefix: "packs/normal/".into(),
+            after: Some("30d".into()),
+            storage: Some("infrequent".into()),
+        },
+        PolicyRule {
+            name: "fixed-large-chunks-to-archive".into(),
+            prefix: "large/chunks/fixed-8m/".into(),
+            after: Some("180d".into()),
+            storage: Some("archive".into()),
+        },
+        PolicyRule {
+            name: "fastcdc-large-chunks-to-archive".into(),
+            prefix: "large/chunks/fastcdc/".into(),
+            after: Some("180d".into()),
+            storage: Some("archive".into()),
+        },
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TransitionRule {
     name: String,
@@ -165,5 +218,57 @@ fn sanitize_lifecycle_rule_id(name: &str) -> String {
         "majutsu-tiering-rule".into()
     } else {
         sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_rules_keep_metadata_hot_and_tier_large_payloads() {
+        let rules = default_tiering_rules();
+
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.prefix == "hosts/" && rule.after.is_none())
+        );
+        assert!(
+            rules.iter().any(|rule| rule.prefix == "large/manifests/"
+                && rule.storage.as_deref() == Some("standard"))
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.prefix == "packs/normal/" && rule.after.as_deref() == Some("30d"))
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.prefix == "large/chunks/fixed-8m/"
+                    && rule.storage.as_deref() == Some("archive"))
+        );
+    }
+
+    #[test]
+    fn lifecycle_policies_skip_hot_metadata_defaults() {
+        let config = PolicyConfig {
+            enabled: true,
+            rules: default_tiering_rules(),
+        };
+
+        let s3 = s3_lifecycle_policy(&config).unwrap();
+        let s3_text = serde_json::to_string(&s3).unwrap();
+        assert!(s3_text.contains("packs/normal/"));
+        assert!(s3_text.contains("large/chunks/fixed-8m/"));
+        assert!(!s3_text.contains("hosts/"));
+        assert!(!s3_text.contains("large/manifests/"));
+
+        let gcs = gcs_lifecycle_policy(&config).unwrap();
+        let gcs_text = serde_json::to_string(&gcs).unwrap();
+        assert!(gcs_text.contains("large/chunks/fastcdc/"));
+        assert!(!gcs_text.contains("metadata/"));
+        assert!(!gcs_text.contains("trees/"));
     }
 }

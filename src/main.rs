@@ -9197,56 +9197,15 @@ impl Default for WatchConfig {
 }
 
 fn default_tiering_rules() -> Vec<TieringRule> {
-    vec![
-        TieringRule {
-            name: "keep-host-metadata-hot".into(),
-            prefix: "hosts/".into(),
-            after: None,
-            storage: Some("standard".into()),
-        },
-        TieringRule {
-            name: "keep-bootstrap-metadata-hot".into(),
-            prefix: "metadata/".into(),
-            after: None,
-            storage: Some("standard".into()),
-        },
-        TieringRule {
-            name: "keep-trees-hot".into(),
-            prefix: "trees/".into(),
-            after: None,
-            storage: Some("standard".into()),
-        },
-        TieringRule {
-            name: "keep-large-manifests-hot".into(),
-            prefix: "large/manifests/".into(),
-            after: None,
-            storage: Some("standard".into()),
-        },
-        TieringRule {
-            name: "keep-indexes-hot".into(),
-            prefix: "indexes/".into(),
-            after: None,
-            storage: Some("standard".into()),
-        },
-        TieringRule {
-            name: "packs-to-ia".into(),
-            prefix: "packs/normal/".into(),
-            after: Some("30d".into()),
-            storage: Some("infrequent".into()),
-        },
-        TieringRule {
-            name: "fixed-large-chunks-to-archive".into(),
-            prefix: "large/chunks/fixed-8m/".into(),
-            after: Some("180d".into()),
-            storage: Some("archive".into()),
-        },
-        TieringRule {
-            name: "fastcdc-large-chunks-to-archive".into(),
-            prefix: "large/chunks/fastcdc/".into(),
-            after: Some("180d".into()),
-            storage: Some("archive".into()),
-        },
-    ]
+    majutsu_policy::default_tiering_rules()
+        .into_iter()
+        .map(|rule| TieringRule {
+            name: rule.name,
+            prefix: rule.prefix,
+            after: rule.after,
+            storage: rule.storage,
+        })
+        .collect()
 }
 
 impl Default for TieringConfig {
