@@ -23,8 +23,10 @@ use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
 };
 use majutsu_store::{
-    LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteCapabilities, RemoteHostIndex,
-    RemoteHostIndexIssue, RemoteHostSummary, select_remote_host,
+    LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteCapabilities,
+    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex,
+    RemoteHostIndexIssue, RemoteHostSummary, remote_gc_mark_key, remote_gc_tombstone_key,
+    remote_gc_tombstone_prefix, select_remote_host,
 };
 use majutsu_watch::{WatchBackend, WatchMode};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -726,23 +728,6 @@ struct ChunkIndexEntry {
     size: u64,
     object_key: String,
     canonical_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GcMarkExport {
-    version: u32,
-    host_id: String,
-    marked_at: DateTime<Utc>,
-    current_snapshot: Option<String>,
-    object_keys: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct GcTombstoneExport {
-    version: u32,
-    host_id: String,
-    deleted_at: DateTime<Utc>,
-    key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2759,7 +2744,7 @@ fn enqueue_and_drain_sync(
     )?;
     enqueue_inline_upload(
         paths,
-        &format!("gc/marks/{}.json", config.host.id),
+        &remote_gc_mark_key(&config.host.id),
         serde_json::to_vec_pretty(&build_gc_mark_export(&config, &export))?,
     )?;
     let recipients = paths.home.join("keys/recipients.toml");
@@ -2995,13 +2980,12 @@ fn build_gc_mark_export(config: &Config, export: &MetadataExport) -> GcMarkExpor
     }
     object_keys.sort();
     object_keys.dedup();
-    GcMarkExport {
-        version: 1,
-        host_id: config.host.id.clone(),
-        marked_at: Utc::now(),
-        current_snapshot: export.refs.get("current").cloned(),
+    GcMarkExport::new(
+        config.host.id.clone(),
+        Utc::now(),
+        export.refs.get("current").cloned(),
         object_keys,
-    }
+    )
 }
 
 fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
@@ -3101,14 +3085,9 @@ fn prune_remote_host_exports(
 }
 
 fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> Result<()> {
-    let tombstone = GcTombstoneExport {
-        version: 1,
-        host_id: host_id.to_string(),
-        deleted_at: Utc::now(),
-        key: key.to_string(),
-    };
+    let tombstone = GcTombstoneExport::new(host_id.to_string(), Utc::now(), key.to_string());
     remote.put(
-        &format!("gc/tombstones/{host_id}/{}.json", new_id("tombstone")),
+        &remote_gc_tombstone_key(host_id, &new_id("tombstone")),
         &serde_json::to_vec_pretty(&tombstone)?,
     )
 }
@@ -5716,7 +5695,7 @@ fn validate_remote_gc_records(
     export: &MetadataExport,
     missing: &mut usize,
 ) -> Result<()> {
-    let mark_key = format!("gc/marks/{host_id}.json");
+    let mark_key = remote_gc_mark_key(host_id);
     if !remote.exists(&mark_key)? {
         *missing += 1;
         eprintln!("missing remote gc mark {mark_key}");
@@ -5746,7 +5725,7 @@ fn validate_remote_gc_records(
         }
         let expected = expected_gc_mark_object_keys(export);
         let actual = mark.object_keys.iter().collect::<BTreeSet<_>>();
-        if actual.len() != mark.object_keys.len() {
+        if mark.has_duplicate_object_keys() {
             *missing += 1;
             eprintln!("remote gc mark contains duplicate object keys {mark_key}");
         }
@@ -5773,7 +5752,7 @@ fn validate_remote_gc_tombstones(
     host_id: &str,
     missing: &mut usize,
 ) -> Result<()> {
-    let prefix = format!("gc/tombstones/{host_id}/");
+    let prefix = remote_gc_tombstone_prefix(host_id);
     let mut seen_keys = BTreeSet::new();
     for key in remote.list(&prefix)? {
         if !key.ends_with(".json") {
@@ -5798,10 +5777,7 @@ fn validate_remote_gc_tombstones(
                 tombstone.host_id
             );
         }
-        if tombstone.key.is_empty()
-            || tombstone.key.starts_with('/')
-            || tombstone.key.contains("..")
-        {
+        if !tombstone.has_valid_deleted_key() {
             *missing += 1;
             eprintln!("remote gc tombstone has invalid deleted key {key}");
         }

@@ -55,6 +55,18 @@ impl RemoteCapabilities {
 pub const REMOTE_HOST_INDEX_KEY: &str = "hosts/index.json";
 pub const LEGACY_METADATA_EXPORT_KEY: &str = "metadata/export.json";
 
+pub fn remote_gc_mark_key(host_id: &str) -> String {
+    format!("gc/marks/{host_id}.json")
+}
+
+pub fn remote_gc_tombstone_prefix(host_id: &str) -> String {
+    format!("gc/tombstones/{host_id}/")
+}
+
+pub fn remote_gc_tombstone_key(host_id: &str, tombstone_id: &str) -> String {
+    format!("{}{tombstone_id}.json", remote_gc_tombstone_prefix(host_id))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteHostSummary {
     pub id: String,
@@ -137,6 +149,65 @@ pub fn select_remote_host(
         0 => bail!("remote host not found: {selector}"),
         1 => Ok(by_name.remove(0)),
         _ => bail!("remote host name is ambiguous: {selector}; use the host id"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteGcMark {
+    pub version: u32,
+    pub host_id: String,
+    pub marked_at: DateTime<Utc>,
+    pub current_snapshot: Option<String>,
+    pub object_keys: Vec<String>,
+}
+
+impl RemoteGcMark {
+    pub fn new(
+        host_id: String,
+        marked_at: DateTime<Utc>,
+        current_snapshot: Option<String>,
+        mut object_keys: Vec<String>,
+    ) -> Self {
+        object_keys.sort();
+        object_keys.dedup();
+        Self {
+            version: 1,
+            host_id,
+            marked_at,
+            current_snapshot,
+            object_keys,
+        }
+    }
+
+    pub fn has_duplicate_object_keys(&self) -> bool {
+        let unique = self
+            .object_keys
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        unique.len() != self.object_keys.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteGcTombstone {
+    pub version: u32,
+    pub host_id: String,
+    pub deleted_at: DateTime<Utc>,
+    pub key: String,
+}
+
+impl RemoteGcTombstone {
+    pub fn new(host_id: String, deleted_at: DateTime<Utc>, key: String) -> Self {
+        Self {
+            version: 1,
+            host_id,
+            deleted_at,
+            key,
+        }
+    }
+
+    pub fn has_valid_deleted_key(&self) -> bool {
+        !self.key.is_empty() && !self.key.starts_with('/') && !self.key.contains("..")
     }
 }
 
@@ -274,6 +345,62 @@ mod tests {
         assert_eq!(
             value["hosts"][0]["metadata_key"],
             "hosts/a/metadata/export.json"
+        );
+    }
+
+    #[test]
+    fn remote_gc_mark_keys_are_sorted_and_deduplicated() {
+        let mark = RemoteGcMark::new(
+            "host-a".into(),
+            DateTime::<Utc>::UNIX_EPOCH,
+            Some("snap-1".into()),
+            vec!["objects/b".into(), "objects/a".into(), "objects/a".into()],
+        );
+
+        assert_eq!(remote_gc_mark_key("host-a"), "gc/marks/host-a.json");
+        assert_eq!(mark.version, 1);
+        assert_eq!(mark.object_keys, vec!["objects/a", "objects/b"]);
+        assert!(!mark.has_duplicate_object_keys());
+    }
+
+    #[test]
+    fn remote_gc_mark_detects_wire_duplicates() {
+        let mark = RemoteGcMark {
+            version: 1,
+            host_id: "host-a".into(),
+            marked_at: DateTime::<Utc>::UNIX_EPOCH,
+            current_snapshot: None,
+            object_keys: vec!["objects/a".into(), "objects/a".into()],
+        };
+
+        assert!(mark.has_duplicate_object_keys());
+    }
+
+    #[test]
+    fn remote_gc_tombstone_keys_and_deleted_key_validation_are_stable() {
+        let tombstone = RemoteGcTombstone::new(
+            "host-a".into(),
+            DateTime::<Utc>::UNIX_EPOCH,
+            "hosts/host-a/ops/op-1.json".into(),
+        );
+
+        assert_eq!(
+            remote_gc_tombstone_prefix("host-a"),
+            "gc/tombstones/host-a/"
+        );
+        assert_eq!(
+            remote_gc_tombstone_key("host-a", "tombstone-1"),
+            "gc/tombstones/host-a/tombstone-1.json"
+        );
+        assert_eq!(tombstone.version, 1);
+        assert!(tombstone.has_valid_deleted_key());
+        assert!(
+            !RemoteGcTombstone::new(
+                "host-a".into(),
+                DateTime::<Utc>::UNIX_EPOCH,
+                "../bad".into()
+            )
+            .has_valid_deleted_key()
         );
     }
 }
