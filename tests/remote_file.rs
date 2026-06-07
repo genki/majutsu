@@ -597,6 +597,72 @@ fn remote_check_accepts_host_index_metadata() {
 }
 
 #[test]
+fn remote_host_index_last_synced_matches_metadata_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let index_path = remote.join("hosts/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(index["hosts"][0]["last_synced_at"].as_str().unwrap())
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap(),
+        chrono::DateTime::parse_from_rfc3339(export["refs"]["last-synced"].as_str().unwrap())
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap()
+    );
+
+    index["hosts"][0]["last_synced_at"] =
+        serde_json::Value::String("2000-01-01T00:00:00+00:00".into());
+    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_accepts_canonical_only_payloads() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

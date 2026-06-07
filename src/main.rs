@@ -3006,10 +3006,16 @@ fn update_remote_host_index(
     metadata_key: &str,
 ) -> Result<RemoteHostIndex> {
     let mut index = read_remote_host_index(remote)?;
+    let last_synced_at = export
+        .refs
+        .get("last-synced")
+        .map(|value| parse_db_time(value))
+        .transpose()?
+        .unwrap_or(export.exported_at);
     let summary = RemoteHostSummary {
         id: config.host.id.clone(),
         name: config.host.name.clone(),
-        last_synced_at: Utc::now(),
+        last_synced_at,
         current_snapshot: export.refs.get("current").cloned(),
         metadata_key: metadata_key.to_string(),
     };
@@ -4652,6 +4658,22 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
                 }
             }
             if let Some(last_synced) = export.refs.get("last-synced") {
+                match parse_db_time(last_synced) {
+                    Ok(metadata_last_synced) if host.last_synced_at == metadata_last_synced => {}
+                    Ok(metadata_last_synced) => {
+                        missing += 1;
+                        eprintln!(
+                            "host index last_synced_at {} does not match metadata last-synced {} for {}",
+                            host.last_synced_at.to_rfc3339(),
+                            metadata_last_synced.to_rfc3339(),
+                            host.id
+                        );
+                    }
+                    Err(err) => {
+                        missing += 1;
+                        eprintln!("invalid metadata last-synced for {}: {err}", host.id);
+                    }
+                }
                 let last_synced_ref_key = format!("hosts/{}/refs/last-synced", host.id);
                 match remote_ref(remote, &last_synced_ref_key)? {
                     Some(remote_last_synced) if remote_last_synced == *last_synced => {}
