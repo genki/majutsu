@@ -1684,11 +1684,11 @@ fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
     match command {
         LifecycleCommand::Policy { provider } => match provider.as_str() {
             "gcs" => {
-                let policy = gcs_lifecycle_policy(&config.tiering)?;
+                let policy = majutsu_policy::gcs_lifecycle_policy(&policy_config(&config.tiering))?;
                 println!("{}", serde_json::to_string_pretty(&policy)?);
             }
             "s3" | "aws" => {
-                let policy = s3_lifecycle_policy(&config.tiering)?;
+                let policy = majutsu_policy::s3_lifecycle_policy(&policy_config(&config.tiering))?;
                 println!("{}", serde_json::to_string_pretty(&policy)?);
             }
             other => bail!("unsupported lifecycle provider: {other}"),
@@ -1697,132 +1697,19 @@ fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
     Ok(())
 }
 
-fn gcs_lifecycle_policy(tiering: &TieringConfig) -> Result<serde_json::Value> {
-    let mut rules = Vec::new();
-    if tiering.enabled {
-        for rule in transition_tiering_rules(tiering)? {
-            rules.push(serde_json::json!({
-                "action": {
-                    "type": "SetStorageClass",
-                    "storageClass": gcs_storage_class(&rule.storage)
-                },
-                "condition": {
-                    "age": rule.after_days,
-                    "matchesPrefix": [rule.prefix]
-                }
-            }));
-        }
-    }
-    Ok(serde_json::json!({ "rule": rules }))
-}
-
-fn s3_lifecycle_policy(tiering: &TieringConfig) -> Result<serde_json::Value> {
-    let mut rules = Vec::new();
-    if tiering.enabled {
-        for rule in transition_tiering_rules(tiering)? {
-            rules.push(serde_json::json!({
-                "ID": sanitize_lifecycle_rule_id(&rule.name),
-                "Status": "Enabled",
-                "Filter": { "Prefix": rule.prefix },
-                "Transitions": [
-                    {
-                        "Days": rule.after_days,
-                        "StorageClass": s3_storage_class(&rule.storage)
-                    }
-                ]
-            }));
-        }
-    }
-    Ok(serde_json::json!({ "Rules": rules }))
-}
-
-struct TransitionTieringRule {
-    name: String,
-    prefix: String,
-    after_days: u32,
-    storage: String,
-}
-
-fn transition_tiering_rules(tiering: &TieringConfig) -> Result<Vec<TransitionTieringRule>> {
-    let mut out = Vec::new();
-    for rule in &tiering.rules {
-        let Some(after) = &rule.after else {
-            continue;
-        };
-        let Some(storage) = &rule.storage else {
-            continue;
-        };
-        if is_hot_storage(storage) {
-            continue;
-        }
-        out.push(TransitionTieringRule {
-            name: rule.name.clone(),
-            prefix: rule.prefix.clone(),
-            after_days: parse_days(after)?,
-            storage: storage.clone(),
-        });
-    }
-    Ok(out)
-}
-
-fn parse_days(input: &str) -> Result<u32> {
-    let trimmed = input.trim();
-    if let Some(days) = trimmed.strip_suffix('d') {
-        return days
-            .parse::<u32>()
-            .with_context(|| format!("invalid tiering duration: {input}"));
-    }
-    trimmed
-        .parse::<u32>()
-        .with_context(|| format!("invalid tiering duration: {input}"))
-}
-
-fn is_hot_storage(storage: &str) -> bool {
-    matches!(
-        normalize_storage_name(storage).as_str(),
-        "standard" | "hot" | "keep" | "none"
-    )
-}
-
-fn gcs_storage_class(storage: &str) -> &'static str {
-    match normalize_storage_name(storage).as_str() {
-        "infrequent" | "ia" | "nearline" => "NEARLINE",
-        "coldline" => "COLDLINE",
-        "archive" | "archive-instant" | "deep-archive" => "ARCHIVE",
-        _ => "STANDARD",
-    }
-}
-
-fn s3_storage_class(storage: &str) -> &'static str {
-    match normalize_storage_name(storage).as_str() {
-        "infrequent" | "ia" | "standard-ia" => "STANDARD_IA",
-        "onezone-ia" => "ONEZONE_IA",
-        "archive-instant" | "glacier-ir" => "GLACIER_IR",
-        "archive" | "glacier" => "GLACIER",
-        "deep-archive" => "DEEP_ARCHIVE",
-        _ => "STANDARD",
-    }
-}
-
-fn normalize_storage_name(storage: &str) -> String {
-    storage.trim().to_ascii_lowercase().replace('_', "-")
-}
-
-fn sanitize_lifecycle_rule_id(name: &str) -> String {
-    let sanitized = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "majutsu-tiering-rule".into()
-    } else {
-        sanitized
+fn policy_config(tiering: &TieringConfig) -> majutsu_policy::PolicyConfig {
+    majutsu_policy::PolicyConfig {
+        enabled: tiering.enabled,
+        rules: tiering
+            .rules
+            .iter()
+            .map(|rule| majutsu_policy::PolicyRule {
+                name: rule.name.clone(),
+                prefix: rule.prefix.clone(),
+                after: rule.after.clone(),
+                storage: rule.storage.clone(),
+            })
+            .collect(),
     }
 }
 

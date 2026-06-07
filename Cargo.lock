@@ -1457,6 +1457,7 @@ dependencies = [
  "libc",
  "majutsu-core",
  "majutsu-crypto",
+ "majutsu-policy",
  "notify",
  "quick-xml",
  "reqwest",
@@ -1525,6 +1526,10 @@ dependencies = [
 [[package]]
 name = "majutsu-policy"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
 
 [[package]]
 name = "majutsu-restore"
