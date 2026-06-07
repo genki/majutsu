@@ -43,6 +43,7 @@ const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
 const SMALL_BLOB_MAX_SIZE: u64 = 128 * 1024;
+const CHUNK_INDEX_SHARD_KEY: &str = "indexes/chunk-index/shard-0000.cbor.zst.enc";
 
 #[derive(Parser)]
 #[command(
@@ -764,6 +765,22 @@ struct ChunkExport {
     oid: String,
     size: u64,
     object_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChunkIndexShard {
+    version: u32,
+    shard: String,
+    updated_at: DateTime<Utc>,
+    chunks: Vec<ChunkIndexEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChunkIndexEntry {
+    oid: String,
+    size: u64,
+    object_key: String,
+    canonical_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2882,6 +2899,11 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         "hosts/index.json",
         serde_json::to_vec_pretty(&host_index)?,
     )?;
+    enqueue_inline_upload(
+        paths,
+        CHUNK_INDEX_SHARD_KEY,
+        encode_canonical_remote_export(paths, &build_chunk_index_shard(&export))?,
+    )?;
 
     for key in local_object_keys(&export) {
         let local = paths.home.join(&key);
@@ -2973,6 +2995,26 @@ fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Res
     let cbor = serde_cbor::to_vec(value)?;
     let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
     encode_object(paths, &compressed)
+}
+
+fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
+    let chunks = export
+        .chunks
+        .iter()
+        .map(|chunk| ChunkIndexEntry {
+            oid: chunk.oid.clone(),
+            size: chunk.size,
+            object_key: chunk.object_key.clone(),
+            canonical_key: canonical_remote_alias(&chunk.object_key)
+                .unwrap_or_else(|| chunk.object_key.clone()),
+        })
+        .collect();
+    ChunkIndexShard {
+        version: 1,
+        shard: "shard-0000".into(),
+        updated_at: Utc::now(),
+        chunks,
+    }
 }
 
 fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
@@ -4626,6 +4668,10 @@ fn remote_fsck_export(
 ) -> Result<MetadataExport> {
     let export: MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
+    if !export.chunks.is_empty() && !remote.exists(CHUNK_INDEX_SHARD_KEY)? {
+        *missing += 1;
+        eprintln!("missing remote chunk index shard {CHUNK_INDEX_SHARD_KEY}");
+    }
     for key in local_object_keys(&export) {
         if !remote.exists(&key)? {
             *missing += 1;
