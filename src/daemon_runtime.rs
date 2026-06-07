@@ -13,6 +13,24 @@ use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::{Paths, open_db, resolve_paths};
 
+struct DaemonStats {
+    pid: u32,
+    roots: usize,
+    current: String,
+    journal_events: usize,
+    pending_journal_events: bool,
+    queued_uploads: usize,
+    queued_uploads_retrying: usize,
+    queued_uploads_delayed: usize,
+    queued_upload_next_retry_after: String,
+    queued_upload_attempts: u64,
+    queued_upload_max_attempts: u32,
+    upload_queue_backpressure: bool,
+    restore_jobs: usize,
+    root_statuses: BTreeMap<String, usize>,
+    restore_statuses: BTreeMap<String, usize>,
+}
+
 pub(crate) fn start_watch_daemon(
     paths: &Paths,
     backend: &str,
@@ -93,57 +111,123 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
     let paths = resolve_paths(Some(home.to_path_buf()))?;
     match command.trim() {
         "status" => {
-            let conn = open_db(&paths)?;
-            let roots = roots(&conn)?;
-            let mut root_statuses = BTreeMap::new();
-            for root in &roots {
-                *root_statuses.entry(root.status.as_str()).or_insert(0usize) += 1;
-            }
-            let current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
-            let journal_records = event_journal_records(&paths)?;
-            let pending_journal_events = majutsu_db::has_pending_journal_events(&journal_records);
-            let upload_stats = upload_queue_stats(&paths)?;
-            let restore_jobs = restore_queue_status_counts(&paths)?;
-            let active_restore_jobs = restore_jobs
-                .iter()
-                .filter(|(status, _)| status.as_str() != "done")
-                .map(|(_, count)| *count)
-                .sum::<usize>();
-            let pid = std::process::id();
-            writeln!(stream, "running pid {pid}")?;
+            let stats = daemon_stats(&paths)?;
+            writeln!(stream, "running pid {}", stats.pid)?;
             writeln!(stream, "ipc ok")?;
-            writeln!(stream, "roots {}", roots.len())?;
-            writeln!(stream, "current {current}")?;
-            writeln!(stream, "journal_events {}", journal_records.len())?;
-            writeln!(stream, "pending_journal_events {pending_journal_events}")?;
-            writeln!(stream, "queued_uploads {}", upload_stats.total)?;
-            writeln!(stream, "queued_uploads_retrying {}", upload_stats.retrying)?;
-            writeln!(stream, "queued_uploads_delayed {}", upload_stats.delayed)?;
+            writeln!(stream, "roots {}", stats.roots)?;
+            writeln!(stream, "current {}", stats.current)?;
+            writeln!(stream, "journal_events {}", stats.journal_events)?;
+            writeln!(
+                stream,
+                "pending_journal_events {}",
+                stats.pending_journal_events
+            )?;
+            writeln!(stream, "queued_uploads {}", stats.queued_uploads)?;
+            writeln!(
+                stream,
+                "queued_uploads_retrying {}",
+                stats.queued_uploads_retrying
+            )?;
+            writeln!(
+                stream,
+                "queued_uploads_delayed {}",
+                stats.queued_uploads_delayed
+            )?;
             writeln!(
                 stream,
                 "queued_upload_next_retry_after {}",
-                upload_stats
-                    .next_retry_after
-                    .map(|retry_after| retry_after.to_rfc3339())
-                    .unwrap_or_else(|| "(none)".into())
+                stats.queued_upload_next_retry_after
             )?;
-            writeln!(stream, "queued_upload_attempts {}", upload_stats.attempts)?;
+            writeln!(
+                stream,
+                "queued_upload_attempts {}",
+                stats.queued_upload_attempts
+            )?;
             writeln!(
                 stream,
                 "queued_upload_max_attempts {}",
-                upload_stats.max_attempts
+                stats.queued_upload_max_attempts
             )?;
             writeln!(
                 stream,
                 "upload_queue_backpressure {}",
-                upload_stats.has_backpressure()
+                stats.upload_queue_backpressure
             )?;
-            writeln!(stream, "restore_jobs {active_restore_jobs}")?;
-            for (status, count) in root_statuses {
+            writeln!(stream, "restore_jobs {}", stats.restore_jobs)?;
+            for (status, count) in stats.root_statuses {
                 writeln!(stream, "root_status {status} {count}")?;
             }
-            for (status, count) in restore_jobs {
+            for (status, count) in stats.restore_statuses {
                 writeln!(stream, "restore_status {status} {count}")?;
+            }
+        }
+        "metrics" => {
+            let stats = daemon_stats(&paths)?;
+            writeln!(stream, "# TYPE majutsu_daemon_up gauge")?;
+            writeln!(stream, "majutsu_daemon_up 1")?;
+            writeln!(stream, "# TYPE majutsu_daemon_ipc_up gauge")?;
+            writeln!(stream, "majutsu_daemon_ipc_up 1")?;
+            writeln!(stream, "# TYPE majutsu_daemon_roots gauge")?;
+            writeln!(stream, "majutsu_daemon_roots {}", stats.roots)?;
+            writeln!(stream, "# TYPE majutsu_daemon_journal_events gauge")?;
+            writeln!(
+                stream,
+                "majutsu_daemon_journal_events {}",
+                stats.journal_events
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_pending_journal_events {}",
+                bool_metric(stats.pending_journal_events)
+            )?;
+            writeln!(stream, "# TYPE majutsu_daemon_queued_uploads gauge")?;
+            writeln!(
+                stream,
+                "majutsu_daemon_queued_uploads {}",
+                stats.queued_uploads
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_queued_uploads_retrying {}",
+                stats.queued_uploads_retrying
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_queued_uploads_delayed {}",
+                stats.queued_uploads_delayed
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_queued_upload_attempts {}",
+                stats.queued_upload_attempts
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_queued_upload_max_attempts {}",
+                stats.queued_upload_max_attempts
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_upload_queue_backpressure {}",
+                bool_metric(stats.upload_queue_backpressure)
+            )?;
+            writeln!(stream, "# TYPE majutsu_daemon_restore_jobs gauge")?;
+            writeln!(stream, "majutsu_daemon_restore_jobs {}", stats.restore_jobs)?;
+            for (status, count) in stats.root_statuses {
+                writeln!(
+                    stream,
+                    "majutsu_daemon_root_status{{status=\"{}\"}} {}",
+                    escape_metric_label(&status),
+                    count
+                )?;
+            }
+            for (status, count) in stats.restore_statuses {
+                writeln!(
+                    stream,
+                    "majutsu_daemon_restore_status{{status=\"{}\"}} {}",
+                    escape_metric_label(&status),
+                    count
+                )?;
             }
         }
         other => {
@@ -151,6 +235,54 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
         }
     }
     Ok(())
+}
+
+fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
+    let conn = open_db(paths)?;
+    let roots = roots(&conn)?;
+    let mut root_statuses = BTreeMap::new();
+    for root in &roots {
+        *root_statuses.entry(root.status.clone()).or_insert(0usize) += 1;
+    }
+    let current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
+    let journal_records = event_journal_records(paths)?;
+    let pending_journal_events = majutsu_db::has_pending_journal_events(&journal_records);
+    let upload_stats = upload_queue_stats(paths)?;
+    let restore_statuses = restore_queue_status_counts(paths)?;
+    let restore_jobs = restore_statuses
+        .iter()
+        .filter(|(status, _)| status.as_str() != "done")
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+
+    Ok(DaemonStats {
+        pid: std::process::id(),
+        roots: roots.len(),
+        current,
+        journal_events: journal_records.len(),
+        pending_journal_events,
+        queued_uploads: upload_stats.total,
+        queued_uploads_retrying: upload_stats.retrying,
+        queued_uploads_delayed: upload_stats.delayed,
+        queued_upload_next_retry_after: upload_stats
+            .next_retry_after
+            .map(|retry_after| retry_after.to_rfc3339())
+            .unwrap_or_else(|| "(none)".into()),
+        queued_upload_attempts: upload_stats.attempts,
+        queued_upload_max_attempts: upload_stats.max_attempts,
+        upload_queue_backpressure: upload_stats.has_backpressure(),
+        restore_jobs,
+        root_statuses,
+        restore_statuses,
+    })
+}
+
+fn bool_metric(value: bool) -> u8 {
+    u8::from(value)
+}
+
+fn escape_metric_label(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn restore_queue_status_counts(paths: &Paths) -> Result<BTreeMap<String, usize>> {

@@ -511,6 +511,7 @@ Minimal background daemon management:
 ```sh
 mj daemon start --interval-secs 60
 mj daemon status
+mj daemon metrics
 mj daemon stop
 mj daemon service --provider systemd > ~/.config/systemd/user/majutsu.service
 mj daemon service --provider launchd > ~/Library/LaunchAgents/dev.majutsu.watch.plist
@@ -531,6 +532,8 @@ event journal counts, whether replay is pending, queued upload retry/backpressur
 state, and active restore jobs. Those backlog fields are intended to make crash
 recovery visible before running `mj snapshot`, `mj sync`, or
 `mj restore resume`.
+`mj daemon metrics` returns the same daemon health and backlog counters in a
+Prometheus-compatible text format for local scraping or service watchdogs.
 `daemon service` renders a user-level systemd unit or launchd plist using the
 resolved state home and `[watch]` timing settings, so the same daemon command
 line can be supervised by the host init system.

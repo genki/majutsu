@@ -386,6 +386,7 @@ pub(crate) enum DaemonCommand {
     },
     Stop,
     Status,
+    Metrics,
 }
 
 #[derive(Subcommand)]

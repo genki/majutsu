@@ -2101,6 +2101,23 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 println!("stopped");
             }
         }
+        DaemonCommand::Metrics => {
+            if let Some(pid) = read_pid(&paths.daemon_pid)? {
+                if pid_alive(pid) {
+                    if let Ok(reply) = daemon_ipc_request(paths, "metrics") {
+                        println!("{reply}");
+                    } else {
+                        println!("majutsu_daemon_up 1");
+                        println!("majutsu_daemon_ipc_up 0");
+                    }
+                } else {
+                    println!("majutsu_daemon_up 0");
+                    println!("majutsu_daemon_stale_pid {}", pid);
+                }
+            } else {
+                println!("majutsu_daemon_up 0");
+            }
+        }
     }
     Ok(())
 }

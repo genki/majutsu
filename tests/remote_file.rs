@@ -9356,6 +9356,20 @@ fn daemon_status_uses_ipc_socket() {
     assert!(status.contains("upload_queue_backpressure true"));
     assert!(status.contains("restore_jobs 1"));
     assert!(status.contains("restore_status prepared 1"));
+    let metrics = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("metrics");
+        c
+    });
+    assert!(metrics.contains("majutsu_daemon_up 1"));
+    assert!(metrics.contains("majutsu_daemon_ipc_up 1"));
+    assert!(metrics.contains("majutsu_daemon_roots 1"));
+    assert!(metrics.contains("majutsu_daemon_queued_uploads 1"));
+    assert!(metrics.contains("majutsu_daemon_queued_uploads_delayed 1"));
+    assert!(metrics.contains("majutsu_daemon_upload_queue_backpressure 1"));
+    assert!(metrics.contains("majutsu_daemon_restore_jobs 1"));
+    assert!(metrics.contains("majutsu_daemon_root_status{status=\"active\"} 1"));
+    assert!(metrics.contains("majutsu_daemon_restore_status{status=\"prepared\"} 1"));
     child.kill().unwrap();
     let _ = child.wait();
 }
