@@ -5284,10 +5284,7 @@ fn apply_restore_plan(
                 restore_special_file(&dest, record, special_kind, force)?;
             }
             Payload::Symlink { target } => {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(target, &dest)?;
-                #[cfg(not(unix))]
-                fs::write(&dest, target)?;
+                restore_symlink(&dest, target, force)?;
             }
             payload => {
                 if let Some((oid, object_key)) = payload_blob_ref(payload) {
@@ -5423,6 +5420,23 @@ fn print_restore_deletes(plan: &RestorePlan) {
     if plan.deletes.len() > 20 {
         println!("delete\t... {} more", plan.deletes.len() - 20);
     }
+}
+
+fn restore_symlink(dest: &Path, target: &str, force: bool) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(dest) {
+        if !force {
+            bail!("symlink restore target exists: {}", dest.display());
+        }
+        if meta.file_type().is_dir() {
+            bail!("symlink restore target is a directory: {}", dest.display());
+        }
+        fs::remove_file(dest)?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, dest)?;
+    #[cfg(not(unix))]
+    fs::write(dest, target)?;
+    Ok(())
 }
 
 fn apply_file_metadata(dest: &Path, record: &FileRecord) -> Result<()> {
