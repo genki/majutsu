@@ -4915,6 +4915,7 @@ fn fsck(paths: &Paths) -> Result<()> {
     }
     validate_host_file(paths, &config, &mut missing)?;
     validate_config_roots(paths, &conn, &config, &mut missing)?;
+    validate_local_refs(&conn, &mut missing)?;
     validate_local_snapshot_objects(paths, &export, &mut missing)?;
     validate_local_large_manifest_objects(paths, &export, &mut missing)?;
     validate_local_pack_objects(paths, &export, &mut missing)?;
@@ -4927,6 +4928,45 @@ fn fsck(paths: &Paths) -> Result<()> {
         bail!("fsck found {missing} problems");
     }
     println!("fsck ok");
+    Ok(())
+}
+
+fn validate_local_refs(conn: &Connection, missing: &mut usize) -> Result<()> {
+    let snapshot_ids = {
+        let mut stmt = conn.prepare("select id from snapshots")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?
+    };
+    let mut seen = BTreeSet::new();
+    let mut stmt = conn.prepare("select name, value from refs order by name")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (name, value) = row?;
+        if !seen.insert(name.clone()) {
+            *missing += 1;
+            eprintln!("duplicate local ref {name}");
+        }
+        match name.as_str() {
+            "current" => {
+                if !snapshot_ids.contains(&value) {
+                    *missing += 1;
+                    eprintln!("local ref {name} points to missing snapshot {value}");
+                }
+            }
+            "last-synced" => {
+                if let Err(err) = parse_db_time(&value) {
+                    *missing += 1;
+                    eprintln!("local ref last-synced has invalid timestamp {value}: {err}");
+                }
+            }
+            _ => {
+                *missing += 1;
+                eprintln!("unknown local ref {name}");
+            }
+        }
+    }
     Ok(())
 }
 
