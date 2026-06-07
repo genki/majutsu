@@ -4955,6 +4955,7 @@ fn validate_local_history_graph(export: &MetadataExport, missing: &mut usize) ->
         }
     }
     for operation in &export.operations {
+        validate_operation_entry(operation, missing);
         if let Some(parent) = operation.parent_op.as_deref() {
             if !operation_ids.contains(parent) {
                 *missing += 1;
@@ -4970,6 +4971,73 @@ fn validate_local_history_graph(export: &MetadataExport, missing: &mut usize) ->
         }
     }
     Ok(())
+}
+
+fn validate_operation_entry(operation: &OperationExport, missing: &mut usize) {
+    if !operation.id.starts_with("op-") {
+        *missing += 1;
+        eprintln!("operation {} has invalid id", operation.id);
+    }
+    if !valid_operation_kind(&operation.kind) {
+        *missing += 1;
+        eprintln!(
+            "operation {} has invalid kind {}",
+            operation.id, operation.kind
+        );
+    }
+    if !matches!(operation.status.as_str(), "done" | "running" | "failed") {
+        *missing += 1;
+        eprintln!(
+            "operation {} has invalid status {}",
+            operation.id, operation.status
+        );
+    }
+    if operation.actor.trim().is_empty() {
+        *missing += 1;
+        eprintln!("operation {} has empty actor", operation.id);
+    }
+    if let Err(err) = parse_db_time(&operation.created_at) {
+        *missing += 1;
+        eprintln!(
+            "operation {} has invalid created_at {}: {err}",
+            operation.id, operation.created_at
+        );
+    }
+}
+
+fn valid_operation_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "init"
+            | "root-added"
+            | "config-change"
+            | "root-removed"
+            | "root-paused"
+            | "root-resumed"
+            | "root-mark-deleted"
+            | "root-missing"
+            | "root-unmounted"
+            | "root-permission-denied"
+            | "manual-snapshot"
+            | "file-events-batch"
+            | "op-restore"
+            | "restore"
+            | "restore-prepare"
+            | "restore-resume"
+            | "mount"
+            | "mount-fuse"
+            | "unmount"
+            | "unmount-fuse"
+            | "hydrate"
+            | "large-pin"
+            | "large-unpin"
+            | "remote-sync"
+            | "key-rotation"
+            | "pack"
+            | "pack-compact"
+            | "prune"
+            | "gc"
+    )
 }
 
 fn validate_remote_refs(conn: &Connection, config: &Config, missing: &mut usize) -> Result<()> {
