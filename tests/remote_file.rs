@@ -97,6 +97,22 @@ fn db_ref(state: &std::path::Path, name: &str) -> Option<String> {
     .ok()
 }
 
+fn db_remote_ref_count(state: &std::path::Path) -> i64 {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.query_row("select count(*) from remote_refs", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn db_remote_ref_value(state: &std::path::Path, name: &str) -> Option<String> {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.query_row(
+        "select value from remote_refs where name=?1",
+        [name],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
 fn db_operation_count(state: &std::path::Path, kind: &str) -> i64 {
     let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
     conn.query_row(
@@ -184,6 +200,20 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c
     });
     assert!(sync_status.contains("remote_last_synced "));
+    let current_ref_name = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("refs/current").exists())
+        .map(|path| {
+            let host_id = path.file_name().unwrap().to_string_lossy();
+            format!("hosts/{host_id}/refs/current")
+        })
+        .unwrap();
+    assert_eq!(
+        db_remote_ref_value(&state, &current_ref_name),
+        db_ref(&state, "current")
+    );
+    assert_eq!(db_remote_ref_count(&state), 2);
     assert!(
         state
             .join("queue/uploads")
@@ -319,6 +349,8 @@ fn file_remote_clone_restores_normal_and_large_files() {
         local_oplog_record_count(&host_clone) as i64,
         db_total_operation_count(&host_clone)
     );
+    assert_eq!(db_remote_ref_count(&clone), 2);
+    assert_eq!(db_remote_ref_count(&host_clone), 2);
     run({
         let mut c = mj();
         c.arg("--home").arg(&clone).arg("fsck");
@@ -1782,6 +1814,7 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
     });
 
     assert_eq!(db_ref(&state, "last-synced"), None);
+    assert_eq!(db_remote_ref_count(&state), 0);
     assert_eq!(db_operation_count(&state, "remote-sync"), 0);
     assert_eq!(
         local_oplog_record_count(&state) as i64,
@@ -1797,6 +1830,7 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
     });
 
     assert!(db_ref(&state, "last-synced").is_some());
+    assert_eq!(db_remote_ref_count(&state), 2);
     assert_eq!(db_operation_count(&state, "remote-sync"), 1);
     assert_eq!(
         local_oplog_record_count(&state) as i64,

@@ -2855,6 +2855,7 @@ fn enqueue_and_drain_sync(
     }
     let uploaded = drain_upload_queue(paths, &remote)?;
     let pruned_remote_exports = prune_remote_host_exports(&remote, &config.host.id, &export)?;
+    persist_export_remote_refs(conn, &remote.describe(), &config.host.id, &export.refs)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
     Ok(())
@@ -2888,6 +2889,40 @@ fn restore_ref_value(conn: &Connection, name: &str, value: Option<&str>) -> Resu
     }
 }
 
+fn set_remote_ref_value(conn: &Connection, remote: &str, name: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "insert into remote_refs(remote, name, value, observed_at) values (?1, ?2, ?3, ?4)
+         on conflict(remote, name) do update set value=excluded.value, observed_at=excluded.observed_at",
+        params![remote, name, value, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn persist_export_remote_refs(
+    conn: &Connection,
+    remote: &str,
+    host_id: &str,
+    refs: &BTreeMap<String, String>,
+) -> Result<()> {
+    if let Some(current) = refs.get("current") {
+        set_remote_ref_value(
+            conn,
+            remote,
+            &format!("hosts/{host_id}/refs/current"),
+            current,
+        )?;
+    }
+    if let Some(last_synced) = refs.get("last-synced") {
+        set_remote_ref_value(
+            conn,
+            remote,
+            &format!("hosts/{host_id}/refs/last-synced"),
+            last_synced,
+        )?;
+    }
+    Ok(())
+}
+
 fn delete_operation(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("delete from operations where id=?1", params![id])?;
     rewrite_local_oplog(conn)?;
@@ -2904,6 +2939,12 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
         remote_current = remote_ref(remote, "hosts/current")?;
     }
     let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
+    if let Some(value) = remote_current.as_deref() {
+        set_remote_ref_value(conn, &remote.describe(), &canonical_current, value)?;
+    }
+    if let Some(value) = remote_last_synced.as_deref() {
+        set_remote_ref_value(conn, &remote.describe(), &canonical_last_synced, value)?;
+    }
     let export = export_metadata(conn, &read_config(paths)?)?;
     let local_keys = local_object_keys(&export);
     let mut missing_remote = 0usize;
@@ -3456,6 +3497,12 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     }
     let conn = open_db(paths)?;
     import_metadata(&conn, &export)?;
+    persist_export_remote_refs(
+        &conn,
+        &remote.describe(),
+        &export.config.host.id,
+        &export.refs,
+    )?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
     Ok(())
@@ -7071,6 +7118,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         create table if not exists large_objects(oid text primary key, size integer not null, chunk_count integer not null, manifest_key text not null);
         create table if not exists chunks(oid text primary key, size integer not null, object_key text not null);
         create table if not exists large_pins(oid text primary key, pinned_at text not null, reason text);
+        create table if not exists remote_refs(
+          remote text not null,
+          name text not null,
+          value text not null,
+          observed_at text not null,
+          primary key(remote, name)
+        );
         ",
     )?;
     let _ = conn.execute("alter table blobs add column pack_id text", []);
