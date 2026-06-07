@@ -1,3 +1,6 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
 pub const ROOTS_TABLE: &str = "roots";
 pub const SNAPSHOTS_TABLE: &str = "snapshots";
 pub const OPERATIONS_TABLE: &str = "operations";
@@ -64,9 +67,101 @@ pub fn compat_migrations() -> &'static [&'static str] {
     COMPAT_MIGRATIONS
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadQueueItem {
+    pub id: String,
+    pub key: String,
+    pub source: Option<String>,
+    pub inline: Option<Vec<u8>>,
+    pub created_at: DateTime<Utc>,
+    pub attempts: u32,
+}
+
+impl UploadQueueItem {
+    pub fn inline(id: String, key: String, bytes: Vec<u8>, created_at: DateTime<Utc>) -> Self {
+        Self {
+            id,
+            key,
+            source: None,
+            inline: Some(bytes),
+            created_at,
+            attempts: 0,
+        }
+    }
+
+    pub fn file(id: String, key: String, source: String, created_at: DateTime<Utc>) -> Self {
+        Self {
+            id,
+            key,
+            source: Some(source),
+            inline: None,
+            created_at,
+            attempts: 0,
+        }
+    }
+
+    pub fn preserve_retry_state(self, existing: &Self) -> Self {
+        Self {
+            attempts: existing.attempts,
+            created_at: existing.created_at,
+            ..self
+        }
+    }
+
+    pub fn record_attempt(&mut self) {
+        self.attempts += 1;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventJournalRecord {
+    pub event_id: String,
+    pub kind: String,
+    pub observed_at: DateTime<Utc>,
+    pub detail: String,
+}
+
+impl EventJournalRecord {
+    pub fn new(event_id: String, kind: String, observed_at: DateTime<Utc>, detail: String) -> Self {
+        Self {
+            event_id,
+            kind,
+            observed_at,
+            detail,
+        }
+    }
+
+    pub fn is_snapshot_finish(&self) -> bool {
+        self.kind == "snapshot-finish"
+    }
+
+    pub fn is_pending_trigger(&self) -> bool {
+        matches!(self.kind.as_str(), "fs-event" | "periodic-rescan")
+    }
+}
+
+pub fn has_pending_journal_events(records: &[EventJournalRecord]) -> bool {
+    let last_snapshot_finish = records
+        .iter()
+        .filter(|event| event.is_snapshot_finish())
+        .map(|event| event.observed_at)
+        .max();
+    records.iter().any(|event| {
+        event.is_pending_trigger()
+            && last_snapshot_finish
+                .map(|finished_at| event.observed_at > finished_at)
+                .unwrap_or(true)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn time(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).unwrap()
+    }
 
     #[test]
     fn schema_defines_required_spec_tables() {
@@ -117,5 +212,95 @@ mod tests {
         );
         assert!(COMPAT_MIGRATIONS.iter().any(|sql| sql.contains("actor")));
         assert!(COMPAT_MIGRATIONS.iter().any(|sql| sql.contains("status")));
+    }
+
+    #[test]
+    fn upload_queue_item_preserves_retry_state_on_reenqueue() {
+        let existing = UploadQueueItem::inline(
+            "upload-a".into(),
+            "objects/a".into(),
+            b"old".to_vec(),
+            time(10),
+        );
+        let mut existing = existing;
+        existing.record_attempt();
+        existing.record_attempt();
+
+        let reenqueued = UploadQueueItem::file(
+            "upload-a".into(),
+            "objects/a".into(),
+            "/tmp/a".into(),
+            time(20),
+        )
+        .preserve_retry_state(&existing);
+
+        assert_eq!(reenqueued.attempts, 2);
+        assert_eq!(reenqueued.created_at, time(10));
+        assert_eq!(reenqueued.source.as_deref(), Some("/tmp/a"));
+        assert!(reenqueued.inline.is_none());
+    }
+
+    #[test]
+    fn upload_queue_item_json_shape_is_stable() {
+        let item = UploadQueueItem::inline(
+            "upload-a".into(),
+            "objects/a".into(),
+            b"abc".to_vec(),
+            time(10),
+        );
+        let json = serde_json::to_value(&item).unwrap();
+
+        assert_eq!(json["id"], "upload-a");
+        assert_eq!(json["key"], "objects/a");
+        assert_eq!(json["source"], serde_json::Value::Null);
+        assert_eq!(json["inline"], serde_json::json!([97, 98, 99]));
+        assert_eq!(json["attempts"], 0);
+    }
+
+    #[test]
+    fn journal_pending_events_follow_latest_snapshot_finish() {
+        assert!(has_pending_journal_events(&[EventJournalRecord::new(
+            "event-1".into(),
+            "fs-event".into(),
+            time(10),
+            "write a".into(),
+        )]));
+
+        assert!(!has_pending_journal_events(&[
+            EventJournalRecord::new(
+                "event-1".into(),
+                "fs-event".into(),
+                time(10),
+                "write a".into(),
+            ),
+            EventJournalRecord::new(
+                "event-2".into(),
+                "snapshot-finish".into(),
+                time(20),
+                "snapshot complete".into(),
+            ),
+        ]));
+
+        assert!(has_pending_journal_events(&[
+            EventJournalRecord::new(
+                "event-1".into(),
+                "snapshot-finish".into(),
+                time(20),
+                "snapshot complete".into(),
+            ),
+            EventJournalRecord::new(
+                "event-2".into(),
+                "periodic-rescan".into(),
+                time(30),
+                "timer".into(),
+            ),
+        ]));
+
+        assert!(!has_pending_journal_events(&[EventJournalRecord::new(
+            "event-1".into(),
+            "event-journal-replay".into(),
+            time(30),
+            "replay".into(),
+        )]));
     }
 }

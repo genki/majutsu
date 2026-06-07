@@ -18,6 +18,7 @@ use majutsu_core::{
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
+use majutsu_db::{EventJournalRecord, UploadQueueItem};
 use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
 use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
 use majutsu_restore::{
@@ -626,24 +627,6 @@ struct MetadataExport {
     packs: Vec<PackExport>,
     #[serde(default)]
     large_pins: Vec<LargePinExport>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct UploadQueueItem {
-    id: String,
-    key: String,
-    source: Option<String>,
-    inline: Option<Vec<u8>>,
-    created_at: DateTime<Utc>,
-    attempts: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct EventJournalRecord {
-    event_id: String,
-    kind: String,
-    observed_at: DateTime<Utc>,
-    detail: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3048,28 +3031,24 @@ fn remote_host_index_with_legacy(remote: &RemoteStore) -> Result<RemoteHostIndex
 fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()> {
     write_upload_item(
         paths,
-        UploadQueueItem {
-            id: format!("upload-{}", blake3_hex(key.as_bytes())),
-            key: key.to_string(),
-            source: None,
-            inline: Some(bytes),
-            created_at: Utc::now(),
-            attempts: 0,
-        },
+        UploadQueueItem::inline(
+            format!("upload-{}", blake3_hex(key.as_bytes())),
+            key.to_string(),
+            bytes,
+            Utc::now(),
+        ),
     )
 }
 
 fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Result<()> {
     write_upload_item(
         paths,
-        UploadQueueItem {
-            id: format!("upload-{}", blake3_hex(key.as_bytes())),
-            key: key.to_string(),
-            source: Some(path_to_slash(source)),
-            inline: None,
-            created_at: Utc::now(),
-            attempts: 0,
-        },
+        UploadQueueItem::file(
+            format!("upload-{}", blake3_hex(key.as_bytes())),
+            key.to_string(),
+            path_to_slash(source),
+            Utc::now(),
+        ),
     )
 }
 
@@ -3078,11 +3057,7 @@ fn write_upload_item(paths: &Paths, item: UploadQueueItem) -> Result<()> {
     let path = paths.upload_queue.join(format!("{}.json", item.id));
     let item = if path.exists() {
         let existing: UploadQueueItem = serde_json::from_slice(&fs::read(&path)?)?;
-        UploadQueueItem {
-            attempts: existing.attempts,
-            created_at: existing.created_at,
-            ..item
-        }
+        item.preserve_retry_state(&existing)
     } else {
         item
     };
@@ -3134,7 +3109,7 @@ fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
                 uploaded += 1;
             }
             Err(err) => {
-                item.attempts += 1;
+                item.record_attempt();
                 fs::write(&path, serde_json::to_vec_pretty(&item)?)?;
                 return Err(err).with_context(|| format!("upload failed for {}", item.key));
             }
@@ -3145,12 +3120,12 @@ fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
 
 fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {
     fs::create_dir_all(&paths.event_queue)?;
-    let event = EventJournalRecord {
-        event_id: new_id("event"),
-        kind: kind.to_string(),
-        observed_at: Utc::now(),
-        detail: detail.to_string(),
-    };
+    let event = EventJournalRecord::new(
+        new_id("event"),
+        kind.to_string(),
+        Utc::now(),
+        detail.to_string(),
+    );
     let path = paths.event_queue.join(format!("{}.json", event.event_id));
     fs::write(path, serde_json::to_vec_pretty(&event)?)?;
     Ok(())
@@ -3175,17 +3150,7 @@ fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRecord>> {
 
 fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
     let records = event_journal_records(paths)?;
-    let last_snapshot_finish = records
-        .iter()
-        .filter(|event| event.kind == "snapshot-finish")
-        .map(|event| event.observed_at)
-        .max();
-    Ok(records.iter().any(|event| {
-        matches!(event.kind.as_str(), "fs-event" | "periodic-rescan")
-            && last_snapshot_finish
-                .map(|finished_at| event.observed_at > finished_at)
-                .unwrap_or(true)
-    }))
+    Ok(majutsu_db::has_pending_journal_events(&records))
 }
 
 fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
