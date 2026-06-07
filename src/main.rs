@@ -70,6 +70,7 @@ use walkdir::WalkDir;
 mod cli;
 mod config;
 mod daemon_runtime;
+mod db_refs;
 mod fs_meta;
 mod object_paths;
 mod process_runtime;
@@ -96,6 +97,9 @@ use config::{
     validate_snapshot_mode, validate_watch_mode, write_config,
 };
 use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
+use db_refs::{
+    persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
+};
 use fs_meta::{
     apply_xattrs, file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind,
 };
@@ -1849,63 +1853,6 @@ fn enqueue_and_drain_sync(
     persist_export_remote_refs(conn, &remote.describe(), &config.host.id, &export.refs)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
-    Ok(())
-}
-
-fn ref_value(conn: &Connection, name: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "select value from refs where name=?1",
-        params![name],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-fn set_ref_value(conn: &Connection, name: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "insert into refs(name, value) values (?1, ?2)
-         on conflict(name) do update set value=excluded.value",
-        params![name, value],
-    )?;
-    Ok(())
-}
-
-fn restore_ref_value(conn: &Connection, name: &str, value: Option<&str>) -> Result<()> {
-    if let Some(value) = value {
-        set_ref_value(conn, name, value)
-    } else {
-        conn.execute("delete from refs where name=?1", params![name])?;
-        Ok(())
-    }
-}
-
-fn set_remote_ref_value(conn: &Connection, remote: &str, name: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "insert into remote_refs(remote, name, value, observed_at) values (?1, ?2, ?3, ?4)
-         on conflict(remote, name) do update set value=excluded.value, observed_at=excluded.observed_at",
-        params![remote, name, value, Utc::now().to_rfc3339()],
-    )?;
-    Ok(())
-}
-
-fn persist_export_remote_refs(
-    conn: &Connection,
-    remote: &str,
-    host_id: &str,
-    refs: &BTreeMap<String, String>,
-) -> Result<()> {
-    if let Some(current) = refs.get("current") {
-        set_remote_ref_value(conn, remote, &host_current_ref_key(host_id), current)?;
-    }
-    if let Some(last_synced) = refs.get("last-synced") {
-        set_remote_ref_value(
-            conn,
-            remote,
-            &host_last_synced_ref_key(host_id),
-            last_synced,
-        )?;
-    }
     Ok(())
 }
 
