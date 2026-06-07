@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use majutsu_restore::RestoreQueueItem;
 use std::fs;
 
-use crate::Paths;
+use crate::{Paths, RestorePlan};
 
 pub(crate) fn write_restore_job(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
     let dir = paths.home.join("queue/restores");
@@ -47,4 +47,24 @@ pub(crate) fn mark_restore_job_done(paths: &Paths, job_id: &str) -> Result<()> {
     let mut job = read_restore_job(paths, job_id)?;
     job.mark_done();
     write_restore_job(paths, &job)
+}
+
+pub(crate) fn print_restore_conflicts(conflicts: &[String]) {
+    println!("conflicts {}", conflicts.len());
+    for conflict in conflicts.iter().take(20) {
+        println!("conflict\t{conflict}");
+    }
+    if conflicts.len() > 20 {
+        println!("conflict\t... {} more", conflicts.len() - 20);
+    }
+}
+
+pub(crate) fn print_restore_deletes(plan: &RestorePlan) {
+    println!("deletes {}", plan.deletes.len());
+    for delete in plan.deletes.iter().take(20) {
+        println!("delete\t{}\t{}", delete.root_id, delete.path);
+    }
+    if plan.deletes.len() > 20 {
+        println!("delete\t... {} more", plan.deletes.len() - 20);
+    }
 }

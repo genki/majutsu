@@ -87,7 +87,8 @@ use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use restore_runtime::{
     ensure_restore_job_has_no_missing_objects, ensure_restore_job_not_blocked,
-    ensure_restore_job_resumable, mark_restore_job_done, read_restore_job, write_restore_job,
+    ensure_restore_job_resumable, mark_restore_job_done, print_restore_conflicts,
+    print_restore_deletes, read_restore_job, write_restore_job,
 };
 use watch_runtime::{
     default_watch_backend, format_notify_event, normalize_watch_backend, recv_watch_event,
@@ -6533,26 +6534,6 @@ fn restore_record_matches_path(
                 Ok(false)
             }
         }
-    }
-}
-
-fn print_restore_conflicts(conflicts: &[String]) {
-    println!("conflicts {}", conflicts.len());
-    for conflict in conflicts.iter().take(20) {
-        println!("conflict\t{conflict}");
-    }
-    if conflicts.len() > 20 {
-        println!("conflict\t... {} more", conflicts.len() - 20);
-    }
-}
-
-fn print_restore_deletes(plan: &RestorePlan) {
-    println!("deletes {}", plan.deletes.len());
-    for delete in plan.deletes.iter().take(20) {
-        println!("delete\t{}\t{}", delete.root_id, delete.path);
-    }
-    if plan.deletes.len() > 20 {
-        println!("delete\t... {} more", plan.deletes.len() - 20);
     }
 }
 
