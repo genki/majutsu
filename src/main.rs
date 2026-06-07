@@ -6370,6 +6370,7 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
             params![pin.oid, pin.pinned_at, pin.reason],
         )?;
     }
+    rewrite_local_oplog(conn)?;
     Ok(())
 }
 

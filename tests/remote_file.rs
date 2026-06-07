@@ -294,6 +294,14 @@ fn file_remote_clone_restores_normal_and_large_files() {
             .arg("test-host");
         c
     });
+    assert_eq!(
+        local_oplog_record_count(&clone) as i64,
+        db_total_operation_count(&clone)
+    );
+    assert_eq!(
+        local_oplog_record_count(&host_clone) as i64,
+        db_total_operation_count(&host_clone)
+    );
     run({
         let mut c = mj();
         c.arg("--home").arg(&clone).arg("fsck");
