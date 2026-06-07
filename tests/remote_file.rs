@@ -543,6 +543,126 @@ fn multi_root_sync_clone_restore_preserves_host_snapshot() {
 }
 
 #[test]
+fn encrypted_multi_root_remote_recovery_uses_exported_master_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs");
+    let media = tmp.path().join("media");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(&media).unwrap();
+    fs::write(docs.join("secret.txt"), b"multi root secret\n").unwrap();
+    fs::write(media.join("payload.zip"), vec![9u8; 32 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--encrypt")
+            .arg("--host-name")
+            .arg("encrypted-multi")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("docs")
+            .arg(&docs);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("media")
+            .arg(&media);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let exported_key = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("key").arg("export");
+        c
+    })
+    .trim()
+    .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let plain_oid = blake3::hash(b"multi root secret\n").to_hex().to_string();
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    assert_eq!(export["roots"].as_array().unwrap().len(), 2);
+    let object_key = export["blobs"][0]["object_key"].as_str().unwrap();
+    assert!(!object_key.contains(&plain_oid));
+    assert!(
+        fs::read(remote.join(object_key))
+            .unwrap()
+            .starts_with(b"age-encryption.org/v1")
+    );
+    assert!(remote.join("keys/recipients.toml").exists());
+
+    fs::remove_dir_all(&state).unwrap();
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_MASTER_KEY", &exported_key)
+            .arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(clone.join("keys/master.key"))
+            .unwrap()
+            .trim(),
+        exported_key
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(docs.join("secret.txt")).unwrap(),
+        fs::read(restore.join("docs/secret.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(media.join("payload.zip")).unwrap(),
+        fs::read(restore.join("media/payload.zip")).unwrap()
+    );
+}
+
+#[test]
 fn file_remote_clone_preserves_restore_archive_config() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

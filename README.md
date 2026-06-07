@@ -341,9 +341,9 @@ New state can encrypt local and remote object payloads:
 mj init --encrypt --remote s3://bucket/prefix
 ```
 
-Encrypted objects are written with a `MJENC1` header and ChaCha20-Poly1305
-ciphertext. `mj init --encrypt` writes `[security] encryption = "age"` in
-`config.toml`; the older `chacha20poly1305` value is still accepted for existing
+`mj init --encrypt` writes `[security] encryption = "age"` in `config.toml`.
+Objects are encrypted for the generated age recipient when a keyring is present;
+the older `MJENC1`/ChaCha20-Poly1305 envelope is still accepted for existing
 state. For encrypted state, content object paths are derived with HMAC-SHA256
 from the master key and the internal content id, so remote object keys do not
 expose raw plaintext hashes. Existing plaintext objects remain readable for
@@ -372,8 +372,8 @@ mj sync
 Rotation currently supports unpacked encrypted objects. Run it before packing
 normal blobs.
 
-To recover from remote storage into a fresh state, provide the key with an
-environment variable or import it first:
+To recover from remote storage into a fresh state, provide the master key with an
+environment variable during clone, or import it before verifying/restoring:
 
 ```sh
 MAJUTSU_MASTER_KEY=<64-hex-key> mj --home /tmp/recovered clone --remote s3://bucket/prefix
