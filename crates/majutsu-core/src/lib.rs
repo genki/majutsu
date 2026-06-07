@@ -211,6 +211,100 @@ where
     issues
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostFileIssue {
+    IdMismatch {
+        host_id: String,
+        config_host_id: String,
+    },
+    NameMismatch {
+        host_name: String,
+        config_host_name: String,
+    },
+}
+
+pub fn host_file_issues(
+    host_id: &str,
+    host_name: &str,
+    config_host_id: &str,
+    config_host_name: &str,
+) -> Vec<HostFileIssue> {
+    let mut issues = Vec::new();
+    if host_id != config_host_id {
+        issues.push(HostFileIssue::IdMismatch {
+            host_id: host_id.to_string(),
+            config_host_id: config_host_id.to_string(),
+        });
+    }
+    if host_name != config_host_name {
+        issues.push(HostFileIssue::NameMismatch {
+            host_name: host_name.to_string(),
+            config_host_name: config_host_name.to_string(),
+        });
+    }
+    issues
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigRootIssue {
+    DuplicateRootId { id: String },
+    DatabaseMissingConfig { id: String },
+    ConfigMissingDatabase { id: String },
+    ConfigMismatch { id: String },
+}
+
+pub fn config_root_consistency_issues<I, J, K, L>(
+    all_config_root_ids: I,
+    valid_config_root_ids: J,
+    db_root_ids: K,
+    mismatched_root_ids: L,
+) -> Vec<ConfigRootIssue>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+    J: IntoIterator,
+    J::Item: AsRef<str>,
+    K: IntoIterator,
+    K::Item: AsRef<str>,
+    L: IntoIterator,
+    L::Item: AsRef<str>,
+{
+    let mut issues = Vec::new();
+    let mut seen_config_ids = BTreeSet::new();
+    for id in all_config_root_ids {
+        let id = id.as_ref();
+        if !seen_config_ids.insert(id.to_string()) {
+            issues.push(ConfigRootIssue::DuplicateRootId { id: id.to_string() });
+        }
+    }
+    let valid_config_root_ids = valid_config_root_ids
+        .into_iter()
+        .map(|id| id.as_ref().to_string())
+        .collect::<BTreeSet<_>>();
+    let db_root_ids = db_root_ids
+        .into_iter()
+        .map(|id| id.as_ref().to_string())
+        .collect::<BTreeSet<_>>();
+
+    for id in &db_root_ids {
+        if !valid_config_root_ids.contains(id) {
+            issues.push(ConfigRootIssue::DatabaseMissingConfig { id: id.clone() });
+        }
+    }
+    for id in &valid_config_root_ids {
+        if !db_root_ids.contains(id) {
+            issues.push(ConfigRootIssue::ConfigMissingDatabase { id: id.clone() });
+        }
+    }
+    for id in mismatched_root_ids {
+        let id = id.as_ref();
+        if valid_config_root_ids.contains(id) && db_root_ids.contains(id) {
+            issues.push(ConfigRootIssue::ConfigMismatch { id: id.to_string() });
+        }
+    }
+    issues
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
     #[serde(rename = "op_id", alias = "id")]
@@ -769,6 +863,49 @@ mod tests {
                 &BTreeSet::from(["chunk-live".to_string()]),
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_file_validation_reports_config_drift() {
+        assert_eq!(
+            host_file_issues("host-file", "old-name", "host-config", "new-name"),
+            vec![
+                HostFileIssue::IdMismatch {
+                    host_id: "host-file".into(),
+                    config_host_id: "host-config".into(),
+                },
+                HostFileIssue::NameMismatch {
+                    host_name: "old-name".into(),
+                    config_host_name: "new-name".into(),
+                },
+            ]
+        );
+        assert!(host_file_issues("host-a", "alice", "host-a", "alice").is_empty());
+    }
+
+    #[test]
+    fn config_root_consistency_validation_reports_config_and_db_drift() {
+        let issues = config_root_consistency_issues(
+            ["alpha", "alpha", "config-only", "drift"],
+            ["alpha", "config-only", "drift"],
+            ["db-only", "drift"],
+            ["drift", "not-common"],
+        );
+
+        assert_eq!(
+            issues,
+            vec![
+                ConfigRootIssue::DuplicateRootId { id: "alpha".into() },
+                ConfigRootIssue::DatabaseMissingConfig {
+                    id: "db-only".into()
+                },
+                ConfigRootIssue::ConfigMissingDatabase { id: "alpha".into() },
+                ConfigRootIssue::ConfigMissingDatabase {
+                    id: "config-only".into(),
+                },
+                ConfigRootIssue::ConfigMismatch { id: "drift".into() },
+            ]
         );
     }
 

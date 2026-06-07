@@ -11,10 +11,11 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_cli::{parse_byte_size, parse_duration_millis};
 use majutsu_core::{
-    FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, MetadataReferenceIssue,
-    OperationLogComparisonIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue,
-    Payload, RootSnapshot, SnapshotExport, SnapshotManifest, SnapshotMode, TreeManifest,
-    decode_operation_log, encode_operation_log, history_graph_issues, metadata_reference_issues,
+    ConfigRootIssue, FileRecord, HistoryGraphIssue, HostFileIssue, LargeChunk, LargeManifest,
+    MetadataReferenceIssue, OperationLogComparisonIssue, OperationLogEntry as OperationExport,
+    OperationLogEntryIssue, Payload, RootSnapshot, SnapshotExport, SnapshotManifest, SnapshotMode,
+    TreeManifest, config_root_consistency_issues, decode_operation_log, encode_operation_log,
+    history_graph_issues, host_file_issues, metadata_reference_issues,
     operation_log_comparison_issues, operation_log_entry_matches, payload_blob_ref,
     payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
 };
@@ -4723,19 +4724,24 @@ fn validate_host_file(paths: &Paths, config: &Config, missing: &mut usize) -> Re
             return Ok(());
         }
     };
-    if host.id != config.host.id {
+    for issue in host_file_issues(&host.id, &host.name, &config.host.id, &config.host.name) {
         *missing += 1;
-        eprintln!(
-            "host file id {} does not match config host id {}",
-            host.id, config.host.id
-        );
-    }
-    if host.name != config.host.name {
-        *missing += 1;
-        eprintln!(
-            "host file name {} does not match config host name {}",
-            host.name, config.host.name
-        );
+        match issue {
+            HostFileIssue::IdMismatch {
+                host_id,
+                config_host_id,
+            } => {
+                eprintln!("host file id {host_id} does not match config host id {config_host_id}");
+            }
+            HostFileIssue::NameMismatch {
+                host_name,
+                config_host_name,
+            } => {
+                eprintln!(
+                    "host file name {host_name} does not match config host name {config_host_name}"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -4753,8 +4759,6 @@ fn validate_config_roots(
     let mut config_roots = BTreeMap::new();
     for config_root in &config.roots {
         if config_roots.contains_key(&config_root.id) {
-            *missing += 1;
-            eprintln!("duplicate root id in config {}", config_root.id);
             continue;
         }
         let existing = db_roots.get(&config_root.id);
@@ -4768,25 +4772,33 @@ fn validate_config_roots(
         };
         config_roots.insert(config_root.id.clone(), root);
     }
-    for id in db_roots.keys() {
-        if !config_roots.contains_key(id) {
-            *missing += 1;
-            eprintln!("root exists in database but not config {id}");
-        }
-    }
-    for id in config_roots.keys() {
-        if !db_roots.contains_key(id) {
-            *missing += 1;
-            eprintln!("root exists in config but not database {id}");
-        }
-    }
-    for (id, db_root) in &db_roots {
-        let Some(config_root) = config_roots.get(id) else {
-            continue;
-        };
-        if !root_configs_match(db_root, config_root) {
-            *missing += 1;
-            eprintln!("root config does not match database {id}");
+    let mismatched_root_ids = db_roots
+        .iter()
+        .filter_map(|(id, db_root)| {
+            let config_root = config_roots.get(id)?;
+            (!root_configs_match(db_root, config_root)).then_some(id.as_str())
+        })
+        .collect::<Vec<_>>();
+    for issue in config_root_consistency_issues(
+        config.roots.iter().map(|root| root.id.as_str()),
+        config_roots.keys().map(String::as_str),
+        db_roots.keys().map(String::as_str),
+        mismatched_root_ids,
+    ) {
+        *missing += 1;
+        match issue {
+            ConfigRootIssue::DuplicateRootId { id } => {
+                eprintln!("duplicate root id in config {id}");
+            }
+            ConfigRootIssue::DatabaseMissingConfig { id } => {
+                eprintln!("root exists in database but not config {id}");
+            }
+            ConfigRootIssue::ConfigMissingDatabase { id } => {
+                eprintln!("root exists in config but not database {id}");
+            }
+            ConfigRootIssue::ConfigMismatch { id } => {
+                eprintln!("root config does not match database {id}");
+            }
         }
     }
     Ok(())
