@@ -2815,6 +2815,15 @@ fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Res
     encode_object(paths, &compressed)
 }
 
+fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(
+    paths: &Paths,
+    bytes: &[u8],
+) -> Result<T> {
+    let compressed = decode_object(paths, bytes)?;
+    let cbor = zstd::stream::decode_all(compressed.as_slice())?;
+    Ok(serde_cbor::from_slice(&cbor)?)
+}
+
 fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
     let chunks = export
         .chunks
@@ -3255,9 +3264,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         }
         fs::write(
             dest,
-            remote
-                .get(&key)
-                .with_context(|| format!("download {key}"))?,
+            download_local_object_from_remote(paths, &remote, &key)?,
         )?;
     }
     let conn = open_db(paths)?;
@@ -3265,6 +3272,49 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
     Ok(())
+}
+
+fn download_local_object_from_remote(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+) -> Result<Vec<u8>> {
+    if remote.exists(key)? {
+        return remote.get(key).with_context(|| format!("download {key}"));
+    }
+    let Some(alias) = canonical_remote_alias(key) else {
+        return remote.get(key).with_context(|| format!("download {key}"));
+    };
+    let bytes = remote
+        .get(&alias)
+        .with_context(|| format!("download {key} via canonical alias {alias}"))?;
+    canonical_remote_object_to_local_bytes(paths, key, &bytes)
+}
+
+fn canonical_remote_object_to_local_bytes(
+    paths: &Paths,
+    key: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    if key.starts_with("objects/trees/") {
+        let manifest: TreeManifest = decode_canonical_remote_export(paths, bytes)?;
+        return Ok(encode_object(
+            paths,
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?);
+    }
+    if key.starts_with("objects/indexes/pack/") {
+        let index: PackIndex = decode_canonical_remote_export(paths, bytes)?;
+        return Ok(serde_json::to_vec_pretty(&index)?);
+    }
+    if key.starts_with("objects/large/manifests/") {
+        let manifest: LargeManifest = decode_canonical_remote_export(paths, bytes)?;
+        return Ok(encode_object(
+            paths,
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?);
+    }
+    Ok(bytes.to_vec())
 }
 
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
