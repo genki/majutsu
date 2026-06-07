@@ -36,9 +36,7 @@ use majutsu_pack::{
 use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, classify_restore_object_availability,
-    count_restore_changes, parse_db_time as restore_parse_db_time,
-    parse_duration_ago as restore_parse_duration_ago, parse_restore_time_rfc3339,
-    validate_relative_filter_path,
+    count_restore_changes, validate_relative_filter_path,
 };
 use majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
@@ -77,6 +75,7 @@ mod daemon_runtime;
 mod process_runtime;
 mod remote_store;
 mod restore_runtime;
+mod util;
 mod watch_runtime;
 
 use cli::{
@@ -106,6 +105,10 @@ use restore_runtime::{
     print_restore_conflicts, print_restore_deletes, read_restore_job, remove_empty_restore_parents,
     restore_delete_destination, restore_destination, restore_root_base, restore_target_label,
     write_restore_job,
+};
+use util::{
+    blake3_hex, media_type_for_path, modified_secs, new_id, parse_db_time, parse_duration_ago,
+    parse_time, path_to_slash, stable_metadata_matches, stable_read,
 };
 use watch_runtime::{format_notify_event, normalize_watch_backend, recv_watch_event};
 
@@ -7302,48 +7305,6 @@ fn looks_binary(path: &Path) -> Result<bool> {
     Ok(buf[..n].contains(&0))
 }
 
-fn media_type_for_path(path: &Path) -> Option<String> {
-    let name = path
-        .file_name()
-        .and_then(OsStr::to_str)?
-        .to_ascii_lowercase();
-    let media_type = if name.ends_with(".tar.zst") {
-        "application/zstd"
-    } else {
-        match path
-            .extension()
-            .and_then(OsStr::to_str)
-            .map(|ext| ext.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("blend") => "application/x-blender",
-            Some("db") | Some("sqlite") => "application/vnd.sqlite3",
-            Some("gz") => "application/gzip",
-            Some("heic") => "image/heic",
-            Some("iso") => "application/x-iso9660-image",
-            Some("jpeg") | Some("jpg") => "image/jpeg",
-            Some("json") => "application/json",
-            Some("log") | Some("txt") => "text/plain",
-            Some("md") => "text/markdown",
-            Some("mkv") => "video/x-matroska",
-            Some("mov") => "video/quicktime",
-            Some("mp4") => "video/mp4",
-            Some("parquet") => "application/vnd.apache.parquet",
-            Some("png") => "image/png",
-            Some("psd") => "image/vnd.adobe.photoshop",
-            Some("qcow2") => "application/x-qcow2",
-            Some("tar") => "application/x-tar",
-            Some("toml") => "application/toml",
-            Some("vmdk") => "application/x-vmdk",
-            Some("yaml") | Some("yml") => "application/yaml",
-            Some("zip") => "application/zip",
-            Some("zst") => "application/zstd",
-            _ => return None,
-        }
-    };
-    Some(media_type.to_string())
-}
-
 fn large_pointer_compression(config: &LargeConfig) -> String {
     if config.compression.enabled {
         format!("per-chunk:{}", config.compression.algorithm)
@@ -7352,42 +7313,8 @@ fn large_pointer_compression(config: &LargeConfig) -> String {
     }
 }
 
-fn stable_read(path: &Path, mode: &str) -> Result<Vec<u8>> {
-    let attempts = if mode == "strict" { 8 } else { 3 };
-    let mut last_error = None;
-    for attempt in 0..attempts {
-        let before = fs::metadata(path)?;
-        let bytes = fs::read(path)?;
-        let after = fs::metadata(path)?;
-        if stable_metadata_matches(&before, &after) {
-            return Ok(bytes);
-        }
-        last_error = Some(anyhow!("file changed while reading: {}", path.display()));
-        std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1) as u64));
-    }
-    Err(last_error.unwrap_or_else(|| anyhow!("file did not become stable: {}", path.display())))
-}
-
 fn is_file_changed_error(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("file changed while reading:")
-}
-
-fn stable_metadata_matches(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-        return false;
-    }
-    stable_file_id(before) == stable_file_id(after)
-}
-
-#[cfg(unix)]
-fn stable_file_id(meta: &fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(meta.ino())
-}
-
-#[cfg(not(unix))]
-fn stable_file_id(_: &fs::Metadata) -> Option<u64> {
-    None
 }
 
 fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<String> {
@@ -7614,14 +7541,6 @@ fn write_master_key(paths: &Paths, hex_key: &str) -> Result<()> {
     majutsu_crypto::write_master_key(&paths.master_key, hex_key)
 }
 
-fn blake3_hex(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
-}
-
-fn new_id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
-
 fn hostname_from_env() -> Result<String> {
     if let Ok(hostname) = env::var("HOSTNAME") {
         if !hostname.is_empty() {
@@ -7690,32 +7609,6 @@ fn unescape_mountinfo_path(input: &str) -> String {
         i += 1;
     }
     out
-}
-
-fn path_to_slash(path: &Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn modified_secs(meta: &fs::Metadata) -> Option<i64> {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-}
-
-fn parse_time(input: &str) -> Result<String> {
-    parse_restore_time_rfc3339(input, Utc::now())
-}
-
-fn parse_db_time(input: &str) -> Result<DateTime<Utc>> {
-    restore_parse_db_time(input)
-}
-
-fn parse_duration_ago(input: &str) -> Result<DateTime<Utc>> {
-    restore_parse_duration_ago(input, Utc::now())
 }
 
 #[cfg(test)]
