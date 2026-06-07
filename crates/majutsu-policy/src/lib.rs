@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, Utc};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TieringRule {
@@ -22,6 +24,58 @@ pub fn is_hot_metadata_prefix(prefix: &str) -> bool {
         || prefix.starts_with("trees/")
         || prefix.starts_with("large/manifests/")
         || prefix.starts_with("indexes/")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPruneInput {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPrunePlan {
+    pub keep: Vec<String>,
+    pub delete: Vec<String>,
+}
+
+pub fn build_snapshot_prune_plan(
+    snapshots_newest_first: &[SnapshotPruneInput],
+    current: Option<&str>,
+    keep_daily: u32,
+    keep_monthly: u32,
+) -> SnapshotPrunePlan {
+    let mut keep = BTreeSet::new();
+    if let Some(current) = current {
+        keep.insert(current.to_string());
+    }
+    let mut daily = BTreeSet::new();
+    let mut monthly = BTreeSet::new();
+    for snapshot in snapshots_newest_first {
+        let day = format!(
+            "{:04}-{:02}-{:02}",
+            snapshot.created_at.year(),
+            snapshot.created_at.month(),
+            snapshot.created_at.day()
+        );
+        if daily.len() < keep_daily as usize && daily.insert(day) {
+            keep.insert(snapshot.id.clone());
+        }
+        let month = format!(
+            "{:04}-{:02}",
+            snapshot.created_at.year(),
+            snapshot.created_at.month()
+        );
+        if monthly.len() < keep_monthly as usize && monthly.insert(month) {
+            keep.insert(snapshot.id.clone());
+        }
+    }
+    let keep = keep.into_iter().collect::<Vec<_>>();
+    let delete = snapshots_newest_first
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .filter(|id| !keep.binary_search(id).is_ok())
+        .collect::<Vec<_>>();
+    SnapshotPrunePlan { keep, delete }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +278,7 @@ fn sanitize_lifecycle_rule_id(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn default_rules_keep_metadata_hot_and_tier_large_payloads() {
@@ -270,5 +325,58 @@ mod tests {
         assert!(gcs_text.contains("large/chunks/fastcdc/"));
         assert!(!gcs_text.contains("metadata/"));
         assert!(!gcs_text.contains("trees/"));
+    }
+
+    #[test]
+    fn snapshot_prune_plan_keeps_current_daily_and_monthly_snapshots() {
+        let snapshots = vec![
+            SnapshotPruneInput {
+                id: "snap-4".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap(),
+            },
+            SnapshotPruneInput {
+                id: "snap-3".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 6, 6, 12, 0, 0).unwrap(),
+            },
+            SnapshotPruneInput {
+                id: "snap-2".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 5, 30, 12, 0, 0).unwrap(),
+            },
+            SnapshotPruneInput {
+                id: "snap-1".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap(),
+            },
+        ];
+
+        let plan = build_snapshot_prune_plan(&snapshots, Some("snap-1"), 2, 1);
+
+        assert_eq!(
+            plan.keep,
+            vec![
+                "snap-1".to_string(),
+                "snap-3".to_string(),
+                "snap-4".to_string(),
+            ]
+        );
+        assert_eq!(plan.delete, vec!["snap-2".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_prune_plan_can_delete_everything_except_current_when_limits_are_zero() {
+        let snapshots = vec![
+            SnapshotPruneInput {
+                id: "snap-2".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap(),
+            },
+            SnapshotPruneInput {
+                id: "snap-1".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 6, 6, 12, 0, 0).unwrap(),
+            },
+        ];
+
+        let plan = build_snapshot_prune_plan(&snapshots, Some("snap-1"), 0, 0);
+
+        assert_eq!(plan.keep, vec!["snap-1".to_string()]);
+        assert_eq!(plan.delete, vec!["snap-2".to_string()]);
     }
 }

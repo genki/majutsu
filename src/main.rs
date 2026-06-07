@@ -35,6 +35,7 @@ use majutsu_pack::{
     PackEntry, PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackTier,
     PackedBlobMetadata, missing_pack_metadata_ids, pack_index_issues, pack_object_issues,
 };
+use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
     parse_db_time as restore_parse_db_time, parse_duration_ago as restore_parse_duration_ago,
@@ -4310,16 +4311,6 @@ fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     Ok(())
 }
 
-struct PrunePlan {
-    keep: Vec<String>,
-    delete: Vec<String>,
-}
-
-struct SnapshotPruneRow {
-    id: String,
-    created_at: DateTime<Utc>,
-}
-
 struct PrunedMetadata {
     blobs: usize,
     large_objects: usize,
@@ -4327,7 +4318,7 @@ struct PrunedMetadata {
     large_pins: usize,
 }
 
-fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<PrunePlan> {
+fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrunePlan> {
     let current = current_snapshot(conn)?;
     let mut stmt = conn.prepare("select id, created_at from snapshots order by created_at desc")?;
     let rows = stmt.query_map([], |row| {
@@ -4337,36 +4328,18 @@ fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<PrunePlan> {
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .map(|(id, created)| {
-            Ok(SnapshotPruneRow {
+            Ok(SnapshotPruneInput {
                 id,
                 created_at: parse_db_time(&created)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut keep = std::collections::BTreeSet::new();
-    if let Some(current) = current {
-        keep.insert(current);
-    }
-    let mut daily = std::collections::BTreeSet::new();
-    let mut monthly = std::collections::BTreeSet::new();
-    for snapshot in &snapshots {
-        let day = snapshot.created_at.format("%Y-%m-%d").to_string();
-        if daily.len() < args.keep_daily as usize && daily.insert(day) {
-            keep.insert(snapshot.id.clone());
-        }
-        let month = snapshot.created_at.format("%Y-%m").to_string();
-        if monthly.len() < args.keep_monthly as usize && monthly.insert(month) {
-            keep.insert(snapshot.id.clone());
-        }
-    }
-    let mut keep = keep.into_iter().collect::<Vec<_>>();
-    keep.sort();
-    let delete = snapshots
-        .into_iter()
-        .map(|snapshot| snapshot.id)
-        .filter(|id| !keep.binary_search(id).is_ok())
-        .collect::<Vec<_>>();
-    Ok(PrunePlan { keep, delete })
+    Ok(build_snapshot_prune_plan(
+        &snapshots,
+        current.as_deref(),
+        args.keep_daily,
+        args.keep_monthly,
+    ))
 }
 
 fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<PrunedMetadata> {
