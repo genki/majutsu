@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::fsync_parent_dir;
+use crate::atomic_io::fsync_parent_dir;
 use crate::util::new_id;
 
 pub(crate) fn record_op(
