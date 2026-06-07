@@ -5467,7 +5467,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
         let large = classify_large(&large_config, &rel, meta.len(), binary);
         let payload = if large {
             let (oid, manifest_key, chunk_count) =
-                store_large_file(paths, entry.path(), &rel, &large_config)?;
+                store_large_file(paths, entry.path(), &rel, &large_config, binary)?;
             Payload::LargeObject {
                 oid,
                 manifest_key,
@@ -5541,6 +5541,7 @@ fn store_large_file(
     path: &Path,
     rel: &Path,
     config: &LargeConfig,
+    binary: bool,
 ) -> Result<(String, String, usize)> {
     let bytes = stable_read(path, "strict")?;
     let mut hasher = blake3::Hasher::new();
@@ -5578,6 +5579,8 @@ fn store_large_file(
         version: 1,
         oid: oid.clone(),
         size: bytes.len() as u64,
+        media_type: media_type_for_path(rel),
+        binary,
         chunking: config.default_chunking.clone(),
         chunk_size: config.chunk_size,
         chunks,
@@ -7180,6 +7183,48 @@ fn looks_binary(path: &Path) -> Result<bool> {
     let mut buf = [0u8; 8192];
     let n = f.read(&mut buf)?;
     Ok(buf[..n].contains(&0))
+}
+
+fn media_type_for_path(path: &Path) -> Option<String> {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)?
+        .to_ascii_lowercase();
+    let media_type = if name.ends_with(".tar.zst") {
+        "application/zstd"
+    } else {
+        match path
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("blend") => "application/x-blender",
+            Some("db") | Some("sqlite") => "application/vnd.sqlite3",
+            Some("gz") => "application/gzip",
+            Some("heic") => "image/heic",
+            Some("iso") => "application/x-iso9660-image",
+            Some("jpeg") | Some("jpg") => "image/jpeg",
+            Some("json") => "application/json",
+            Some("log") | Some("txt") => "text/plain",
+            Some("md") => "text/markdown",
+            Some("mkv") => "video/x-matroska",
+            Some("mov") => "video/quicktime",
+            Some("mp4") => "video/mp4",
+            Some("parquet") => "application/vnd.apache.parquet",
+            Some("png") => "image/png",
+            Some("psd") => "image/vnd.adobe.photoshop",
+            Some("qcow2") => "application/x-qcow2",
+            Some("tar") => "application/x-tar",
+            Some("toml") => "application/toml",
+            Some("vmdk") => "application/x-vmdk",
+            Some("yaml") | Some("yml") => "application/yaml",
+            Some("zip") => "application/zip",
+            Some("zst") => "application/zstd",
+            _ => return None,
+        }
+    };
+    Some(media_type.to_string())
 }
 
 fn stable_read(path: &Path, mode: &str) -> Result<Vec<u8>> {

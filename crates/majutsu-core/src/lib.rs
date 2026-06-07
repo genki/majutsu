@@ -203,6 +203,10 @@ pub struct LargeManifest {
     pub version: u32,
     pub oid: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub binary: bool,
     #[serde(default = "default_large_chunking")]
     pub chunking: String,
     pub chunk_size: usize,
