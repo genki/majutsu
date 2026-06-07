@@ -3,16 +3,15 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use majutsu_core::{
-    FileRecord, LargeChunk, LargeManifest, LiveMetadataReferences,
-    OperationLogEntry as OperationExport, Payload, RootSnapshot, SnapshotExport, SnapshotManifest,
-    TreeManifest, decode_operation_log, encode_operation_log, payload_blob_ref,
-    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
+    FileRecord, LargeChunk, LargeManifest, OperationLogEntry as OperationExport, Payload,
+    RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
+    encode_operation_log, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
+    payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
 use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier, PackedBlobMetadata};
-use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use majutsu_restore::{
     RestoreQueueItem, classify_restore_object_availability, validate_relative_filter_path,
 };
@@ -54,6 +53,7 @@ mod fuse_mount;
 mod object_paths;
 mod operation_log;
 mod process_runtime;
+mod prune_runtime;
 mod queue_runtime;
 mod remote_store;
 mod restore_apply;
@@ -67,9 +67,9 @@ mod watch_runtime;
 use atomic_io::{write_atomic, write_atomic_with};
 use cli::{
     Cli, CloneArgs, Command, DaemonCommand, DiffArgs, HydrateArgs, InitArgs, KeyCommand,
-    LargeCommand, LifecycleCommand, LogArgs, MountArgs, OpCommand, PackArgs, PruneArgs,
-    RemoteCommand, RestoreArgs, RestoreCommand, RestoreTopArgs, RootCommand, SnapshotArgs,
-    SyncCommand, UnmountArgs,
+    LargeCommand, LifecycleCommand, LogArgs, MountArgs, OpCommand, PackArgs, RemoteCommand,
+    RestoreArgs, RestoreCommand, RestoreTopArgs, RootCommand, SnapshotArgs, SyncCommand,
+    UnmountArgs,
 };
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, LazyMountEntry,
@@ -88,14 +88,13 @@ use db_refs::{
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::{fsck, remote_fsck};
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
-use object_paths::{
-    all_local_object_keys, large_chunk_base, large_chunk_base_for_key, local_object_keys,
-};
+use object_paths::{large_chunk_base, large_chunk_base_for_key, local_object_keys};
 use operation_log::{
     query_operation, query_operations, record_op, record_op_with_id, record_op_with_id_and_status,
     rewrite_local_oplog,
 };
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
+use prune_runtime::{gc_cmd, prune_cmd};
 use queue_runtime::{
     drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, has_pending_journal_events,
     record_event, upload_queue_items,
@@ -2474,144 +2473,6 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
         blobs.len(),
         indexes.len()
     );
-    Ok(())
-}
-
-fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
-    ensure_ready(paths)?;
-    let conn = open_db(paths)?;
-    let plan = build_prune_plan(&conn, &args)?;
-    let total = plan.keep.len() + plan.delete.len();
-    println!("snapshots {total}");
-    println!("keep_daily {}", args.keep_daily);
-    println!("keep_monthly {}", args.keep_monthly);
-    println!("keep_snapshots {}", plan.keep.len());
-    println!("candidate_snapshots {}", plan.delete.len());
-    if args.dry_run {
-        println!("dry_run true");
-    } else {
-        let before = current_snapshot(&conn)?;
-        for snapshot in &plan.delete {
-            conn.execute("delete from snapshots where id=?1", params![snapshot])?;
-        }
-        let removed = prune_unreferenced_metadata(paths, &conn)?;
-        record_op(
-            &conn,
-            "prune",
-            before.as_deref(),
-            before.as_deref(),
-            Some(&format!("deleted {} snapshots", plan.delete.len())),
-        )?;
-        println!("dry_run false");
-        println!("deleted_snapshots {}", plan.delete.len());
-        println!("removed_blob_metadata {}", removed.blobs);
-        println!("removed_large_metadata {}", removed.large_objects);
-        println!("removed_chunk_metadata {}", removed.chunks);
-        println!("removed_large_pins {}", removed.large_pins);
-    }
-    Ok(())
-}
-
-struct PrunedMetadata {
-    blobs: usize,
-    large_objects: usize,
-    chunks: usize,
-    large_pins: usize,
-}
-
-fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrunePlan> {
-    let current = current_snapshot(conn)?;
-    let mut stmt = conn.prepare("select id, created_at from snapshots order by created_at desc")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let snapshots = rows
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|(id, created)| {
-            Ok(SnapshotPruneInput {
-                id,
-                created_at: parse_db_time(&created)?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(build_snapshot_prune_plan(
-        &snapshots,
-        current.as_deref(),
-        args.keep_daily,
-        args.keep_monthly,
-    ))
-}
-
-fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<PrunedMetadata> {
-    let mut live = LiveMetadataReferences::default();
-    let mut stmt = conn.prepare("select manifest_json from snapshots")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    for row in rows {
-        let manifest: SnapshotManifest = serde_json::from_str(&row?)?;
-        for manifest_key in live.add_snapshot_manifest(&manifest) {
-            let large_manifest: LargeManifest =
-                serde_json::from_slice(&read_object(paths, &manifest_key)?)?;
-            live.add_large_manifest(large_manifest);
-        }
-    }
-    let blobs = delete_rows_not_in(conn, "blobs", "oid", &live.blobs)?;
-    let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live.large_objects)?;
-    let chunks = delete_rows_not_in(conn, "chunks", "oid", &live.chunks)?;
-    let large_pins = delete_rows_not_in(conn, "large_pins", "oid", &live.large_objects)?;
-    Ok(PrunedMetadata {
-        blobs,
-        large_objects,
-        chunks,
-        large_pins,
-    })
-}
-
-fn delete_rows_not_in(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    live: &std::collections::BTreeSet<String>,
-) -> Result<usize> {
-    let mut stmt = conn.prepare(&format!("select {column} from {table}"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut removed = 0usize;
-    for row in rows {
-        let id = row?;
-        if !live.contains(&id) {
-            conn.execute(
-                &format!("delete from {table} where {column}=?1"),
-                params![id],
-            )?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
-}
-
-fn gc_cmd(paths: &Paths) -> Result<()> {
-    ensure_ready(paths)?;
-    let conn = open_db(paths)?;
-    let config = read_config(paths)?;
-    let export = export_metadata(&conn, &config)?;
-    let referenced = local_object_keys(&export)
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut removed = 0usize;
-    for key in all_local_object_keys(paths)? {
-        if !referenced.contains(&key) {
-            fs::remove_file(paths.home.join(&key))?;
-            removed += 1;
-        }
-    }
-    record_op(
-        &conn,
-        "gc",
-        current_snapshot(&conn)?.as_deref(),
-        current_snapshot(&conn)?.as_deref(),
-        Some(&format!("removed {removed} unreferenced objects")),
-    )?;
-    println!("removed_unreferenced_objects {removed}");
     Ok(())
 }
 
