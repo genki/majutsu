@@ -505,12 +505,17 @@ Minimal background daemon management:
 mj daemon start --interval-secs 60
 mj daemon status
 mj daemon stop
+mj daemon service --provider systemd > ~/.config/systemd/user/majutsu.service
+mj daemon service --provider launchd > ~/Library/LaunchAgents/dev.majutsu.watch.plist
 ```
 
 The daemon is a process wrapper around foreground watch. It uses the native
 watch backend by default (`inotify` on Linux), records filesystem events in the
 event journal, and exposes a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock`
 for status IPC.
+`daemon service` renders a user-level systemd unit or launchd plist using the
+resolved state home and `[watch]` timing settings, so the same daemon command
+line can be supervised by the host init system.
 When timing flags are omitted, watch and daemon start use `[watch]` from
 `config.toml`:
 

@@ -7578,6 +7578,45 @@ fn notify_watch_replays_pending_event_journal() {
     assert!(events.contains("event-journal-replay"));
 }
 
+#[test]
+fn daemon_service_renders_systemd_and_launchd_configs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+
+    let systemd = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("service");
+        c
+    });
+    assert!(systemd.contains("[Service]"));
+    assert!(systemd.contains("ExecStart="));
+    assert!(systemd.contains("--home"));
+    assert!(systemd.contains(state.to_str().unwrap()));
+    assert!(systemd.contains("watch"));
+    assert!(systemd.contains("--backend"));
+    assert!(systemd.contains("Restart=on-failure"));
+
+    let launchd = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("service")
+            .arg("--provider")
+            .arg("launchd");
+        c
+    });
+    assert!(launchd.contains("<key>ProgramArguments</key>"));
+    assert!(launchd.contains("<string>--home</string>"));
+    assert!(launchd.contains(&format!("<string>{}</string>", state.display())));
+    assert!(launchd.contains("<key>KeepAlive</key>"));
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_status_uses_ipc_socket() {
