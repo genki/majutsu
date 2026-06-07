@@ -598,6 +598,89 @@ fn restore_preserves_file_mode_and_mtime() {
     );
 }
 
+#[test]
+fn restore_atomic_writes_do_not_clobber_legacy_temp_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("payload.bin"), vec![b'Z'; 16 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 4096");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::create_dir_all(restore.join("sample")).unwrap();
+    fs::write(restore.join("sample/alpha.mjtmp"), b"keep blob temp\n").unwrap();
+    fs::write(restore.join("sample/payload.mjtmp"), b"keep large temp\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--path")
+            .arg("alpha.txt")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--path")
+            .arg("payload.bin")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+    assert_eq!(
+        fs::read(restore.join("sample/payload.bin")).unwrap(),
+        vec![b'Z'; 16 * 1024]
+    );
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.mjtmp")).unwrap(),
+        b"keep blob temp\n"
+    );
+    assert_eq!(
+        fs::read(restore.join("sample/payload.mjtmp")).unwrap(),
+        b"keep large temp\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn follow_symlinks_controls_snapshot_payload_kind() {
