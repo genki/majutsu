@@ -3727,6 +3727,48 @@ fn root_pause_and_resume_control_snapshot_participation() {
 }
 
 #[test]
+fn status_reports_configured_root_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("pause")
+            .arg("sample");
+        c
+    });
+
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+
+    assert!(status.contains("roots 1"));
+    assert!(status.contains("sample\tpaused\t"));
+}
+
+#[test]
 fn require_mount_root_is_skipped_as_unmounted_without_mass_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

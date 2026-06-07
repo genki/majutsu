@@ -1562,10 +1562,10 @@ fn status(paths: &Paths) -> Result<()> {
     println!("home {}", paths.home.display());
     println!("roots {}", roots.len());
     for root in roots {
-        let state = if root.path.exists() {
-            "active"
-        } else {
+        let state = if root.status == "active" && !root.path.exists() {
             "missing"
+        } else {
+            root.status.as_str()
         };
         println!("  {}\t{}\t{}", root.id, state, root.path.display());
     }
