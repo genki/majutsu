@@ -1178,6 +1178,9 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             if !path.exists() {
                 bail!("root path does not exist: {}", path.display());
             }
+            if root_by_id_optional(&conn, &args.id)?.is_some() {
+                bail!("root already exists: {}; use `mj root set` to change it", args.id);
+            }
             validate_snapshot_mode(&args.snapshot_mode)?;
             if let Some(chunking) = &args.large_chunking {
                 validate_large_chunking(chunking)?;
@@ -1212,8 +1215,7 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 large,
             };
             conn.execute(
-                "insert into roots(id, data_json) values (?1, ?2)
-                 on conflict(id) do update set data_json=excluded.data_json",
+                "insert into roots(id, data_json) values (?1, ?2)",
                 params![root.id, serde_json::to_string(&root)?],
             )?;
             sync_roots_to_config(paths, &conn)?;

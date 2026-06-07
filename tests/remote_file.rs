@@ -4257,6 +4257,56 @@ fn root_commands_sync_config_roots() {
 }
 
 #[test]
+fn root_add_rejects_duplicate_id_without_overwriting_existing_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let other = tmp.path().join("other");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&other).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&other);
+        c
+    });
+
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("list");
+        c
+    });
+    assert!(roots.contains(&format!("sample\tactive\tsample\t{}", source.display())));
+    assert!(!roots.contains(&other.display().to_string()));
+    let ops = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert_eq!(ops.matches("root-added").count(), 1);
+}
+
+#[test]
 fn root_include_can_select_subtree_patterns() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

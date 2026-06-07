@@ -205,6 +205,8 @@ mj root set app-data --snapshot-mode transactional \
   --post-snapshot '/usr/local/bin/app-checkpoint end'
 ```
 
+`root add` refuses an existing root id so root status and policy history are not
+silently overwritten; use `root set` for intentional changes.
 `root set` records a `config-change` operation so root policy changes are
 visible in the operation log.
 
