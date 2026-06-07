@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::process_runtime::{pid_alive, read_pid};
-use crate::queue_runtime::{has_pending_journal_events, upload_queue_items};
+use crate::queue_runtime::{event_journal_records, upload_queue_stats};
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::{Paths, open_db, resolve_paths};
@@ -100,8 +100,9 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
                 *root_statuses.entry(root.status.as_str()).or_insert(0usize) += 1;
             }
             let current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
-            let pending_journal_events = has_pending_journal_events(&paths)?;
-            let queued_uploads = upload_queue_items(&paths)?.len();
+            let journal_records = event_journal_records(&paths)?;
+            let pending_journal_events = majutsu_db::has_pending_journal_events(&journal_records);
+            let upload_stats = upload_queue_stats(&paths)?;
             let restore_jobs = restore_queue_status_counts(&paths)?;
             let active_restore_jobs = restore_jobs
                 .iter()
@@ -113,8 +114,21 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
             writeln!(stream, "ipc ok")?;
             writeln!(stream, "roots {}", roots.len())?;
             writeln!(stream, "current {current}")?;
+            writeln!(stream, "journal_events {}", journal_records.len())?;
             writeln!(stream, "pending_journal_events {pending_journal_events}")?;
-            writeln!(stream, "queued_uploads {queued_uploads}")?;
+            writeln!(stream, "queued_uploads {}", upload_stats.total)?;
+            writeln!(stream, "queued_uploads_retrying {}", upload_stats.retrying)?;
+            writeln!(stream, "queued_upload_attempts {}", upload_stats.attempts)?;
+            writeln!(
+                stream,
+                "queued_upload_max_attempts {}",
+                upload_stats.max_attempts
+            )?;
+            writeln!(
+                stream,
+                "upload_queue_backpressure {}",
+                upload_stats.has_backpressure()
+            )?;
             writeln!(stream, "restore_jobs {active_restore_jobs}")?;
             for (status, count) in root_statuses {
                 writeln!(stream, "root_status {status} {count}")?;

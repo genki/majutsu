@@ -521,9 +521,10 @@ watch backend by default (`inotify` on Linux), records filesystem events in the
 event journal, and exposes a Unix socket at `$MAJUTSU_HOME/runtime/daemon.sock`
 for status IPC.
 `mj daemon status` reports the daemon pid, current snapshot, root status counts,
-whether event journal replay is pending, queued uploads, and active restore jobs.
-Those backlog fields are intended to make crash recovery visible before running
-`mj snapshot`, `mj sync`, or `mj restore resume`.
+event journal counts, whether replay is pending, queued upload retry/backpressure
+state, and active restore jobs. Those backlog fields are intended to make crash
+recovery visible before running `mj snapshot`, `mj sync`, or
+`mj restore resume`.
 `daemon service` renders a user-level systemd unit or launchd plist using the
 resolved state home and `[watch]` timing settings, so the same daemon command
 line can be supervised by the host init system.

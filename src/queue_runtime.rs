@@ -10,6 +10,20 @@ use crate::config::Paths;
 use crate::remote_store::RemoteStore;
 use crate::util::{new_id, path_to_slash};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UploadQueueStats {
+    pub(crate) total: usize,
+    pub(crate) retrying: usize,
+    pub(crate) attempts: u64,
+    pub(crate) max_attempts: u32,
+}
+
+impl UploadQueueStats {
+    pub(crate) fn has_backpressure(&self) -> bool {
+        self.total > 0 && self.max_attempts > 0
+    }
+}
+
 pub(crate) fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()> {
     write_upload_item(
         paths,
@@ -63,6 +77,24 @@ pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQu
     }
     items.sort_by(|a, b| a.1.key.cmp(&b.1.key));
     Ok(items)
+}
+
+pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
+    let items = upload_queue_items(paths)?;
+    let mut stats = UploadQueueStats {
+        total: items.len(),
+        retrying: 0,
+        attempts: 0,
+        max_attempts: 0,
+    };
+    for (_, item) in items {
+        if item.attempts > 0 {
+            stats.retrying += 1;
+        }
+        stats.attempts += u64::from(item.attempts);
+        stats.max_attempts = stats.max_attempts.max(item.attempts);
+    }
+    Ok(stats)
 }
 
 pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {

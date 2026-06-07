@@ -9303,6 +9303,20 @@ fn daemon_status_uses_ipc_socket() {
         c
     });
     assert!(prepare.contains("restore_job "));
+    fs::create_dir_all(state.join("queue/uploads")).unwrap();
+    fs::write(
+        state.join("queue/uploads/retry-upload.json"),
+        serde_json::json!({
+            "id": "retry-upload",
+            "key": "objects/blobs/retry",
+            "source": null,
+            "inline": [114, 101, 116, 114, 121],
+            "created_at": "2026-06-07T00:00:00Z",
+            "attempts": 2
+        })
+        .to_string(),
+    )
+    .unwrap();
     let mut child = mj()
         .arg("--home")
         .arg(&state)
@@ -9329,8 +9343,13 @@ fn daemon_status_uses_ipc_socket() {
     assert!(status.contains("ipc ok"));
     assert!(status.contains("roots 1"));
     assert!(status.contains("root_status active 1"));
+    assert!(status.contains("journal_events "));
     assert!(status.contains("pending_journal_events false"));
-    assert!(status.contains("queued_uploads 0"));
+    assert!(status.contains("queued_uploads 1"));
+    assert!(status.contains("queued_uploads_retrying 1"));
+    assert!(status.contains("queued_upload_attempts 2"));
+    assert!(status.contains("queued_upload_max_attempts 2"));
+    assert!(status.contains("upload_queue_backpressure true"));
     assert!(status.contains("restore_jobs 1"));
     assert!(status.contains("restore_status prepared 1"));
     child.kill().unwrap();
