@@ -3285,41 +3285,73 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
     validate_config(&export.config)?;
-    create_layout(paths)?;
-    write_config(paths, &export.config)?;
-    fs::write(&paths.host, toml::to_string_pretty(&export.config.host)?)?;
-    if remote.exists("keys/recipients.toml")? {
+    let staging_home = clone_staging_home(&paths.home);
+    let staging_paths = resolve_paths(Some(staging_home.clone()))?;
+    let clone_result = (|| -> Result<()> {
+        create_layout(&staging_paths)?;
+        write_config(&staging_paths, &export.config)?;
         fs::write(
-            paths.home.join("keys/recipients.toml"),
-            remote.get("keys/recipients.toml")?,
+            &staging_paths.host,
+            toml::to_string_pretty(&export.config.host)?,
         )?;
-    }
-    if export.config.security.encryption != "none" {
-        if let Ok(key) = env::var("MAJUTSU_MASTER_KEY") {
-            write_master_key(paths, &key)?;
+        if remote.exists("keys/recipients.toml")? {
+            fs::write(
+                staging_paths.home.join("keys/recipients.toml"),
+                remote.get("keys/recipients.toml")?,
+            )?;
         }
-    }
-    for key in local_object_keys(&export) {
-        let dest = paths.home.join(&key);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+        if export.config.security.encryption != "none" {
+            if let Ok(key) = env::var("MAJUTSU_MASTER_KEY") {
+                write_master_key(&staging_paths, &key)?;
+            }
         }
-        fs::write(
-            dest,
-            download_local_object_from_remote(paths, &remote, &key)?,
+        for key in local_object_keys(&export) {
+            let dest = staging_paths.home.join(&key);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(
+                dest,
+                download_local_object_from_remote(&staging_paths, &remote, &key)?,
+            )?;
+        }
+        let conn = open_db(&staging_paths)?;
+        import_metadata(&conn, &export)?;
+        persist_export_remote_refs(
+            &conn,
+            &remote.describe(),
+            &export.config.host.id,
+            &export.refs,
         )?;
+        Ok(())
+    })();
+    if let Err(err) = clone_result {
+        let _ = fs::remove_dir_all(&staging_home);
+        return Err(err);
     }
-    let conn = open_db(paths)?;
-    import_metadata(&conn, &export)?;
-    persist_export_remote_refs(
-        &conn,
-        &remote.describe(),
-        &export.config.host.id,
-        &export.refs,
-    )?;
+    if paths.home.exists() {
+        fs::remove_dir(&paths.home)
+            .with_context(|| format!("remove empty clone target {}", paths.home.display()))?;
+    }
+    fs::rename(&staging_home, &paths.home).with_context(|| {
+        format!(
+            "move clone staging {} to {}",
+            staging_home.display(),
+            paths.home.display()
+        )
+    })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
     Ok(())
+}
+
+fn clone_staging_home(home: &Path) -> PathBuf {
+    let parent = home.parent().unwrap_or_else(|| Path::new("."));
+    let name = home
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "majutsu".into());
+    parent.join(format!(".{name}.clone-{}", Uuid::new_v4()))
 }
 
 fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String> {
