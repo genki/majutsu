@@ -3989,6 +3989,90 @@ fn restore_prepare_can_hydrate_from_canonical_aliases() {
 }
 
 #[test]
+fn restore_prepare_can_hydrate_large_objects_from_canonical_aliases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    let payload = (0..32768).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+    fs::write(source.join("payload.zip"), &payload).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--large-min-size")
+            .arg("4")
+            .arg("--large-chunking")
+            .arg("fixed")
+            .arg("--large-chunk-size")
+            .arg("32768");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fs::remove_dir_all(remote.join("objects")).unwrap();
+    fs::remove_dir_all(state.join("objects/large/manifests")).unwrap();
+    fs::remove_dir_all(state.join("objects/large/chunks")).unwrap();
+
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(prepare.contains("required_objects 2"));
+    assert!(prepare.contains("archived_objects 2"));
+    assert!(prepare.contains("missing_objects 0"));
+    let job_id = prepare
+        .lines()
+        .find_map(|line| line.strip_prefix("restore_job "))
+        .unwrap()
+        .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id);
+        c
+    });
+
+    assert_eq!(
+        fs::read(restore.join("sample/payload.zip")).unwrap(),
+        payload
+    );
+}
+
+#[test]
 fn restore_prepare_resume_preserves_root_path_and_target_filters() {
     let tmp = tempfile::tempdir().unwrap();
     let docs = tmp.path().join("docs");

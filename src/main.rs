@@ -5179,9 +5179,15 @@ fn restore_object_stats(
 fn required_chunk_count_for_plan(paths: &Paths, plan: &RestorePlan) -> Result<usize> {
     let mut chunks = 0usize;
     for record in &plan.files {
-        if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
-            let manifest: LargeManifest =
-                serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+        if let Some((_, manifest_key, chunk_count)) = payload_large_ref(&record.payload) {
+            let manifest = read_large_manifest_for_restore(paths, manifest_key)
+                .with_context(|| format!("read large manifest {manifest_key}"))?;
+            if manifest.chunks.len() != chunk_count {
+                bail!(
+                    "large manifest chunk count mismatch for {manifest_key}: payload={chunk_count} manifest={}",
+                    manifest.chunks.len()
+                );
+            }
             chunks += manifest.chunks.len();
         }
     }
@@ -5338,10 +5344,16 @@ fn required_object_keys_for_plan(
             } else {
                 keys.push(object_key.to_string());
             }
-        } else if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
+        } else if let Some((_, manifest_key, chunk_count)) = payload_large_ref(&record.payload) {
             keys.push(manifest_key.to_string());
-            let manifest: LargeManifest =
-                serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+            let manifest = read_large_manifest_for_restore(paths, manifest_key)
+                .with_context(|| format!("read large manifest {manifest_key}"))?;
+            if manifest.chunks.len() != chunk_count {
+                bail!(
+                    "large manifest chunk count mismatch for {manifest_key}: payload={chunk_count} manifest={}",
+                    manifest.chunks.len()
+                );
+            }
             for chunk in manifest.chunks {
                 keys.push(chunk.object_key);
             }
@@ -5350,6 +5362,29 @@ fn required_object_keys_for_plan(
     keys.sort();
     keys.dedup();
     Ok(keys)
+}
+
+fn read_large_manifest_for_restore(paths: &Paths, manifest_key: &str) -> Result<LargeManifest> {
+    match read_object(paths, manifest_key) {
+        Ok(bytes) => return serde_json::from_slice(&bytes).map_err(Into::into),
+        Err(local_err) => {
+            let config = read_config(paths).with_context(|| {
+                format!(
+                    "read config after local large manifest {manifest_key} was unavailable: {local_err}"
+                )
+            })?;
+            let Some(remote_config) = config.remote.as_ref() else {
+                return Err(local_err)
+                    .with_context(|| format!("read local large manifest {manifest_key}"));
+            };
+            let remote = open_remote(remote_config)?;
+            let bytes = download_local_object_from_remote(paths, &remote, manifest_key)
+                .with_context(|| format!("download large manifest {manifest_key}"))?;
+            let decoded = decode_object(paths, &bytes)
+                .with_context(|| format!("decode large manifest {manifest_key}"))?;
+            serde_json::from_slice(&decoded).map_err(Into::into)
+        }
+    }
 }
 
 fn write_restore_job(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
