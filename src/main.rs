@@ -9139,11 +9139,11 @@ fn default_large_compression_skip_extensions() -> Vec<String> {
 }
 
 fn default_small_pack_target() -> u64 {
-    64 * 1024 * 1024
+    majutsu_pack::default_small_pack_target()
 }
 
 fn default_normal_pack_target() -> u64 {
-    256 * 1024 * 1024
+    majutsu_pack::default_normal_pack_target()
 }
 
 impl Default for PackConfig {
