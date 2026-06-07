@@ -18,6 +18,7 @@ use majutsu_core::{
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
+use majutsu_large::{LargeObjectExport, LargePinExport};
 use majutsu_pack::{PackEntry, PackIndex, PackTier};
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
@@ -700,25 +701,10 @@ struct BlobExport {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct LargeObjectExport {
-    oid: String,
-    size: u64,
-    chunk_count: usize,
-    manifest_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct ChunkExport {
     oid: String,
     size: u64,
     object_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LargePinExport {
-    oid: String,
-    pinned_at: String,
-    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5788,17 +5774,12 @@ fn remote_fsck_export(
 ) -> Result<MetadataExport> {
     let export: MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
-    let large_object_ids = export
-        .large_objects
-        .iter()
-        .map(|large| large.oid.as_str())
-        .collect::<BTreeSet<_>>();
     for pin in &export.large_pins {
-        if !large_object_ids.contains(pin.oid.as_str()) {
+        if !pin.references_known_object(&export.large_objects) {
             *missing += 1;
             eprintln!("dangling remote large pin {} in {metadata_key}", pin.oid);
         }
-        if parse_db_time(&pin.pinned_at).is_err() {
+        if pin.pinned_time().is_err() {
             *missing += 1;
             eprintln!(
                 "invalid remote large pin timestamp {} in {metadata_key}",

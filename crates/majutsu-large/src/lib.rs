@@ -1,5 +1,7 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use majutsu_core::ObjectKey;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_LARGE_MIN_SIZE: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_LARGE_BINARY_MIN_SIZE: u64 = 16 * 1024 * 1024;
@@ -37,6 +39,39 @@ pub struct LargeChunkRef {
 pub struct StoredLargeChunk {
     pub bytes: Vec<u8>,
     pub compression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargeObjectExport {
+    pub oid: String,
+    pub size: u64,
+    pub chunk_count: usize,
+    pub manifest_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LargePinExport {
+    pub oid: String,
+    pub pinned_at: String,
+    pub reason: Option<String>,
+}
+
+impl LargePinExport {
+    pub fn new(oid: String, pinned_at: DateTime<Utc>, reason: Option<String>) -> Self {
+        Self {
+            oid,
+            pinned_at: pinned_at.to_rfc3339(),
+            reason,
+        }
+    }
+
+    pub fn pinned_time(&self) -> Result<DateTime<Utc>> {
+        Ok(DateTime::parse_from_rfc3339(&self.pinned_at)?.with_timezone(&Utc))
+    }
+
+    pub fn references_known_object(&self, large_objects: &[LargeObjectExport]) -> bool {
+        large_objects.iter().any(|large| large.oid == self.oid)
+    }
 }
 
 pub fn chunk_ranges_for_bytes(
@@ -320,5 +355,56 @@ mod tests {
             &skip,
             "payload.zip"
         ));
+    }
+
+    #[test]
+    fn large_export_json_shape_is_stable() {
+        let large = LargeObjectExport {
+            oid: "large-1".into(),
+            size: 1024,
+            chunk_count: 2,
+            manifest_key: "objects/large/manifests/large-1".into(),
+        };
+
+        let value = serde_json::to_value(large).unwrap();
+
+        assert_eq!(value["oid"], "large-1");
+        assert_eq!(value["size"], 1024);
+        assert_eq!(value["chunk_count"], 2);
+        assert_eq!(value["manifest_key"], "objects/large/manifests/large-1");
+    }
+
+    #[test]
+    fn large_pin_tracks_time_and_referenced_object() {
+        let large = LargeObjectExport {
+            oid: "large-1".into(),
+            size: 1024,
+            chunk_count: 2,
+            manifest_key: "objects/large/manifests/large-1".into(),
+        };
+        let pinned_at = DateTime::<Utc>::UNIX_EPOCH;
+        let pin = LargePinExport::new("large-1".into(), pinned_at, Some("manual".into()));
+
+        assert_eq!(pin.pinned_time().unwrap(), pinned_at);
+        assert!(pin.references_known_object(std::slice::from_ref(&large)));
+        assert!(
+            !LargePinExport {
+                oid: "missing".into(),
+                pinned_at: pinned_at.to_rfc3339(),
+                reason: None,
+            }
+            .references_known_object(&[large])
+        );
+    }
+
+    #[test]
+    fn large_pin_rejects_invalid_timestamp() {
+        let pin = LargePinExport {
+            oid: "large-1".into(),
+            pinned_at: "not-a-time".into(),
+            reason: None,
+        };
+
+        assert!(pin.pinned_time().is_err());
     }
 }
