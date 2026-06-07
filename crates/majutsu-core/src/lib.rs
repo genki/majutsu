@@ -716,6 +716,44 @@ pub struct LargeChunk {
     pub object_key: String,
 }
 
+pub fn snapshot_manifest_matches(actual: &SnapshotManifest, expected: &SnapshotManifest) -> bool {
+    serde_json::to_value(actual).ok() == serde_json::to_value(expected).ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeManifestIssue {
+    RootIdMismatch { expected: String, actual: String },
+    TreeIdMismatch { expected: String, actual: String },
+    FileCountMismatch { expected: usize, actual: usize },
+}
+
+pub fn tree_manifest_issues(
+    actual: &TreeManifest,
+    expected_root_id: &str,
+    expected: &RootSnapshot,
+) -> Vec<TreeManifestIssue> {
+    let mut issues = Vec::new();
+    if actual.root_id != expected_root_id {
+        issues.push(TreeManifestIssue::RootIdMismatch {
+            expected: expected_root_id.to_string(),
+            actual: actual.root_id.clone(),
+        });
+    }
+    if actual.tree_id != expected.tree_id {
+        issues.push(TreeManifestIssue::TreeIdMismatch {
+            expected: expected.tree_id.clone(),
+            actual: actual.tree_id.clone(),
+        });
+    }
+    if actual.entries.len() != expected.file_count {
+        issues.push(TreeManifestIssue::FileCountMismatch {
+            expected: expected.file_count,
+            actual: actual.entries.len(),
+        });
+    }
+    issues
+}
+
 fn default_large_chunking() -> String {
     "fixed".into()
 }
@@ -905,6 +943,65 @@ mod tests {
                     id: "config-only".into(),
                 },
                 ConfigRootIssue::ConfigMismatch { id: "drift".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_manifest_comparison_uses_stable_json_shape() {
+        let manifest = SnapshotManifest {
+            snapshot_id: "snap-1".into(),
+            parent: None,
+            op_id: "op-1".into(),
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            root_trees: BTreeMap::new(),
+            roots: BTreeMap::new(),
+        };
+        let mut changed = SnapshotManifest {
+            snapshot_id: "snap-2".into(),
+            parent: None,
+            op_id: "op-1".into(),
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            root_trees: BTreeMap::new(),
+            roots: BTreeMap::new(),
+        };
+
+        assert!(snapshot_manifest_matches(&manifest, &manifest));
+        assert!(!snapshot_manifest_matches(&changed, &manifest));
+        changed.snapshot_id = "snap-1".into();
+        assert!(snapshot_manifest_matches(&changed, &manifest));
+    }
+
+    #[test]
+    fn tree_manifest_validation_reports_snapshot_metadata_drift() {
+        let tree = TreeManifest {
+            version: 1,
+            tree_id: "tree-actual".into(),
+            root_id: "root-actual".into(),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            entries: BTreeMap::new(),
+        };
+        let expected = RootSnapshot {
+            tree_id: "tree-expected".into(),
+            tree_key: "objects/trees/tree-expected.json".into(),
+            file_count: 1,
+        };
+
+        assert_eq!(
+            tree_manifest_issues(&tree, "root-expected", &expected),
+            vec![
+                TreeManifestIssue::RootIdMismatch {
+                    expected: "root-expected".into(),
+                    actual: "root-actual".into(),
+                },
+                TreeManifestIssue::TreeIdMismatch {
+                    expected: "tree-expected".into(),
+                    actual: "tree-actual".into(),
+                },
+                TreeManifestIssue::FileCountMismatch {
+                    expected: 1,
+                    actual: 0,
+                },
             ]
         );
     }

@@ -18,6 +18,7 @@ use majutsu_core::{
     history_graph_issues, host_file_issues, metadata_reference_issues,
     operation_log_comparison_issues, operation_log_entry_matches, payload_blob_ref,
     payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
+    snapshot_manifest_matches, tree_manifest_issues,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -26,7 +27,7 @@ use majutsu_db::{
     RemoteRefIssue, UploadQueueItem, UploadQueueItemIssue, expected_upload_queue_item_id,
     local_ref_issues, remote_ref_issues,
 };
-use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
+use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport, large_manifest_issues};
 use majutsu_pack::{
     PackEntry, PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackTier,
     PackedBlobMetadata, missing_pack_metadata_ids, pack_index_issues, pack_object_issues,
@@ -5174,10 +5175,7 @@ fn validate_local_snapshot_objects(
                 serde_json::from_slice::<TreeManifest>(&bytes).map_err(Into::into)
             }) {
                 Ok(tree) => {
-                    if tree.root_id != *root_id
-                        || tree.tree_id != root_tree.tree_id
-                        || tree.entries.len() != root_tree.file_count
-                    {
+                    if !tree_manifest_issues(&tree, root_id, root_tree).is_empty() {
                         *missing += 1;
                         eprintln!(
                             "tree manifest object does not match snapshot metadata {} {}",
@@ -5208,10 +5206,7 @@ fn validate_local_large_manifest_objects(
             .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
         {
             Ok(manifest) => {
-                if manifest.oid != large.oid
-                    || manifest.size != large.size
-                    || manifest.chunks.len() != large.chunk_count
-                {
+                if !large_manifest_issues(&manifest, large).is_empty() {
                     *missing += 1;
                     eprintln!(
                         "large manifest object does not match metadata {} {}",
@@ -5938,10 +5933,7 @@ fn validate_remote_snapshot_objects(
                             )
                         },
                     )?;
-                if tree.root_id != *root_id
-                    || tree.tree_id != root_tree.tree_id
-                    || tree.entries.len() != root_tree.file_count
-                {
+                if !tree_manifest_issues(&tree, root_id, root_tree).is_empty() {
                     *missing += 1;
                     eprintln!(
                         "tree manifest object does not match snapshot metadata {} {}",
@@ -6002,10 +5994,7 @@ fn validate_remote_large_manifest_objects(
                         )
                     },
                 )?;
-            if manifest.oid != large.oid
-                || manifest.size != large.size
-                || manifest.chunks.len() != large.chunk_count
-            {
+            if !large_manifest_issues(&manifest, large).is_empty() {
                 *missing += 1;
                 eprintln!(
                     "large manifest object does not match metadata {} {}",
@@ -6120,10 +6109,6 @@ fn validate_remote_pack_objects(
         eprintln!("packed blob references missing pack metadata {pack_id}");
     }
     Ok(())
-}
-
-fn snapshot_manifest_matches(remote: &SnapshotManifest, metadata: &SnapshotManifest) -> bool {
-    serde_json::to_value(remote).ok() == serde_json::to_value(metadata).ok()
 }
 
 #[derive(Debug)]

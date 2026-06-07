@@ -49,6 +49,39 @@ pub struct LargeObjectExport {
     pub manifest_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LargeManifestIssue {
+    OidMismatch { expected: String, actual: String },
+    SizeMismatch { expected: u64, actual: u64 },
+    ChunkCountMismatch { expected: usize, actual: usize },
+}
+
+pub fn large_manifest_issues(
+    actual: &majutsu_core::LargeManifest,
+    expected: &LargeObjectExport,
+) -> Vec<LargeManifestIssue> {
+    let mut issues = Vec::new();
+    if actual.oid != expected.oid {
+        issues.push(LargeManifestIssue::OidMismatch {
+            expected: expected.oid.clone(),
+            actual: actual.oid.clone(),
+        });
+    }
+    if actual.size != expected.size {
+        issues.push(LargeManifestIssue::SizeMismatch {
+            expected: expected.size,
+            actual: actual.size,
+        });
+    }
+    if actual.chunks.len() != expected.chunk_count {
+        issues.push(LargeManifestIssue::ChunkCountMismatch {
+            expected: expected.chunk_count,
+            actual: actual.chunks.len(),
+        });
+    }
+    issues
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LargePinExport {
     pub oid: String,
@@ -406,6 +439,52 @@ mod tests {
         assert_eq!(value["size"], 1024);
         assert_eq!(value["chunk_count"], 2);
         assert_eq!(value["manifest_key"], "objects/large/manifests/large-1");
+    }
+
+    #[test]
+    fn large_manifest_validation_reports_export_metadata_drift() {
+        let manifest = majutsu_core::LargeManifest {
+            version: 1,
+            oid: "actual".into(),
+            size: 11,
+            media_type: None,
+            binary: true,
+            chunking: "fixed".into(),
+            chunk_size: 8,
+            chunks: vec![majutsu_core::LargeChunk {
+                index: 0,
+                offset: 0,
+                len: 11,
+                stored_len: None,
+                compression: "none".into(),
+                oid: "chunk-a".into(),
+                object_key: "objects/chunks/chunk-a".into(),
+            }],
+        };
+        let export = LargeObjectExport {
+            oid: "expected".into(),
+            size: 10,
+            chunk_count: 2,
+            manifest_key: "objects/large/expected.json".into(),
+        };
+
+        assert_eq!(
+            large_manifest_issues(&manifest, &export),
+            vec![
+                LargeManifestIssue::OidMismatch {
+                    expected: "expected".into(),
+                    actual: "actual".into(),
+                },
+                LargeManifestIssue::SizeMismatch {
+                    expected: 10,
+                    actual: 11,
+                },
+                LargeManifestIssue::ChunkCountMismatch {
+                    expected: 2,
+                    actual: 1,
+                },
+            ]
+        );
     }
 
     #[test]
