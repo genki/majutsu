@@ -3415,6 +3415,15 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         }
         RemoteCommand::Fsck => {
             remote_fsck(paths, &remote)?;
+            let conn = open_db(paths)?;
+            let current = current_snapshot(&conn)?;
+            record_op(
+                &conn,
+                "fsck",
+                current.as_deref(),
+                current.as_deref(),
+                Some("checked remote state"),
+            )?;
         }
         RemoteCommand::Capabilities => {
             let capabilities = remote.capabilities();

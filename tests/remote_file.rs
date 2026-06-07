@@ -923,6 +923,11 @@ fn remote_fsck_accepts_canonical_only_payloads() {
         c
     });
     assert!(fsck.contains("remote fsck ok"));
+    assert_eq!(db_operation_count(&state, "fsck"), 1);
+    assert_eq!(
+        local_oplog_record_count(&state) as i64,
+        db_total_operation_count(&state)
+    );
 }
 
 #[test]
