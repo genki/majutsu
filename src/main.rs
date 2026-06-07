@@ -3415,8 +3415,15 @@ fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String
 }
 
 fn select_remote_host(hosts: Vec<RemoteHostSummary>, selector: &str) -> Result<RemoteHostSummary> {
-    if let Some(host) = hosts.iter().find(|host| host.id == selector) {
-        return Ok(host.clone());
+    let mut by_id = hosts
+        .iter()
+        .filter(|host| host.id == selector)
+        .cloned()
+        .collect::<Vec<_>>();
+    match by_id.len() {
+        0 => {}
+        1 => return Ok(by_id.remove(0)),
+        _ => bail!("remote host id is duplicated in hosts/index.json: {selector}"),
     }
     let mut by_name = hosts
         .into_iter()
@@ -4605,8 +4612,13 @@ fn remote_fsck(remote: &RemoteStore) -> Result<()> {
 
     if has_host_index {
         let index = read_remote_host_index(remote)?;
+        let mut seen_host_ids = BTreeSet::new();
         for host in &index.hosts {
             verified_hosts += 1;
+            if !seen_host_ids.insert(host.id.clone()) {
+                missing += 1;
+                eprintln!("duplicate host id in hosts/index.json: {}", host.id);
+            }
             if !remote.exists(&host.metadata_key)? {
                 missing += 1;
                 eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
