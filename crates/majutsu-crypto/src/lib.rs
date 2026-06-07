@@ -12,11 +12,53 @@ use std::path::Path;
 const ENC_MAGIC: &[u8] = b"MJENC1\n";
 const AGE_MAGIC: &[u8] = b"age-encryption.org/v1";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionMode {
     None,
     Age,
     ChaCha20Poly1305,
+}
+
+impl EncryptionMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "" | "none" => Ok(Self::None),
+            "age" => Ok(Self::Age),
+            "chacha20poly1305" => Ok(Self::ChaCha20Poly1305),
+            _ => bail!("security encryption must be none, age, or chacha20poly1305"),
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Age => "age",
+            Self::ChaCha20Poly1305 => "chacha20poly1305",
+        }
+    }
+}
+
+pub fn encryption_enabled(value: &str) -> Result<bool> {
+    Ok(EncryptionMode::parse(value)?.enabled())
+}
+
+pub fn default_security_key_id() -> &'static str {
+    "default"
+}
+
+pub fn default_security_hash() -> &'static str {
+    "blake3-keyed"
+}
+
+pub fn validate_security_hash(hash: &str) -> Result<()> {
+    match hash {
+        "blake3-keyed" | "blake3" | "sha256" => Ok(()),
+        _ => bail!("security hash must be blake3-keyed, blake3, or sha256"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,4 +266,42 @@ fn read_age_identities(recipients_path: &Path) -> Result<Vec<age::x25519::Identi
                 .map_err(|err| anyhow!("invalid age identity: {err}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_encryption_modes() {
+        assert_eq!(EncryptionMode::parse("").unwrap(), EncryptionMode::None);
+        assert_eq!(EncryptionMode::parse("none").unwrap(), EncryptionMode::None);
+        assert_eq!(EncryptionMode::parse("age").unwrap(), EncryptionMode::Age);
+        assert_eq!(
+            EncryptionMode::parse("chacha20poly1305").unwrap(),
+            EncryptionMode::ChaCha20Poly1305
+        );
+        assert!(EncryptionMode::parse("aes").is_err());
+    }
+
+    #[test]
+    fn encryption_enabled_matches_mode() {
+        assert!(!encryption_enabled("none").unwrap());
+        assert!(encryption_enabled("age").unwrap());
+        assert!(encryption_enabled("chacha20poly1305").unwrap());
+    }
+
+    #[test]
+    fn security_defaults_match_config_defaults() {
+        assert_eq!(default_security_key_id(), "default");
+        assert_eq!(default_security_hash(), "blake3-keyed");
+    }
+
+    #[test]
+    fn validates_supported_security_hashes() {
+        for hash in ["blake3-keyed", "blake3", "sha256"] {
+            validate_security_hash(hash).unwrap();
+        }
+        assert!(validate_security_hash("md5").is_err());
+    }
 }

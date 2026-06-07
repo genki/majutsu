@@ -8650,27 +8650,15 @@ fn validate_watch_mode(mode: &str) -> Result<()> {
 
 fn validate_security_config(security: &SecurityConfig) -> Result<()> {
     encryption_enabled(security)?;
-    match security.hash.as_str() {
-        "blake3-keyed" | "blake3" | "sha256" => Ok(()),
-        _ => bail!("security hash must be blake3-keyed, blake3, or sha256"),
-    }
+    majutsu_crypto::validate_security_hash(&security.hash)
 }
 
 fn encryption_enabled(security: &SecurityConfig) -> Result<bool> {
-    match security.encryption.as_str() {
-        "" | "none" => Ok(false),
-        "age" | "chacha20poly1305" => Ok(true),
-        _ => bail!("security encryption must be none, age, or chacha20poly1305"),
-    }
+    majutsu_crypto::encryption_enabled(&security.encryption)
 }
 
 fn encryption_mode(security: &SecurityConfig) -> Result<EncryptionMode> {
-    match security.encryption.as_str() {
-        "" | "none" => Ok(EncryptionMode::None),
-        "age" => Ok(EncryptionMode::Age),
-        "chacha20poly1305" => Ok(EncryptionMode::ChaCha20Poly1305),
-        _ => bail!("security encryption must be none, age, or chacha20poly1305"),
-    }
+    EncryptionMode::parse(&security.encryption)
 }
 
 fn validate_large_chunking(chunking: &str) -> Result<()> {
@@ -9140,11 +9128,11 @@ fn default_watch_interval_secs() -> u64 {
 }
 
 fn default_security_key_id() -> String {
-    "default".into()
+    majutsu_crypto::default_security_key_id().into()
 }
 
 fn default_security_hash() -> String {
-    "blake3-keyed".into()
+    majutsu_crypto::default_security_hash().into()
 }
 
 impl Default for WatchConfig {
