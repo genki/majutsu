@@ -8807,6 +8807,64 @@ mod tests {
     }
 
     #[test]
+    fn s3_restore_archive_posts_restore_request_xml() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before sending headers");
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while bytes.len() < header_end + content_length {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "client closed before sending body");
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            tx.send(bytes).unwrap();
+        });
+
+        let mut remote = test_s3_remote();
+        remote.endpoint = endpoint;
+        remote.prefix = "majutsu/v1".into();
+        assert!(
+            remote
+                .restore_archive("objects/blobs/aa/bb", 5, "Bulk")
+                .unwrap()
+        );
+        server.join().unwrap();
+        let request = rx.recv().unwrap();
+        let text = String::from_utf8_lossy(&request);
+        let lower = text.to_ascii_lowercase();
+        assert!(text.starts_with("POST /bucket/majutsu/v1/objects/blobs/aa/bb?restore="));
+        assert!(lower.contains("authorization: aws4-hmac-sha256"));
+        assert!(lower.contains("content-type: application/xml"));
+        assert!(text.contains("<RestoreRequest><Days>5</Days>"));
+        assert!(text.contains("<Tier>Bulk</Tier>"));
+    }
+
+    #[test]
     fn file_remote_put_if_absent_does_not_overwrite_existing_object() {
         let tmp = tempfile::tempdir().unwrap();
         let remote = RemoteStore::File(FileRemote {
