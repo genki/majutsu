@@ -4946,10 +4946,7 @@ fn remote_fsck_export(
             );
         }
     }
-    if !export.chunks.is_empty() && !remote.exists(CHUNK_INDEX_SHARD_KEY)? {
-        *missing += 1;
-        eprintln!("missing remote chunk index shard {CHUNK_INDEX_SHARD_KEY}");
-    }
+    validate_remote_chunk_index(paths, remote, &export, missing)?;
     for key in local_object_keys(&export) {
         let legacy_exists = remote.exists(&key)?;
         let aliases = canonical_remote_aliases(&key);
@@ -5030,6 +5027,72 @@ fn remote_fsck_export(
         }
     }
     Ok(export)
+}
+
+fn validate_remote_chunk_index(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    if export.chunks.is_empty() {
+        return Ok(());
+    }
+    if !remote.exists(CHUNK_INDEX_SHARD_KEY)? {
+        *missing += 1;
+        eprintln!("missing remote chunk index shard {CHUNK_INDEX_SHARD_KEY}");
+        return Ok(());
+    }
+    let shard: ChunkIndexShard =
+        decode_canonical_remote_export(paths, &remote.get(CHUNK_INDEX_SHARD_KEY)?)
+            .with_context(|| format!("parse remote chunk index shard {CHUNK_INDEX_SHARD_KEY}"))?;
+    if shard.version != 1
+        || shard.shard != "shard-0000"
+        || shard.chunks.len() != export.chunks.len()
+    {
+        *missing += 1;
+        eprintln!("remote chunk index shard metadata does not match export");
+        return Ok(());
+    }
+    let expected = export
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.oid.as_str(), chunk))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for entry in &shard.chunks {
+        let Some(chunk) = expected.get(entry.oid.as_str()) else {
+            *missing += 1;
+            eprintln!(
+                "remote chunk index entry has no matching chunk {}",
+                entry.oid
+            );
+            continue;
+        };
+        if !seen.insert(entry.oid.as_str()) {
+            *missing += 1;
+            eprintln!("duplicate remote chunk index entry {}", entry.oid);
+        }
+        let expected_canonical =
+            canonical_remote_alias(&chunk.object_key).unwrap_or_else(|| chunk.object_key.clone());
+        if entry.size != chunk.size
+            || entry.object_key != chunk.object_key
+            || entry.canonical_key != expected_canonical
+        {
+            *missing += 1;
+            eprintln!(
+                "remote chunk index entry does not match metadata {}",
+                entry.oid
+            );
+        }
+    }
+    for oid in expected.keys() {
+        if !seen.contains(oid) {
+            *missing += 1;
+            eprintln!("chunk missing from remote chunk index {oid}");
+        }
+    }
+    Ok(())
 }
 
 fn validate_remote_snapshot_objects(

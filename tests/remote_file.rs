@@ -1284,6 +1284,60 @@ fn remote_fsck_detects_missing_chunk_index_shard() {
 }
 
 #[test]
+fn remote_fsck_detects_corrupt_chunk_index_shard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.zip"), vec![7u8; 32 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    rewrite_canonical_cbor_zstd(
+        &remote.join("indexes/chunk-index/shard-0000.cbor.zst.enc"),
+        |value| {
+            value["chunks"][0]["canonical_key"] =
+                serde_json::Value::String("large/chunks/corrupt.chunk.enc".into());
+        },
+    );
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_detects_missing_canonical_host_export() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
