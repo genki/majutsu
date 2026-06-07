@@ -41,7 +41,6 @@ use majutsu_store::{
     host_snapshot_key, host_snapshots_prefix, remote_gc_mark_key, remote_gc_tombstone_key,
     remote_gc_tombstone_prefix, remote_object_availability_issues, select_remote_host,
 };
-use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 #[cfg(test)]
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
@@ -54,8 +53,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+#[cfg(test)]
 use std::sync::mpsc;
-use std::time::Duration;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -84,8 +83,8 @@ use atomic_io::{write_atomic, write_atomic_with};
 use cli::{
     Cli, CloneArgs, Command, DaemonCommand, DiffArgs, HydrateArgs, InitArgs, KeyCommand,
     LargeCommand, LifecycleCommand, LogArgs, MountArgs, OpCommand, PackArgs, PruneArgs,
-    RemoteCommand, ResolvedWatchArgs, RestoreArgs, RestoreCommand, RestoreTopArgs, RootCommand,
-    SnapshotArgs, SyncCommand, UnmountArgs, WatchArgs,
+    RemoteCommand, RestoreArgs, RestoreCommand, RestoreTopArgs, RootCommand, SnapshotArgs,
+    SyncCommand, UnmountArgs,
 };
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, LazyMountEntry,
@@ -97,7 +96,7 @@ use config::{
     validate_large_chunking, validate_restore_archive_config, validate_snapshot_mode,
     validate_watch_mode, write_config,
 };
-use daemon_runtime::{daemon_ipc_request, start_daemon_ipc, start_watch_daemon};
+use daemon_runtime::{daemon_ipc_request, start_watch_daemon};
 use db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
@@ -148,7 +147,7 @@ use util::{
     blake3_hex, media_type_for_path, modified_secs, new_id, parse_db_time, parse_duration_ago,
     parse_time, path_to_slash, stable_metadata_matches, stable_read,
 };
-use watch_runtime::{format_notify_event, normalize_watch_backend, recv_watch_event};
+use watch_runtime::{normalize_watch_backend, watch_cmd};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1998,234 +1997,6 @@ fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<String> {
         }
     }
     Ok(key.to_string())
-}
-
-fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
-    ensure_ready(paths)?;
-    let config = read_config(paths)?;
-    let args = resolve_watch_args(args, &config.watch)?;
-    let backend = normalize_watch_backend(&args.backend)?;
-    if !args.foreground {
-        let pid = start_watch_daemon(
-            paths,
-            backend,
-            &args.mode,
-            args.interval_secs,
-            args.debounce_ms,
-            args.settle_ms,
-            args.periodic_rescan_secs,
-        )?;
-        println!("started daemon pid {pid}");
-        return Ok(());
-    }
-    let _lock = acquire_process_lock(&paths.daemon_lock, "daemon")?;
-    start_daemon_ipc(paths)?;
-    match backend {
-        "notify" => watch_notify(paths, args, "notify"),
-        "inotify" => watch_notify(paths, args, "inotify"),
-        "poll" => watch_poll(paths, &args),
-        other => bail!("unsupported watch backend: {other}"),
-    }
-}
-
-fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedWatchArgs> {
-    let mode = args.mode.unwrap_or_else(|| config.mode.clone());
-    validate_watch_mode(&mode)?;
-    Ok(ResolvedWatchArgs {
-        foreground: args.foreground,
-        mode,
-        interval_secs: args.interval_secs.unwrap_or(config.interval),
-        debounce_ms: args.debounce_ms.unwrap_or(config.debounce),
-        settle_ms: args.settle_ms.unwrap_or(config.settle),
-        periodic_rescan_secs: args.periodic_rescan_secs.unwrap_or(config.periodic_rescan),
-        backend: args.backend.unwrap_or_else(|| config.backend.clone()),
-        once: args.once,
-    })
-}
-
-fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
-    record_event(
-        paths,
-        "watch-start",
-        &format!(
-            "backend=poll mode={} interval_secs={}",
-            args.mode, args.interval_secs
-        ),
-    )?;
-    loop {
-        snapshot(
-            paths,
-            SnapshotArgs {
-                message: Some("watch snapshot".into()),
-            },
-        )?;
-        if args.once {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(args.interval_secs.max(1)));
-    }
-    record_event(paths, "watch-stop", "foreground watch stopped")?;
-    Ok(())
-}
-
-fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> Result<()> {
-    let conn = open_db(paths)?;
-    let active_roots = roots(&conn)?
-        .into_iter()
-        .filter(|root| root.status == "active" && root.path.exists())
-        .collect::<Vec<_>>();
-    if active_roots.is_empty() {
-        bail!("no active roots are available to watch");
-    }
-    record_event(
-        paths,
-        "watch-start",
-        &format!(
-            "backend={} mode={} debounce_ms={} settle_ms={} periodic_rescan_secs={}",
-            backend_label, args.mode, args.debounce_ms, args.settle_ms, args.periodic_rescan_secs
-        ),
-    )?;
-    let (tx, rx) = mpsc::channel();
-    #[cfg(target_os = "linux")]
-    if backend_label == "inotify" {
-        let watcher = notify::INotifyWatcher::new(
-            move |res| {
-                let _ = tx.send(res);
-            },
-            NotifyConfig::default(),
-        )?;
-        return watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx);
-    }
-    let watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx.send(res);
-        },
-        NotifyConfig::default(),
-    )?;
-    watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx)
-}
-
-fn watch_notify_loop<W: Watcher>(
-    paths: &Paths,
-    args: ResolvedWatchArgs,
-    backend_label: &str,
-    active_roots: Vec<RootConfig>,
-    mut watcher: W,
-    rx: mpsc::Receiver<notify::Result<notify::Event>>,
-) -> Result<()> {
-    for root in &active_roots {
-        watcher.watch(&root.path, RecursiveMode::Recursive)?;
-        record_event(
-            paths,
-            "watch-root",
-            &format!("{} {}", root.id, root.path.display()),
-        )?;
-    }
-    if replay_pending_journal_events(paths)? && args.once {
-        record_event(
-            paths,
-            "watch-stop",
-            &format!("foreground {backend_label} watch stopped after journal replay"),
-        )?;
-        return Ok(());
-    }
-    loop {
-        let event = match recv_watch_event(&rx, args.periodic_rescan_secs)? {
-            Some(event) => event,
-            None => {
-                record_event(
-                    paths,
-                    "periodic-rescan",
-                    &format!("interval_secs={}", args.periodic_rescan_secs),
-                )?;
-                snapshot(
-                    paths,
-                    SnapshotArgs {
-                        message: Some("watch periodic rescan".into()),
-                    },
-                )?;
-                if args.once {
-                    break;
-                }
-                continue;
-            }
-        };
-        let detail = format_notify_event(&event);
-        record_event(paths, "fs-event", &detail)?;
-        if args.mode == "strict" {
-            snapshot(
-                paths,
-                SnapshotArgs {
-                    message: Some("watch strict event snapshot".into()),
-                },
-            )?;
-            if args.once {
-                break;
-            }
-            continue;
-        }
-        let debounce = std::time::Duration::from_millis(args.debounce_ms.max(1));
-        let settle = std::time::Duration::from_millis(args.settle_ms);
-        drain_watch_debounce(paths, &rx, debounce)?;
-        if !settle.is_zero() {
-            record_event(
-                paths,
-                "watch-settle",
-                &format!("settle_ms={}", args.settle_ms),
-            )?;
-            loop {
-                match rx.recv_timeout(settle) {
-                    Ok(Ok(next)) => {
-                        record_event(paths, "fs-event", &format_notify_event(&next))?;
-                        drain_watch_debounce(paths, &rx, debounce)?;
-                        record_event(
-                            paths,
-                            "watch-settle",
-                            &format!("settle_ms={}", args.settle_ms),
-                        )?;
-                        continue;
-                    }
-                    Ok(Err(err)) => return Err(err.into()),
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        bail!("watch channel disconnected")
-                    }
-                }
-            }
-        }
-        snapshot(
-            paths,
-            SnapshotArgs {
-                message: Some("watch event snapshot".into()),
-            },
-        )?;
-        if args.once {
-            break;
-        }
-    }
-    record_event(
-        paths,
-        "watch-stop",
-        &format!("foreground {backend_label} watch stopped"),
-    )?;
-    Ok(())
-}
-
-fn drain_watch_debounce(
-    paths: &Paths,
-    rx: &mpsc::Receiver<notify::Result<notify::Event>>,
-    debounce: Duration,
-) -> Result<()> {
-    loop {
-        match rx.recv_timeout(debounce) {
-            Ok(Ok(next)) => {
-                record_event(paths, "fs-event", &format_notify_event(&next))?;
-            }
-            Ok(Err(err)) => return Err(err.into()),
-            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
-            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
-        }
-    }
 }
 
 fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
