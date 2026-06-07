@@ -386,6 +386,8 @@ struct WatchArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     foreground: bool,
     #[arg(long)]
+    mode: Option<String>,
+    #[arg(long)]
     interval_secs: Option<u64>,
     #[arg(long)]
     debounce_ms: Option<u64>,
@@ -414,6 +416,10 @@ struct ResolvedWatchArgs {
 #[derive(Subcommand)]
 enum DaemonCommand {
     Start {
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        mode: Option<String>,
         #[arg(long)]
         interval_secs: Option<u64>,
         #[arg(long)]
@@ -3627,12 +3633,13 @@ fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<String> {
 fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
-    let args = resolve_watch_args(args, &config.watch);
+    let args = resolve_watch_args(args, &config.watch)?;
     let backend = normalize_watch_backend(&args.backend)?;
     if !args.foreground {
         let pid = start_watch_daemon(
             paths,
             backend,
+            &args.mode,
             args.interval_secs,
             args.debounce_ms,
             args.settle_ms,
@@ -3666,17 +3673,19 @@ fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
     }
 }
 
-fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> ResolvedWatchArgs {
-    ResolvedWatchArgs {
+fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedWatchArgs> {
+    let mode = args.mode.unwrap_or_else(|| config.mode.clone());
+    validate_watch_mode(&mode)?;
+    Ok(ResolvedWatchArgs {
         foreground: args.foreground,
-        mode: config.mode.clone(),
+        mode,
         interval_secs: args.interval_secs.unwrap_or(config.interval),
         debounce_ms: args.debounce_ms.unwrap_or(config.debounce),
         settle_ms: args.settle_ms.unwrap_or(config.settle),
         periodic_rescan_secs: args.periodic_rescan_secs.unwrap_or(config.periodic_rescan),
         backend: args.backend.unwrap_or_else(|| config.backend.clone()),
         once: args.once,
-    }
+    })
 }
 
 fn default_daemon_backend() -> &'static str {
@@ -3893,6 +3902,7 @@ fn recv_watch_event(
 fn start_watch_daemon(
     paths: &Paths,
     backend: &str,
+    mode: &str,
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
@@ -3917,6 +3927,8 @@ fn start_watch_daemon(
         .arg("true")
         .arg("--backend")
         .arg(backend)
+        .arg("--mode")
+        .arg(mode)
         .arg("--interval-secs")
         .arg(interval_secs.to_string())
         .arg("--debounce-ms")
@@ -3938,14 +3950,20 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     let config = read_config(paths)?;
     match command {
         DaemonCommand::Start {
+            backend,
+            mode,
             interval_secs,
             settle_ms,
             periodic_rescan_secs,
         } => {
-            let backend = normalize_watch_backend(&config.watch.backend)?;
+            let configured_backend = backend.unwrap_or_else(|| config.watch.backend.clone());
+            let backend = normalize_watch_backend(&configured_backend)?;
+            let mode = mode.unwrap_or_else(|| config.watch.mode.clone());
+            validate_watch_mode(&mode)?;
             let pid = start_watch_daemon(
                 paths,
                 backend,
+                &mode,
                 interval_secs.unwrap_or(config.watch.interval),
                 config.watch.debounce,
                 settle_ms.unwrap_or(config.watch.settle),
@@ -3961,6 +3979,7 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 &exe,
                 &paths.home,
                 backend,
+                &config.watch.mode,
                 config.watch.interval,
                 config.watch.debounce,
                 config.watch.settle,
@@ -4006,6 +4025,7 @@ fn render_daemon_service(
     exe: &Path,
     home: &Path,
     backend: &str,
+    mode: &str,
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
@@ -4016,6 +4036,7 @@ fn render_daemon_service(
             exe,
             home,
             backend,
+            mode,
             interval_secs,
             debounce_ms,
             settle_ms,
@@ -4025,6 +4046,7 @@ fn render_daemon_service(
             exe,
             home,
             backend,
+            mode,
             interval_secs,
             debounce_ms,
             settle_ms,
@@ -4038,6 +4060,7 @@ fn daemon_watch_args(
     exe: &Path,
     home: &Path,
     backend: &str,
+    mode: &str,
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
@@ -4052,6 +4075,8 @@ fn daemon_watch_args(
         "true".into(),
         "--backend".into(),
         backend.into(),
+        "--mode".into(),
+        mode.into(),
         "--interval-secs".into(),
         interval_secs.to_string(),
         "--debounce-ms".into(),
@@ -4067,6 +4092,7 @@ fn render_systemd_user_service(
     exe: &Path,
     home: &Path,
     backend: &str,
+    mode: &str,
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
@@ -4076,6 +4102,7 @@ fn render_systemd_user_service(
         exe,
         home,
         backend,
+        mode,
         interval_secs,
         debounce_ms,
         settle_ms,
@@ -4116,6 +4143,7 @@ fn render_launchd_plist(
     exe: &Path,
     home: &Path,
     backend: &str,
+    mode: &str,
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
@@ -4125,6 +4153,7 @@ fn render_launchd_plist(
         exe,
         home,
         backend,
+        mode,
         interval_secs,
         debounce_ms,
         settle_ms,

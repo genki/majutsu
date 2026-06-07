@@ -475,7 +475,7 @@ separate tree manifest object under `objects/trees/`.
 Foreground OS-native filesystem watching. On Linux, `inotify` is the default:
 
 ```sh
-mj watch --foreground --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
+mj watch --foreground --mode default --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
 ```
 
 `--backend inotify` can be specified explicitly on Linux. `--backend notify` is
@@ -491,6 +491,12 @@ One-shot notify watch, useful for tests:
 
 ```sh
 mj watch --once --backend notify --debounce-ms 100
+```
+
+Strict watch mode can be selected per invocation:
+
+```sh
+mj watch --once --backend notify --mode strict
 ```
 
 Daemonized watch can also be started through `watch`:

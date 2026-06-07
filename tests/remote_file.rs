@@ -7859,7 +7859,6 @@ fn watch_strict_mode_snapshots_each_observed_event_without_debounce() {
     let config_path = state.join("config.toml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
-        .replace("mode = \"default\"", "mode = \"strict\"")
         .replace("debounce = 1500", "debounce = \"2000ms\"")
         .replace("settle = 500", "settle = \"2000ms\"")
         .replace("periodic_rescan = 3600", "periodic_rescan = \"0s\"");
@@ -7883,6 +7882,8 @@ fn watch_strict_mode_snapshots_each_observed_event_without_debounce() {
         .arg("--once")
         .arg("--backend")
         .arg("notify")
+        .arg("--mode")
+        .arg("strict")
         .spawn()
         .unwrap();
     thread::sleep(Duration::from_millis(300));
@@ -8149,6 +8150,7 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(systemd.contains(state.to_str().unwrap()));
     assert!(systemd.contains("watch"));
     assert!(systemd.contains("--backend"));
+    assert!(systemd.contains("--mode"));
     assert!(systemd.contains("Restart=on-failure"));
 
     let launchd = output({
