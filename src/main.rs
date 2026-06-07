@@ -7352,9 +7352,8 @@ fn classify_large(config: &LargeConfig, rel: &Path, size: u64, binary: bool) -> 
 fn glob_match(pattern: &str, name: &str) -> bool {
     if let Some(ext) = pattern.strip_prefix("*.") {
         return name
-            .rsplit_once('.')
-            .map(|(_, e)| e.eq_ignore_ascii_case(ext))
-            .unwrap_or(false);
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{}", ext.to_ascii_lowercase()));
     }
     pattern == name
 }
@@ -7368,9 +7367,8 @@ fn path_pattern_match(pattern: &str, rel: &str) -> bool {
     }
     if let Some(ext) = pattern.strip_prefix("*.") {
         return rel
-            .rsplit_once('.')
-            .map(|(_, e)| e.eq_ignore_ascii_case(ext))
-            .unwrap_or(false);
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{}", ext.to_ascii_lowercase()));
     }
     if let Some(suffix) = pattern.strip_prefix("**/") {
         if let Some(middle) = suffix.strip_suffix("/**") {

@@ -4587,7 +4587,24 @@ fn default_large_always_patterns_route_known_binary_extensions() {
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("dataset.parquet"), b"tiny parquet marker\n").unwrap();
+    for name in [
+        "movie.mp4",
+        "clip.mov",
+        "video.mkv",
+        "archive.zip",
+        "bundle.tar",
+        "bundle.tar.zst",
+        "dataset.parquet",
+        "app.sqlite",
+        "app.db",
+        "disk.vmdk",
+        "disk.qcow2",
+        "installer.iso",
+        "design.psd",
+        "scene.blend",
+    ] {
+        fs::write(source.join(name), format!("tiny marker for {name}\n")).unwrap();
+    }
 
     run({
         let mut c = mj();
@@ -4600,6 +4617,7 @@ fn default_large_always_patterns_route_known_binary_extensions() {
     assert!(config.contains("\"*.qcow2\""));
     assert!(config.contains("\"*.psd\""));
     assert!(config.contains("\"*.blend\""));
+    assert!(config.contains("\"*.tar.zst\""));
     run({
         let mut c = mj();
         c.arg("--home")
@@ -4620,7 +4638,7 @@ fn default_large_always_patterns_route_known_binary_extensions() {
         c.arg("--home").arg(&state).arg("large").arg("stat");
         c
     });
-    assert!(stat.contains("large_objects 1"));
+    assert!(stat.contains("large_objects 14"));
 }
 
 #[test]
