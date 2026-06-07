@@ -3173,12 +3173,20 @@ fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             let keys = remote.list("")?;
             println!("remote {}", remote.describe());
             println!("objects {}", keys.len());
-            if remote.exists("metadata/export.json")? {
-                println!("metadata ok");
-                let first = remote.get_range("metadata/export.json", 0, 1)?;
-                println!("range_get {}", first.len());
+            let metadata_key = if remote.exists("metadata/export.json")? {
+                "metadata/export.json"
+            } else if remote.exists("hosts/index.json")? {
+                "hosts/index.json"
             } else {
-                bail!("metadata/export.json is missing on remote");
+                bail!(
+                    "remote metadata is missing: metadata/export.json and hosts/index.json not found"
+                );
+            };
+            if remote.exists(metadata_key)? {
+                println!("metadata ok");
+                println!("metadata_key {metadata_key}");
+                let first = remote.get_range(metadata_key, 0, 1)?;
+                println!("range_get {}", first.len());
             }
         }
         RemoteCommand::Fsck => {
