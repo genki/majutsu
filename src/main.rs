@@ -949,7 +949,7 @@ struct RootConfig {
     large: Option<RootLargeConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 struct RootLargeConfig {
     #[serde(default, deserialize_with = "deserialize_option_u64_bytes")]
     min_size: Option<u64>,
@@ -4913,6 +4913,7 @@ fn fsck(paths: &Paths) -> Result<()> {
         missing += 1;
         eprintln!("dangling large pin {oid} pinned_at={pinned_at}");
     }
+    validate_config_roots(paths, &conn, &config, &mut missing)?;
     validate_local_snapshot_objects(paths, &export, &mut missing)?;
     validate_local_large_manifest_objects(paths, &export, &mut missing)?;
     validate_local_pack_objects(paths, &export, &mut missing)?;
@@ -4926,6 +4927,75 @@ fn fsck(paths: &Paths) -> Result<()> {
     }
     println!("fsck ok");
     Ok(())
+}
+
+fn validate_config_roots(
+    paths: &Paths,
+    conn: &Connection,
+    config: &Config,
+    missing: &mut usize,
+) -> Result<()> {
+    let db_roots = roots(conn)?
+        .into_iter()
+        .map(|root| (root.id.clone(), root))
+        .collect::<BTreeMap<_, _>>();
+    let mut config_roots = BTreeMap::new();
+    for config_root in &config.roots {
+        if config_roots.contains_key(&config_root.id) {
+            *missing += 1;
+            eprintln!("duplicate root id in config {}", config_root.id);
+            continue;
+        }
+        let existing = db_roots.get(&config_root.id);
+        let root = match config_root.to_root_config(paths, existing) {
+            Ok(root) => root,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid config root {}: {err}", config_root.id);
+                continue;
+            }
+        };
+        config_roots.insert(config_root.id.clone(), root);
+    }
+    for id in db_roots.keys() {
+        if !config_roots.contains_key(id) {
+            *missing += 1;
+            eprintln!("root exists in database but not config {id}");
+        }
+    }
+    for id in config_roots.keys() {
+        if !db_roots.contains_key(id) {
+            *missing += 1;
+            eprintln!("root exists in config but not database {id}");
+        }
+    }
+    for (id, db_root) in &db_roots {
+        let Some(config_root) = config_roots.get(id) else {
+            continue;
+        };
+        if !root_configs_match(db_root, config_root) {
+            *missing += 1;
+            eprintln!("root config does not match database {id}");
+        }
+    }
+    Ok(())
+}
+
+fn root_configs_match(left: &RootConfig, right: &RootConfig) -> bool {
+    left.id == right.id
+        && left.name == right.name
+        && left.path == right.path
+        && left.include == right.include
+        && left.exclude == right.exclude
+        && left.follow_symlinks == right.follow_symlinks
+        && left.require_mount == right.require_mount
+        && left.status == right.status
+        && left.snapshot_mode == right.snapshot_mode
+        && left.pre_snapshot == right.pre_snapshot
+        && left.post_snapshot == right.post_snapshot
+        && left.snapshot_source == right.snapshot_source
+        && left.application_plugin == right.application_plugin
+        && left.large == right.large
 }
 
 fn validate_local_metadata_references(

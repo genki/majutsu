@@ -5589,6 +5589,48 @@ fn fsck_detects_corrupt_event_journal_item() {
 }
 
 #[test]
+fn fsck_detects_config_root_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("id = \"sample\"", "id = \"drifted\"");
+    fs::write(config_path, config).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn large_pin_unpin_is_persisted_in_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
