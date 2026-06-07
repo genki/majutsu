@@ -5363,6 +5363,10 @@ fn remote_fsck_export(
 ) -> Result<MetadataExport> {
     let export: MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
+    if let Err(err) = validate_config(&export.config) {
+        *missing += 1;
+        eprintln!("invalid remote config in {metadata_key}: {err}");
+    }
     for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
         *missing += 1;
         match issue {
@@ -7826,11 +7830,16 @@ fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
 
 fn read_config(paths: &Paths) -> Result<Config> {
     let config: Config = toml::from_str(&fs::read_to_string(&paths.config)?)?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
     normalize_watch_backend(&config.watch.backend)?;
     validate_watch_mode(&config.watch.mode)?;
     validate_security_config(&config.security)?;
     validate_restore_archive_config(&config.restore.archive)?;
-    Ok(config)
+    Ok(())
 }
 
 fn write_config(paths: &Paths, config: &Config) -> Result<()> {

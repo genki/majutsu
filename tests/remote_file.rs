@@ -1786,6 +1786,58 @@ fn remote_fsck_detects_dangling_blob_metadata() {
 }
 
 #[test]
+fn remote_fsck_detects_invalid_restore_archive_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export_path = remote.join("metadata/export.json");
+    let mut export: serde_json::Value =
+        serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
+    export["config"]["restore"]["archive"]["days"] = serde_json::Value::Number(0.into());
+    fs::write(&export_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_detects_corrupt_canonical_tree_manifest_object() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
