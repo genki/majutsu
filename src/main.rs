@@ -15,6 +15,7 @@ use majutsu_core::{
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_pack::{PackEntry, PackIndex, PackTier};
+use majutsu_restore::{RestoreChangeStats, RestorePathState, count_restore_changes};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -4570,13 +4571,6 @@ struct RestoreObjectStats {
     archive_or_missing_objects: usize,
 }
 
-struct RestoreChangeStats {
-    restore_files: usize,
-    modify_files: usize,
-    keep_files: usize,
-    delete_files: usize,
-}
-
 fn build_restore_plan(
     _paths: &Paths,
     conn: &Connection,
@@ -4818,23 +4812,16 @@ fn restore_change_stats(
     conn: &Connection,
     plan: &RestorePlan,
 ) -> Result<RestoreChangeStats> {
-    let mut stats = RestoreChangeStats {
-        restore_files: 0,
-        modify_files: 0,
-        keep_files: 0,
-        delete_files: plan.deletes.len(),
-    };
-    for record in &plan.files {
+    count_restore_changes(&plan.files, plan.deletes.len(), |record| {
         let dest = restore_destination(plan, record)?;
         if !dest.try_exists()? {
-            stats.restore_files += 1;
+            Ok(RestorePathState::Missing)
         } else if restore_record_matches_path(paths, conn, record, &dest).unwrap_or(false) {
-            stats.keep_files += 1;
+            Ok(RestorePathState::Matches)
         } else {
-            stats.modify_files += 1;
+            Ok(RestorePathState::Differs)
         }
-    }
-    Ok(stats)
+    })
 }
 
 fn restore_object_stats(

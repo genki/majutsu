@@ -1460,6 +1460,7 @@ dependencies = [
  "majutsu-large",
  "majutsu-pack",
  "majutsu-policy",
+ "majutsu-restore",
  "notify",
  "quick-xml",
  "reqwest",
