@@ -1179,7 +1179,10 @@ fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 bail!("root path does not exist: {}", path.display());
             }
             if root_by_id_optional(&conn, &args.id)?.is_some() {
-                bail!("root already exists: {}; use `mj root set` to change it", args.id);
+                bail!(
+                    "root already exists: {}; use `mj root set` to change it",
+                    args.id
+                );
             }
             validate_snapshot_mode(&args.snapshot_mode)?;
             if let Some(chunking) = &args.large_chunking {
@@ -2688,22 +2691,36 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
         return sync_status(paths, &conn, &remote);
     }
     let current = current_snapshot(&conn)?;
+    let previous_last_synced = ref_value(&conn, "last-synced")?;
     let synced_at = Utc::now().to_rfc3339();
-    conn.execute(
-        "insert into refs(name, value) values ('last-synced', ?1)
-         on conflict(name) do update set value=excluded.value",
-        params![synced_at],
-    )?;
-    record_op(
+    set_ref_value(&conn, "last-synced", &synced_at)?;
+    let sync_op = record_op(
         &conn,
         "remote-sync",
         current.as_deref(),
         current.as_deref(),
         Some("pushed metadata and objects"),
     )?;
-    let export = export_metadata(&conn, &config)?;
-    let export_json = serde_json::to_vec_pretty(&export)?;
-    enqueue_inline_upload(paths, "metadata/export.json", export_json)?;
+    let result = enqueue_and_drain_sync(paths, &conn, &config, &remote);
+    if result.is_err() {
+        restore_ref_value(&conn, "last-synced", previous_last_synced.as_deref())?;
+        delete_operation(&conn, &sync_op)?;
+    }
+    result
+}
+
+fn enqueue_and_drain_sync(
+    paths: &Paths,
+    conn: &Connection,
+    config: &Config,
+    remote: &RemoteStore,
+) -> Result<()> {
+    let export = export_metadata(conn, config)?;
+    enqueue_inline_upload(
+        paths,
+        "metadata/export.json",
+        serde_json::to_vec_pretty(&export)?,
+    )?;
     let host_metadata_key = format!("hosts/{}/metadata/export.json", config.host.id);
     enqueue_inline_upload(
         paths,
@@ -2806,6 +2823,39 @@ fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
     let pruned_remote_exports = prune_remote_host_exports(&remote, &config.host.id, &export)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
+    Ok(())
+}
+
+fn ref_value(conn: &Connection, name: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "select value from refs where name=?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn set_ref_value(conn: &Connection, name: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "insert into refs(name, value) values (?1, ?2)
+         on conflict(name) do update set value=excluded.value",
+        params![name, value],
+    )?;
+    Ok(())
+}
+
+fn restore_ref_value(conn: &Connection, name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        set_ref_value(conn, name, value)
+    } else {
+        conn.execute("delete from refs where name=?1", params![name])?;
+        Ok(())
+    }
+}
+
+fn delete_operation(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("delete from operations where id=?1", params![id])?;
     Ok(())
 }
 

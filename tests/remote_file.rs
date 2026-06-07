@@ -1,4 +1,5 @@
 use chrono::{SecondsFormat, Utc};
+use rusqlite::Connection;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -73,6 +74,24 @@ fn count_files_ending(root: &std::path::Path, suffix: &str) -> usize {
             entry.file_type().is_file() && entry.path().to_string_lossy().ends_with(suffix)
         })
         .count()
+}
+
+fn db_ref(state: &std::path::Path, name: &str) -> Option<String> {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.query_row("select value from refs where name=?1", [name], |row| {
+        row.get(0)
+    })
+    .ok()
+}
+
+fn db_operation_count(state: &std::path::Path, kind: &str) -> i64 {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.query_row(
+        "select count(*) from operations where kind=?1",
+        [kind],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -1078,6 +1097,62 @@ fn sync_retry_queue_preserves_attempt_count_across_reenqueue() {
         0
     );
     assert!(remote.join("metadata/export.json").exists());
+}
+
+#[test]
+fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote-file");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(&remote, b"not a directory\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    assert_eq!(db_ref(&state, "last-synced"), None);
+    assert_eq!(db_operation_count(&state, "remote-sync"), 0);
+
+    fs::remove_file(&remote).unwrap();
+    fs::create_dir_all(&remote).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    assert!(db_ref(&state, "last-synced").is_some());
+    assert_eq!(db_operation_count(&state, "remote-sync"), 1);
 }
 
 #[test]
