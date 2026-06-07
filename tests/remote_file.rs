@@ -9074,6 +9074,128 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_watch_snapshot_survives_sync_retry_and_remote_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote-file");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(&remote, b"not a directory\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let started = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("start")
+            .arg("--backend")
+            .arg("notify")
+            .arg("--settle-ms")
+            .arg("50")
+            .arg("--periodic-rescan-secs")
+            .arg("3600");
+        c
+    });
+    assert!(started.contains("started daemon pid"));
+    for _ in 0..50 {
+        if state.join("runtime/daemon.sock").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    fs::write(source.join("alpha.txt"), b"daemon retry captured\n").unwrap();
+    let mut captured = false;
+    for _ in 0..100 {
+        if db_ref(&state, "current").is_some() {
+            captured = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
+    assert!(
+        captured,
+        "daemon did not create a snapshot for the file event"
+    );
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let queued = fs::read_dir(state.join("queue/uploads"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(queued.iter().any(|item| item.contains("\"attempts\": 2")));
+
+    fs::remove_file(&remote).unwrap();
+    fs::create_dir_all(&remote).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert_eq!(
+        fs::read_dir(state.join("queue/uploads")).unwrap().count(),
+        0
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "daemon retry captured\n"
+    );
+}
+
 #[test]
 fn transactional_snapshot_runs_pre_and_post_hooks() {
     let tmp = tempfile::tempdir().unwrap();
