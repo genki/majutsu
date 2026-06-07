@@ -1587,9 +1587,9 @@ fn log_ops(paths: &Paths, args: LogArgs) -> Result<()> {
 fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let mut stmt = conn.prepare(
         "select id, kind, before_snapshot, after_snapshot, created_at, message
-         from operations order by rowid desc limit ?1",
+         from operations order by rowid desc",
     )?;
-    let rows = stmt.query_map(params![args.limit as i64], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -1599,6 +1599,7 @@ fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
             row.get::<_, Option<String>>(5)?,
         ))
     })?;
+    let mut printed = 0usize;
     for row in rows {
         let (id, kind, before, after, created, message) = row?;
         if let Some(root) = &args.root {
@@ -1615,12 +1616,16 @@ fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
                 continue;
             }
         }
+        if printed >= args.limit {
+            break;
+        }
         println!(
             "{id}\t{created}\t{kind}\t{} -> {}\t{}",
             before.unwrap_or_default(),
             after.unwrap_or_default(),
             message.unwrap_or_default()
         );
+        printed += 1;
     }
     Ok(())
 }

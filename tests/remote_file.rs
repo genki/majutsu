@@ -1539,6 +1539,68 @@ fn diff_reports_added_modified_and_deleted_paths() {
 }
 
 #[test]
+fn log_root_filter_applies_limit_after_filtering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_a = tmp.path().join("source-a");
+    let source_b = tmp.path().join("source-b");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source_a).unwrap();
+    fs::create_dir_all(&source_b).unwrap();
+    fs::write(source_a.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source_b.join("beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source_a);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("other")
+            .arg(&source_b);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("pause")
+            .arg("other");
+        c
+    });
+
+    let log = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--root")
+            .arg("sample")
+            .arg("--limit")
+            .arg("1");
+        c
+    });
+    assert_eq!(log.lines().count(), 1);
+    assert!(log.contains("root-added"));
+    assert!(log.contains("sample"));
+}
+
+#[test]
 fn prune_dry_run_and_gc_are_safe_entry_points() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
