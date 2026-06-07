@@ -1457,6 +1457,7 @@ dependencies = [
  "hmac",
  "ignore",
  "libc",
+ "majutsu-core",
  "notify",
  "quick-xml",
  "rand",
@@ -1483,6 +1484,10 @@ version = "0.1.0"
 [[package]]
 name = "majutsu-core"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+]
 
 [[package]]
 name = "majutsu-crypto"

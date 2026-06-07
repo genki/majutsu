@@ -12,6 +12,10 @@ use fuser::{
 use hmac::{Hmac, Mac};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libc::{EIO, EISDIR, ENOENT, EROFS};
+use majutsu_core::{
+    FileRecord, LargeChunk, LargeManifest, Payload, RootSnapshot, SnapshotManifest, TreeManifest,
+    payload_blob_ref, payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
+};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -979,164 +983,6 @@ struct RootLargeConfig {
     always: Vec<String>,
     #[serde(default)]
     never: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct FileRecord {
-    root_id: String,
-    path: String,
-    kind: String,
-    size: u64,
-    mode: u32,
-    modified: Option<i64>,
-    #[serde(default)]
-    xattrs: BTreeMap<String, String>,
-    payload: Payload,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-enum Payload {
-    Directory,
-    InlineSmall {
-        oid: String,
-        object_key: String,
-    },
-    NormalBlob {
-        oid: String,
-        object_key: String,
-    },
-    ChunkedBlob {
-        oid: String,
-        manifest_key: String,
-        chunk_count: usize,
-    },
-    LargeObject {
-        oid: String,
-        manifest_key: String,
-        chunk_count: usize,
-    },
-    Blob {
-        oid: String,
-        object_key: String,
-    },
-    Large {
-        oid: String,
-        manifest_key: String,
-        chunk_count: usize,
-    },
-    Symlink {
-        target: String,
-    },
-    Special {
-        special_kind: String,
-    },
-}
-
-fn payload_blob_ref(payload: &Payload) -> Option<(&str, &str)> {
-    match payload {
-        Payload::InlineSmall { oid, object_key }
-        | Payload::NormalBlob { oid, object_key }
-        | Payload::Blob { oid, object_key } => Some((oid, object_key)),
-        _ => None,
-    }
-}
-
-fn payload_blob_ref_mut(payload: &mut Payload) -> Option<(&str, &mut String)> {
-    match payload {
-        Payload::InlineSmall { oid, object_key } => Some((oid.as_str(), object_key)),
-        Payload::NormalBlob { oid, object_key } => Some((oid.as_str(), object_key)),
-        Payload::Blob { oid, object_key } => Some((oid.as_str(), object_key)),
-        _ => None,
-    }
-}
-
-fn payload_large_ref(payload: &Payload) -> Option<(&str, &str, usize)> {
-    match payload {
-        Payload::ChunkedBlob {
-            oid,
-            manifest_key,
-            chunk_count,
-        }
-        | Payload::LargeObject {
-            oid,
-            manifest_key,
-            chunk_count,
-        }
-        | Payload::Large {
-            oid,
-            manifest_key,
-            chunk_count,
-        } => Some((oid, manifest_key, *chunk_count)),
-        _ => None,
-    }
-}
-
-fn payload_large_ref_mut(payload: &mut Payload) -> Option<(&str, &mut String)> {
-    match payload {
-        Payload::ChunkedBlob {
-            oid, manifest_key, ..
-        } => Some((oid.as_str(), manifest_key)),
-        Payload::LargeObject {
-            oid, manifest_key, ..
-        } => Some((oid.as_str(), manifest_key)),
-        Payload::Large {
-            oid, manifest_key, ..
-        } => Some((oid.as_str(), manifest_key)),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SnapshotManifest {
-    snapshot_id: String,
-    parent: Option<String>,
-    op_id: String,
-    timestamp: DateTime<Utc>,
-    #[serde(default)]
-    root_trees: BTreeMap<String, RootSnapshot>,
-    #[serde(default)]
-    roots: BTreeMap<String, Vec<FileRecord>>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct RootSnapshot {
-    tree_id: String,
-    tree_key: String,
-    file_count: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct TreeManifest {
-    version: u32,
-    tree_id: String,
-    root_id: String,
-    created_at: DateTime<Utc>,
-    entries: BTreeMap<String, FileRecord>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LargeManifest {
-    version: u32,
-    oid: String,
-    size: u64,
-    #[serde(default = "default_large_chunking")]
-    chunking: String,
-    chunk_size: usize,
-    chunks: Vec<LargeChunk>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LargeChunk {
-    index: usize,
-    offset: u64,
-    len: u64,
-    #[serde(default)]
-    stored_len: Option<u64>,
-    #[serde(default = "default_chunk_compression")]
-    compression: String,
-    oid: String,
-    object_key: String,
 }
 
 #[cfg(unix)]
@@ -7211,10 +7057,6 @@ fn default_snapshot_mode() -> String {
 
 fn default_large_chunking() -> String {
     "fixed".into()
-}
-
-fn default_chunk_compression() -> String {
-    "none".into()
 }
 
 fn default_true() -> bool {
