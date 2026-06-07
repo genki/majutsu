@@ -2909,6 +2909,48 @@ fn root_large_policy_override_can_route_small_files_to_large_pipeline() {
 }
 
 #[test]
+fn default_large_always_patterns_route_known_binary_extensions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("dataset.parquet"), b"tiny parquet marker\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    assert!(config.contains("\"*.parquet\""));
+    assert!(config.contains("\"*.vmdk\""));
+    assert!(config.contains("\"*.qcow2\""));
+    assert!(config.contains("\"*.psd\""));
+    assert!(config.contains("\"*.blend\""));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("large_objects 1"));
+}
+
+#[test]
 fn root_set_updates_filters_and_records_config_change() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
