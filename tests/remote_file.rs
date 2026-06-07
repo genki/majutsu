@@ -7683,6 +7683,97 @@ fn large_files_can_use_content_defined_chunking() {
 }
 
 #[test]
+fn large_chunk_dedup_sync_clone_restore_preserves_shared_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    let shared = vec![7u8; 4096];
+    let mut alpha = shared.clone();
+    alpha.extend(vec![1u8; 4096]);
+    let mut beta = shared;
+    beta.extend(vec![2u8; 4096]);
+    fs::write(source.join("alpha.bin"), &alpha).unwrap();
+    fs::write(source.join("beta.bin"), &beta).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 4096");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert_eq!(
+        count_files_ending(&state.join("objects/large/chunks/fixed"), ""),
+        3,
+        "two 2-chunk large files should store the shared chunk once"
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert_eq!(
+        count_files_ending(&remote.join("large/chunks/fixed-8m"), ".chunk.enc"),
+        3,
+        "remote should upload only the deduplicated chunk set"
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(source.join("alpha.bin")).unwrap(),
+        fs::read(restore.join("sample/alpha.bin")).unwrap()
+    );
+    assert_eq!(
+        fs::read(source.join("beta.bin")).unwrap(),
+        fs::read(restore.join("sample/beta.bin")).unwrap()
+    );
+}
+
+#[test]
 fn mount_creates_lazy_view_and_can_hydrate_large_files() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
