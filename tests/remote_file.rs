@@ -1801,6 +1801,32 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
     .unwrap()
     .to_string();
 
+    let dry_run = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--keep-daily")
+            .arg("1")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    assert!(dry_run.contains("dry_run true"));
+    assert!(dry_run.contains("candidate_snapshots 1"));
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
     let prune = output({
         let mut c = mj();
         c.arg("--home")
