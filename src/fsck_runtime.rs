@@ -1238,6 +1238,13 @@ pub(crate) fn validate_remote_pack_objects(
     export: &crate::MetadataExport,
     missing: &mut usize,
 ) -> Result<()> {
+    let expected_pack_index_keys = expected_canonical_pack_index_keys(export);
+    for key in remote.list("indexes/pack-index/")? {
+        if !expected_pack_index_keys.contains(&key) {
+            *missing += 1;
+            eprintln!("unexpected remote pack index object {key}");
+        }
+    }
     let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
     for blob in &export.blobs {
         if let Some(pack_id) = blob.pack_id.as_deref() {
@@ -1335,6 +1342,15 @@ pub(crate) fn validate_remote_pack_objects(
         eprintln!("packed blob references missing pack metadata {pack_id}");
     }
     Ok(())
+}
+
+fn expected_canonical_pack_index_keys(export: &crate::MetadataExport) -> BTreeSet<String> {
+    export
+        .packs
+        .iter()
+        .flat_map(|pack| canonical_remote_aliases(&pack.index_key))
+        .filter(|key| key.starts_with("indexes/pack-index/"))
+        .collect()
 }
 
 pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
