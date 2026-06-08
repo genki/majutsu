@@ -8539,6 +8539,7 @@ storage = "deep-archive"
     assert!(dry_run.contains("dry_run true"));
     assert!(dry_run.contains("apply_hint aws s3api put-bucket-lifecycle-configuration"));
     assert!(dry_run.contains("apply_warning remote does not advertise lifecycle rule support"));
+    assert_eq!(db_operation_count(&state, "lifecycle-apply"), 0);
 
     let applied = output({
         let mut c = mj();
@@ -8562,6 +8563,18 @@ storage = "deep-archive"
     assert_eq!(applied_status["provider"], "s3");
     assert_eq!(applied_status["policy_key"], "lifecycle/policy-s3.json");
     assert_eq!(applied_status["provider_applied"], false);
+    assert_eq!(db_operation_count(&state, "lifecycle-apply"), 1);
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(op_log.contains("lifecycle-apply"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
 }
 
 #[test]

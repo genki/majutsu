@@ -3,7 +3,9 @@ use chrono::Utc;
 
 use crate::cli::LifecycleCommand;
 use crate::config::{Config, Paths, policy_config, read_config};
+use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
+use crate::snapshot_state::current_snapshot;
 
 pub(crate) fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
     crate::ensure_ready(paths)?;
@@ -77,6 +79,15 @@ pub(crate) fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<
                     "note": "desired lifecycle policy artifact stored by majutsu"
                 });
                 remote.put(status_key, &serde_json::to_vec_pretty(&status)?)?;
+                let conn = crate::open_db(paths)?;
+                let current = current_snapshot(&conn)?;
+                record_op(
+                    &conn,
+                    "lifecycle-apply",
+                    current.as_deref(),
+                    current.as_deref(),
+                    Some(&format!("provider {provider} policy {policy_key}")),
+                )?;
                 println!("policy_key {policy_key}");
                 println!("status_key {status_key}");
                 println!("provider_applied {provider_applied}");

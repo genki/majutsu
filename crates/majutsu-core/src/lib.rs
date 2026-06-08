@@ -421,6 +421,7 @@ pub enum OperationKind {
     #[serde(alias = "Prune")]
     Prune,
     Gc,
+    LifecycleApply,
     #[serde(alias = "KeyRotation")]
     KeyRotation,
     #[serde(alias = "Fsck")]
@@ -546,6 +547,7 @@ pub fn valid_operation_kind_label(kind: &str) -> bool {
             | "pack-compact"
             | "prune"
             | "gc"
+            | "lifecycle-apply"
             | "fsck"
     )
 }
@@ -1405,6 +1407,7 @@ mod tests {
             "pack-compact",
             "prune",
             "gc",
+            "lifecycle-apply",
             "fsck",
         ] {
             serde_json::from_value::<OperationKind>(serde_json::Value::String(kind.into()))
