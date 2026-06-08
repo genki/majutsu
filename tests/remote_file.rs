@@ -6252,6 +6252,55 @@ fn remote_fsck_detects_unknown_host_gc_mark() {
 }
 
 #[test]
+fn remote_fsck_detects_unknown_host_prefix_export() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::create_dir_all(remote.join("hosts/ghost-host/metadata")).unwrap();
+    fs::write(remote.join("hosts/ghost-host/metadata/export.json"), b"{}").unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn remote_fsck_detects_unknown_host_gc_tombstone() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

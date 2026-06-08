@@ -1489,6 +1489,7 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
             }
             validate_remote_gc_records(remote, &host.id, &export, &mut missing)?;
         }
+        validate_remote_host_prefix_hosts(remote, &indexed_host_ids, &mut missing)?;
         validate_remote_gc_prefix_hosts(remote, &indexed_host_ids, &mut missing)?;
     }
 
@@ -1676,6 +1677,38 @@ fn validate_remote_gc_prefix_hosts(
         {
             *missing += 1;
             eprintln!("remote gc tombstones reference unknown host {host_id}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_host_prefix_hosts(
+    remote: &RemoteStore,
+    indexed_host_ids: &BTreeSet<String>,
+    missing: &mut usize,
+) -> Result<()> {
+    let mut reported_hosts = BTreeSet::new();
+    for key in remote.list("hosts/")? {
+        let Some(rest) = key.strip_prefix("hosts/") else {
+            *missing += 1;
+            eprintln!("unexpected remote host key {key}");
+            continue;
+        };
+        if matches!(rest, "index.json" | "current") {
+            continue;
+        }
+        let Some((host_id, _)) = rest.split_once('/') else {
+            *missing += 1;
+            eprintln!("unexpected remote host key {key}");
+            continue;
+        };
+        if host_id.is_empty() {
+            *missing += 1;
+            eprintln!("unexpected remote host key {key}");
+        } else if !indexed_host_ids.contains(host_id) && reported_hosts.insert(host_id.to_string())
+        {
+            *missing += 1;
+            eprintln!("remote hosts prefix references unknown host {host_id}");
         }
     }
     Ok(())
