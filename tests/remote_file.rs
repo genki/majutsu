@@ -10644,6 +10644,14 @@ fn watch_can_start_daemon_when_not_foreground() {
         c.arg("--home").arg(&state).arg("daemon").arg("stop");
         c
     });
+    let stopped = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("status");
+        c
+    });
+    assert!(stopped.contains("stopped"));
+    assert!(!state.join("runtime/daemon.pid").exists());
+    assert!(!state.join("runtime/daemon.sock").exists());
 }
 
 #[cfg(unix)]

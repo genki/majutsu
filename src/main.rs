@@ -43,6 +43,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 #[cfg(test)]
 use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -2597,14 +2599,8 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         DaemonCommand::Stop => {
             let pid =
                 read_pid(&paths.daemon_pid)?.ok_or_else(|| anyhow!("daemon pid file not found"))?;
-            if pid_alive(pid) {
-                let status = ProcessCommand::new("kill").arg(pid.to_string()).status()?;
-                if !status.success() {
-                    bail!("failed to stop daemon pid {pid}");
-                }
-            }
-            let _ = fs::remove_file(&paths.daemon_pid);
-            let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
+            stop_daemon_process(pid)?;
+            cleanup_daemon_runtime(paths);
             println!("stopped daemon pid {pid}");
         }
         DaemonCommand::Status => {
@@ -2642,6 +2638,48 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn stop_daemon_process(pid: u32) -> Result<()> {
+    if !pid_alive(pid) {
+        return Ok(());
+    }
+    let status = ProcessCommand::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()?;
+    if !status.success() {
+        bail!("failed to stop daemon pid {pid}");
+    }
+    if wait_for_pid_exit(pid, 50, Duration::from_millis(100)) {
+        return Ok(());
+    }
+    let status = ProcessCommand::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status()?;
+    if !status.success() {
+        bail!("failed to force stop daemon pid {pid}");
+    }
+    if !wait_for_pid_exit(pid, 50, Duration::from_millis(100)) {
+        bail!("daemon pid {pid} did not exit after stop signal");
+    }
+    Ok(())
+}
+
+fn wait_for_pid_exit(pid: u32, attempts: usize, delay: Duration) -> bool {
+    for _ in 0..attempts {
+        if !pid_alive(pid) {
+            return true;
+        }
+        thread::sleep(delay);
+    }
+    !pid_alive(pid)
+}
+
+fn cleanup_daemon_runtime(paths: &Paths) {
+    let _ = fs::remove_file(&paths.daemon_pid);
+    let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
 }
 
 fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {
