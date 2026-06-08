@@ -2058,6 +2058,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &export.snapshots,
             &export.operations,
         )?;
+        validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
         for key in local_object_keys(&export) {
             let dest = staging_paths.home.join(&key);
             if let Some(parent) = dest.parent() {
@@ -2095,6 +2096,66 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+fn validate_clone_remote_chunk_index(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<()> {
+    if export.chunks.is_empty() {
+        return Ok(());
+    }
+    if !remote.exists(REMOTE_CHUNK_INDEX_SHARD_KEY)? {
+        bail!("remote is missing chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}");
+    }
+    let shard: ChunkIndexShard =
+        decode_canonical_remote_export(paths, &remote.get(REMOTE_CHUNK_INDEX_SHARD_KEY)?)
+            .with_context(|| {
+                format!("parse remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}")
+            })?;
+    if shard.version != 1 || shard.shard != majutsu_store::DEFAULT_CHUNK_INDEX_SHARD {
+        bail!("remote chunk index shard metadata does not match export");
+    }
+    if shard.chunks.len() != export.chunks.len() {
+        bail!("remote chunk index shard metadata does not match export");
+    }
+    if shard.has_duplicate_oids() {
+        bail!("remote chunk index shard contains duplicate chunk oids");
+    }
+    let expected = export
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.oid.as_str(), chunk))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for entry in &shard.chunks {
+        let Some(chunk) = expected.get(entry.oid.as_str()) else {
+            bail!(
+                "remote chunk index entry has no matching chunk {}",
+                entry.oid
+            );
+        };
+        if !seen.insert(entry.oid.as_str()) {
+            bail!("duplicate remote chunk index entry {}", entry.oid);
+        }
+        if entry.size != chunk.size || entry.object_key != chunk.object_key {
+            bail!(
+                "remote chunk index entry does not match metadata {}: index={} size={} metadata={} size={}",
+                entry.oid,
+                entry.object_key,
+                entry.size,
+                chunk.object_key,
+                chunk.size
+            );
+        }
+    }
+    for oid in expected.keys() {
+        if !seen.contains(oid) {
+            bail!("chunk missing from remote chunk index {oid}");
+        }
+    }
     Ok(())
 }
 

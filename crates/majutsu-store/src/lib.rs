@@ -188,7 +188,7 @@ pub fn is_content_addressed_remote_key(key: &str) -> bool {
         || key.starts_with("trees/")
         || key.starts_with("blobs/loose/")
         || key.starts_with("packs/")
-        || key.starts_with("indexes/")
+        || key.starts_with("indexes/pack-index/")
         || key.starts_with("large/")
 }
 
@@ -645,6 +645,12 @@ mod tests {
         assert!(canonical_remote_alias("logs/local").is_none());
         assert!(is_content_addressed_remote_key(
             "large/chunks/fixed-8m/chunk-1.chunk.enc"
+        ));
+        assert!(is_content_addressed_remote_key(
+            "indexes/pack-index/2026/06/pack-1.cbor.zst.enc"
+        ));
+        assert!(!is_content_addressed_remote_key(
+            "indexes/chunk-index/shard-0000.cbor.zst.enc"
         ));
         assert!(!is_content_addressed_remote_key("queue/uploads/item.json"));
     }
