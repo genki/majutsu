@@ -6,8 +6,9 @@ use majutsu_core::{
     FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, LiveMetadataReferences,
     MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
     RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
-    encode_operation_log, history_graph_issues, metadata_reference_issues, payload_blob_ref,
-    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
+    encode_operation_log, history_graph_issues, metadata_reference_issues,
+    operation_log_comparison_issues, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
+    payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -2044,6 +2045,12 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
                 .context("encrypted clone requires MAJUTSU_MASTER_KEY=<64-hex-key>")?;
             write_master_key(&staging_paths, &key)?;
         }
+        validate_clone_remote_oplog(
+            &staging_paths,
+            &remote,
+            metadata.host.as_ref(),
+            &export.operations,
+        )?;
         for key in local_object_keys(&export) {
             let dest = staging_paths.home.join(&key);
             if let Some(parent) = dest.parent() {
@@ -2081,6 +2088,38 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+fn validate_clone_remote_oplog(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host: Option<&RemoteHostSummary>,
+    expected: &[OperationExport],
+) -> Result<()> {
+    let Some(host) = host else {
+        return Ok(());
+    };
+    let key = host_oplog_canonical_key(&host.id);
+    if !remote.exists(&key)? {
+        bail!("remote is missing canonical host operation log {key}");
+    }
+    let actual = decode_canonical_remote_oplog(paths, &remote.get(&key)?)
+        .with_context(|| format!("parse remote operation log {key}"))?;
+    for issue in operation_log_comparison_issues(&actual, expected) {
+        match issue {
+            majutsu_core::OperationLogComparisonIssue::CountMismatch { expected, actual } => {
+                bail!(
+                    "remote operation log count mismatch {key} expected={expected} actual={actual}"
+                );
+            }
+            majutsu_core::OperationLogComparisonIssue::EntryMismatch { index, id } => {
+                bail!(
+                    "remote operation log entry does not match metadata {key} {id} index={index}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

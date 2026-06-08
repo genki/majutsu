@@ -2326,6 +2326,64 @@ fn remote_fsck_detects_missing_canonical_operation_log() {
 }
 
 #[test]
+fn clone_rejects_missing_remote_operation_log_without_creating_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let host_dir = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("ops/local-oplog.cborl.zst.enc").exists())
+        .unwrap();
+    fs::remove_file(host_dir.join("ops/local-oplog.cborl.zst.enc")).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone.exists());
+}
+
+#[test]
 fn remote_fsck_detects_corrupt_canonical_host_snapshot_export() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
