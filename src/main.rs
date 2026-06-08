@@ -3,10 +3,10 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use majutsu_core::{
-    FileRecord, LargeChunk, LargeManifest, OperationLogEntry as OperationExport, Payload,
-    RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
-    encode_operation_log, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
-    payload_large_ref_mut,
+    FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, OperationLogEntry as OperationExport,
+    OperationLogEntryIssue, Payload, RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest,
+    decode_operation_log, encode_operation_log, history_graph_issues, payload_blob_ref,
+    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -2018,6 +2018,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
     validate_config(&export.config)?;
+    validate_clone_metadata(&export)?;
     ensure_clone_objects_available(&remote, &export)?;
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
@@ -2077,6 +2078,102 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
     Ok(())
+}
+
+fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
+    let mut issues = Vec::new();
+    for operation in &export.operations {
+        for issue in operation.validation_issues() {
+            issues.push(format_operation_entry_issue(operation, issue));
+        }
+    }
+    for issue in history_graph_issues(&export.snapshots, &export.operations) {
+        issues.push(format_history_graph_issue(issue));
+    }
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let sample = issues
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if issues.len() > 5 {
+        format!("; ... {} more", issues.len() - 5)
+    } else {
+        String::new()
+    };
+    bail!("remote metadata is inconsistent and cannot be cloned: {sample}{suffix}")
+}
+
+fn format_operation_entry_issue(
+    operation: &OperationExport,
+    issue: OperationLogEntryIssue,
+) -> String {
+    match issue {
+        OperationLogEntryIssue::InvalidId => format!("operation {} has invalid id", operation.id),
+        OperationLogEntryIssue::InvalidKind(kind) => {
+            format!("operation {} has invalid kind {kind}", operation.id)
+        }
+        OperationLogEntryIssue::InvalidStatus(status) => {
+            format!("operation {} has invalid status {status}", operation.id)
+        }
+        OperationLogEntryIssue::InvalidRemoteSyncState(state) => {
+            format!(
+                "operation {} has invalid remote_sync_state {state}",
+                operation.id
+            )
+        }
+        OperationLogEntryIssue::FailedWithoutError => {
+            format!("operation {} is failed without error detail", operation.id)
+        }
+        OperationLogEntryIssue::RemoteSyncMissingState => {
+            format!(
+                "operation {} is remote-sync without remote_sync_state",
+                operation.id
+            )
+        }
+        OperationLogEntryIssue::RemoteSyncStateMismatch {
+            status,
+            remote_sync_state,
+        } => format!(
+            "operation {} remote-sync status {status} does not match remote_sync_state {remote_sync_state}",
+            operation.id
+        ),
+        OperationLogEntryIssue::EmptyActor => {
+            format!("operation {} has empty actor", operation.id)
+        }
+        OperationLogEntryIssue::InvalidCreatedAt { value, error } => {
+            format!(
+                "operation {} has invalid created_at {value}: {error}",
+                operation.id
+            )
+        }
+    }
+}
+
+fn format_history_graph_issue(issue: HistoryGraphIssue) -> String {
+    match issue {
+        HistoryGraphIssue::SnapshotSelfParent { snapshot_id } => {
+            format!("snapshot {snapshot_id} references itself as parent")
+        }
+        HistoryGraphIssue::SnapshotMissingOperation {
+            snapshot_id,
+            operation_id,
+        } => {
+            format!("snapshot {snapshot_id} references missing operation {operation_id}")
+        }
+        HistoryGraphIssue::OperationMissingParent {
+            operation_id,
+            parent_id,
+        } => {
+            format!("operation {operation_id} references missing parent operation {parent_id}")
+        }
+        HistoryGraphIssue::OperationSelfParent { operation_id } => {
+            format!("operation {operation_id} references itself as parent")
+        }
+    }
 }
 
 fn clone_staging_home(home: &Path) -> PathBuf {
