@@ -2118,6 +2118,12 @@ fn validate_clone_remote_pack_objects(
             bail!("remote contains unexpected pack index object {key}");
         }
     }
+    let expected_pack_object_keys = expected_canonical_pack_object_keys(export);
+    for key in remote.list("packs/")? {
+        if !expected_pack_object_keys.contains(&key) {
+            bail!("remote contains unexpected pack object {key}");
+        }
+    }
     let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
     for blob in &export.blobs {
         if let Some(pack_id) = blob.pack_id.as_deref() {
@@ -2225,6 +2231,15 @@ fn expected_canonical_pack_index_keys(export: &MetadataExport) -> BTreeSet<Strin
         .iter()
         .flat_map(|pack| canonical_remote_aliases(&pack.index_key))
         .filter(|key| key.starts_with("indexes/pack-index/"))
+        .collect()
+}
+
+fn expected_canonical_pack_object_keys(export: &MetadataExport) -> BTreeSet<String> {
+    export
+        .packs
+        .iter()
+        .flat_map(|pack| canonical_remote_aliases(&pack.pack_key))
+        .filter(|key| key.starts_with("packs/"))
         .collect()
 }
 
