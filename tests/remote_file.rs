@@ -6192,6 +6192,125 @@ fn remote_fsck_detects_corrupt_gc_tombstone() {
 }
 
 #[test]
+fn remote_fsck_detects_unknown_host_gc_mark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::create_dir_all(remote.join("gc/marks")).unwrap();
+    fs::write(
+        remote.join("gc/marks/ghost-host.json"),
+        serde_json::json!({
+            "version": 1,
+            "host_id": "ghost-host",
+            "marked_at": "2026-06-08T00:00:00Z",
+            "current_snapshot": null,
+            "object_keys": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_detects_unknown_host_gc_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::create_dir_all(remote.join("gc/tombstones/ghost-host")).unwrap();
+    fs::write(
+        remote.join("gc/tombstones/ghost-host/tombstone-1.json"),
+        serde_json::json!({
+            "version": 1,
+            "host_id": "ghost-host",
+            "deleted_at": "2026-06-08T00:00:00Z",
+            "key": "objects/deleted"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn clone_rejects_corrupt_gc_tombstone_without_creating_home() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

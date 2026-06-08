@@ -1356,6 +1356,11 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
 
     if has_host_index {
         let index = read_remote_host_index(remote)?;
+        let indexed_host_ids = index
+            .hosts
+            .iter()
+            .map(|host| host.id.clone())
+            .collect::<BTreeSet<_>>();
         for issue in index.duplicate_issues() {
             missing += 1;
             match issue {
@@ -1484,6 +1489,7 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
             }
             validate_remote_gc_records(remote, &host.id, &export, &mut missing)?;
         }
+        validate_remote_gc_prefix_hosts(remote, &indexed_host_ids, &mut missing)?;
     }
 
     if !has_legacy_export && !has_host_index {
@@ -1625,6 +1631,54 @@ fn remote_fsck_export(
         }
     }
     Ok(export)
+}
+
+fn validate_remote_gc_prefix_hosts(
+    remote: &RemoteStore,
+    indexed_host_ids: &BTreeSet<String>,
+    missing: &mut usize,
+) -> Result<()> {
+    for key in remote.list("gc/marks/")? {
+        let Some(host_id) = key
+            .strip_prefix("gc/marks/")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            *missing += 1;
+            eprintln!("unexpected remote gc mark key {key}");
+            continue;
+        };
+        if host_id.is_empty() || host_id.contains('/') {
+            *missing += 1;
+            eprintln!("unexpected remote gc mark key {key}");
+        } else if !indexed_host_ids.contains(host_id) {
+            *missing += 1;
+            eprintln!("remote gc mark references unknown host {key}");
+        }
+    }
+
+    let mut reported_tombstone_hosts = BTreeSet::new();
+    for key in remote.list("gc/tombstones/")? {
+        let Some(rest) = key.strip_prefix("gc/tombstones/") else {
+            *missing += 1;
+            eprintln!("unexpected remote gc tombstone key {key}");
+            continue;
+        };
+        let Some((host_id, _)) = rest.split_once('/') else {
+            *missing += 1;
+            eprintln!("unexpected remote gc tombstone key {key}");
+            continue;
+        };
+        if host_id.is_empty() {
+            *missing += 1;
+            eprintln!("unexpected remote gc tombstone key {key}");
+        } else if !indexed_host_ids.contains(host_id)
+            && reported_tombstone_hosts.insert(host_id.to_string())
+        {
+            *missing += 1;
+            eprintln!("remote gc tombstones reference unknown host {host_id}");
+        }
+    }
+    Ok(())
 }
 
 fn validate_remote_timeline_prefixes(
