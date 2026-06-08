@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, params};
 use std::fs;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
+#[cfg(unix)]
+use std::{io, mem};
 use walkdir::WalkDir;
 
 use crate::cli::{DiffArgs, LogArgs, OpCommand};
@@ -21,86 +25,397 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     let config = read_config(paths)?;
     let roots = roots(&conn)?;
     let current = current_snapshot(&conn)?;
+    let current_label = current.as_deref().unwrap_or("(none)");
+    let remote = read_remote_status(&config)?;
     let db_stats = read_status_db_stats(&conn)?;
     let storage = read_storage_stats(paths)?;
     let upload_stats = upload_queue_stats(paths)?;
     let event_count = event_journal_records(paths)?.len();
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
+    let width = terminal_width();
 
-    println!("home {}", paths.home.display());
-    println!("config {}", paths.config.display());
-    println!("database {}", paths.db.display());
-    println!("host_id {}", config.host.id);
-    println!("host_name {}", config.host.name);
-    print_remote_status(&config)?;
-    println!("security_encryption {}", config.security.encryption);
-    println!("security_hash {}", config.security.hash);
-    println!("watch_backend {}", config.watch.backend);
-    println!("watch_mode {}", config.watch.mode);
-    println!("watch_debounce_ms {}", config.watch.debounce);
-    println!("watch_settle_ms {}", config.watch.settle);
-    println!("large_enabled {}", config.large.enabled);
-    println!("large_min_size_bytes {}", config.large.min_size);
-    println!(
-        "large_binary_min_size_bytes {}",
-        config.large.binary_min_size
+    println!("Status");
+    print_kv(width, "Current snapshot", current_label);
+    print_kv(width, "Roots", &roots.len().to_string());
+    print_kv(width, "Remote", remote.summary());
+    print_kv(width, "Queued uploads", &upload_stats.total.to_string());
+    print_kv(width, "State usage", &format_bytes(storage.state_bytes));
+    println!();
+
+    println!("Host");
+    print_kv(width, "Name", &config.host.name);
+    print_kv(width, "ID", &config.host.id);
+    print_kv(width, "Home", &paths.home.display().to_string());
+    print_kv(width, "Config", &paths.config.display().to_string());
+    print_kv(width, "Database", &paths.db.display().to_string());
+    println!();
+
+    print_remote_section(width, &remote);
+    println!();
+
+    println!("Configuration");
+    print_table(
+        width,
+        &["AREA", "SETTING", "VALUE"],
+        &[
+            [
+                "security",
+                "encryption",
+                config.security.encryption.as_str(),
+            ],
+            ["security", "hash", config.security.hash.as_str()],
+            ["watch", "backend", config.watch.backend.as_str()],
+            ["watch", "mode", config.watch.mode.as_str()],
+            [
+                "watch",
+                "debounce",
+                &format!("{} ms", config.watch.debounce),
+            ],
+            ["watch", "settle", &format!("{} ms", config.watch.settle)],
+            ["large", "enabled", &config.large.enabled.to_string()],
+            ["large", "min-size", &format_bytes(config.large.min_size)],
+            [
+                "large",
+                "binary-min-size",
+                &format_bytes(config.large.binary_min_size),
+            ],
+            ["large", "chunking", config.large.default_chunking.as_str()],
+            [
+                "large",
+                "chunk-size",
+                &format_bytes(config.large.chunk_size as u64),
+            ],
+            ["large", "multipart", &config.large.multipart.to_string()],
+            [
+                "pack",
+                "small-target",
+                &format_bytes(config.pack.small_pack_target),
+            ],
+            [
+                "pack",
+                "normal-target",
+                &format_bytes(config.pack.normal_pack_target),
+            ],
+        ],
     );
-    println!("large_chunking {}", config.large.default_chunking);
-    println!("large_chunk_size_bytes {}", config.large.chunk_size);
-    println!("large_multipart {}", config.large.multipart);
-    println!("pack_small_target_bytes {}", config.pack.small_pack_target);
-    println!(
-        "pack_normal_target_bytes {}",
-        config.pack.normal_pack_target
-    );
-    println!("roots {}", roots.len());
-    for root in roots {
+    println!();
+
+    println!("Roots");
+    if roots.is_empty() {
+        println!("  (none)");
+    } else {
+        let (id_width, status_width) = root_table_widths(width);
+        println!(
+            "  {:<id_width$} {:<status_width$} PATH",
+            "ID",
+            "STATUS",
+            id_width = id_width,
+            status_width = status_width
+        );
+        println!(
+            "  {:<id_width$} {:<status_width$} {}",
+            "-".repeat(id_width),
+            "-".repeat(status_width),
+            "-".repeat(4),
+            id_width = id_width,
+            status_width = status_width
+        );
+    }
+    for root in &roots {
         let state = if root.status == "active" && !root.path.exists() {
             "missing"
         } else {
             root.status.as_str()
         };
-        println!("  {}\t{}\t{}", root.id, state, root.path.display());
+        print_root_row(width, &root.id, state, &root.path.display().to_string());
     }
-    println!("current {}", current.unwrap_or_else(|| "(none)".into()));
-    println!("snapshots {}", db_stats.snapshots);
-    println!("operations {}", db_stats.operations);
-    println!("refs {}", db_stats.refs);
-    println!("blobs {}", db_stats.blobs);
-    println!("blob_bytes {}", db_stats.blob_bytes);
-    println!("large_objects {}", db_stats.large_objects);
-    println!("large_object_bytes {}", db_stats.large_object_bytes);
-    println!("chunks {}", db_stats.chunks);
-    println!("chunk_bytes {}", db_stats.chunk_bytes);
-    println!("packs {}", db_stats.packs);
-    println!("pack_bytes {}", db_stats.pack_bytes);
-    println!("large_pins {}", db_stats.large_pins);
-    println!("remote_refs {}", db_stats.remote_refs);
-    println!("state_files {}", storage.state_files);
-    println!("state_bytes {}", storage.state_bytes);
-    println!("objects_files {}", storage.objects_files);
-    println!("objects_bytes {}", storage.objects_bytes);
-    println!("logs_files {}", storage.logs_files);
-    println!("logs_bytes {}", storage.logs_bytes);
-    println!("queue_files {}", storage.queue_files);
-    println!("queue_bytes {}", storage.queue_bytes);
-    println!("queued_uploads {}", upload_stats.total);
-    println!("queued_uploads_retrying {}", upload_stats.retrying);
-    println!("queued_uploads_delayed {}", upload_stats.delayed);
-    if let Some(next_retry_after) = upload_stats.next_retry_after {
-        println!("queued_upload_next_retry_after {}", next_retry_after);
-    } else {
-        println!("queued_upload_next_retry_after (none)");
-    }
-    println!("queued_upload_attempts {}", upload_stats.attempts);
-    println!("queued_upload_max_attempts {}", upload_stats.max_attempts);
-    println!(
-        "upload_queue_backpressure {}",
-        upload_stats.has_backpressure()
+    println!();
+
+    println!("Metadata");
+    print_table(
+        width,
+        &["ITEM", "COUNT", "LOGICAL SIZE"],
+        &[
+            ["snapshots", &db_stats.snapshots.to_string(), "-"],
+            ["operations", &db_stats.operations.to_string(), "-"],
+            ["refs", &db_stats.refs.to_string(), "-"],
+            [
+                "blobs",
+                &db_stats.blobs.to_string(),
+                &format_bytes(db_stats.blob_bytes as u64),
+            ],
+            [
+                "large objects",
+                &db_stats.large_objects.to_string(),
+                &format_bytes(db_stats.large_object_bytes as u64),
+            ],
+            [
+                "chunks",
+                &db_stats.chunks.to_string(),
+                &format_bytes(db_stats.chunk_bytes as u64),
+            ],
+            [
+                "packs",
+                &db_stats.packs.to_string(),
+                &format_bytes(db_stats.pack_bytes as u64),
+            ],
+            ["large pins", &db_stats.large_pins.to_string(), "-"],
+            ["remote refs", &db_stats.remote_refs.to_string(), "-"],
+        ],
     );
-    println!("event_journal_records {}", event_count);
-    println!("restore_queue_items {}", restore_queue_count);
+    println!();
+
+    println!("Storage");
+    print_table(
+        width,
+        &["SCOPE", "FILES", "SIZE"],
+        &[
+            [
+                "state",
+                &storage.state_files.to_string(),
+                &format_bytes(storage.state_bytes),
+            ],
+            [
+                "objects",
+                &storage.objects_files.to_string(),
+                &format_bytes(storage.objects_bytes),
+            ],
+            [
+                "logs",
+                &storage.logs_files.to_string(),
+                &format_bytes(storage.logs_bytes),
+            ],
+            [
+                "queue",
+                &storage.queue_files.to_string(),
+                &format_bytes(storage.queue_bytes),
+            ],
+        ],
+    );
+    println!();
+
+    println!("Queues");
+    print_table(
+        width,
+        &["QUEUE", "ITEMS", "DETAILS"],
+        &[
+            [
+                "uploads",
+                &upload_stats.total.to_string(),
+                &format!(
+                    "retrying={}, delayed={}, attempts={}, max_attempts={}, next_retry={}, backpressure={}",
+                    upload_stats.retrying,
+                    upload_stats.delayed,
+                    upload_stats.attempts,
+                    upload_stats.max_attempts,
+                    upload_stats
+                        .next_retry_after
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_else(|| "(none)".into()),
+                    upload_stats.has_backpressure()
+                ),
+            ],
+            [
+                "event journal",
+                &event_count.to_string(),
+                "pending local observations",
+            ],
+            [
+                "restore jobs",
+                &restore_queue_count.to_string(),
+                "prepared restore jobs",
+            ],
+        ],
+    );
+    println!();
+
+    println!("Machine");
+    println!("current {current_label}");
     Ok(())
+}
+
+fn print_kv(width: usize, key: &str, value: &str) {
+    let prefix = format!("  {key:<18} ");
+    print_wrapped(&prefix, value, width);
+}
+
+fn print_table<const N: usize>(width: usize, headers: &[&str; N], rows: &[[&str; N]]) {
+    let mut widths = [0usize; N];
+    for (i, column_width) in widths.iter_mut().enumerate() {
+        *column_width = headers[i].len();
+    }
+    for row in rows {
+        for (i, column_width) in widths.iter_mut().enumerate() {
+            *column_width = (*column_width).max(row[i].len());
+        }
+    }
+    if N > 1 {
+        let fixed_width: usize = widths[..N - 1].iter().sum::<usize>() + ((N - 1) * 2) + 2;
+        let max_last = width
+            .saturating_sub(fixed_width)
+            .max(headers[N - 1].len())
+            .max(12);
+        widths[N - 1] = widths[N - 1].min(max_last);
+    }
+    print!("  ");
+    for (i, column_width) in widths.iter().enumerate() {
+        if i > 0 {
+            print!("  ");
+        }
+        print!("{:<width$}", headers[i], width = *column_width);
+    }
+    println!();
+    print!("  ");
+    for (i, column_width) in widths.iter().enumerate() {
+        if i > 0 {
+            print!("  ");
+        }
+        print!(
+            "{:<width$}",
+            "-".repeat(*column_width),
+            width = *column_width
+        );
+    }
+    println!();
+    for row in rows {
+        print_table_row(row, &widths, width);
+    }
+}
+
+fn print_table_row<const N: usize>(row: &[&str; N], widths: &[usize; N], terminal_width: usize) {
+    let mut line_prefix = String::from("  ");
+    for i in 0..N.saturating_sub(1) {
+        if i > 0 {
+            line_prefix.push_str("  ");
+        }
+        line_prefix.push_str(&format!("{:<width$}", row[i], width = widths[i]));
+    }
+    if N > 1 {
+        line_prefix.push_str("  ");
+        print_wrapped(&line_prefix, row[N - 1], terminal_width);
+    } else if let Some(value) = row.first() {
+        print_wrapped(&line_prefix, value, terminal_width);
+    }
+}
+
+fn print_root_row(width: usize, id: &str, state: &str, path: &str) {
+    let (id_width, status_width) = root_table_widths(width);
+    let prefix = format!(
+        "  {id:<id_width$} {state:<status_width$} ",
+        id_width = id_width,
+        status_width = status_width
+    );
+    print_wrapped(&prefix, path, width);
+}
+
+fn root_table_widths(width: usize) -> (usize, usize) {
+    if width < 60 {
+        (18, 10)
+    } else if width < 88 {
+        (24, 18)
+    } else {
+        (32, 18)
+    }
+}
+
+fn print_wrapped(prefix: &str, value: &str, width: usize) {
+    let available = width.saturating_sub(prefix.len()).max(16);
+    let lines = wrap_text(value, available);
+    if let Some((first, rest)) = lines.split_first() {
+        println!("{prefix}{first}");
+        let continuation = " ".repeat(prefix.len());
+        for line in rest {
+            println!("{continuation}{line}");
+        }
+    } else {
+        println!("{prefix}");
+    }
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    if value.len() <= width {
+        return vec![value.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in value.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.len() + 1 + word.len() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            lines.push(line);
+            line = word.to_string();
+        }
+        while line.len() > width {
+            let rest = line.split_off(width);
+            lines.push(line);
+            line = rest;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width >= 40)
+        .or_else(detect_terminal_width)
+        .unwrap_or(100)
+}
+
+#[cfg(unix)]
+fn detect_terminal_width() -> Option<usize> {
+    #[repr(C)]
+    struct Winsize {
+        ws_row: libc::c_ushort,
+        ws_col: libc::c_ushort,
+        ws_xpixel: libc::c_ushort,
+        ws_ypixel: libc::c_ushort,
+    }
+
+    let mut winsize: Winsize = unsafe { mem::zeroed() };
+    let result = unsafe {
+        libc::ioctl(
+            io::stdout().as_raw_fd(),
+            libc::TIOCGWINSZ,
+            &mut winsize as *mut Winsize,
+        )
+    };
+    if result == 0 && winsize.ws_col >= 40 {
+        Some(winsize.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn detect_terminal_width() -> Option<usize> {
+    None
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {} ({bytes} B)", UNITS[unit])
+    }
 }
 
 #[derive(Default)]
@@ -213,11 +528,49 @@ fn count_json_files(path: &Path) -> Result<usize> {
     Ok(count)
 }
 
-fn print_remote_status(config: &Config) -> Result<()> {
+struct RemoteStatus {
+    configured: bool,
+    backend: String,
+    url: Option<String>,
+    resolved: Option<String>,
+    open_error: Option<String>,
+    lifecycle_rules: Option<bool>,
+    object_tags: Option<bool>,
+    storage_class_on_put: Option<bool>,
+    restore_archived_object: Option<bool>,
+    multipart_upload: Option<bool>,
+    range_get: Option<bool>,
+    conditional_put: Option<bool>,
+}
+
+impl RemoteStatus {
+    fn summary(&self) -> &str {
+        if !self.configured {
+            return "not configured";
+        }
+        if self.open_error.is_some() {
+            return "configured, unavailable";
+        }
+        "configured"
+    }
+}
+
+fn read_remote_status(config: &Config) -> Result<RemoteStatus> {
     let Some(remote_config) = &config.remote else {
-        println!("remote_configured false");
-        println!("remote_backend none");
-        return Ok(());
+        return Ok(RemoteStatus {
+            configured: false,
+            backend: "none".into(),
+            url: None,
+            resolved: None,
+            open_error: None,
+            lifecycle_rules: None,
+            object_tags: None,
+            storage_class_on_put: None,
+            restore_archived_object: None,
+            multipart_upload: None,
+            range_get: None,
+            conditional_put: None,
+        });
     };
     let remote_url = remote_config.url().context("resolve remote URL")?;
     let backend = if remote_url.starts_with("file://") {
@@ -227,32 +580,90 @@ fn print_remote_status(config: &Config) -> Result<()> {
     } else {
         "unknown"
     };
-    println!("remote_configured true");
-    println!("remote_backend {backend}");
-    println!("remote_url {remote_url}");
     match open_remote(remote_config) {
         Ok(remote) => {
             let capabilities = remote.capabilities();
-            println!("remote_resolved {}", remote.describe());
-            println!("remote_lifecycle_rules {}", capabilities.lifecycle_rules);
-            println!("remote_object_tags {}", capabilities.object_tags);
-            println!(
-                "remote_storage_class_on_put {}",
-                capabilities.storage_class_on_put
-            );
-            println!(
-                "remote_restore_archived_object {}",
-                capabilities.restore_archived_object
-            );
-            println!("remote_multipart_upload {}", capabilities.multipart_upload);
-            println!("remote_range_get {}", capabilities.range_get);
-            println!("remote_conditional_put {}", capabilities.conditional_put);
+            Ok(RemoteStatus {
+                configured: true,
+                backend: backend.into(),
+                url: Some(remote_url),
+                resolved: Some(remote.describe()),
+                open_error: None,
+                lifecycle_rules: Some(capabilities.lifecycle_rules),
+                object_tags: Some(capabilities.object_tags),
+                storage_class_on_put: Some(capabilities.storage_class_on_put),
+                restore_archived_object: Some(capabilities.restore_archived_object),
+                multipart_upload: Some(capabilities.multipart_upload),
+                range_get: Some(capabilities.range_get),
+                conditional_put: Some(capabilities.conditional_put),
+            })
         }
-        Err(err) => {
-            println!("remote_open_error {err:#}");
-        }
+        Err(err) => Ok(RemoteStatus {
+            configured: true,
+            backend: backend.into(),
+            url: Some(remote_url),
+            resolved: None,
+            open_error: Some(format!("{err:#}")),
+            lifecycle_rules: None,
+            object_tags: None,
+            storage_class_on_put: None,
+            restore_archived_object: None,
+            multipart_upload: None,
+            range_get: None,
+            conditional_put: None,
+        }),
     }
-    Ok(())
+}
+
+fn print_remote_section(width: usize, remote: &RemoteStatus) {
+    println!("Remote");
+    print_kv(width, "Configured", &remote.configured.to_string());
+    print_kv(width, "Backend", &remote.backend);
+    if let Some(url) = &remote.url {
+        print_kv(width, "URL", url);
+    }
+    if let Some(resolved) = &remote.resolved {
+        print_kv(width, "Resolved", resolved);
+    }
+    if let Some(error) = &remote.open_error {
+        print_kv(width, "Open error", error);
+    }
+    if remote.lifecycle_rules.is_some() {
+        print_table(
+            width,
+            &["CAPABILITY", "SUPPORTED"],
+            &[
+                [
+                    "lifecycle rules",
+                    &display_option_bool(remote.lifecycle_rules),
+                ],
+                ["object tags", &display_option_bool(remote.object_tags)],
+                [
+                    "storage class on put",
+                    &display_option_bool(remote.storage_class_on_put),
+                ],
+                [
+                    "restore archived object",
+                    &display_option_bool(remote.restore_archived_object),
+                ],
+                [
+                    "multipart upload",
+                    &display_option_bool(remote.multipart_upload),
+                ],
+                ["range get", &display_option_bool(remote.range_get)],
+                [
+                    "conditional put",
+                    &display_option_bool(remote.conditional_put),
+                ],
+            ],
+        );
+    }
+}
+
+fn display_option_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {

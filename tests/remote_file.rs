@@ -12530,26 +12530,39 @@ fn status_reports_configured_root_state() {
 
     let status = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("status");
+        c.env("COLUMNS", "48")
+            .arg("--home")
+            .arg(&state)
+            .arg("status");
         c
     });
 
-    assert!(status.contains("roots 1"));
-    assert!(status.contains("sample\tpaused\t"));
-    assert!(status.contains("remote_configured false"));
-    assert!(status.contains("remote_backend none"));
-    assert!(status.contains("security_encryption none"));
-    assert!(status.contains("watch_backend "));
-    assert!(status.contains("large_enabled true"));
-    assert!(status.contains("pack_normal_target_bytes "));
-    assert!(status.contains("snapshots 0"));
-    assert!(status.contains("operations "));
-    assert!(status.contains("blobs 0"));
-    assert!(status.contains("state_bytes "));
-    assert!(status.contains("objects_bytes "));
-    assert!(status.contains("queued_uploads 0"));
-    assert!(status.contains("event_journal_records "));
-    assert!(status.contains("restore_queue_items 0"));
+    assert!(status.contains("Status"));
+    assert!(status.contains("Roots              1"));
+    assert!(status.contains("Remote             not configured"));
+    assert!(status.contains("Host"));
+    assert!(status.contains("Configuration"));
+    assert!(status.contains("Roots"));
+    assert!(status.contains("sample"));
+    assert!(status.contains("paused"));
+    assert!(status.contains("Metadata"));
+    assert!(status.contains("snapshots"));
+    assert!(status.contains("operations"));
+    assert!(status.contains("blobs"));
+    assert!(status.contains("Storage"));
+    assert!(status.contains("state"));
+    assert!(status.contains("objects"));
+    assert!(status.contains("Queues"));
+    assert!(status.contains("uploads"));
+    assert!(status.contains("event journal"));
+    assert!(status.contains("restore jobs"));
+    assert!(
+        status
+            .lines()
+            .filter(|line| !line.starts_with("current "))
+            .all(|line| line.len() <= 48),
+        "{status}"
+    );
 }
 
 #[test]
