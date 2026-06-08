@@ -12536,6 +12536,20 @@ fn status_reports_configured_root_state() {
 
     assert!(status.contains("roots 1"));
     assert!(status.contains("sample\tpaused\t"));
+    assert!(status.contains("remote_configured false"));
+    assert!(status.contains("remote_backend none"));
+    assert!(status.contains("security_encryption none"));
+    assert!(status.contains("watch_backend "));
+    assert!(status.contains("large_enabled true"));
+    assert!(status.contains("pack_normal_target_bytes "));
+    assert!(status.contains("snapshots 0"));
+    assert!(status.contains("operations "));
+    assert!(status.contains("blobs 0"));
+    assert!(status.contains("state_bytes "));
+    assert!(status.contains("objects_bytes "));
+    assert!(status.contains("queued_uploads 0"));
+    assert!(status.contains("event_journal_records "));
+    assert!(status.contains("restore_queue_items 0"));
 }
 
 #[test]
