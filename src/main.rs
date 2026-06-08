@@ -2016,11 +2016,12 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     }
     let remote_config = RemoteConfig::from_url(args.remote);
     let remote = open_remote(&remote_config)?;
-    let metadata_key = clone_metadata_key(&remote, args.host.as_deref())?;
-    let export_bytes = remote.get(&metadata_key)?;
+    let metadata = clone_metadata_selection(&remote, args.host.as_deref())?;
+    let export_bytes = remote.get(&metadata.key)?;
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
     validate_config(&export.config)?;
+    validate_clone_host_summary(&metadata.host, &export)?;
     validate_clone_metadata(&export)?;
     ensure_clone_objects_available(&remote, &export)?;
     let staging_home = clone_staging_home(&paths.home);
@@ -2080,6 +2081,48 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+struct CloneMetadataSelection {
+    key: String,
+    host: Option<RemoteHostSummary>,
+}
+
+fn validate_clone_host_summary(
+    host: &Option<RemoteHostSummary>,
+    export: &MetadataExport,
+) -> Result<()> {
+    let Some(host) = host else {
+        return Ok(());
+    };
+    if host.id != export.config.host.id {
+        bail!(
+            "remote host index id {} does not match metadata host id {}",
+            host.id,
+            export.config.host.id
+        );
+    }
+    if host.name != export.config.host.name {
+        bail!(
+            "remote host index name {} does not match metadata host name {}",
+            host.name,
+            export.config.host.name
+        );
+    }
+    if host.current_snapshot.as_ref() != export.refs.get("current") {
+        bail!("remote host index current snapshot does not match metadata");
+    }
+    if let Some(last_synced) = export.refs.get("last-synced") {
+        let metadata_last_synced = parse_db_time(last_synced)?;
+        if host.last_synced_at != metadata_last_synced {
+            bail!(
+                "remote host index last_synced_at {} does not match metadata last-synced {}",
+                host.last_synced_at.to_rfc3339(),
+                metadata_last_synced.to_rfc3339()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2272,15 +2315,28 @@ fn ensure_clone_objects_available(remote: &RemoteStore, export: &MetadataExport)
     )
 }
 
-fn clone_metadata_key(remote: &RemoteStore, host: Option<&str>) -> Result<String> {
+fn clone_metadata_selection(
+    remote: &RemoteStore,
+    host: Option<&str>,
+) -> Result<CloneMetadataSelection> {
     if let Some(host_id) = host {
         let index = remote_host_index_with_legacy(remote)?;
-        return Ok(select_remote_host(index.hosts, host_id)?.metadata_key);
+        let host = select_remote_host(index.hosts, host_id)?;
+        return Ok(CloneMetadataSelection {
+            key: host.metadata_key.clone(),
+            host: Some(host),
+        });
     }
     let index = remote_host_index_with_legacy(remote)?;
     match index.hosts.as_slice() {
-        [host] => Ok(host.metadata_key.clone()),
-        [] if remote.exists(LEGACY_METADATA_EXPORT_KEY)? => Ok(LEGACY_METADATA_EXPORT_KEY.into()),
+        [host] => Ok(CloneMetadataSelection {
+            key: host.metadata_key.clone(),
+            host: Some(host.clone()),
+        }),
+        [] if remote.exists(LEGACY_METADATA_EXPORT_KEY)? => Ok(CloneMetadataSelection {
+            key: LEGACY_METADATA_EXPORT_KEY.into(),
+            host: None,
+        }),
         [] => {
             bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")
         }
