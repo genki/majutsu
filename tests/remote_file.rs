@@ -9259,6 +9259,235 @@ fn restore_prepare_can_hydrate_from_canonical_aliases() {
 }
 
 #[test]
+fn restore_resume_uses_s3_range_get_for_packed_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let pack_key: String = conn
+        .query_row("select pack_key from packs limit 1", [], |row| row.get(0))
+        .unwrap();
+    let index_key: String = conn
+        .query_row("select index_key from packs limit 1", [], |row| row.get(0))
+        .unwrap();
+    let alpha_oid = blake3::hash(b"alpha\n").to_hex().to_string();
+    let alpha_object_key: String = conn
+        .query_row(
+            "select object_key from blobs where oid=?1",
+            [&alpha_oid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fs::remove_file(state.join(&pack_key)).unwrap();
+    fs::remove_file(state.join(&index_key)).unwrap();
+    fs::remove_dir_all(state.join("objects/blobs")).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let remote_root = remote.clone();
+    let pack_key_for_server = pack_key.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let started = std::time::Instant::now();
+        let mut seen = Vec::new();
+        let mut range_seen_at = None;
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                if started.elapsed() > Duration::from_secs(30)
+                    || range_seen_at.is_some_and(|seen_at: std::time::Instant| {
+                        seen_at.elapsed() > Duration::from_secs(2)
+                    })
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+                .unwrap_or(request.len());
+            let header = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let first = header.lines().next().unwrap_or("").to_string();
+            let key = first
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .trim_start_matches("/range-bucket/majutsu/v1/")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            let range = line_header_value(&header, "Range")
+                .map(str::trim)
+                .map(str::to_string);
+            seen.push((first.clone(), range.clone()));
+            if first.starts_with("POST ") && first.contains("?restore") {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+                continue;
+            }
+            let path = remote_root.join(key);
+            if !path.exists() {
+                stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+                continue;
+            }
+            if first.starts_with("HEAD ") {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+                continue;
+            }
+            let mut body = fs::read(&path).unwrap();
+            let mut status = "200 OK";
+            if let Some(range) = &range {
+                if key == pack_key_for_server {
+                    range_seen_at = Some(std::time::Instant::now());
+                }
+                let spec = range.strip_prefix("bytes=").unwrap();
+                let (start, end) = spec.split_once('-').unwrap();
+                let start = start.parse::<usize>().unwrap();
+                let end = end.parse::<usize>().unwrap();
+                body = body[start..=end].to_vec();
+                status = "206 Partial Content";
+            }
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+        tx.send(seen).unwrap();
+    });
+
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let before_remote = config.split("\n[remote]\n").next().unwrap();
+    let after_remote = config.split("\n[large]\n").nth(1).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            r#"{before_remote}
+[remote]
+type = "s3"
+bucket = "range-bucket"
+prefix = "majutsu/v1"
+endpoint = "http://{addr}"
+region = "us-test-1"
+signature_version = "s3v4"
+
+[large]
+{after_remote}"#
+        ),
+    )
+    .unwrap();
+
+    let prepare = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("prepare")
+            .arg("--to")
+            .arg(&restore)
+            .env("AWS_ACCESS_KEY_ID", "dummy")
+            .env("AWS_SECRET_ACCESS_KEY", "dummy");
+        c
+    });
+    let job_id = prepare
+        .lines()
+        .find_map(|line| line.strip_prefix("restore_job "))
+        .unwrap()
+        .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("resume")
+            .arg(&job_id)
+            .env("AWS_ACCESS_KEY_ID", "dummy")
+            .env("AWS_SECRET_ACCESS_KEY", "dummy");
+        c
+    });
+
+    let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.join().unwrap();
+    assert!(seen.iter().any(|(line, range)| {
+        line.starts_with("GET ")
+            && line.contains(&pack_key)
+            && range
+                .as_deref()
+                .is_some_and(|range| range.starts_with("bytes="))
+    }));
+    assert!(!state.join(&pack_key).exists());
+    assert!(state.join(&alpha_object_key).exists());
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+}
+
+#[test]
 fn restore_prepare_can_hydrate_large_objects_from_canonical_aliases() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

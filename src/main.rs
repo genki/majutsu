@@ -1678,6 +1678,10 @@ fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Res
             hydrated.push(key.clone());
             continue;
         }
+        if hydrate_packed_blobs_from_remote(paths, &remote, key)? {
+            hydrated.push(key.clone());
+            continue;
+        }
         if !remote_object_available(&remote, key)? {
             still_pending.push(key.clone());
             continue;
@@ -1704,6 +1708,70 @@ fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Res
         )?;
     }
     Ok(())
+}
+
+fn hydrate_packed_blobs_from_remote(
+    paths: &Paths,
+    remote: &RemoteStore,
+    pack_key: &str,
+) -> Result<bool> {
+    let conn = open_db(paths)?;
+    let Some(pack) = query_packs(&conn)?
+        .into_iter()
+        .find(|pack| pack.pack_key == pack_key)
+    else {
+        return Ok(false);
+    };
+    if paths.home.join(&pack.pack_key).exists() {
+        return Ok(false);
+    }
+    let remote_pack_key = remote_available_key(remote, &pack.pack_key)?;
+    if !remote_object_available(remote, &pack.pack_key)? {
+        return Ok(false);
+    }
+    let blobs = query_blobs(&conn)?
+        .into_iter()
+        .filter(|blob| blob.pack_id.as_deref() == Some(pack.pack_id.as_str()))
+        .collect::<Vec<_>>();
+    for blob in blobs {
+        if paths.home.join(&blob.object_key).exists() {
+            continue;
+        }
+        let offset = blob
+            .pack_offset
+            .ok_or_else(|| anyhow!("missing pack offset for {}", blob.oid))?;
+        let len = blob
+            .pack_len
+            .ok_or_else(|| anyhow!("missing pack len for {}", blob.oid))?;
+        let entry = remote
+            .get_range(&remote_pack_key, offset, len)
+            .with_context(|| format!("download packed blob {} from {}", blob.oid, pack.pack_key))?;
+        let encoded = pack_entry_payload(&blob.oid, &entry)?;
+        let decoded = decode_object(paths, encoded)
+            .with_context(|| format!("decode packed blob {}", blob.oid))?;
+        if decoded.len() as u64 != blob.size || blake3_hex(&decoded) != blob.oid {
+            bail!("packed blob range hash mismatch {}", blob.oid);
+        }
+        let dest = paths.home.join(&blob.object_key);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(dest, encoded)?;
+    }
+    Ok(true)
+}
+
+fn pack_entry_payload<'a>(oid: &str, entry: &'a [u8]) -> Result<&'a [u8]> {
+    if entry.len() < 8 {
+        bail!("pack entry too short for {oid}");
+    }
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&entry[..8]);
+    let stored_len = u64::from_le_bytes(len_bytes) as usize;
+    if stored_len != entry.len() - 8 {
+        bail!("pack entry length mismatch for {oid}");
+    }
+    Ok(&entry[8..])
 }
 
 fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<FileRecord>> {
@@ -2572,20 +2640,14 @@ pub(crate) fn read_blob_payload(
         let len = blob
             .pack_len
             .ok_or_else(|| anyhow!("missing pack len for {oid}"))? as usize;
+        if !paths.home.join(&pack.pack_key).exists() && paths.home.join(fallback_key).exists() {
+            return read_object(paths, fallback_key);
+        }
         let bytes = fs::read(paths.home.join(pack.pack_key))?;
         let slice = bytes
             .get(offset..offset + len)
             .ok_or_else(|| anyhow!("pack entry out of range for {oid}"))?;
-        if slice.len() < 8 {
-            bail!("pack entry too short for {oid}");
-        }
-        let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(&slice[..8]);
-        let stored_len = u64::from_le_bytes(len_bytes) as usize;
-        if stored_len != slice.len() - 8 {
-            bail!("pack entry length mismatch for {oid}");
-        }
-        decode_object(paths, &slice[8..])
+        decode_object(paths, pack_entry_payload(oid, slice)?)
     } else {
         read_object(paths, fallback_key)
     }
