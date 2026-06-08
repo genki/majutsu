@@ -13,7 +13,8 @@ use majutsu_core::{
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
 use majutsu_large::{
-    ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_pin_issues,
+    ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_manifest_issues,
+    large_pin_issues,
 };
 use majutsu_pack::{
     PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackedBlobMetadata,
@@ -2067,6 +2068,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         )?;
         validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
         validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
+        validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
         for key in local_object_keys(&export) {
             let dest = staging_paths.home.join(&key);
             if let Some(parent) = dest.parent() {
@@ -2104,6 +2106,34 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+fn validate_clone_remote_large_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<()> {
+    for large in &export.large_objects {
+        for variant in remote_local_object_variants(paths, remote, &large.manifest_key)? {
+            let manifest: LargeManifest =
+                serde_json::from_slice(&decode_object(paths, &variant.bytes)?).with_context(
+                    || {
+                        format!(
+                            "parse remote large manifest {} from {}",
+                            large.manifest_key, variant.remote_key
+                        )
+                    },
+                )?;
+            if !large_manifest_issues(&manifest, large).is_empty() {
+                bail!(
+                    "remote large manifest object does not match metadata {} {}",
+                    large.oid,
+                    variant.remote_key
+                );
+            }
+        }
+    }
     Ok(())
 }
 
