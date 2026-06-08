@@ -5664,6 +5664,36 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     assert!(!object_key.contains(&plain_oid));
     let object = fs::read(remote.join(object_key)).unwrap();
     assert!(object.starts_with(b"age-encryption.org/v1"));
+    let large_oid = export["large_objects"][0]["oid"].as_str().unwrap();
+    let large_manifest_key = export["large_objects"][0]["manifest_key"].as_str().unwrap();
+    assert!(!large_manifest_key.contains(large_oid));
+    assert!(remote.join(large_manifest_key).exists());
+    let manifest_alias = large_manifest_key
+        .strip_prefix("objects/large/manifests/")
+        .map(|rest| format!("large/manifests/{rest}.cbor.zst.enc"))
+        .unwrap();
+    assert!(remote.join(&manifest_alias).exists());
+    let chunk_oid = export["chunks"][0]["oid"].as_str().unwrap();
+    let chunk_key = export["chunks"][0]["object_key"].as_str().unwrap();
+    assert!(!chunk_key.contains(chunk_oid));
+    assert!(remote.join(chunk_key).exists());
+    let chunk_alias = chunk_key
+        .strip_prefix("objects/large/chunks/fixed/")
+        .map(|rest| format!("large/chunks/fixed-8m/{rest}.chunk.enc"))
+        .unwrap();
+    assert!(remote.join(&chunk_alias).exists());
+    assert!(
+        !remote
+            .join("objects/large/chunks/fixed")
+            .join(chunk_oid)
+            .exists()
+    );
+    assert!(
+        !remote
+            .join("large/chunks/fixed-8m")
+            .join(format!("{chunk_oid}.chunk.enc"))
+            .exists()
+    );
     assert!(remote.join("keys/recipients.toml").exists());
 
     let missing_key_clone = tmp.path().join("missing-key-clone");
