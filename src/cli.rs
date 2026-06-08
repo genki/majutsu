@@ -185,25 +185,57 @@ pub(crate) struct RootAddArgs {
         long_help = "snapshot modeを指定します。通常は default、欠落や不安定なrootを厳格に扱う場合は strict、pre/post hookで整合点を作る場合は transactional を使います。"
     )]
     pub(crate) snapshot_mode: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "COMMAND",
+        help = "transactional snapshot前に実行するコマンド"
+    )]
     pub(crate) pre_snapshot: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "COMMAND",
+        help = "transactional snapshot後に実行するコマンド"
+    )]
     pub(crate) post_snapshot: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "実際に読み取るsnapshot sourceをroot pathとは別に指定する"
+    )]
     pub(crate) snapshot_source: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "アプリケーション固有snapshot plugin名"
+    )]
     pub(crate) application_plugin: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_name = "BYTES", help = "large object扱いにする最小サイズ")]
     pub(crate) large_min_size: Option<u64>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "BYTES",
+        help = "binary fileをlarge object扱いにする最小サイズ"
+    )]
     pub(crate) large_binary_min_size: Option<u64>,
-    #[arg(long)]
+    #[arg(long, value_name = "BYTES", help = "large object chunkサイズ")]
     pub(crate) large_chunk_size: Option<usize>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "large object chunk方式。fixed または fastcdc"
+    )]
     pub(crate) large_chunking: Option<String>,
-    #[arg(long = "large-always")]
+    #[arg(
+        long = "large-always",
+        value_name = "GLOB",
+        help = "常にlarge object扱いにするglob"
+    )]
     pub(crate) large_always: Vec<String>,
-    #[arg(long = "large-never")]
+    #[arg(
+        long = "large-never",
+        value_name = "GLOB",
+        help = "large object扱いにしないglob"
+    )]
     pub(crate) large_never: Vec<String>,
 }
 
