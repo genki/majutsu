@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use libc::{EIO, EISDIR, ENOENT, EROFS};
 use majutsu_core::{FileRecord, LargeManifest, Payload, payload_blob_ref, payload_large_ref};
@@ -243,6 +243,27 @@ impl Filesystem for MajutsuFuseFs {
         }
     }
 
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        reply.error(EROFS);
+    }
+
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         if flags & libc::O_ACCMODE != libc::O_RDONLY {
             reply.error(EROFS);
@@ -253,6 +274,74 @@ impl Filesystem for MajutsuFuseFs {
             Some(FuseNodeKind::Directory { .. }) => reply.error(EISDIR),
             _ => reply.error(ENOENT),
         }
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(EROFS);
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(EROFS);
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _link_name: &OsStr,
+        _target: &Path,
+        reply: ReplyEntry,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _newparent: u64,
+        _newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _newparent: u64,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(EROFS);
     }
 
     fn read(
@@ -315,6 +404,17 @@ impl Filesystem for MajutsuFuseFs {
         reply.ok();
     }
 
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            reply.error(EROFS);
+            return;
+        }
+        match self.nodes.get(&ino).map(|node| &node.kind) {
+            Some(FuseNodeKind::Directory { .. }) => reply.opened(0, 0),
+            _ => reply.error(ENOENT),
+        }
+    }
+
     fn write(
         &mut self,
         _req: &Request<'_>,
@@ -325,6 +425,105 @@ impl Filesystem for MajutsuFuseFs {
         _write_flags: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(EROFS);
+    }
+
+    fn access(&mut self, _req: &Request<'_>, _ino: u64, mask: i32, reply: ReplyEmpty) {
+        match read_only_access(mask) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _offset: i64,
+        _length: i64,
+        _mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(EROFS);
+    }
+
+    fn copy_file_range(
+        &mut self,
+        _req: &Request<'_>,
+        _ino_in: u64,
+        _fh_in: u64,
+        _offset_in: i64,
+        _ino_out: u64,
+        _fh_out: u64,
+        _offset_out: i64,
+        _len: u64,
+        _flags: u32,
         reply: ReplyWrite,
     ) {
         reply.error(EROFS);
@@ -412,6 +611,14 @@ fn fuse_record_file_type(record: &FileRecord, kind: &FuseNodeKind) -> FileType {
     }
 }
 
+fn read_only_access(mask: i32) -> std::result::Result<(), i32> {
+    if mask & libc::W_OK != 0 {
+        Err(EROFS)
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
     if !mountpoint.exists() {
         fs::create_dir_all(mountpoint)?;
@@ -425,6 +632,19 @@ pub(crate) fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
         bail!("mountpoint is not empty: {}", mountpoint.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_access_rejects_write_masks() {
+        assert_eq!(read_only_access(libc::W_OK), Err(EROFS));
+        assert_eq!(read_only_access(libc::R_OK | libc::W_OK), Err(EROFS));
+        assert_eq!(read_only_access(libc::R_OK), Ok(()));
+        assert_eq!(read_only_access(libc::R_OK | libc::X_OK), Ok(()));
+    }
 }
 
 pub(crate) fn is_mountpoint(path: &Path) -> Result<bool> {
