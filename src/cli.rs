@@ -416,7 +416,14 @@ pub(crate) enum KeyCommand {
 
 #[derive(Args)]
 pub(crate) struct PruneArgs {
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(
+        long,
+        default_value_t = false,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+        action = clap::ArgAction::Set
+    )]
     pub(crate) dry_run: bool,
     #[arg(long, default_value_t = 90)]
     pub(crate) keep_daily: u32,

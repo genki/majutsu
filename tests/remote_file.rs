@@ -6249,7 +6249,7 @@ fn prune_dry_run_and_gc_are_safe_entry_points() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("prune");
+        c.arg("--home").arg(&state).arg("prune").arg("--dry-run");
         c
     });
     run({
@@ -6666,6 +6666,7 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
         c.arg("--home")
             .arg(&state)
             .arg("prune")
+            .arg("--dry-run")
             .arg("--keep-daily")
             .arg("1")
             .arg("--keep-monthly")
@@ -6693,7 +6694,6 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
         c.arg("--home")
             .arg(&state)
             .arg("prune")
-            .arg("--dry-run=false")
             .arg("--keep-daily")
             .arg("1")
             .arg("--keep-monthly")
