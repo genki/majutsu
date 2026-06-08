@@ -23,14 +23,13 @@ use majutsu_restore::{
     RestoreQueueItem, classify_restore_object_availability, validate_relative_filter_path,
 };
 use majutsu_store::{
-    BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY,
-    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
-    RemoteGcTombstone as GcTombstoneExport, RemoteHostSummary, canonical_remote_alias,
-    canonical_remote_aliases, host_current_ref_key, host_last_synced_ref_key,
-    host_legacy_current_key, host_metadata_key, host_operation_canonical_key, host_operation_key,
-    host_oplog_canonical_key, host_oplog_key, host_ops_prefix, host_snapshot_canonical_key,
-    host_snapshot_key, host_snapshots_prefix, remote_gc_mark_key, remote_gc_tombstone_prefix,
-    select_remote_host,
+    BlobExport, REMOTE_CHUNK_INDEX_SHARD_KEY, RemoteChunkIndexShard as ChunkIndexShard,
+    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostSummary,
+    canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
+    host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
+    host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
+    host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
+    remote_gc_mark_key, remote_gc_tombstone_prefix,
 };
 #[cfg(test)]
 use reqwest::blocking::Client;
@@ -51,6 +50,7 @@ use walkdir::WalkDir;
 
 mod atomic_io;
 mod cli;
+mod clone_runtime;
 mod config;
 mod daemon_runtime;
 mod db_refs;
@@ -82,18 +82,18 @@ mod watch_runtime;
 use atomic_io::write_atomic_with;
 #[cfg(test)]
 use cli::PackArgs;
-use cli::{Cli, CloneArgs, Command, InitArgs, RestoreArgs, RootCommand, SnapshotArgs};
+use cli::{Cli, Command, InitArgs, RestoreArgs, RootCommand, SnapshotArgs};
+use clone_runtime::clone_cmd;
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
     MetadataExport, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig, SecurityConfig,
     TieringConfig, WatchConfig, default_chunk_size, default_include, default_large_binary_min_size,
     default_large_chunking, default_large_max_parallel_uploads, default_large_min_size,
     default_security_hash, default_security_key_id, encryption_enabled, encryption_mode,
-    read_config, resolve_paths, validate_config, validate_large_chunking,
-    validate_restore_archive_config, validate_snapshot_mode, write_config,
+    read_config, resolve_paths, validate_large_chunking, validate_restore_archive_config,
+    validate_snapshot_mode, write_config,
 };
 use daemon_runtime::daemon_cmd;
-use db_refs::persist_export_remote_refs;
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::fsck;
 use history_runtime::{diff_cmd, log_cmd, op_cmd, status_cmd};
@@ -109,7 +109,7 @@ use pack_runtime::pack_cmd;
 use process_runtime::acquire_process_lock;
 use prune_runtime::{gc_cmd, prune_cmd};
 use queue_runtime::{has_pending_journal_events, record_event};
-use remote_runtime::{read_remote_host_index, remote_cmd, remote_host_index_with_legacy};
+use remote_runtime::remote_cmd;
 #[cfg(test)]
 use remote_store::{
     DEFAULT_MULTIPART_THRESHOLD, FileRemote, MIN_MULTIPART_PART_SIZE, S3Remote, s3_object_class,
@@ -707,101 +707,7 @@ fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
     Ok(true)
 }
 
-fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
-    if paths.home.exists() && paths.home.read_dir()?.next().is_some() {
-        bail!("target majutsu home is not empty: {}", paths.home.display());
-    }
-    let remote_config = RemoteConfig::from_url(args.remote);
-    let remote = open_remote(&remote_config)?;
-    let metadata = clone_metadata_selection(&remote, args.host.as_deref())?;
-    let export_bytes = remote.get(&metadata.key)?;
-    let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
-    export.config.remote = Some(remote_config);
-    validate_config(&export.config)?;
-    validate_clone_host_summary(&metadata.host, metadata.host_index, &export)?;
-    validate_clone_metadata(&export)?;
-    validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
-    validate_clone_remote_gc_mark(&remote, metadata.host.as_ref(), &export)?;
-    ensure_clone_objects_available(&remote, &export)?;
-    let staging_home = clone_staging_home(&paths.home);
-    let staging_paths = resolve_paths(Some(staging_home.clone()))?;
-    let clone_result = (|| -> Result<()> {
-        create_layout(&staging_paths)?;
-        write_config(&staging_paths, &export.config)?;
-        fs::write(
-            &staging_paths.host,
-            toml::to_string_pretty(&export.config.host)?,
-        )?;
-        if remote.exists("keys/recipients.toml")? {
-            fs::write(
-                staging_paths.home.join("keys/recipients.toml"),
-                remote.get("keys/recipients.toml")?,
-            )?;
-        }
-        if export.config.security.encryption != "none" {
-            let key = env::var("MAJUTSU_MASTER_KEY")
-                .context("encrypted clone requires MAJUTSU_MASTER_KEY=<64-hex-key>")?;
-            write_master_key(&staging_paths, &key)?;
-        }
-        validate_clone_remote_oplog(
-            &staging_paths,
-            &remote,
-            metadata.host.as_ref(),
-            &export.operations,
-        )?;
-        validate_clone_remote_timeline_exports(
-            &staging_paths,
-            &remote,
-            metadata.host.as_ref(),
-            &export.snapshots,
-            &export.operations,
-        )?;
-        validate_clone_remote_snapshot_objects(&staging_paths, &remote, &export)?;
-        validate_clone_remote_blob_objects(&staging_paths, &remote, &export)?;
-        validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
-        validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
-        validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
-        for key in local_object_keys(&export) {
-            let dest = staging_paths.home.join(&key);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(
-                dest,
-                download_local_object_from_remote(&staging_paths, &remote, &key)?,
-            )?;
-        }
-        let conn = open_db(&staging_paths)?;
-        import_metadata(&conn, &export)?;
-        persist_export_remote_refs(
-            &conn,
-            &remote.describe(),
-            &export.config.host.id,
-            &export.refs,
-        )?;
-        Ok(())
-    })();
-    if let Err(err) = clone_result {
-        let _ = fs::remove_dir_all(&staging_home);
-        return Err(err);
-    }
-    if paths.home.exists() {
-        fs::remove_dir(&paths.home)
-            .with_context(|| format!("remove empty clone target {}", paths.home.display()))?;
-    }
-    fs::rename(&staging_home, &paths.home).with_context(|| {
-        format!(
-            "move clone staging {} to {}",
-            staging_home.display(),
-            paths.home.display()
-        )
-    })?;
-    println!("cloned {} into {}", remote.describe(), paths.home.display());
-    println!("host {} {}", export.config.host.name, export.config.host.id);
-    Ok(())
-}
-
-fn validate_clone_remote_blob_objects(
+pub(crate) fn validate_clone_remote_blob_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &MetadataExport,
@@ -836,7 +742,7 @@ fn validate_clone_remote_blob_objects(
     Ok(())
 }
 
-fn validate_clone_remote_snapshot_objects(
+pub(crate) fn validate_clone_remote_snapshot_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &MetadataExport,
@@ -886,7 +792,7 @@ fn validate_clone_remote_snapshot_objects(
     Ok(())
 }
 
-fn validate_clone_remote_large_objects(
+pub(crate) fn validate_clone_remote_large_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &MetadataExport,
@@ -963,7 +869,7 @@ fn validate_clone_remote_large_chunk_object(
     Ok(())
 }
 
-fn validate_clone_remote_pack_objects(
+pub(crate) fn validate_clone_remote_pack_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &MetadataExport,
@@ -1099,7 +1005,7 @@ fn expected_canonical_pack_object_keys(export: &MetadataExport) -> BTreeSet<Stri
         .collect()
 }
 
-fn validate_clone_remote_chunk_index(
+pub(crate) fn validate_clone_remote_chunk_index(
     paths: &Paths,
     remote: &RemoteStore,
     export: &MetadataExport,
@@ -1164,7 +1070,7 @@ fn validate_clone_remote_chunk_index(
     Ok(())
 }
 
-fn validate_clone_remote_timeline_exports(
+pub(crate) fn validate_clone_remote_timeline_exports(
     paths: &Paths,
     remote: &RemoteStore,
     host: Option<&RemoteHostSummary>,
@@ -1228,7 +1134,7 @@ fn validate_clone_remote_timeline_exports(
     Ok(())
 }
 
-fn validate_clone_remote_oplog(
+pub(crate) fn validate_clone_remote_oplog(
     paths: &Paths,
     remote: &RemoteStore,
     host: Option<&RemoteHostSummary>,
@@ -1260,13 +1166,7 @@ fn validate_clone_remote_oplog(
     Ok(())
 }
 
-struct CloneMetadataSelection {
-    key: String,
-    host: Option<RemoteHostSummary>,
-    host_index: bool,
-}
-
-fn validate_clone_host_summary(
+pub(crate) fn validate_clone_host_summary(
     host: &Option<RemoteHostSummary>,
     host_index: bool,
     export: &MetadataExport,
@@ -1314,7 +1214,7 @@ fn validate_clone_host_summary(
     Ok(())
 }
 
-fn validate_clone_remote_refs(
+pub(crate) fn validate_clone_remote_refs(
     remote: &RemoteStore,
     host: Option<&RemoteHostSummary>,
     export: &MetadataExport,
@@ -1364,7 +1264,7 @@ fn validate_clone_remote_refs(
     Ok(())
 }
 
-fn validate_clone_remote_gc_mark(
+pub(crate) fn validate_clone_remote_gc_mark(
     remote: &RemoteStore,
     host: Option<&RemoteHostSummary>,
     export: &MetadataExport,
@@ -1420,7 +1320,7 @@ fn validate_clone_remote_gc_tombstones(remote: &RemoteStore, host_id: &str) -> R
     Ok(())
 }
 
-fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
+pub(crate) fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
     let mut issues = Vec::new();
     if export.version != METADATA_EXPORT_VERSION {
         issues.push(format!(
@@ -1593,84 +1493,7 @@ fn format_history_graph_issue(issue: HistoryGraphIssue) -> String {
     }
 }
 
-fn clone_staging_home(home: &Path) -> PathBuf {
-    let parent = home.parent().unwrap_or_else(|| Path::new("."));
-    let name = home
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "majutsu".into());
-    parent.join(format!(".{name}.clone-{}", Uuid::new_v4()))
-}
-
-fn ensure_clone_objects_available(remote: &RemoteStore, export: &MetadataExport) -> Result<()> {
-    let mut missing = Vec::new();
-    for key in local_object_keys(export) {
-        if !remote_object_available(remote, &key)? {
-            missing.push(key);
-        }
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-    let sample = missing
-        .iter()
-        .take(5)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let suffix = if missing.len() > 5 {
-        format!(", ... {} more", missing.len() - 5)
-    } else {
-        String::new()
-    };
-    bail!(
-        "remote is missing {} object(s) required for clone: {sample}{suffix}",
-        missing.len()
-    )
-}
-
-fn clone_metadata_selection(
-    remote: &RemoteStore,
-    host: Option<&str>,
-) -> Result<CloneMetadataSelection> {
-    if let Some(host_id) = host {
-        let index = read_remote_host_index(remote)?;
-        if !index.hosts.is_empty() {
-            let host = select_remote_host(index.hosts, host_id)?;
-            return Ok(CloneMetadataSelection {
-                key: host.metadata_key.clone(),
-                host: Some(host),
-                host_index: true,
-            });
-        }
-        let index = remote_host_index_with_legacy(remote)?;
-        let host = select_remote_host(index.hosts, host_id)?;
-        return Ok(CloneMetadataSelection {
-            key: host.metadata_key.clone(),
-            host: Some(host),
-            host_index: false,
-        });
-    }
-    let index = read_remote_host_index(remote)?;
-    match index.hosts.as_slice() {
-        [host] => Ok(CloneMetadataSelection {
-            key: host.metadata_key.clone(),
-            host: Some(host.clone()),
-            host_index: true,
-        }),
-        [] if remote.exists(LEGACY_METADATA_EXPORT_KEY)? => Ok(CloneMetadataSelection {
-            key: LEGACY_METADATA_EXPORT_KEY.into(),
-            host: None,
-            host_index: false,
-        }),
-        [] => {
-            bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")
-        }
-        _ => bail!("remote contains multiple hosts; rerun clone with --host"),
-    }
-}
-
-fn download_local_object_from_remote(
+pub(crate) fn download_local_object_from_remote(
     paths: &Paths,
     remote: &RemoteStore,
     key: &str,
