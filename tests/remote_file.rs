@@ -5931,6 +5931,11 @@ storage = "infrequent"
     assert!(lifecycle_put.0.contains("/life-bucket/"));
     assert!(lifecycle_put.1.contains("<LifecycleConfiguration>"));
     assert!(lifecycle_put.1.contains("<ID>custom-packs-to-ia</ID>"));
+    assert!(
+        lifecycle_put
+            .1
+            .contains("<Prefix>majutsu/v1/objects/packs/normal/</Prefix>")
+    );
     assert!(lifecycle_put.1.contains("<Days>14</Days>"));
     assert!(
         lifecycle_put

@@ -208,11 +208,12 @@ impl RemoteStore {
         }
     }
 
-    pub(crate) fn apply_s3_lifecycle(&self, policy_xml: &str) -> Result<bool> {
+    pub(crate) fn apply_s3_lifecycle_policy(&self, policy: &serde_json::Value) -> Result<bool> {
         match self {
             RemoteStore::File(_) => Ok(false),
             RemoteStore::S3(remote) => {
-                remote.put_lifecycle_configuration(policy_xml)?;
+                let policy_xml = remote.lifecycle_configuration_xml(policy)?;
+                remote.put_lifecycle_configuration(&policy_xml)?;
                 Ok(true)
             }
         }
@@ -329,6 +330,25 @@ impl S3Remote {
             );
         }
         Ok(())
+    }
+
+    fn lifecycle_configuration_xml(&self, policy: &serde_json::Value) -> Result<String> {
+        let mut prefixed = policy.clone();
+        if let Some(rules) = prefixed
+            .get_mut("Rules")
+            .and_then(|rules| rules.as_array_mut())
+        {
+            for rule in rules {
+                if let Some(prefix) = rule
+                    .pointer_mut("/Filter/Prefix")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                {
+                    rule["Filter"]["Prefix"] = serde_json::Value::String(self.remote_key(&prefix));
+                }
+            }
+        }
+        majutsu_policy::s3_lifecycle_configuration_xml(&prefixed)
     }
 
     fn upload_multipart_parts(

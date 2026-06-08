@@ -621,7 +621,8 @@ With `--dry-run=false` on an S3-compatible remote, majutsu sends `PUT
 ?lifecycle` to apply the bucket lifecycle configuration. It also stores the
 desired policy artifact under `lifecycle/policy-<provider>.json` and records
 `lifecycle/status.json` on the remote so operators can audit the same versioned
-policy.
+policy. For S3 remotes that use a configured remote prefix, the bucket lifecycle
+filters are expanded to include that prefix before they are sent to the provider.
 
 The generated rules are derived from `[tiering]` in `config.toml`. Rules without
 `after`, or rules whose storage is `standard`, are treated as keep-hot policy

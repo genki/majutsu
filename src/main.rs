@@ -823,8 +823,7 @@ fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
             } else {
                 let provider = normalize_lifecycle_provider(&provider)?;
                 let provider_applied = if provider == "s3" {
-                    let policy_xml = majutsu_policy::s3_lifecycle_configuration_xml(&policy)?;
-                    remote.apply_s3_lifecycle(&policy_xml)?
+                    remote.apply_s3_lifecycle_policy(&policy)?
                 } else {
                     false
                 };
