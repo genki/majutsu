@@ -7428,6 +7428,54 @@ fn fsck_detects_invalid_operation_entry() {
 }
 
 #[test]
+fn fsck_detects_inconsistent_operation_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.execute(
+        "update operations set status='failed', error=null where kind='initial-scan'",
+        [],
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn large_pin_unpin_is_persisted_in_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

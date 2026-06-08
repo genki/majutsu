@@ -222,6 +222,24 @@ fn validate_operation_entry(operation: &OperationExport, missing: &mut usize) {
                     operation.id
                 );
             }
+            OperationLogEntryIssue::FailedWithoutError => {
+                eprintln!("operation {} is failed without error detail", operation.id);
+            }
+            OperationLogEntryIssue::RemoteSyncMissingState => {
+                eprintln!(
+                    "operation {} is remote-sync without remote_sync_state",
+                    operation.id
+                );
+            }
+            OperationLogEntryIssue::RemoteSyncStateMismatch {
+                status,
+                remote_sync_state,
+            } => {
+                eprintln!(
+                    "operation {} remote-sync status {status} does not match remote_sync_state {remote_sync_state}",
+                    operation.id
+                );
+            }
             OperationLogEntryIssue::EmptyActor => {
                 eprintln!("operation {} has empty actor", operation.id);
             }

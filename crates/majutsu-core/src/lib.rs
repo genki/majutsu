@@ -463,6 +463,24 @@ impl OperationLogEntry {
                 ));
             }
         }
+        if self.status == "failed" && self.error.as_deref().unwrap_or_default().trim().is_empty() {
+            issues.push(OperationLogEntryIssue::FailedWithoutError);
+        }
+        if self.kind == "remote-sync" {
+            match self.remote_sync_state.as_deref() {
+                None => issues.push(OperationLogEntryIssue::RemoteSyncMissingState),
+                Some("queued") if self.status == "running" => {}
+                Some("synced") if self.status == "done" => {}
+                Some("failed") if self.status == "failed" => {}
+                Some(state) if valid_remote_sync_state_label(state) => {
+                    issues.push(OperationLogEntryIssue::RemoteSyncStateMismatch {
+                        status: self.status.clone(),
+                        remote_sync_state: state.to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
         if self.actor.trim().is_empty() {
             issues.push(OperationLogEntryIssue::EmptyActor);
         }
@@ -482,8 +500,17 @@ pub enum OperationLogEntryIssue {
     InvalidKind(String),
     InvalidStatus(String),
     InvalidRemoteSyncState(String),
+    FailedWithoutError,
+    RemoteSyncMissingState,
+    RemoteSyncStateMismatch {
+        status: String,
+        remote_sync_state: String,
+    },
     EmptyActor,
-    InvalidCreatedAt { value: String, error: String },
+    InvalidCreatedAt {
+        value: String,
+        error: String,
+    },
 }
 
 pub fn valid_operation_kind_label(kind: &str) -> bool {
@@ -1479,6 +1506,66 @@ mod tests {
         assert!(valid_remote_sync_state_label("queued"));
         assert!(valid_remote_sync_state_label("synced"));
         assert!(!valid_remote_sync_state_label("stale"));
+    }
+
+    #[test]
+    fn operation_log_entry_validation_reports_state_inconsistency() {
+        let failed_without_error = OperationLogEntry {
+            id: "op-1".into(),
+            parent_op: None,
+            kind: "manual-snapshot".into(),
+            actor: "alice@host".into(),
+            status: "failed".into(),
+            before_snapshot: None,
+            after_snapshot: None,
+            created_at: "2026-06-07T00:00:00Z".into(),
+            message: Some("snapshot failed".into()),
+            error: None,
+            remote_sync_state: None,
+        };
+        assert_eq!(
+            failed_without_error.validation_issues(),
+            vec![OperationLogEntryIssue::FailedWithoutError]
+        );
+
+        let remote_sync_without_state = OperationLogEntry {
+            id: "op-2".into(),
+            parent_op: Some("op-1".into()),
+            kind: "remote-sync".into(),
+            actor: "alice@host".into(),
+            status: "done".into(),
+            before_snapshot: None,
+            after_snapshot: None,
+            created_at: "2026-06-07T00:01:00Z".into(),
+            message: None,
+            error: None,
+            remote_sync_state: None,
+        };
+        assert_eq!(
+            remote_sync_without_state.validation_issues(),
+            vec![OperationLogEntryIssue::RemoteSyncMissingState]
+        );
+
+        let remote_sync_mismatch = OperationLogEntry {
+            id: "op-3".into(),
+            parent_op: Some("op-2".into()),
+            kind: "remote-sync".into(),
+            actor: "alice@host".into(),
+            status: "done".into(),
+            before_snapshot: None,
+            after_snapshot: None,
+            created_at: "2026-06-07T00:02:00Z".into(),
+            message: None,
+            error: None,
+            remote_sync_state: Some("queued".into()),
+        };
+        assert_eq!(
+            remote_sync_mismatch.validation_issues(),
+            vec![OperationLogEntryIssue::RemoteSyncStateMismatch {
+                status: "done".into(),
+                remote_sync_state: "queued".into(),
+            }]
+        );
     }
 
     #[test]
