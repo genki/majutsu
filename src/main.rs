@@ -7,9 +7,8 @@ use majutsu_core::{
     MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
     RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
     history_graph_issues, metadata_reference_issues, operation_log_comparison_issues,
-    operation_log_entry_matches, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
-    payload_large_ref_mut, snapshot_export_matches, snapshot_manifest_matches,
-    tree_manifest_issues,
+    operation_log_entry_matches, payload_blob_ref, payload_large_ref, snapshot_export_matches,
+    snapshot_manifest_matches, tree_manifest_issues,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -61,6 +60,7 @@ mod db_refs;
 mod fs_meta;
 mod fsck_runtime;
 mod fuse_mount;
+mod key_runtime;
 mod large_runtime;
 mod object_paths;
 mod operation_log;
@@ -83,9 +83,9 @@ use atomic_io::{write_atomic, write_atomic_with};
 #[cfg(test)]
 use cli::PackArgs;
 use cli::{
-    Cli, CloneArgs, Command, DaemonCommand, DiffArgs, HydrateArgs, InitArgs, KeyCommand,
-    LifecycleCommand, LogArgs, MountArgs, OpCommand, RestoreArgs, RestoreCommand, RestoreTopArgs,
-    RootCommand, SnapshotArgs, UnmountArgs,
+    Cli, CloneArgs, Command, DaemonCommand, DiffArgs, HydrateArgs, InitArgs, LifecycleCommand,
+    LogArgs, MountArgs, OpCommand, RestoreArgs, RestoreCommand, RestoreTopArgs, RootCommand,
+    SnapshotArgs, UnmountArgs,
 };
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, LazyMountEntry,
@@ -102,8 +102,9 @@ use db_refs::persist_export_remote_refs;
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::fsck;
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
+use key_runtime::key_cmd;
 use large_runtime::large_cmd;
-use object_paths::{large_chunk_base, large_chunk_base_for_key, local_object_keys};
+use object_paths::{large_chunk_base, local_object_keys};
 use operation_log::{
     query_operation, query_operations, record_op, record_op_with_details, record_op_with_id,
     rewrite_local_oplog,
@@ -2489,196 +2490,6 @@ fn cleanup_daemon_runtime(paths: &Paths) {
     let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
 }
 
-fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {
-    match command {
-        KeyCommand::Export => {
-            ensure_ready(paths)?;
-            let key = read_master_key(paths)?;
-            println!("{key}");
-        }
-        KeyCommand::Import { hex } => {
-            create_layout(paths)?;
-            validate_key_hex(&hex)?;
-            write_master_key(paths, &hex)?;
-            println!("imported master key into {}", paths.master_key.display());
-        }
-        KeyCommand::Rotate { new_key } => {
-            ensure_ready(paths)?;
-            let rotated = rotate_master_key(paths, new_key)?;
-            println!("rotated master key");
-            println!("objects_rewritten {}", rotated.objects);
-            println!("snapshots_rewritten {}", rotated.snapshots);
-            println!("new_key {}", rotated.new_key);
-        }
-    }
-    Ok(())
-}
-
-struct KeyRotationResult {
-    objects: usize,
-    snapshots: usize,
-    new_key: String,
-}
-
-fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotationResult> {
-    let config = read_config(paths)?;
-    if !encryption_enabled(&config.security)? {
-        bail!("key rotation requires encrypted state");
-    }
-    let conn = open_db(paths)?;
-    let old_key = read_master_key(paths)?;
-    let new_key = new_key.unwrap_or(random_key_hex()?);
-    validate_key_hex(&new_key)?;
-    if old_key.trim() == new_key.trim() {
-        bail!("new key must differ from current key");
-    }
-
-    let blobs = query_blobs(&conn)?;
-    let chunks = query_chunks(&conn)?;
-    let large_objects = query_large_objects(&conn)?;
-    let mut blob_payloads = BTreeMap::new();
-    for blob in &blobs {
-        blob_payloads.insert(
-            blob.oid.clone(),
-            read_blob_payload(paths, &conn, &blob.oid, &blob.object_key)?,
-        );
-    }
-    let mut chunk_payloads = BTreeMap::new();
-    for chunk in &chunks {
-        chunk_payloads.insert(chunk.oid.clone(), read_object(paths, &chunk.object_key)?);
-    }
-    let mut large_manifests = BTreeMap::new();
-    for large in &large_objects {
-        let manifest: LargeManifest =
-            serde_json::from_slice(&read_object(paths, &large.manifest_key)?)?;
-        large_manifests.insert(large.oid.clone(), manifest);
-    }
-    let mut snapshots = Vec::new();
-    let mut stmt = conn.prepare("select id, manifest_json from snapshots order by created_at")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (id, json) = row?;
-        snapshots.push((id, serde_json::from_str::<SnapshotManifest>(&json)?));
-    }
-
-    write_master_key(paths, &new_key)?;
-    let mut objects = 0usize;
-    let mut blob_keys = BTreeMap::new();
-    for blob in &blobs {
-        let key = store_bytes(paths, &paths.objects, &blob.oid, &blob_payloads[&blob.oid])?;
-        conn.execute(
-            "update blobs set object_key=?2, pack_id=null, pack_offset=null, pack_len=null where oid=?1",
-            params![blob.oid, key],
-        )?;
-        blob_keys.insert(blob.oid.clone(), key);
-        objects += 1;
-    }
-    conn.execute("delete from packs", [])?;
-    let mut chunk_keys = BTreeMap::new();
-    for chunk in &chunks {
-        let key = store_bytes(
-            paths,
-            &large_chunk_base_for_key(paths, &chunk.object_key),
-            &chunk.oid,
-            &chunk_payloads[&chunk.oid],
-        )?;
-        conn.execute(
-            "update chunks set object_key=?2 where oid=?1",
-            params![chunk.oid, key],
-        )?;
-        chunk_keys.insert(chunk.oid.clone(), key);
-        objects += 1;
-    }
-    let mut large_manifest_keys = BTreeMap::new();
-    for large in &large_objects {
-        let mut manifest = large_manifests
-            .remove(&large.oid)
-            .ok_or_else(|| anyhow!("missing loaded large manifest {}", large.oid))?;
-        for chunk in &mut manifest.chunks {
-            chunk.object_key = chunk_keys
-                .get(&chunk.oid)
-                .ok_or_else(|| anyhow!("missing rotated chunk key {}", chunk.oid))?
-                .clone();
-        }
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
-        let manifest_oid = blake3_hex(&bytes);
-        let key = store_bytes(paths, &paths.large_manifests, &manifest_oid, &bytes)?;
-        conn.execute(
-            "update large_objects set manifest_key=?2 where oid=?1",
-            params![large.oid, key],
-        )?;
-        large_manifest_keys.insert(large.oid.clone(), key);
-        objects += 1;
-    }
-
-    let mut snapshots_rewritten = 0usize;
-    for (snapshot_id, mut manifest) in snapshots {
-        rewrite_manifest_payload_keys(&mut manifest, &blob_keys, &large_manifest_keys)?;
-        manifest.root_trees.clear();
-        for (root_id, records) in &manifest.roots {
-            let tree = build_tree_manifest(root_id, records.clone())?;
-            let tree_json = serde_json::to_vec_pretty(&tree)?;
-            let tree_oid = blake3_hex(&tree_json);
-            let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
-            manifest.root_trees.insert(
-                root_id.clone(),
-                RootSnapshot {
-                    tree_id: tree.tree_id,
-                    tree_key,
-                    file_count: tree.entries.len(),
-                },
-            );
-            objects += 1;
-        }
-        let manifest_json = serde_json::to_vec_pretty(&manifest)?;
-        let manifest_oid = blake3_hex(&manifest_json);
-        let manifest_key = store_bytes(paths, &paths.objects, &manifest_oid, &manifest_json)?;
-        conn.execute(
-            "update snapshots set manifest_key=?2, manifest_json=?3 where id=?1",
-            params![snapshot_id, manifest_key, String::from_utf8(manifest_json)?],
-        )?;
-        snapshots_rewritten += 1;
-        objects += 1;
-    }
-    record_op(
-        &conn,
-        "key-rotation",
-        current_snapshot(&conn)?.as_deref(),
-        current_snapshot(&conn)?.as_deref(),
-        Some(&format!("rewrote {objects} objects")),
-    )?;
-    Ok(KeyRotationResult {
-        objects,
-        snapshots: snapshots_rewritten,
-        new_key,
-    })
-}
-
-fn rewrite_manifest_payload_keys(
-    manifest: &mut SnapshotManifest,
-    blob_keys: &BTreeMap<String, String>,
-    large_manifest_keys: &BTreeMap<String, String>,
-) -> Result<()> {
-    for records in manifest.roots.values_mut() {
-        for record in records {
-            if let Some((oid, object_key)) = payload_blob_ref_mut(&mut record.payload) {
-                *object_key = blob_keys
-                    .get(oid)
-                    .ok_or_else(|| anyhow!("missing rotated blob key {oid}"))?
-                    .clone();
-            } else if let Some((oid, manifest_key)) = payload_large_ref_mut(&mut record.payload) {
-                *manifest_key = large_manifest_keys
-                    .get(oid)
-                    .ok_or_else(|| anyhow!("missing rotated large manifest key {oid}"))?
-                    .clone();
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn packed_blob_metadata(blobs: &BTreeMap<&str, &BlobExport>) -> Vec<PackedBlobMetadata> {
     blobs
         .values()
@@ -3156,7 +2967,7 @@ fn is_permission_denied_error(err: &anyhow::Error) -> bool {
     false
 }
 
-fn build_tree_manifest(root_id: &str, records: Vec<FileRecord>) -> Result<TreeManifest> {
+pub(crate) fn build_tree_manifest(root_id: &str, records: Vec<FileRecord>) -> Result<TreeManifest> {
     let mut entries = BTreeMap::new();
     for record in records {
         entries.insert(record.path.clone(), record);
@@ -3369,7 +3180,7 @@ pub(crate) fn decode_large_chunk_stored_bytes(chunk: &LargeChunk, bytes: &[u8]) 
     }
 }
 
-fn create_layout(paths: &Paths) -> Result<()> {
+pub(crate) fn create_layout(paths: &Paths) -> Result<()> {
     fs::create_dir_all(paths.db.parent().unwrap())?;
     fs::create_dir_all(&paths.objects)?;
     fs::create_dir_all(&paths.trees)?;
@@ -3588,7 +3399,7 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
     Ok(())
 }
 
-fn query_blobs(conn: &Connection) -> Result<Vec<BlobExport>> {
+pub(crate) fn query_blobs(conn: &Connection) -> Result<Vec<BlobExport>> {
     let mut stmt = conn.prepare(
         "select oid, size, object_key, pack_id, pack_offset, pack_len from blobs order by oid",
     )?;
@@ -3623,7 +3434,7 @@ fn query_packs(conn: &Connection) -> Result<Vec<PackExport>> {
         .map_err(Into::into)
 }
 
-fn query_large_objects(conn: &Connection) -> Result<Vec<LargeObjectExport>> {
+pub(crate) fn query_large_objects(conn: &Connection) -> Result<Vec<LargeObjectExport>> {
     let mut stmt = conn
         .prepare("select oid, size, chunk_count, manifest_key from large_objects order by oid")?;
     let rows = stmt.query_map([], |row| {
@@ -3638,7 +3449,7 @@ fn query_large_objects(conn: &Connection) -> Result<Vec<LargeObjectExport>> {
         .map_err(Into::into)
 }
 
-fn query_chunks(conn: &Connection) -> Result<Vec<ChunkExport>> {
+pub(crate) fn query_chunks(conn: &Connection) -> Result<Vec<ChunkExport>> {
     let mut stmt = conn.prepare("select oid, size, object_key from chunks order by oid")?;
     let rows = stmt.query_map([], |row| {
         Ok(ChunkExport {
@@ -3765,7 +3576,7 @@ fn is_file_changed_error(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("file changed while reading:")
 }
 
-fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<String> {
+pub(crate) fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<String> {
     let storage_id = object_storage_id(paths, oid)?;
     let (a, b) = storage_id.split_at(2);
     let dir = base.join(a);
@@ -3838,7 +3649,7 @@ pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
     decode_object(paths, &bytes)
 }
 
-fn read_blob_payload(
+pub(crate) fn read_blob_payload(
     paths: &Paths,
     conn: &Connection,
     oid: &str,
@@ -3891,23 +3702,23 @@ pub(crate) fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
     majutsu_crypto::decode_object(bytes, &paths.master_key, &recipients_path(paths))
 }
 
-fn recipients_path(paths: &Paths) -> PathBuf {
+pub(crate) fn recipients_path(paths: &Paths) -> PathBuf {
     paths.home.join("keys/recipients.toml")
 }
 
-fn random_key_hex() -> Result<String> {
+pub(crate) fn random_key_hex() -> Result<String> {
     majutsu_crypto::random_key_hex()
 }
 
-fn validate_key_hex(hex_key: &str) -> Result<()> {
+pub(crate) fn validate_key_hex(hex_key: &str) -> Result<()> {
     majutsu_crypto::validate_key_hex(hex_key)
 }
 
-fn read_master_key(paths: &Paths) -> Result<String> {
+pub(crate) fn read_master_key(paths: &Paths) -> Result<String> {
     majutsu_crypto::read_master_key(&paths.master_key)
 }
 
-fn write_master_key(paths: &Paths, hex_key: &str) -> Result<()> {
+pub(crate) fn write_master_key(paths: &Paths, hex_key: &str) -> Result<()> {
     majutsu_crypto::write_master_key(&paths.master_key, hex_key)
 }
 
