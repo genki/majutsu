@@ -1516,6 +1516,21 @@ fn remote_fsck_export(
         *missing += 1;
         eprintln!("invalid remote config in {metadata_key}: {err}");
     }
+    let snapshot_ids = export
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .collect::<BTreeSet<_>>();
+    for issue in local_ref_issues(
+        export
+            .refs
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+        &snapshot_ids,
+    ) {
+        *missing += 1;
+        eprintln!("remote metadata {metadata_key}: {}", issue.message());
+    }
     for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
         *missing += 1;
         match issue {
@@ -1553,16 +1568,6 @@ fn remote_fsck_export(
     validate_remote_large_manifest_objects(paths, remote, &export, missing)?;
     validate_remote_pack_objects(paths, remote, &export, missing)?;
     validate_remote_metadata_references(paths, remote, &export, missing)?;
-    if let Some(current) = export.refs.get("current") {
-        let found = export
-            .snapshots
-            .iter()
-            .any(|snapshot| &snapshot.id == current);
-        if !found {
-            *missing += 1;
-            eprintln!("remote current ref points to missing snapshot {current}");
-        }
-    }
     if let Some(host_id) = host_id {
         validate_remote_oplog(paths, remote, host_id, &export.operations, missing)?;
         for snapshot in &export.snapshots {
