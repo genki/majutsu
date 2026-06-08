@@ -82,8 +82,8 @@ use atomic_io::write_atomic_with;
 #[cfg(test)]
 use cli::PackArgs;
 use cli::{
-    Cli, CloneArgs, Command, DiffArgs, InitArgs, LogArgs, OpCommand, RestoreArgs, RestoreCommand,
-    RestoreTopArgs, RootCommand, SnapshotArgs,
+    Cli, CloneArgs, Command, DiffArgs, InitArgs, LogArgs, OpCommand, RestoreArgs, RootCommand,
+    SnapshotArgs,
 };
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
@@ -118,10 +118,7 @@ use remote_store::{
 };
 use remote_store::{RemoteStore, open_remote};
 use restore_runtime::{
-    RestoreDelete, RestorePlan, apply_restore_plan, ensure_restore_job_has_no_missing_objects,
-    ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
-    print_restore_conflicts, print_restore_plan, read_restore_job, required_object_keys_for_plan,
-    restore_conflicts, restore_object_stats, restore_root_base, restore_target_label,
+    RestoreDelete, RestorePlan, required_object_keys_for_plan, restore_cmd, restore_root_base,
     write_restore_job,
 };
 use root_state::{
@@ -845,99 +842,6 @@ fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
                 println!("M\t{key}");
             }
             _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
-    ensure_ready(paths)?;
-    let conn = open_db(paths)?;
-    let command = top_args
-        .command
-        .unwrap_or_else(|| RestoreCommand::Apply(top_args.args));
-    match command {
-        RestoreCommand::Plan(args) => {
-            let plan = build_restore_plan(paths, &conn, &args)?;
-            print_restore_plan(paths, &conn, &plan)?;
-            if args.check_conflicts {
-                let conflicts = restore_conflicts(paths, &conn, &plan)?;
-                print_restore_conflicts(&conflicts);
-            }
-        }
-        RestoreCommand::Apply(args) => {
-            let plan = build_restore_plan(paths, &conn, &args)?;
-            apply_restore_plan(paths, &plan, args.force, args.check_conflicts)?;
-            let after = plan.snapshot.snapshot_id.as_str();
-            record_op(
-                &conn,
-                "restore",
-                None,
-                Some(after),
-                Some(&format!("to {}", restore_target_label(&plan))),
-            )?;
-            print_restore_plan(paths, &conn, &plan)?;
-            println!("restored to {}", restore_target_label(&plan));
-        }
-        RestoreCommand::Prepare(args) => {
-            let plan = build_restore_plan(paths, &conn, &args)?;
-            let stats = restore_object_stats(paths, &conn, &plan)?;
-            let mut job = build_restore_job(paths, &plan, &args)?;
-            request_archive_restore_for_job(paths, &mut job)?;
-            write_restore_job(paths, &job)?;
-            record_op(
-                &conn,
-                "restore-prepare",
-                None,
-                Some(&plan.snapshot.snapshot_id),
-                Some(&job.id),
-            )?;
-            println!("restore_job {}", job.id);
-            println!("snapshot {}", job.snapshot_id);
-            println!("required_objects {}", job.required_objects.len());
-            println!("required_chunks {}", stats.required_chunks);
-            println!("local_chunks {}", stats.local_chunks);
-            println!("remote_chunks {}", stats.remote_chunks);
-            println!("archived_chunks {}", stats.archived_chunks);
-            println!("missing_chunks {}", stats.missing_chunks);
-            println!("archived_objects {}", job.archived_objects.len());
-            println!("missing_objects {}", job.missing_objects.len());
-            println!(
-                "archive_requested_objects {}",
-                job.archive_requested_objects.len()
-            );
-        }
-        RestoreCommand::Resume { job_id } => {
-            let mut job = read_restore_job(paths, &job_id)?;
-            ensure_restore_job_resumable(&job)?;
-            ensure_restore_job_has_no_missing_objects(&job)?;
-            hydrate_restore_job_objects(paths, &mut job)?;
-            ensure_restore_job_not_blocked(&job)?;
-            let args = RestoreArgs {
-                snapshot: Some(job.snapshot_id.clone()),
-                at: None,
-                root: job.root.clone(),
-                path: job.path.as_ref().map(PathBuf::from),
-                to: if job.target == "original-roots" {
-                    None
-                } else {
-                    Some(PathBuf::from(&job.target))
-                },
-                force: job.force,
-                check_conflicts: job.check_conflicts,
-            };
-            let plan = build_restore_plan(paths, &conn, &args)?;
-            apply_restore_plan(paths, &plan, job.force, job.check_conflicts)?;
-            mark_restore_job_done(paths, &job.id)?;
-            record_op(
-                &conn,
-                "restore-resume",
-                None,
-                Some(&plan.snapshot.snapshot_id),
-                Some(&job.id),
-            )?;
-            println!("resumed {}", job.id);
-            println!("restored to {}", restore_target_label(&plan));
         }
     }
     Ok(())

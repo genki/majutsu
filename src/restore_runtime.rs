@@ -16,15 +16,18 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, params};
 
 use crate::atomic_io::write_atomic;
+use crate::cli::{RestoreArgs, RestoreCommand, RestoreTopArgs};
 use crate::config::{Paths, read_config};
+use crate::operation_log::record_op;
 use crate::remote_store::open_remote;
 use crate::restore_apply::{
     apply_file_metadata, prepare_directory_restore_destination, prepare_file_restore_destination,
     restore_special_file, restore_special_matches, restore_symlink,
 };
 use crate::{
-    decode_object, download_local_object_from_remote, query_blobs, read_blob_payload,
-    read_large_chunk, read_object, remote_object_available, write_large_chunks_atomic,
+    build_restore_job, decode_object, download_local_object_from_remote,
+    hydrate_restore_job_objects, query_blobs, read_blob_payload, read_large_chunk, read_object,
+    remote_object_available, request_archive_restore_for_job, write_large_chunks_atomic,
 };
 
 #[derive(Debug)]
@@ -54,6 +57,99 @@ pub(crate) struct RestoreObjectStats {
     pub(crate) archived_objects: usize,
     pub(crate) missing_objects: usize,
     pub(crate) archive_or_missing_objects: usize,
+}
+
+pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
+    crate::ensure_ready(paths)?;
+    let conn = crate::open_db(paths)?;
+    let command = top_args
+        .command
+        .unwrap_or_else(|| RestoreCommand::Apply(top_args.args));
+    match command {
+        RestoreCommand::Plan(args) => {
+            let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            print_restore_plan(paths, &conn, &plan)?;
+            if args.check_conflicts {
+                let conflicts = restore_conflicts(paths, &conn, &plan)?;
+                print_restore_conflicts(&conflicts);
+            }
+        }
+        RestoreCommand::Apply(args) => {
+            let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            apply_restore_plan(paths, &plan, args.force, args.check_conflicts)?;
+            let after = plan.snapshot.snapshot_id.as_str();
+            record_op(
+                &conn,
+                "restore",
+                None,
+                Some(after),
+                Some(&format!("to {}", restore_target_label(&plan))),
+            )?;
+            print_restore_plan(paths, &conn, &plan)?;
+            println!("restored to {}", restore_target_label(&plan));
+        }
+        RestoreCommand::Prepare(args) => {
+            let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            let stats = restore_object_stats(paths, &conn, &plan)?;
+            let mut job = build_restore_job(paths, &plan, &args)?;
+            request_archive_restore_for_job(paths, &mut job)?;
+            write_restore_job(paths, &job)?;
+            record_op(
+                &conn,
+                "restore-prepare",
+                None,
+                Some(&plan.snapshot.snapshot_id),
+                Some(&job.id),
+            )?;
+            println!("restore_job {}", job.id);
+            println!("snapshot {}", job.snapshot_id);
+            println!("required_objects {}", job.required_objects.len());
+            println!("required_chunks {}", stats.required_chunks);
+            println!("local_chunks {}", stats.local_chunks);
+            println!("remote_chunks {}", stats.remote_chunks);
+            println!("archived_chunks {}", stats.archived_chunks);
+            println!("missing_chunks {}", stats.missing_chunks);
+            println!("archived_objects {}", job.archived_objects.len());
+            println!("missing_objects {}", job.missing_objects.len());
+            println!(
+                "archive_requested_objects {}",
+                job.archive_requested_objects.len()
+            );
+        }
+        RestoreCommand::Resume { job_id } => {
+            let mut job = read_restore_job(paths, &job_id)?;
+            ensure_restore_job_resumable(&job)?;
+            ensure_restore_job_has_no_missing_objects(&job)?;
+            hydrate_restore_job_objects(paths, &mut job)?;
+            ensure_restore_job_not_blocked(&job)?;
+            let args = RestoreArgs {
+                snapshot: Some(job.snapshot_id.clone()),
+                at: None,
+                root: job.root.clone(),
+                path: job.path.as_ref().map(PathBuf::from),
+                to: if job.target == "original-roots" {
+                    None
+                } else {
+                    Some(PathBuf::from(&job.target))
+                },
+                force: job.force,
+                check_conflicts: job.check_conflicts,
+            };
+            let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            apply_restore_plan(paths, &plan, job.force, job.check_conflicts)?;
+            mark_restore_job_done(paths, &job.id)?;
+            record_op(
+                &conn,
+                "restore-resume",
+                None,
+                Some(&plan.snapshot.snapshot_id),
+                Some(&job.id),
+            )?;
+            println!("resumed {}", job.id);
+            println!("restored to {}", restore_target_label(&plan));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn write_restore_job(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
