@@ -5411,6 +5411,7 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
     });
     assert!(dry_run.contains("dry_run true"));
     assert!(dry_run.contains("candidate_snapshots 1"));
+    assert_eq!(db_operation_count(&state, "prune"), 0);
     run({
         let mut c = mj();
         c.arg("--home")
@@ -5437,6 +5438,7 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
         c
     });
     assert!(prune.contains("deleted_snapshots 1"));
+    assert_eq!(db_operation_count(&state, "prune"), 1);
     fails({
         let mut c = mj();
         c.arg("--home")
@@ -5454,6 +5456,7 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
         c.arg("--home").arg(&state).arg("gc");
         c
     });
+    assert_eq!(db_operation_count(&state, "gc"), 1);
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("fsck");
