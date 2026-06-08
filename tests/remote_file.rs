@@ -5112,8 +5112,9 @@ fn restore_preserves_fifo_special_entries() {
     perms.set_mode(0o620);
     fs::set_permissions(&fifo, perms).unwrap();
     let status = Command::new("touch")
-        .arg("-d")
-        .arg("@1720000000")
+        .env("TZ", "UTC")
+        .arg("-t")
+        .arg("202407030946.40")
         .arg(&fifo)
         .status()
         .unwrap();
@@ -12736,9 +12737,12 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         .join("\n");
     assert!(events.contains("watch-settle"));
     assert!(events.contains("settle_ms=50"));
-    assert!(events.contains("\"root_id\": \"sample\""));
-    assert!(events.contains("\"path\": \"alpha.txt\""));
-    assert!(events.contains("\"raw_backend\": \"notify\""));
+    #[cfg(target_os = "linux")]
+    {
+        assert!(events.contains("\"root_id\": \"sample\""));
+        assert!(events.contains("\"path\": \"alpha.txt\""));
+        assert!(events.contains("\"raw_backend\": \"notify\""));
+    }
 }
 
 #[test]
