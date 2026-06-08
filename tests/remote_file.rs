@@ -2889,6 +2889,131 @@ fn s3_remote_capabilities_honor_large_multipart_config() {
     assert!(capabilities.contains("multipart_upload false"));
 }
 
+#[test]
+fn remote_check_uses_s3_range_get_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let started = std::time::Instant::now();
+        let mut seen = Vec::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                if started.elapsed() > Duration::from_secs(5) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+                .unwrap_or(request.len());
+            let header = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let first = header.lines().next().unwrap_or("").to_string();
+            let range = line_header_value(&header, "Range")
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default();
+            seen.push((first.clone(), range));
+            if first.starts_with("GET ") && first.contains("?prefix=") {
+                let body = concat!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                    "<ListBucketResult>",
+                    "<Contents><Key>majutsu/v1/hosts/index.json</Key></Contents>",
+                    "</ListBucketResult>"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if first.starts_with("HEAD ") {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            } else if first.starts_with("GET ") {
+                stream
+                    .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\n\r\n{")
+                    .unwrap();
+                break;
+            } else {
+                stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            }
+        }
+        tx.send(seen).unwrap();
+    });
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg("s3://range-bucket/majutsu/v1");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let before_remote = config.split("\n[remote]\n").next().unwrap();
+    let after_remote = config.split("\n[large]\n").nth(1).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            r#"{before_remote}
+[remote]
+type = "s3"
+bucket = "range-bucket"
+prefix = "majutsu/v1"
+endpoint = "http://{addr}"
+region = "us-test-1"
+signature_version = "s3v4"
+
+[large]
+{after_remote}"#
+        ),
+    )
+    .unwrap();
+
+    let check = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("check")
+            .env("AWS_ACCESS_KEY_ID", "dummy")
+            .env("AWS_SECRET_ACCESS_KEY", "dummy");
+        c
+    });
+    assert!(check.contains("metadata ok"));
+    assert!(check.contains("range_get 1"));
+
+    let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.join().unwrap();
+    assert!(seen.iter().any(|(line, _)| line.starts_with("HEAD ")
+        && line.contains("/range-bucket/majutsu/v1/hosts/index.json")));
+    assert!(seen.iter().any(|(line, range)| line.starts_with("GET ")
+        && line.contains("/range-bucket/majutsu/v1/hosts/index.json")
+        && range == "bytes=0-0"));
+}
+
 #[cfg(unix)]
 #[test]
 fn restore_preserves_file_mode_and_mtime() {
