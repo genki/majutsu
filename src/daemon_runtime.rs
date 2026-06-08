@@ -1,4 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+use majutsu_daemon::render_daemon_service;
 use majutsu_restore::RestoreQueueItem;
 use std::collections::BTreeMap;
 use std::env;
@@ -6,12 +7,17 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
+use std::thread;
+use std::time::Duration;
 
+use crate::cli::DaemonCommand;
+use crate::config::{Paths, read_config, validate_watch_mode};
 use crate::process_runtime::{pid_alive, read_pid};
 use crate::queue_runtime::{event_journal_records, upload_queue_stats};
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
-use crate::{Paths, open_db, resolve_paths};
+use crate::watch_runtime::normalize_watch_backend;
+use crate::{open_db, resolve_paths};
 
 struct DaemonStats {
     pid: u32,
@@ -29,6 +35,94 @@ struct DaemonStats {
     restore_jobs: usize,
     root_statuses: BTreeMap<String, usize>,
     restore_statuses: BTreeMap<String, usize>,
+}
+
+pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
+    crate::ensure_ready(paths)?;
+    let config = read_config(paths)?;
+    match command {
+        DaemonCommand::Start {
+            backend,
+            mode,
+            interval_secs,
+            debounce_ms,
+            settle_ms,
+            periodic_rescan_secs,
+        } => {
+            let configured_backend = backend.unwrap_or_else(|| config.watch.backend.clone());
+            let backend = normalize_watch_backend(&configured_backend)?;
+            let mode = mode.unwrap_or_else(|| config.watch.mode.clone());
+            validate_watch_mode(&mode)?;
+            let pid = start_watch_daemon(
+                paths,
+                backend,
+                &mode,
+                interval_secs.unwrap_or(config.watch.interval),
+                debounce_ms.unwrap_or(config.watch.debounce),
+                settle_ms.unwrap_or(config.watch.settle),
+                periodic_rescan_secs.unwrap_or(config.watch.periodic_rescan),
+            )?;
+            println!("started daemon pid {pid}");
+        }
+        DaemonCommand::Service { provider } => {
+            let exe = env::current_exe()?;
+            let backend = normalize_watch_backend(&config.watch.backend)?;
+            let service = render_daemon_service(
+                &provider,
+                &exe,
+                &paths.home,
+                backend,
+                &config.watch.mode,
+                config.watch.interval,
+                config.watch.debounce,
+                config.watch.settle,
+                config.watch.periodic_rescan,
+            )
+            .map_err(anyhow::Error::msg)?;
+            print!("{service}");
+        }
+        DaemonCommand::Stop => {
+            let pid =
+                read_pid(&paths.daemon_pid)?.ok_or_else(|| anyhow!("daemon pid file not found"))?;
+            stop_daemon_process(pid)?;
+            cleanup_daemon_runtime(paths);
+            println!("stopped daemon pid {pid}");
+        }
+        DaemonCommand::Status => {
+            if let Some(pid) = read_pid(&paths.daemon_pid)? {
+                if pid_alive(pid) {
+                    if let Ok(reply) = daemon_ipc_request(paths, "status") {
+                        println!("{reply}");
+                    } else {
+                        println!("running pid {pid}");
+                        println!("ipc unavailable");
+                    }
+                } else {
+                    println!("stale pid {pid}");
+                }
+            } else {
+                println!("stopped");
+            }
+        }
+        DaemonCommand::Metrics => {
+            if let Some(pid) = read_pid(&paths.daemon_pid)? {
+                if pid_alive(pid) {
+                    if let Ok(reply) = daemon_ipc_request(paths, "metrics") {
+                        println!("{reply}");
+                    } else {
+                        println!("majutsu_daemon_up 1");
+                        println!("majutsu_daemon_ipc_up 0");
+                    }
+                } else {
+                    println!("majutsu_daemon_up 0");
+                    println!("majutsu_daemon_stale_pid {}", pid);
+                }
+            } else {
+                println!("majutsu_daemon_up 0");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn start_watch_daemon(
@@ -75,6 +169,48 @@ pub(crate) fn start_watch_daemon(
     let pid = child.id();
     fs::write(&paths.daemon_pid, pid.to_string())?;
     Ok(pid)
+}
+
+fn stop_daemon_process(pid: u32) -> Result<()> {
+    if !pid_alive(pid) {
+        return Ok(());
+    }
+    let status = ProcessCommand::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()?;
+    if !status.success() {
+        bail!("failed to stop daemon pid {pid}");
+    }
+    if wait_for_pid_exit(pid, 50, Duration::from_millis(100)) {
+        return Ok(());
+    }
+    let status = ProcessCommand::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status()?;
+    if !status.success() {
+        bail!("failed to force stop daemon pid {pid}");
+    }
+    if !wait_for_pid_exit(pid, 50, Duration::from_millis(100)) {
+        bail!("daemon pid {pid} did not exit after stop signal");
+    }
+    Ok(())
+}
+
+fn wait_for_pid_exit(pid: u32, attempts: usize, delay: Duration) -> bool {
+    for _ in 0..attempts {
+        if !pid_alive(pid) {
+            return true;
+        }
+        thread::sleep(delay);
+    }
+    !pid_alive(pid)
+}
+
+fn cleanup_daemon_runtime(paths: &Paths) {
+    let _ = fs::remove_file(&paths.daemon_pid);
+    let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
 }
 
 #[cfg(unix)]
