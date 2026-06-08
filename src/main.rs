@@ -2068,6 +2068,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &export.operations,
         )?;
         validate_clone_remote_snapshot_objects(&staging_paths, &remote, &export)?;
+        validate_clone_remote_blob_objects(&staging_paths, &remote, &export)?;
         validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
         validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
         validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
@@ -2108,6 +2109,41 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+fn validate_clone_remote_blob_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<()> {
+    for blob in &export.blobs {
+        if blob.pack_id.is_some() {
+            continue;
+        }
+        for variant in remote_local_object_variants(paths, remote, &blob.object_key)? {
+            let payload = decode_object(paths, &variant.bytes).with_context(|| {
+                format!(
+                    "decode remote blob object {} from {}",
+                    blob.object_key, variant.remote_key
+                )
+            })?;
+            if payload.len() as u64 != blob.size {
+                bail!(
+                    "remote blob object size does not match metadata {} {}",
+                    blob.oid,
+                    variant.remote_key
+                );
+            }
+            if blake3_hex(&payload) != blob.oid {
+                bail!(
+                    "remote blob object hash does not match metadata {} {}",
+                    blob.oid,
+                    variant.remote_key
+                );
+            }
+        }
+    }
     Ok(())
 }
 

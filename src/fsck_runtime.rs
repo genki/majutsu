@@ -44,7 +44,7 @@ use crate::operation_log::{local_oplog_path, query_operations, record_op};
 use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
-use crate::util::parse_db_time;
+use crate::util::{blake3_hex, parse_db_time};
 use crate::{
     decode_canonical_remote_export, decode_canonical_remote_oplog, decode_object, export_metadata,
     open_db, packed_blob_metadata, read_blob_payload, read_large_chunk, read_object,
@@ -1127,6 +1127,43 @@ pub(crate) fn validate_remote_large_manifest_objects(
     Ok(())
 }
 
+pub(crate) fn validate_remote_blob_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &crate::MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    for blob in &export.blobs {
+        if blob.pack_id.is_some() {
+            continue;
+        }
+        for variant in remote_local_object_variants(paths, remote, &blob.object_key)? {
+            let payload = decode_object(paths, &variant.bytes).with_context(|| {
+                format!(
+                    "decode blob object {} from {}",
+                    blob.object_key, variant.remote_key
+                )
+            })?;
+            if payload.len() as u64 != blob.size {
+                *missing += 1;
+                eprintln!(
+                    "blob object size does not match metadata {} {}",
+                    blob.oid, variant.remote_key
+                );
+                continue;
+            }
+            if blake3_hex(&payload) != blob.oid {
+                *missing += 1;
+                eprintln!(
+                    "blob object hash does not match metadata {} {}",
+                    blob.oid, variant.remote_key
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_remote_metadata_references(
     paths: &Paths,
     remote: &RemoteStore,
@@ -1620,6 +1657,7 @@ fn remote_fsck_export(
         }
     }
     validate_remote_snapshot_objects(paths, remote, &export, missing)?;
+    validate_remote_blob_objects(paths, remote, &export, missing)?;
     validate_remote_large_manifest_objects(paths, remote, &export, missing)?;
     validate_remote_pack_objects(paths, remote, &export, missing)?;
     validate_remote_metadata_references(paths, remote, &export, missing)?;

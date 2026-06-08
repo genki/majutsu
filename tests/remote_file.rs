@@ -3353,6 +3353,73 @@ fn remote_fsck_detects_dangling_blob_metadata() {
 }
 
 #[test]
+fn remote_fsck_and_clone_reject_corrupt_loose_blob_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let object_key = export["blobs"][0]["object_key"].as_str().unwrap();
+    fs::write(remote.join(object_key), b"corrupt\n").unwrap();
+    fs::write(
+        remote.join(object_key.replacen("objects/blobs/", "blobs/loose/", 1) + ".blob.enc"),
+        b"corrupt\n",
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone.exists());
+}
+
+#[test]
 fn remote_fsck_detects_unsupported_metadata_export_version() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
