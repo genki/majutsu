@@ -7605,6 +7605,78 @@ storage = "deep-archive"
 }
 
 #[test]
+fn remote_fsck_validates_lifecycle_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("apply")
+            .arg("--provider")
+            .arg("s3")
+            .arg("--dry-run")
+            .arg("false");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+
+    let mut status: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("lifecycle/status.json")).unwrap()).unwrap();
+    status["policy_key"] = serde_json::Value::String("lifecycle/missing.json".into());
+    fs::write(
+        remote.join("lifecycle/status.json"),
+        serde_json::to_vec_pretty(&status).unwrap(),
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
 fn lifecycle_apply_puts_s3_bucket_lifecycle_configuration() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
