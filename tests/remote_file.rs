@@ -7414,6 +7414,43 @@ fn xdg_config_can_select_state_home() {
 }
 
 #[test]
+fn state_home_priority_prefers_cli_then_env_then_xdg_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_home = tmp.path().join("xdg");
+    let xdg_state = tmp.path().join("xdg-state");
+    let env_state = tmp.path().join("env-state");
+    let cli_state = tmp.path().join("cli-state");
+    fs::create_dir_all(config_home.join("majutsu")).unwrap();
+    fs::write(
+        config_home.join("majutsu/config.toml"),
+        format!("[state]\nhome = \"{}\"\n", xdg_state.display()),
+    )
+    .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("init")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("MAJUTSU_HOME", &env_state);
+        c
+    });
+    assert!(env_state.join("config.toml").exists());
+    assert!(!xdg_state.join("config.toml").exists());
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&cli_state)
+            .arg("init")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("MAJUTSU_HOME", &env_state);
+        c
+    });
+    assert!(cli_state.join("config.toml").exists());
+    assert!(!xdg_state.join("config.toml").exists());
+}
+
+#[test]
 fn operations_are_appended_to_local_oplog() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
