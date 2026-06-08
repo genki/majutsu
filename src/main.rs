@@ -15,7 +15,10 @@ use majutsu_daemon::render_daemon_service;
 use majutsu_large::{
     ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_pin_issues,
 };
-use majutsu_pack::{PackExport, PackIndex, PackedBlobMetadata};
+use majutsu_pack::{
+    PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackedBlobMetadata,
+    missing_pack_metadata_ids, pack_index_issues, pack_object_issues,
+};
 use majutsu_restore::{
     RestoreQueueItem, classify_restore_object_availability, validate_relative_filter_path,
 };
@@ -2063,6 +2066,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &export.operations,
         )?;
         validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
+        validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
         for key in local_object_keys(&export) {
             let dest = staging_paths.home.join(&key);
             if let Some(parent) = dest.parent() {
@@ -2100,6 +2104,112 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+fn validate_clone_remote_pack_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<()> {
+    let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
+    for blob in &export.blobs {
+        if let Some(pack_id) = blob.pack_id.as_deref() {
+            blobs_by_pack
+                .entry(pack_id)
+                .or_default()
+                .insert(blob.oid.as_str(), blob);
+        }
+    }
+    for pack in &export.packs {
+        let expected_blobs = blobs_by_pack
+            .get(pack.pack_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let expected_blob_metadata = packed_blob_metadata(&expected_blobs);
+        for variant in remote_local_object_variants(paths, remote, &pack.index_key)? {
+            let index: PackIndex = serde_json::from_slice(&variant.bytes).with_context(|| {
+                format!(
+                    "parse remote pack index {} from {}",
+                    pack.index_key, variant.remote_key
+                )
+            })?;
+            for issue in pack_index_issues(pack, &index, &expected_blob_metadata) {
+                match issue {
+                    PackIndexIssue::PackMetadataMismatch => {
+                        bail!(
+                            "remote pack index does not match metadata {} {}",
+                            pack.pack_id,
+                            variant.remote_key
+                        );
+                    }
+                    PackIndexIssue::EntryWithoutBlobMetadata { oid } => {
+                        bail!(
+                            "remote pack index entry has no matching blob metadata {} {}",
+                            pack.pack_id,
+                            oid
+                        );
+                    }
+                    PackIndexIssue::EntryOffsetMismatch { oid } => {
+                        bail!(
+                            "remote pack index entry does not match blob offset metadata {} {}",
+                            pack.pack_id,
+                            oid
+                        );
+                    }
+                    PackIndexIssue::MissingBlobEntry { oid } => {
+                        bail!(
+                            "packed blob missing from remote pack index {} {}",
+                            pack.pack_id,
+                            oid
+                        );
+                    }
+                }
+            }
+        }
+        for variant in remote_local_object_variants(paths, remote, &pack.pack_key)? {
+            for issue in
+                pack_object_issues(pack, variant.bytes.len() as u64, &expected_blob_metadata)
+            {
+                match issue {
+                    PackObjectIssue::SizeMismatch => {
+                        bail!(
+                            "remote pack object size does not match metadata {} {}",
+                            pack.pack_id,
+                            variant.remote_key
+                        );
+                    }
+                    PackObjectIssue::MissingBlobOffset { oid } => {
+                        bail!(
+                            "packed blob missing offset metadata {} {}",
+                            pack.pack_id,
+                            oid
+                        );
+                    }
+                    PackObjectIssue::MissingBlobLength { oid } => {
+                        bail!(
+                            "packed blob missing length metadata {} {}",
+                            pack.pack_id,
+                            oid
+                        );
+                    }
+                    PackObjectIssue::BlobRangeOutOfBounds { oid } => {
+                        bail!(
+                            "packed blob range out of remote pack bounds {} {}",
+                            pack.pack_id,
+                            oid
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for pack_id in missing_pack_metadata_ids(
+        blobs_by_pack.keys().copied(),
+        export.packs.iter().map(|pack| pack.pack_id.as_str()),
+    ) {
+        bail!("packed blob references missing remote pack metadata {pack_id}");
+    }
     Ok(())
 }
 
