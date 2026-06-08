@@ -3225,6 +3225,67 @@ fn clone_rejects_host_index_metadata_mismatch_without_creating_home() {
 }
 
 #[test]
+fn clone_rejects_remote_ref_mismatch_without_creating_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
+    let host_id = index["hosts"][0]["id"].as_str().unwrap();
+    fs::write(
+        remote.join(format!("hosts/{host_id}/refs/current")),
+        b"snap-wrong",
+    )
+    .unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone.exists());
+}
+
+#[test]
 fn remote_fsck_detects_corrupt_canonical_tree_manifest_object() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

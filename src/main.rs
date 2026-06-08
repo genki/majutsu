@@ -2026,6 +2026,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     validate_config(&export.config)?;
     validate_clone_host_summary(&metadata.host, &export)?;
     validate_clone_metadata(&export)?;
+    validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
     ensure_clone_objects_available(&remote, &export)?;
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
@@ -2265,6 +2266,45 @@ fn validate_clone_host_summary(
                 host.last_synced_at.to_rfc3339(),
                 metadata_last_synced.to_rfc3339()
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_clone_remote_refs(
+    remote: &RemoteStore,
+    host: Option<&RemoteHostSummary>,
+    export: &MetadataExport,
+) -> Result<()> {
+    let Some(host) = host else {
+        return Ok(());
+    };
+    if let Some(current) = export.refs.get("current") {
+        let key = host_current_ref_key(&host.id);
+        match remote_ref(remote, &key)? {
+            Some(remote_current) if remote_current == *current => {}
+            Some(remote_current) => bail!(
+                "remote ref {key} points to {remote_current}, expected metadata current {current}"
+            ),
+            None => bail!("remote is missing canonical host current ref {key}"),
+        }
+        let legacy_key = host_legacy_current_key(&host.id);
+        if let Some(legacy_current) = remote_ref(remote, &legacy_key)?
+            && legacy_current != *current
+        {
+            bail!(
+                "remote ref {legacy_key} points to {legacy_current}, expected metadata current {current}"
+            );
+        }
+    }
+    if let Some(last_synced) = export.refs.get("last-synced") {
+        let key = host_last_synced_ref_key(&host.id);
+        match remote_ref(remote, &key)? {
+            Some(remote_last_synced) if remote_last_synced == *last_synced => {}
+            Some(remote_last_synced) => bail!(
+                "remote ref {key} points to {remote_last_synced}, expected metadata last-synced {last_synced}"
+            ),
+            None => bail!("remote is missing canonical host last-synced ref {key}"),
         }
     }
     Ok(())
