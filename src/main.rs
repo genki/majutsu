@@ -1145,6 +1145,85 @@ fn validate_clone_remote_gc_tombstones(remote: &RemoteStore, host_id: &str) -> R
     Ok(())
 }
 
+pub(crate) fn validate_clone_remote_lifecycle_artifacts(remote: &RemoteStore) -> Result<()> {
+    let keys = remote.list("lifecycle/")?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let allowed_keys = [
+        "lifecycle/status.json".to_string(),
+        "lifecycle/policy-s3.json".to_string(),
+        "lifecycle/policy-gcs.json".to_string(),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for key in &keys {
+        if !allowed_keys.contains(key) {
+            bail!("remote has unexpected lifecycle artifact {key}");
+        }
+    }
+    let has_policy = keys
+        .iter()
+        .any(|key| key == "lifecycle/policy-s3.json" || key == "lifecycle/policy-gcs.json");
+    if has_policy && !remote.exists("lifecycle/status.json")? {
+        bail!("remote lifecycle policy exists without lifecycle/status.json");
+    }
+    if remote.exists("lifecycle/status.json")? {
+        validate_clone_remote_lifecycle_status(remote)?;
+    }
+    for key in ["lifecycle/policy-s3.json", "lifecycle/policy-gcs.json"] {
+        if remote.exists(key)? {
+            validate_clone_remote_lifecycle_policy(remote, key)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_clone_remote_lifecycle_status(remote: &RemoteStore) -> Result<()> {
+    let status_key = "lifecycle/status.json";
+    let status: serde_json::Value = serde_json::from_slice(&remote.get(status_key)?)
+        .with_context(|| format!("parse lifecycle status {status_key}"))?;
+    let provider = match status.get("provider").and_then(|value| value.as_str()) {
+        Some("s3" | "gcs") => status["provider"].as_str().unwrap(),
+        Some(provider) => bail!("lifecycle status has unsupported provider {provider}"),
+        None => bail!("lifecycle status is missing provider"),
+    };
+    let Some(policy_key) = status.get("policy_key").and_then(|value| value.as_str()) else {
+        bail!("lifecycle status is missing policy_key");
+    };
+    let expected_policy_key = format!("lifecycle/policy-{provider}.json");
+    if policy_key != expected_policy_key {
+        bail!("lifecycle status policy_key {policy_key} does not match {expected_policy_key}");
+    }
+    if !remote.exists(policy_key)? {
+        bail!("lifecycle status points to missing policy {policy_key}");
+    }
+    if !status
+        .get("provider_applied")
+        .is_some_and(|value| value.is_boolean())
+    {
+        bail!("lifecycle status is missing boolean provider_applied");
+    }
+    let Some(applied_at) = status.get("applied_at").and_then(|value| value.as_str()) else {
+        bail!("lifecycle status is missing applied_at");
+    };
+    parse_db_time(applied_at)
+        .with_context(|| format!("lifecycle status has invalid applied_at {applied_at}"))?;
+    Ok(())
+}
+
+fn validate_clone_remote_lifecycle_policy(remote: &RemoteStore, key: &str) -> Result<()> {
+    let policy: serde_json::Value = serde_json::from_slice(&remote.get(key)?)
+        .with_context(|| format!("parse lifecycle policy {key}"))?;
+    if key == "lifecycle/policy-s3.json" {
+        majutsu_policy::s3_lifecycle_configuration_xml(&policy)
+            .with_context(|| format!("validate S3 lifecycle policy {key}"))?;
+    } else if !policy.get("rule").is_some_and(|rule| rule.is_array()) {
+        bail!("invalid GCS lifecycle policy {key}: missing rule array");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
     let mut issues = Vec::new();
     if export.version != METADATA_EXPORT_VERSION {

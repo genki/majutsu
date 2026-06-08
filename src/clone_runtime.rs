@@ -29,6 +29,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     crate::validate_clone_metadata(&export)?;
     crate::validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
     crate::validate_clone_remote_gc_mark(&remote, metadata.host.as_ref(), &export)?;
+    crate::validate_clone_remote_lifecycle_artifacts(&remote)?;
     ensure_clone_objects_available(&remote, &export)?;
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;

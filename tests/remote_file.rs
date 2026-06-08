@@ -8664,6 +8664,7 @@ fn remote_fsck_validates_lifecycle_artifacts() {
     let source = tmp.path().join("source");
     let remote = tmp.path().join("remote");
     let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
 
@@ -8728,6 +8729,16 @@ fn remote_fsck_validates_lifecycle_artifacts() {
         c.arg("--home").arg(&state).arg("remote").arg("fsck");
         c
     });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone.exists());
 }
 
 #[test]
