@@ -1548,6 +1548,93 @@ fn remote_host_index_last_synced_matches_metadata_ref() {
 }
 
 #[test]
+fn remote_hosts_can_browse_multi_host_timeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source_alpha = tmp.path().join("source-alpha");
+    let source_beta = tmp.path().join("source-beta");
+    let state_alpha = tmp.path().join("state-alpha");
+    let state_beta = tmp.path().join("state-beta");
+    fs::create_dir_all(&source_alpha).unwrap();
+    fs::create_dir_all(&source_beta).unwrap();
+    fs::write(source_alpha.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source_beta.join("beta.txt"), b"beta\n").unwrap();
+
+    for (state, source, host, root) in [
+        (&state_alpha, &source_alpha, "alpha-host", "alpha-root"),
+        (&state_beta, &source_beta, "beta-host", "beta-root"),
+    ] {
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("init")
+                .arg("--host-name")
+                .arg(host)
+                .arg("--remote")
+                .arg(format!("file://{}", remote.display()));
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("root")
+                .arg("add")
+                .arg(root)
+                .arg(source);
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("snapshot");
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("sync");
+            c
+        });
+    }
+
+    let hosts = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state_alpha).arg("remote").arg("hosts");
+        c
+    });
+    assert!(hosts.contains("hosts 2"), "{hosts}");
+    assert!(hosts.contains("\talpha-host\t"), "{hosts}");
+    assert!(hosts.contains("\tbeta-host\t"), "{hosts}");
+    assert!(hosts.contains("hosts/"), "{hosts}");
+    assert!(hosts.contains("/metadata/export.json"), "{hosts}");
+
+    let beta = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state_alpha)
+            .arg("remote")
+            .arg("host")
+            .arg("beta-host")
+            .arg("--snapshots")
+            .arg("--operations");
+        c
+    });
+    assert!(beta.contains("name beta-host"), "{beta}");
+    assert!(beta.contains("roots 1"), "{beta}");
+    assert!(beta.contains("snapshots 1"), "{beta}");
+    assert!(
+        beta.contains("snapshot_id\tcreated_at\tparent\top_id"),
+        "{beta}"
+    );
+    assert!(
+        beta.contains("op_id\tcreated_at\tkind\tstatus\tbefore\tafter\tmessage"),
+        "{beta}"
+    );
+    assert!(beta.contains("\tdone\t"), "{beta}");
+    assert!(beta.contains("beta-root"), "{beta}");
+}
+
+#[test]
 fn remote_host_index_duplicate_id_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -5633,6 +5720,14 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     });
     assert!(rotated.contains("rotated master key"));
     assert!(rotated.contains(new_key));
+    assert_eq!(db_operation_count(&state, "key-rotation"), 1);
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(op_log.contains("key-rotation"), "{op_log}");
+    assert!(op_log.contains("done"), "{op_log}");
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("fsck");
