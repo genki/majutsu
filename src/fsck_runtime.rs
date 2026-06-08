@@ -46,9 +46,10 @@ use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::util::{blake3_hex, parse_db_time};
 use crate::{
-    decode_canonical_remote_export, decode_canonical_remote_oplog, decode_object, export_metadata,
-    open_db, packed_blob_metadata, read_blob_payload, read_large_chunk, read_object,
-    read_remote_host_index, remote_local_object_variants, remote_ref,
+    decode_canonical_remote_export, decode_canonical_remote_oplog, decode_large_chunk_stored_bytes,
+    decode_object, export_metadata, open_db, packed_blob_metadata, read_blob_payload,
+    read_large_chunk, read_object, read_remote_host_index, remote_local_object_variants,
+    remote_ref,
 };
 
 pub(crate) fn fsck(paths: &Paths) -> Result<()> {
@@ -1121,7 +1122,60 @@ pub(crate) fn validate_remote_large_manifest_objects(
                     "large manifest object does not match metadata {} {}",
                     large.oid, bytes.remote_key
                 );
+                continue;
             }
+            for chunk in &manifest.chunks {
+                validate_remote_large_chunk_object(paths, remote, chunk, missing)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_large_chunk_object(
+    paths: &Paths,
+    remote: &RemoteStore,
+    chunk: &majutsu_core::LargeChunk,
+    missing: &mut usize,
+) -> Result<()> {
+    for variant in remote_local_object_variants(paths, remote, &chunk.object_key)? {
+        let stored = decode_object(paths, &variant.bytes).with_context(|| {
+            format!(
+                "decode large chunk object {} from {}",
+                chunk.object_key, variant.remote_key
+            )
+        })?;
+        if chunk
+            .stored_len
+            .is_some_and(|stored_len| stored.len() as u64 != stored_len)
+        {
+            *missing += 1;
+            eprintln!(
+                "large chunk object stored size does not match metadata {} {}",
+                chunk.oid, variant.remote_key
+            );
+            continue;
+        }
+        let payload = decode_large_chunk_stored_bytes(chunk, &stored).with_context(|| {
+            format!(
+                "decode large chunk payload {} from {}",
+                chunk.object_key, variant.remote_key
+            )
+        })?;
+        if payload.len() as u64 != chunk.len {
+            *missing += 1;
+            eprintln!(
+                "large chunk object size does not match metadata {} {}",
+                chunk.oid, variant.remote_key
+            );
+            continue;
+        }
+        if blake3_hex(&payload) != chunk.oid {
+            *missing += 1;
+            eprintln!(
+                "large chunk object hash does not match metadata {} {}",
+                chunk.oid, variant.remote_key
+            );
         }
     }
     Ok(())

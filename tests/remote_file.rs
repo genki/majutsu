@@ -2485,6 +2485,71 @@ fn clone_rejects_corrupt_canonical_large_manifest_without_creating_home() {
 }
 
 #[test]
+fn remote_fsck_and_clone_reject_corrupt_canonical_large_chunk_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.bin"), vec![8u8; 8192]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 4096");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let chunk = find_file_ending(&remote.join("large/chunks/fixed-8m"), ".chunk.enc");
+    fs::write(chunk, b"corrupt\n").unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone.exists());
+}
+
+#[test]
 fn remote_fsck_detects_corrupt_chunk_index_shard() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

@@ -2220,6 +2220,55 @@ fn validate_clone_remote_large_objects(
                     variant.remote_key
                 );
             }
+            for chunk in &manifest.chunks {
+                validate_clone_remote_large_chunk_object(paths, remote, chunk)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_clone_remote_large_chunk_object(
+    paths: &Paths,
+    remote: &RemoteStore,
+    chunk: &LargeChunk,
+) -> Result<()> {
+    for variant in remote_local_object_variants(paths, remote, &chunk.object_key)? {
+        let stored = decode_object(paths, &variant.bytes).with_context(|| {
+            format!(
+                "decode remote large chunk {} from {}",
+                chunk.object_key, variant.remote_key
+            )
+        })?;
+        if chunk
+            .stored_len
+            .is_some_and(|stored_len| stored.len() as u64 != stored_len)
+        {
+            bail!(
+                "remote large chunk stored size does not match metadata {} {}",
+                chunk.oid,
+                variant.remote_key
+            );
+        }
+        let payload = decode_large_chunk_stored_bytes(chunk, &stored).with_context(|| {
+            format!(
+                "decode remote large chunk payload {} from {}",
+                chunk.object_key, variant.remote_key
+            )
+        })?;
+        if payload.len() as u64 != chunk.len {
+            bail!(
+                "remote large chunk size does not match metadata {} {}",
+                chunk.oid,
+                variant.remote_key
+            );
+        }
+        if blake3_hex(&payload) != chunk.oid {
+            bail!(
+                "remote large chunk hash does not match metadata {} {}",
+                chunk.oid,
+                variant.remote_key
+            );
         }
     }
     Ok(())
@@ -3995,9 +4044,13 @@ fn compress_large_chunk(
 
 fn read_large_chunk(paths: &Paths, chunk: &LargeChunk) -> Result<Vec<u8>> {
     let bytes = read_object(paths, &chunk.object_key)?;
+    decode_large_chunk_stored_bytes(chunk, &bytes)
+}
+
+pub(crate) fn decode_large_chunk_stored_bytes(chunk: &LargeChunk, bytes: &[u8]) -> Result<Vec<u8>> {
     match chunk.compression.as_str() {
-        "none" => Ok(bytes),
-        "zstd" => Ok(zstd::stream::decode_all(bytes.as_slice())?),
+        "none" => Ok(bytes.to_vec()),
+        "zstd" => Ok(zstd::stream::decode_all(bytes)?),
         other => bail!("unsupported large chunk compression: {other}"),
     }
 }
