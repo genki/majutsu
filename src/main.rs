@@ -125,7 +125,8 @@ use restore_runtime::{
     RestoreDelete, RestorePlan, apply_restore_plan, ensure_restore_job_has_no_missing_objects,
     ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
     print_restore_conflicts, print_restore_plan, read_restore_job, required_object_keys_for_plan,
-    restore_conflicts, restore_root_base, restore_target_label, write_restore_job,
+    restore_conflicts, restore_object_stats, restore_root_base, restore_target_label,
+    write_restore_job,
 };
 use root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_config_roots, sync_roots_to_config,
@@ -1006,6 +1007,7 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
         }
         RestoreCommand::Prepare(args) => {
             let plan = build_restore_plan(paths, &conn, &args)?;
+            let stats = restore_object_stats(paths, &conn, &plan)?;
             let mut job = build_restore_job(paths, &plan, &args)?;
             request_archive_restore_for_job(paths, &mut job)?;
             write_restore_job(paths, &job)?;
@@ -1019,6 +1021,11 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
             println!("restore_job {}", job.id);
             println!("snapshot {}", job.snapshot_id);
             println!("required_objects {}", job.required_objects.len());
+            println!("required_chunks {}", stats.required_chunks);
+            println!("local_chunks {}", stats.local_chunks);
+            println!("remote_chunks {}", stats.remote_chunks);
+            println!("archived_chunks {}", stats.archived_chunks);
+            println!("missing_chunks {}", stats.missing_chunks);
             println!("archived_objects {}", job.archived_objects.len());
             println!("missing_objects {}", job.missing_objects.len());
             println!(

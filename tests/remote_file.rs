@@ -9101,6 +9101,11 @@ fn restore_prepare_can_hydrate_large_objects_from_canonical_aliases() {
         c
     });
     assert!(prepare.contains("required_objects 2"));
+    assert!(prepare.contains("required_chunks 1"));
+    assert!(prepare.contains("local_chunks 0"));
+    assert!(prepare.contains("remote_chunks 1"));
+    assert!(prepare.contains("archived_chunks 1"));
+    assert!(prepare.contains("missing_chunks 0"));
     assert!(prepare.contains("archived_objects 2"));
     assert!(prepare.contains("missing_objects 0"));
     let job_id = prepare
