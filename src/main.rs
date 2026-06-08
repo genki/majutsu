@@ -2024,7 +2024,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
     validate_config(&export.config)?;
-    validate_clone_host_summary(&metadata.host, &export)?;
+    validate_clone_host_summary(&metadata.host, metadata.host_index, &export)?;
     validate_clone_metadata(&export)?;
     validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
     ensure_clone_objects_available(&remote, &export)?;
@@ -2232,15 +2232,27 @@ fn validate_clone_remote_oplog(
 struct CloneMetadataSelection {
     key: String,
     host: Option<RemoteHostSummary>,
+    host_index: bool,
 }
 
 fn validate_clone_host_summary(
     host: &Option<RemoteHostSummary>,
+    host_index: bool,
     export: &MetadataExport,
 ) -> Result<()> {
     let Some(host) = host else {
         return Ok(());
     };
+    if host_index {
+        let expected_metadata_key = host_metadata_key(&host.id);
+        if host.metadata_key != expected_metadata_key {
+            bail!(
+                "remote host index metadata_key {} does not match canonical key {}",
+                host.metadata_key,
+                expected_metadata_key
+            );
+        }
+    }
     if host.id != export.config.host.id {
         bail!(
             "remote host index id {} does not match metadata host id {}",
@@ -2524,22 +2536,34 @@ fn clone_metadata_selection(
     host: Option<&str>,
 ) -> Result<CloneMetadataSelection> {
     if let Some(host_id) = host {
+        let index = read_remote_host_index(remote)?;
+        if !index.hosts.is_empty() {
+            let host = select_remote_host(index.hosts, host_id)?;
+            return Ok(CloneMetadataSelection {
+                key: host.metadata_key.clone(),
+                host: Some(host),
+                host_index: true,
+            });
+        }
         let index = remote_host_index_with_legacy(remote)?;
         let host = select_remote_host(index.hosts, host_id)?;
         return Ok(CloneMetadataSelection {
             key: host.metadata_key.clone(),
             host: Some(host),
+            host_index: false,
         });
     }
-    let index = remote_host_index_with_legacy(remote)?;
+    let index = read_remote_host_index(remote)?;
     match index.hosts.as_slice() {
         [host] => Ok(CloneMetadataSelection {
             key: host.metadata_key.clone(),
             host: Some(host.clone()),
+            host_index: true,
         }),
         [] if remote.exists(LEGACY_METADATA_EXPORT_KEY)? => Ok(CloneMetadataSelection {
             key: LEGACY_METADATA_EXPORT_KEY.into(),
             host: None,
+            host_index: false,
         }),
         [] => {
             bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")

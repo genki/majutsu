@@ -25,9 +25,9 @@ use majutsu_store::{
     RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
     RemoteGcTombstone as GcTombstoneExport, RemoteHostIndexIssue, RemoteObjectAvailabilityIssue,
     canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
-    host_last_synced_ref_key, host_legacy_current_key, host_operation_canonical_key,
-    host_operation_key, host_oplog_canonical_key, host_oplog_key, host_snapshot_canonical_key,
-    host_snapshot_key, remote_gc_mark_key, remote_gc_tombstone_prefix,
+    host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
+    host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
+    host_snapshot_canonical_key, host_snapshot_key, remote_gc_mark_key, remote_gc_tombstone_prefix,
     remote_object_availability_issues,
 };
 use rusqlite::Connection;
@@ -1369,6 +1369,14 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
         }
         for host in &index.hosts {
             verified_hosts += 1;
+            let expected_metadata_key = host_metadata_key(&host.id);
+            if host.metadata_key != expected_metadata_key {
+                missing += 1;
+                eprintln!(
+                    "host index metadata_key {} does not match canonical key {}",
+                    host.metadata_key, expected_metadata_key
+                );
+            }
             if !remote.exists(&host.metadata_key)? {
                 missing += 1;
                 eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
