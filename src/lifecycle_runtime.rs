@@ -29,6 +29,13 @@ pub(crate) fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<
             println!("lifecycle_rules {}", capabilities.lifecycle_rules);
             println!("object_tags {}", capabilities.object_tags);
             println!("storage_class_on_put {}", capabilities.storage_class_on_put);
+            println!(
+                "restore_archived_object {}",
+                capabilities.restore_archived_object
+            );
+            println!("multipart_upload {}", capabilities.multipart_upload);
+            println!("range_get {}", capabilities.range_get);
+            println!("conditional_put {}", capabilities.conditional_put);
             println!("policy_rules_s3 {}", lifecycle_rule_count(&config, "s3")?);
             println!("policy_rules_gcs {}", lifecycle_rule_count(&config, "gcs")?);
         }

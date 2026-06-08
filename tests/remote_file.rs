@@ -8489,6 +8489,10 @@ storage = "deep-archive"
     });
     assert!(status.contains("remote file://"));
     assert!(status.contains("lifecycle_rules false"));
+    assert!(status.contains("restore_archived_object true"));
+    assert!(status.contains("multipart_upload false"));
+    assert!(status.contains("range_get true"));
+    assert!(status.contains("conditional_put true"));
     assert!(status.contains("policy_rules_s3 2"));
     assert!(status.contains("policy_rules_gcs 2"));
 
@@ -8528,6 +8532,87 @@ storage = "deep-archive"
     assert_eq!(applied_status["provider"], "s3");
     assert_eq!(applied_status["policy_key"], "lifecycle/policy-s3.json");
     assert_eq!(applied_status["provider_applied"], false);
+}
+
+#[test]
+fn lifecycle_apply_stores_gcs_policy_and_remote_fsck_validates_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let applied = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("apply")
+            .arg("--provider")
+            .arg("gcs")
+            .arg("--dry-run")
+            .arg("false");
+        c
+    });
+    assert!(applied.contains("provider gcs"));
+    assert!(applied.contains("policy_key lifecycle/policy-gcs.json"));
+    assert!(applied.contains("provider_applied false"));
+    assert!(remote.join("lifecycle/policy-gcs.json").exists());
+    assert!(remote.join("lifecycle/status.json").exists());
+
+    let policy: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("lifecycle/policy-gcs.json")).unwrap())
+            .unwrap();
+    assert!(policy.get("rule").is_some_and(|rule| rule.is_array()));
+    let status: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("lifecycle/status.json")).unwrap()).unwrap();
+    assert_eq!(status["provider"], "gcs");
+    assert_eq!(status["policy_key"], "lifecycle/policy-gcs.json");
+    assert_eq!(status["provider_applied"], false);
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+
+    fs::write(remote.join("lifecycle/policy-gcs.json"), br#"{"rules":[]}"#).unwrap();
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
 }
 
 #[test]
