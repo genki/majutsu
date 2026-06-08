@@ -1111,6 +1111,13 @@ fn encrypted_clone_can_restore_from_canonical_object_aliases() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    let exported_key = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("key").arg("export");
+        c
+    })
+    .trim()
+    .to_string();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
@@ -1120,7 +1127,8 @@ fn encrypted_clone_can_restore_from_canonical_object_aliases() {
 
     run({
         let mut c = mj();
-        c.arg("--home")
+        c.env("MAJUTSU_MASTER_KEY", &exported_key)
+            .arg("--home")
             .arg(&clone)
             .arg("clone")
             .arg("--remote")
@@ -3741,6 +3749,13 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    let exported_key = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("key").arg("export");
+        c
+    })
+    .trim()
+    .to_string();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
@@ -3762,7 +3777,20 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     assert!(object.starts_with(b"age-encryption.org/v1"));
     assert!(remote.join("keys/recipients.toml").exists());
 
+    let missing_key_clone = tmp.path().join("missing-key-clone");
+    let missing_key_status = mj()
+        .arg("--home")
+        .arg(&missing_key_clone)
+        .arg("clone")
+        .arg("--remote")
+        .arg(format!("file://{}", remote.display()))
+        .status()
+        .unwrap();
+    assert!(!missing_key_status.success());
+    assert!(!missing_key_clone.exists());
+
     let status = mj()
+        .env("MAJUTSU_MASTER_KEY", &exported_key)
         .arg("--home")
         .arg(&clone)
         .arg("clone")
@@ -3820,6 +3848,7 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     assert!(!rotated_object_key.contains(&plain_oid));
 
     let status = mj()
+        .env("MAJUTSU_MASTER_KEY", new_key)
         .arg("--home")
         .arg(&rotated_clone)
         .arg("clone")
@@ -3954,7 +3983,8 @@ fn encrypted_key_rotation_rewrites_packed_blobs() {
     });
     run({
         let mut c = mj();
-        c.arg("--home")
+        c.env("MAJUTSU_MASTER_KEY", new_key)
+            .arg("--home")
             .arg(&clone)
             .arg("clone")
             .arg("--remote")

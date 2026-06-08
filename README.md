@@ -377,16 +377,15 @@ metadata. Packed blobs are unpacked during rotation so their object keys can be
 derived from the new master key.
 
 To recover from remote storage into a fresh state, provide the master key with an
-environment variable during clone, or import it before verifying/restoring:
+environment variable during clone:
 
 ```sh
 MAJUTSU_MASTER_KEY=<64-hex-key> mj --home /tmp/recovered clone --remote s3://bucket/prefix
-
-mj --home /tmp/recovered key import <64-hex-key>
 ```
 
-Without the master key, encrypted objects can be downloaded but cannot be
-verified or restored.
+Encrypted clone refuses to proceed without the master key so recovered states can
+continue deriving the same HMAC object-key namespace. `mj key import` remains
+available for already-initialized local states.
 
 ## Snapshot Modes
 

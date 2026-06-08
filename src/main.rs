@@ -2014,9 +2014,9 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             )?;
         }
         if export.config.security.encryption != "none" {
-            if let Ok(key) = env::var("MAJUTSU_MASTER_KEY") {
-                write_master_key(&staging_paths, &key)?;
-            }
+            let key = env::var("MAJUTSU_MASTER_KEY")
+                .context("encrypted clone requires MAJUTSU_MASTER_KEY=<64-hex-key>")?;
+            write_master_key(&staging_paths, &key)?;
         }
         for key in local_object_keys(&export) {
             let dest = staging_paths.home.join(&key);
