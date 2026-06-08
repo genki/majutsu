@@ -45,6 +45,10 @@ pub(crate) struct RestoreDelete {
 pub(crate) struct RestoreObjectStats {
     pub(crate) required_objects: usize,
     pub(crate) required_chunks: usize,
+    pub(crate) local_chunks: usize,
+    pub(crate) remote_chunks: usize,
+    pub(crate) archived_chunks: usize,
+    pub(crate) missing_chunks: usize,
     pub(crate) local_objects: usize,
     pub(crate) remote_objects: usize,
     pub(crate) archived_objects: usize,
@@ -228,6 +232,10 @@ pub(crate) fn print_restore_plan(
     println!("large_files {large}");
     println!("required_objects {}", stats.required_objects);
     println!("required_chunks {}", stats.required_chunks);
+    println!("local_chunks {}", stats.local_chunks);
+    println!("remote_chunks {}", stats.remote_chunks);
+    println!("archived_chunks {}", stats.archived_chunks);
+    println!("missing_chunks {}", stats.missing_chunks);
     println!("local_objects {}", stats.local_objects);
     println!("remote_objects {}", stats.remote_objects);
     println!("archived_objects {}", stats.archived_objects);
@@ -263,6 +271,7 @@ pub(crate) fn restore_object_stats(
 ) -> Result<RestoreObjectStats> {
     let required_objects = required_object_keys_for_plan(paths, conn, plan)?;
     let required_chunks = required_chunk_count_for_plan(paths, plan)?;
+    let required_chunk_keys = required_large_chunk_keys_for_plan(paths, plan)?;
     let local_objects = required_objects
         .iter()
         .filter(|key| paths.home.join(key).exists())
@@ -289,6 +298,32 @@ pub(crate) fn restore_object_stats(
             missing_objects += 1;
         }
     }
+    let mut local_chunks = 0usize;
+    let mut remote_chunks = 0usize;
+    let mut archived_chunks = 0usize;
+    let mut missing_chunks = 0usize;
+    for key in &required_chunk_keys {
+        if paths.home.join(key).exists() {
+            local_chunks += 1;
+            if let Some(remote) = remote.as_ref() {
+                if remote_object_available(remote, key)? {
+                    remote_chunks += 1;
+                }
+            }
+            continue;
+        }
+        let available_remote = remote
+            .as_ref()
+            .map(|remote| remote_object_available(remote, key))
+            .transpose()?
+            .unwrap_or(false);
+        if available_remote {
+            remote_chunks += 1;
+            archived_chunks += 1;
+        } else {
+            missing_chunks += 1;
+        }
+    }
     if let Some(remote) = remote.as_ref() {
         for key in required_objects
             .iter()
@@ -303,6 +338,10 @@ pub(crate) fn restore_object_stats(
     Ok(RestoreObjectStats {
         required_objects: required_objects.len(),
         required_chunks,
+        local_chunks,
+        remote_chunks,
+        archived_chunks,
+        missing_chunks,
         local_objects,
         remote_objects,
         archived_objects,
@@ -327,6 +366,24 @@ pub(crate) fn required_chunk_count_for_plan(paths: &Paths, plan: &RestorePlan) -
         }
     }
     Ok(chunks)
+}
+
+fn required_large_chunk_keys_for_plan(paths: &Paths, plan: &RestorePlan) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for record in &plan.files {
+        if let Some((_, manifest_key, chunk_count)) = payload_large_ref(&record.payload) {
+            let manifest = read_large_manifest_for_restore(paths, manifest_key)
+                .with_context(|| format!("read large manifest {manifest_key}"))?;
+            if manifest.chunks.len() != chunk_count {
+                bail!(
+                    "large manifest chunk count mismatch for {manifest_key}: payload={chunk_count} manifest={}",
+                    manifest.chunks.len()
+                );
+            }
+            keys.extend(manifest.chunks.into_iter().map(|chunk| chunk.object_key));
+        }
+    }
+    Ok(keys)
 }
 
 pub(crate) fn required_object_keys_for_plan(

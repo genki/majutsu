@@ -9074,6 +9074,22 @@ fn restore_prepare_can_hydrate_large_objects_from_canonical_aliases() {
     fs::remove_dir_all(state.join("objects/large/manifests")).unwrap();
     fs::remove_dir_all(state.join("objects/large/chunks")).unwrap();
 
+    let plan = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(plan.contains("required_chunks 1"));
+    assert!(plan.contains("local_chunks 0"));
+    assert!(plan.contains("remote_chunks 1"));
+    assert!(plan.contains("archived_chunks 1"));
+    assert!(plan.contains("missing_chunks 0"));
+
     let prepare = output({
         let mut c = mj();
         c.arg("--home")
@@ -11107,6 +11123,10 @@ fn large_chunks_can_be_compressed_and_restored() {
     });
     assert!(plan.contains("large_files 1"));
     assert!(plan.contains("required_chunks 2"));
+    assert!(plan.contains("local_chunks 2"));
+    assert!(plan.contains("remote_chunks 2"));
+    assert!(plan.contains("archived_chunks 0"));
+    assert!(plan.contains("missing_chunks 0"));
     assert!(plan.contains("required_objects "));
     assert!(plan.contains("local_objects "));
     assert!(plan.contains("remote_objects "));
