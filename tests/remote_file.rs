@@ -66,6 +66,19 @@ fn host_metadata_export_path(remote: &std::path::Path) -> std::path::PathBuf {
     remote.join(index["hosts"][0]["metadata_key"].as_str().unwrap())
 }
 
+fn first_blob_object_key(state: &std::path::Path) -> String {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.query_row("select object_key from blobs limit 1", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn canonical_loose_blob_key(object_key: &str) -> String {
+    let rest = object_key
+        .strip_prefix("objects/blobs/")
+        .unwrap_or_else(|| panic!("unexpected blob object key {object_key}"));
+    format!("blobs/loose/{rest}.blob.enc")
+}
+
 fn assert_canonical_cbor_zstd(path: &std::path::Path) {
     let compressed = fs::read(path).unwrap();
     let cbor = zstd::stream::decode_all(compressed.as_slice()).unwrap();
@@ -7483,6 +7496,169 @@ fn pack_gc_and_remote_clone_restore_packed_blobs() {
         fs::read(source.join("beta.txt")).unwrap(),
         fs::read(restore.join("sample/beta.txt")).unwrap()
     );
+}
+
+#[test]
+fn sync_prunes_remote_loose_blobs_after_pack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let object_key = first_blob_object_key(&state);
+    let canonical_key = canonical_loose_blob_key(&object_key);
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK", "0");
+        c
+    });
+    assert!(remote.join(&object_key).exists());
+    assert!(remote.join(&canonical_key).exists());
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("pruned_remote_objects "));
+    assert!(!remote.join(&object_key).exists());
+    assert!(!remote.join(&canonical_key).exists());
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+    assert_eq!(
+        fs::read(restore.join("sample/beta.txt")).unwrap(),
+        b"beta\n"
+    );
+}
+
+#[test]
+fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let object_key = first_blob_object_key(&state);
+    let canonical_key = canonical_loose_blob_key(&object_key);
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK", "0");
+        c
+    });
+    fs::create_dir_all(remote.join("gc/marks")).unwrap();
+    fs::write(
+        remote.join("gc/marks/other-host.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "host_id": "other-host",
+            "marked_at": Utc::now(),
+            "current_snapshot": null,
+            "object_keys": [object_key, canonical_key],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("pruned_remote_objects 0"));
+    assert!(remote.join(first_blob_object_key(&state)).exists());
 }
 
 #[test]

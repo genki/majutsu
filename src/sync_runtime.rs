@@ -269,9 +269,16 @@ fn enqueue_and_drain_sync(
     }
     let uploaded = drain_upload_queue(paths, remote)?;
     let pruned_remote_exports = prune_remote_host_exports(remote, &config.host.id, &export)?;
+    let pruned_remote_objects = prune_remote_packed_blob_objects(
+        remote,
+        &config.host.id,
+        &export,
+        config.large.max_parallel_uploads,
+    )?;
     persist_export_remote_refs(conn, &remote.describe(), &config.host.id, &export.refs)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
+    println!("pruned_remote_objects {}", pruned_remote_objects);
     Ok(())
 }
 
@@ -471,6 +478,76 @@ fn prune_remote_host_exports(
         }
     }
     Ok(removed)
+}
+
+fn prune_remote_packed_blob_objects(
+    remote: &RemoteStore,
+    _host_id: &str,
+    export: &MetadataExport,
+    max_parallel_deletes: usize,
+) -> Result<usize> {
+    if env::var("MAJUTSU_SYNC_REMOTE_OBJECT_PRUNE").as_deref() == Ok("0") {
+        return Ok(0);
+    }
+    let protected = remote_gc_mark_live_keys(remote)?;
+    let candidates = export
+        .blobs
+        .iter()
+        .filter(|blob| blob.pack_id.is_some())
+        .flat_map(|blob| {
+            let mut keys = vec![blob.object_key.clone()];
+            keys.extend(canonical_remote_aliases(&blob.object_key));
+            keys
+        })
+        .filter(|key| !protected.contains(key))
+        .collect::<BTreeSet<_>>();
+    let remote_blob_keys = remote
+        .list("objects/blobs/")?
+        .into_iter()
+        .chain(remote.list("blobs/loose/")?)
+        .collect::<BTreeSet<_>>();
+    let delete_keys = candidates
+        .into_iter()
+        .filter(|key| remote_blob_keys.contains(key))
+        .collect::<Vec<_>>();
+    delete_remote_keys(remote, &delete_keys, max_parallel_deletes)?;
+    Ok(delete_keys.len())
+}
+
+fn delete_remote_keys(
+    remote: &RemoteStore,
+    keys: &[String],
+    max_parallel_deletes: usize,
+) -> Result<()> {
+    let parallelism = max_parallel_deletes.max(1);
+    for batch in keys.chunks(parallelism) {
+        std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|key| scope.spawn(move || remote.delete(key).with_context(|| key.clone())))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("remote delete worker panicked"))??;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+    Ok(())
+}
+
+fn remote_gc_mark_live_keys(remote: &RemoteStore) -> Result<BTreeSet<String>> {
+    let mut live = BTreeSet::new();
+    for key in remote.list("gc/marks/")? {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let mark: GcMarkExport = serde_json::from_slice(&remote.get(&key)?)
+            .with_context(|| format!("decode remote gc mark {key}"))?;
+        live.extend(mark.object_keys);
+    }
+    Ok(live)
 }
 
 fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> Result<()> {

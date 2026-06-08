@@ -26,6 +26,16 @@ MAJUTSU_SYNC_AUTO_PACK=0 mj sync
 MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS=512 mj sync
 ```
 
+pack 済みになった blob については、旧 loose blob object と canonical loose blob alias を remote から削除する。削除対象は remote の `gc/marks/` にある全 host の live object set と照合し、別 host が参照している object は削除しない。
+
+この remote cleanup は環境変数で無効化できる。
+
+```sh
+MAJUTSU_SYNC_REMOTE_OBJECT_PRUNE=0 mj sync
+```
+
+cleanup は remote list で存在する loose blob object を絞り込み、S3 upload 並列度の設定を使って delete を並列化する。削除された旧 loose object は pack から復元できるため、通常の clone / restore には不要。
+
 S3 multipart upload の part size は endpoint に応じて選ぶ。
 
 - MinIO / localhost: 16 MiB
