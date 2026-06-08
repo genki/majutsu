@@ -268,6 +268,12 @@ mj remote host test-host --snapshots --operations
 mj remote fsck
 ```
 
+Podman でローカル MinIO を起動し、S3 互換 remote の E2E を実行できます。
+
+```sh
+scripts/e2e-minio.sh
+```
+
 `[remote]` also accepts the split config form used in the spec:
 
 ```toml

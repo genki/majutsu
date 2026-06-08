@@ -8,7 +8,7 @@
 - [ ] 複数 root の timeline を空の state directory に clone し、別 target へ restore できる。
 - [ ] large object が pointer manifest と chunk 経由で保存され、byte-for-byte で復元できる。
 - [ ] file remote で `sync`、`remote check`、`remote fsck`、`clone`、`restore apply` が通過する。
-- [ ] S3 互換 remote が MinIO E2E スクリプトを通過する。
+- [ ] S3 互換 remote が Podman ベースの MinIO E2E スクリプトを通過する。
 - [ ] 暗号化 state を remote metadata と export 済み master key だけで clone / restore できる。
 - [ ] `fsck` が metadata graph、local object、pack、chunk、manifest、queue、ref、operation log を検査する。
 - [ ] `prune --dry-run` と `gc` が live data を削除しない。

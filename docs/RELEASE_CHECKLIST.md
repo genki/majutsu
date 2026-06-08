@@ -6,9 +6,10 @@
    scripts/check-completion.sh
    ```
 
-2. S3 互換 E2E を実行する。
+2. Podman で S3 互換 MinIO E2E を実行する。
 
    ```sh
+   podman info
    scripts/e2e-minio.sh
    ```
 
