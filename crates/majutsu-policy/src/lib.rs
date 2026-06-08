@@ -389,6 +389,43 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_policies_reject_custom_hot_metadata_transitions() {
+        let config = PolicyConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    name: "bad-hosts-to-archive".into(),
+                    prefix: "hosts/".into(),
+                    after: Some("1d".into()),
+                    storage: Some("archive".into()),
+                },
+                PolicyRule {
+                    name: "bad-trees-to-archive".into(),
+                    prefix: "trees/".into(),
+                    after: Some("1d".into()),
+                    storage: Some("deep-archive".into()),
+                },
+                PolicyRule {
+                    name: "large-ok".into(),
+                    prefix: "large/chunks/fixed-8m/".into(),
+                    after: Some("30d".into()),
+                    storage: Some("archive".into()),
+                },
+            ],
+        };
+
+        let s3_text = serde_json::to_string(&s3_lifecycle_policy(&config).unwrap()).unwrap();
+        assert!(s3_text.contains("large/chunks/fixed-8m/"));
+        assert!(!s3_text.contains("hosts/"));
+        assert!(!s3_text.contains("trees/"));
+
+        let gcs_text = serde_json::to_string(&gcs_lifecycle_policy(&config).unwrap()).unwrap();
+        assert!(gcs_text.contains("large/chunks/fixed-8m/"));
+        assert!(!gcs_text.contains("hosts/"));
+        assert!(!gcs_text.contains("trees/"));
+    }
+
+    #[test]
     fn s3_lifecycle_policy_can_render_rest_xml() {
         let config = PolicyConfig {
             enabled: true,
