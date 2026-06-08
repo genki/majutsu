@@ -10,10 +10,8 @@ use crate::daemon_runtime::{start_daemon_ipc, start_watch_daemon};
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{record_event, record_file_event};
 use crate::root_state::roots;
-use crate::{
-    AutoSyncResult, ensure_ready, open_db, replay_pending_journal_events, snapshot,
-    sync_current_if_remote,
-};
+use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
+use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
 
 pub fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
     majutsu_watch::WatchBackend::normalize(backend)
