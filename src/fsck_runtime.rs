@@ -1039,6 +1039,12 @@ pub(crate) fn validate_remote_chunk_index(
     if export.chunks.is_empty() {
         return Ok(());
     }
+    for key in remote.list("indexes/chunk-index/")? {
+        if key != REMOTE_CHUNK_INDEX_SHARD_KEY {
+            *missing += 1;
+            eprintln!("unexpected remote chunk index shard {key}");
+        }
+    }
     if !remote.exists(REMOTE_CHUNK_INDEX_SHARD_KEY)? {
         *missing += 1;
         eprintln!("missing remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}");
