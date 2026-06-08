@@ -4391,6 +4391,70 @@ fn sync_retry_queue_preserves_attempt_count_across_reenqueue() {
 }
 
 #[test]
+fn sync_status_reports_upload_queue_retry_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::create_dir_all(state.join("queue/uploads")).unwrap();
+    fs::write(
+        state.join("queue/uploads/retry-upload.json"),
+        serde_json::json!({
+            "id": "retry-upload",
+            "key": "objects/blobs/retry",
+            "source": null,
+            "inline": [114, 101, 116, 114, 121],
+            "created_at": "2026-06-07T00:00:00Z",
+            "attempts": 2,
+            "retry_after": "2999-01-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("status");
+        c
+    });
+
+    assert!(status.contains("queued_uploads 1"));
+    assert!(status.contains("queued_uploads_retrying 1"));
+    assert!(status.contains("queued_uploads_delayed 1"));
+    assert!(status.contains("queued_upload_next_retry_after 2999-01-01T00:00:00+00:00"));
+    assert!(status.contains("queued_upload_attempts 2"));
+    assert!(status.contains("queued_upload_max_attempts 2"));
+    assert!(status.contains("upload_queue_backpressure true"));
+}
+
+#[test]
 fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

@@ -111,7 +111,7 @@ use process_runtime::{acquire_process_lock, pid_alive, read_pid};
 use prune_runtime::{gc_cmd, prune_cmd};
 use queue_runtime::{
     drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, has_pending_journal_events,
-    record_event, upload_queue_items, upload_queue_stats,
+    record_event, upload_queue_stats,
 };
 #[cfg(test)]
 use remote_store::{
@@ -1649,6 +1649,7 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
             missing_remote += 1;
         }
     }
+    let upload_stats = upload_queue_stats(paths)?;
     println!("remote {}", remote.describe());
     println!(
         "local_current {}",
@@ -1664,7 +1665,22 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
     );
     println!("local_objects {}", local_keys.len());
     println!("missing_remote_objects {}", missing_remote);
-    println!("queued_uploads {}", upload_queue_items(paths)?.len());
+    println!("queued_uploads {}", upload_stats.total);
+    println!("queued_uploads_retrying {}", upload_stats.retrying);
+    println!("queued_uploads_delayed {}", upload_stats.delayed);
+    println!(
+        "queued_upload_next_retry_after {}",
+        upload_stats
+            .next_retry_after
+            .map(|retry_after| retry_after.to_rfc3339())
+            .unwrap_or_else(|| "(none)".into())
+    );
+    println!("queued_upload_attempts {}", upload_stats.attempts);
+    println!("queued_upload_max_attempts {}", upload_stats.max_attempts);
+    println!(
+        "upload_queue_backpressure {}",
+        upload_stats.has_backpressure()
+    );
     Ok(())
 }
 
