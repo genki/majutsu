@@ -36,6 +36,14 @@ MAJUTSU_SYNC_REMOTE_OBJECT_PRUNE=0 mj sync
 
 cleanup は remote list で存在する loose blob object を絞り込み、S3 upload 並列度の設定を使って delete を並列化する。削除された旧 loose object は pack から復元できるため、通常の clone / restore には不要。
 
+`mj sync` 成功後は、ローカルに pack と pack index が揃っている pack 済み blob の旧 loose file も削除する。これにより auto pack 後の `~/.majutsu` 使用量が blob と pack の二重保持で増え続けることを抑える。pack から読める状態を確認してから削除するため、restore / fsck / remote sync の参照先は維持される。
+
+この local cleanup は環境変数で無効化できる。
+
+```sh
+MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE=0 mj sync
+```
+
 S3 multipart upload の part size は endpoint に応じて選ぶ。
 
 - MinIO / localhost: 16 MiB

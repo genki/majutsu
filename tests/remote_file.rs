@@ -7591,6 +7591,87 @@ fn sync_prunes_remote_loose_blobs_after_pack() {
 }
 
 #[test]
+fn sync_prunes_local_loose_blobs_after_auto_pack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let object_key = first_blob_object_key(&state);
+    assert!(state.join(&object_key).exists());
+
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS", "1");
+        c
+    });
+    assert!(sync.contains("auto_pack unpacked_small_blobs "));
+    assert!(sync.contains("pruned_local_objects "));
+    assert!(!state.join(&object_key).exists());
+    assert!(find_file_ending(&state.join("objects/packs/small"), ".mpack").exists());
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+    assert_eq!(
+        fs::read(restore.join("sample/beta.txt")).unwrap(),
+        b"beta\n"
+    );
+}
+
+#[test]
 fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

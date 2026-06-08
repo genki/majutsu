@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 
 use crate::cli::{PackArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
@@ -275,10 +276,12 @@ fn enqueue_and_drain_sync(
         &export,
         config.large.max_parallel_uploads,
     )?;
+    let pruned_local_objects = prune_local_packed_blob_objects(paths, &export)?;
     persist_export_remote_refs(conn, &remote.describe(), &config.host.id, &export.refs)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
     println!("pruned_remote_objects {}", pruned_remote_objects);
+    println!("pruned_local_objects {}", pruned_local_objects);
     Ok(())
 }
 
@@ -512,6 +515,35 @@ fn prune_remote_packed_blob_objects(
         .collect::<Vec<_>>();
     delete_remote_keys(remote, &delete_keys, max_parallel_deletes)?;
     Ok(delete_keys.len())
+}
+
+fn prune_local_packed_blob_objects(paths: &Paths, export: &MetadataExport) -> Result<usize> {
+    if env::var("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE").as_deref() == Ok("0") {
+        return Ok(0);
+    }
+    let local_pack_keys = export
+        .packs
+        .iter()
+        .filter(|pack| {
+            paths.home.join(&pack.pack_key).exists() && paths.home.join(&pack.index_key).exists()
+        })
+        .map(|pack| pack.pack_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut removed = 0usize;
+    for blob in &export.blobs {
+        let Some(pack_id) = blob.pack_id.as_deref() else {
+            continue;
+        };
+        if !local_pack_keys.contains(pack_id) {
+            continue;
+        }
+        let local = paths.home.join(&blob.object_key);
+        if local.exists() {
+            fs::remove_file(&local).with_context(|| format!("remove {}", blob.object_key))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn delete_remote_keys(
