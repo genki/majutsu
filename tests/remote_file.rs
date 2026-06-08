@@ -563,6 +563,157 @@ fn multi_root_sync_clone_restore_preserves_host_snapshot() {
 }
 
 #[test]
+fn disaster_recovery_e2e_preserves_multi_root_large_dedup_and_packed_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs");
+    let assets = tmp.path().join("assets");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(docs.join("notes")).unwrap();
+    fs::create_dir_all(&assets).unwrap();
+    fs::write(docs.join("README.md"), b"# project\n").unwrap();
+    fs::write(docs.join("notes/todo.txt"), b"- snapshot\n- sync\n").unwrap();
+    let shared = vec![9u8; 4096];
+    let mut alpha = shared.clone();
+    alpha.extend(vec![1u8; 4096]);
+    let mut beta = shared;
+    beta.extend(vec![2u8; 4096]);
+    fs::write(assets.join("alpha.bin"), &alpha).unwrap();
+    fs::write(assets.join("beta.bin"), &beta).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--host-name")
+            .arg("dr-host")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 1024")
+        .replace("chunk_size = 8388608", "chunk_size = 4096")
+        .replace("small_pack_target = 67108864", "small_pack_target = 64")
+        .replace("normal_pack_target = 268435456", "normal_pack_target = 64");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("docs")
+            .arg(&docs);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("assets")
+            .arg(&assets);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("disaster recovery baseline");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    assert!(find_file_ending(&state.join("objects/packs"), ".mpack").exists());
+    assert_eq!(
+        count_files_ending(&state.join("objects/large/chunks/fixed"), ""),
+        3,
+        "shared large chunk should be stored once locally"
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+    assert!(find_file_ending(&remote.join("packs/small"), ".mpack").exists());
+    assert_eq!(
+        count_files_ending(&remote.join("large/chunks/fixed-8m"), ".chunk.enc"),
+        3,
+        "remote should contain the deduplicated large chunk set"
+    );
+
+    fs::remove_dir_all(remote.join("objects")).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("fsck");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&clone).arg("large").arg("verify");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read(docs.join("README.md")).unwrap(),
+        fs::read(restore.join("docs/README.md")).unwrap()
+    );
+    assert_eq!(
+        fs::read(docs.join("notes/todo.txt")).unwrap(),
+        fs::read(restore.join("docs/notes/todo.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(assets.join("alpha.bin")).unwrap(),
+        fs::read(restore.join("assets/alpha.bin")).unwrap()
+    );
+    assert_eq!(
+        fs::read(assets.join("beta.bin")).unwrap(),
+        fs::read(restore.join("assets/beta.bin")).unwrap()
+    );
+}
+
+#[test]
 fn remote_recovery_preserves_paused_resumed_and_missing_roots() {
     let tmp = tempfile::tempdir().unwrap();
     let docs = tmp.path().join("docs");
