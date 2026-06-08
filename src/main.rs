@@ -7,7 +7,7 @@ use majutsu_core::{
     MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
     RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
     history_graph_issues, metadata_reference_issues, operation_log_comparison_issues,
-    operation_log_entry_matches, payload_blob_ref, payload_large_ref, snapshot_export_matches,
+    operation_log_entry_matches, payload_large_ref, snapshot_export_matches,
     snapshot_manifest_matches, tree_manifest_issues,
 };
 use majutsu_crypto::EncryptionMode;
@@ -60,6 +60,7 @@ mod fuse_mount;
 mod key_runtime;
 mod large_runtime;
 mod lifecycle_runtime;
+mod mount_runtime;
 mod object_paths;
 mod operation_log;
 mod pack_runtime;
@@ -77,31 +78,30 @@ mod sync_runtime;
 mod util;
 mod watch_runtime;
 
-use atomic_io::{write_atomic, write_atomic_with};
+use atomic_io::write_atomic_with;
 #[cfg(test)]
 use cli::PackArgs;
 use cli::{
-    Cli, CloneArgs, Command, DiffArgs, HydrateArgs, InitArgs, LogArgs, MountArgs, OpCommand,
-    RestoreArgs, RestoreCommand, RestoreTopArgs, RootCommand, SnapshotArgs, UnmountArgs,
+    Cli, CloneArgs, Command, DiffArgs, InitArgs, LogArgs, OpCommand, RestoreArgs, RestoreCommand,
+    RestoreTopArgs, RootCommand, SnapshotArgs,
 };
 use config::{
-    Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, LazyMountEntry,
-    METADATA_EXPORT_VERSION, MetadataExport, MountViewMetadata, PackConfig, Paths, RemoteConfig,
-    RestoreConfig, RootConfig, SecurityConfig, TieringConfig, WatchConfig, default_chunk_size,
-    default_include, default_large_binary_min_size, default_large_chunking,
-    default_large_max_parallel_uploads, default_large_min_size, default_security_hash,
-    default_security_key_id, encryption_enabled, encryption_mode, read_config, resolve_paths,
-    validate_config, validate_large_chunking, validate_restore_archive_config,
-    validate_snapshot_mode, write_config,
+    Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
+    MetadataExport, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig, SecurityConfig,
+    TieringConfig, WatchConfig, default_chunk_size, default_include, default_large_binary_min_size,
+    default_large_chunking, default_large_max_parallel_uploads, default_large_min_size,
+    default_security_hash, default_security_key_id, encryption_enabled, encryption_mode,
+    read_config, resolve_paths, validate_config, validate_large_chunking,
+    validate_restore_archive_config, validate_snapshot_mode, write_config,
 };
 use daemon_runtime::daemon_cmd;
 use db_refs::persist_export_remote_refs;
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::fsck;
-use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use key_runtime::key_cmd;
 use large_runtime::large_cmd;
 use lifecycle_runtime::lifecycle_cmd;
+use mount_runtime::{hydrate_cmd, mount_cmd, unmount_cmd};
 use object_paths::{large_chunk_base, local_object_keys};
 use operation_log::{
     query_operation, query_operations, record_op, record_op_with_details, record_op_with_id,
@@ -117,9 +117,6 @@ use remote_store::{
     DEFAULT_MULTIPART_THRESHOLD, FileRemote, MIN_MULTIPART_PART_SIZE, S3Remote, s3_object_class,
 };
 use remote_store::{RemoteStore, open_remote};
-use restore_apply::{
-    apply_file_metadata, prepare_directory_restore_destination, restore_special_file,
-};
 use restore_runtime::{
     RestoreDelete, RestorePlan, apply_restore_plan, ensure_restore_job_has_no_missing_objects,
     ensure_restore_job_not_blocked, ensure_restore_job_resumable, mark_restore_job_done,
@@ -943,220 +940,6 @@ fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()> {
             println!("restored to {}", restore_target_label(&plan));
         }
     }
-    Ok(())
-}
-
-fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
-    ensure_ready(paths)?;
-    let conn = open_db(paths)?;
-    let restore_args = RestoreArgs {
-        snapshot: args.snapshot.clone(),
-        at: args.at.clone(),
-        root: args.root.clone(),
-        path: args.path.clone(),
-        to: Some(args.mountpoint.clone()),
-        force: true,
-        check_conflicts: false,
-    };
-    let plan = build_restore_plan(paths, &conn, &restore_args)?;
-    if args.backend == "fuse" {
-        return mount_fuse_cmd(paths, &conn, &plan);
-    }
-    if args.backend != "materialized" {
-        bail!("mount backend must be materialized or fuse");
-    }
-    let mountpoint = plan
-        .to
-        .as_ref()
-        .ok_or_else(|| anyhow!("mount requires a target directory"))?;
-    prepare_mountpoint(mountpoint)?;
-    let lazy_root = mountpoint.join(".majutsu-lazy");
-    let mut lazy_files = 0usize;
-    let mut hydrated_large = 0usize;
-    let mut directory_metadata = Vec::new();
-    for record in &plan.files {
-        let dest = mountpoint.join(&record.root_id).join(&record.path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match &record.payload {
-            Payload::Directory => {
-                prepare_directory_restore_destination(&dest, false)?;
-                fs::create_dir_all(&dest)?;
-                directory_metadata.push((dest, record));
-            }
-            Payload::Special { special_kind } => {
-                restore_special_file(&dest, record, special_kind, true)?;
-            }
-            Payload::Symlink { target } => {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(target, &dest)?;
-                #[cfg(not(unix))]
-                fs::write(&dest, target)?;
-            }
-            payload => {
-                if let Some((oid, object_key)) = payload_blob_ref(payload) {
-                    write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
-                    apply_file_metadata(&dest, record)?;
-                } else if let Some((_, manifest_key, chunk_count)) = payload_large_ref(payload) {
-                    if args.hydrate_large {
-                        let manifest: LargeManifest =
-                            serde_json::from_slice(&read_object(paths, manifest_key)?)?;
-                        write_large_chunks_atomic(paths, &dest, &manifest)?;
-                        apply_file_metadata(&dest, record)?;
-                        hydrated_large += 1;
-                    } else {
-                        let file = File::create(&dest)?;
-                        file.set_len(record.size)?;
-                        apply_file_metadata(&dest, record)?;
-                        let sidecar = lazy_root
-                            .join(&record.root_id)
-                            .join(format!("{}.json", record.path));
-                        if let Some(parent) = sidecar.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        let entry = LazyMountEntry {
-                            version: 1,
-                            snapshot_id: plan.snapshot.snapshot_id.clone(),
-                            root_id: record.root_id.clone(),
-                            path: record.path.clone(),
-                            size: record.size,
-                            manifest_key: manifest_key.to_string(),
-                            chunk_count,
-                        };
-                        fs::write(sidecar, serde_json::to_vec_pretty(&entry)?)?;
-                        lazy_files += 1;
-                    }
-                }
-            }
-        }
-    }
-    for (dest, record) in directory_metadata {
-        apply_file_metadata(&dest, record)?;
-    }
-    record_op(
-        &conn,
-        "mount",
-        None,
-        Some(&plan.snapshot.snapshot_id),
-        Some(&format!("at {}", mountpoint.display())),
-    )?;
-    let mount_metadata = MountViewMetadata {
-        version: 1,
-        snapshot_id: plan.snapshot.snapshot_id.clone(),
-        created_at: Utc::now(),
-        hydrate_large: args.hydrate_large,
-        files: plan.files.len(),
-        lazy_large_files: lazy_files,
-        hydrated_large_files: hydrated_large,
-    };
-    fs::write(
-        mountpoint.join(".majutsu-mount.json"),
-        serde_json::to_vec_pretty(&mount_metadata)?,
-    )?;
-    println!("mounted snapshot {}", plan.snapshot.snapshot_id);
-    println!("target {}", mountpoint.display());
-    println!("files {}", plan.files.len());
-    println!("lazy_large_files {lazy_files}");
-    println!("hydrated_large_files {hydrated_large}");
-    Ok(())
-}
-
-fn unmount_cmd(paths: &Paths, args: UnmountArgs) -> Result<()> {
-    ensure_ready(paths)?;
-    let conn = open_db(paths)?;
-    let marker = args.mountpoint.join(".majutsu-mount.json");
-    if !marker.exists() && is_mountpoint(&args.mountpoint)? {
-        unmount_fuse(&args.mountpoint)?;
-        record_op(
-            &conn,
-            "unmount-fuse",
-            None,
-            None,
-            Some(&format!("from {}", args.mountpoint.display())),
-        )?;
-        println!("unmounted {}", args.mountpoint.display());
-        return Ok(());
-    }
-    if !marker.exists() {
-        bail!(
-            "{} is not a majutsu mount view; missing .majutsu-mount.json",
-            args.mountpoint.display()
-        );
-    }
-    let metadata: MountViewMetadata = serde_json::from_slice(&fs::read(&marker)?)
-        .with_context(|| format!("read mount metadata {}", marker.display()))?;
-    fs::remove_dir_all(&args.mountpoint)
-        .with_context(|| format!("remove mount view {}", args.mountpoint.display()))?;
-    record_op(
-        &conn,
-        "unmount",
-        Some(&metadata.snapshot_id),
-        None,
-        Some(&format!("from {}", args.mountpoint.display())),
-    )?;
-    println!("unmounted {}", args.mountpoint.display());
-    println!("snapshot {}", metadata.snapshot_id);
-    Ok(())
-}
-
-fn hydrate_cmd(paths: &Paths, args: HydrateArgs) -> Result<()> {
-    ensure_ready(paths)?;
-    if let Some(path) = &args.path {
-        validate_relative_filter_path(path, "hydrate --path")?;
-    }
-    let conn = open_db(paths)?;
-    let lazy_root = args.view.join(".majutsu-lazy");
-    if !lazy_root.exists() {
-        bail!("lazy metadata not found: {}", lazy_root.display());
-    }
-    let requested_path = args.path.as_ref().map(|path| path_to_slash(path));
-    let mut sidecars = Vec::new();
-    for entry in WalkDir::new(&lazy_root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() || entry.path().extension() != Some(OsStr::new("json")) {
-            continue;
-        }
-        let lazy: LazyMountEntry = serde_json::from_slice(&fs::read(entry.path())?)
-            .with_context(|| format!("read lazy metadata {}", entry.path().display()))?;
-        if args
-            .root
-            .as_deref()
-            .is_some_and(|root| root != lazy.root_id)
-        {
-            continue;
-        }
-        if requested_path
-            .as_deref()
-            .is_some_and(|path| path != lazy.path)
-        {
-            continue;
-        }
-        sidecars.push((entry.path().to_path_buf(), lazy));
-    }
-    if sidecars.is_empty() {
-        bail!("no lazy large files matched");
-    }
-    let mut hydrated = 0usize;
-    for (sidecar, lazy) in sidecars {
-        let manifest: LargeManifest =
-            serde_json::from_slice(&read_object(paths, &lazy.manifest_key)?)
-                .with_context(|| format!("read large manifest {}", lazy.manifest_key))?;
-        let dest = args.view.join(&lazy.root_id).join(&lazy.path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        write_large_chunks_atomic(paths, &dest, &manifest)?;
-        fs::remove_file(sidecar)?;
-        hydrated += 1;
-    }
-    record_op(
-        &conn,
-        "hydrate",
-        None,
-        None,
-        Some(&format!("view {}", args.view.display())),
-    )?;
-    println!("hydrated_large_files {hydrated}");
     Ok(())
 }
 
