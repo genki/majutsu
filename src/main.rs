@@ -7,8 +7,8 @@ use majutsu_core::{
     MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
     RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
     encode_operation_log, history_graph_issues, metadata_reference_issues,
-    operation_log_comparison_issues, payload_blob_ref, payload_blob_ref_mut, payload_large_ref,
-    payload_large_ref_mut,
+    operation_log_comparison_issues, operation_log_entry_matches, payload_blob_ref,
+    payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -2051,6 +2051,13 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             metadata.host.as_ref(),
             &export.operations,
         )?;
+        validate_clone_remote_timeline_exports(
+            &staging_paths,
+            &remote,
+            metadata.host.as_ref(),
+            &export.snapshots,
+            &export.operations,
+        )?;
         for key in local_object_keys(&export) {
             let dest = staging_paths.home.join(&key);
             if let Some(parent) = dest.parent() {
@@ -2088,6 +2095,41 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+fn validate_clone_remote_timeline_exports(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host: Option<&RemoteHostSummary>,
+    snapshots: &[SnapshotExport],
+    operations: &[OperationExport],
+) -> Result<()> {
+    let Some(host) = host else {
+        return Ok(());
+    };
+    for snapshot in snapshots {
+        let key = host_snapshot_canonical_key(&host.id, &snapshot.id);
+        if !remote.exists(&key)? {
+            bail!("remote is missing canonical host snapshot export {key}");
+        }
+        let actual: SnapshotExport = decode_canonical_remote_export(paths, &remote.get(&key)?)
+            .with_context(|| format!("parse remote snapshot export {key}"))?;
+        if !snapshot_export_matches(&actual, snapshot) {
+            bail!("remote snapshot export does not match metadata {key}");
+        }
+    }
+    for operation in operations {
+        let key = host_operation_canonical_key(&host.id, &operation.id);
+        if !remote.exists(&key)? {
+            bail!("remote is missing canonical host operation export {key}");
+        }
+        let actual: OperationExport = decode_canonical_remote_export(paths, &remote.get(&key)?)
+            .with_context(|| format!("parse remote operation export {key}"))?;
+        if !operation_log_entry_matches(&actual, operation) {
+            bail!("remote operation export does not match metadata {key}");
+        }
+    }
     Ok(())
 }
 
