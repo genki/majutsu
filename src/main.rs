@@ -27,7 +27,7 @@ use majutsu_store::{
     host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
     host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
     host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
-    remote_gc_mark_key, remote_gc_tombstone_key, select_remote_host,
+    remote_gc_mark_key, remote_gc_tombstone_key, remote_gc_tombstone_prefix, select_remote_host,
 };
 #[cfg(test)]
 use reqwest::blocking::Client;
@@ -2373,6 +2373,37 @@ fn validate_clone_remote_gc_mark(
     let expected = expected.into_iter().collect::<BTreeSet<_>>();
     for issue in mark.validation_issues(&host.id, export.refs.get("current"), &expected) {
         bail!("{}", issue.message(&key, &host.id));
+    }
+    validate_clone_remote_gc_tombstones(remote, &host.id)?;
+    Ok(())
+}
+
+fn validate_clone_remote_gc_tombstones(remote: &RemoteStore, host_id: &str) -> Result<()> {
+    let prefix = remote_gc_tombstone_prefix(host_id);
+    let mut seen_keys = BTreeSet::new();
+    for key in remote.list(&prefix)? {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let tombstone: GcTombstoneExport = serde_json::from_slice(&remote.get(&key)?)
+            .with_context(|| format!("parse remote gc tombstone {key}"))?;
+        let issues = tombstone.validation_issues(host_id);
+        if let Some(issue) = issues.into_iter().next() {
+            bail!("{}", issue.message(&key, host_id));
+        }
+        if remote.exists(&tombstone.key)? {
+            bail!(
+                "remote gc tombstone points to existing object {} {}",
+                key,
+                tombstone.key
+            );
+        }
+        if !seen_keys.insert(tombstone.key.clone()) {
+            bail!(
+                "duplicate remote gc tombstone deleted key {}",
+                tombstone.key
+            );
+        }
     }
     Ok(())
 }
