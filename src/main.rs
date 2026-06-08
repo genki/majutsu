@@ -9,6 +9,7 @@ use majutsu_core::{
     encode_operation_log, history_graph_issues, metadata_reference_issues,
     operation_log_comparison_issues, operation_log_entry_matches, payload_blob_ref,
     payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut, snapshot_export_matches,
+    snapshot_manifest_matches, tree_manifest_issues,
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
@@ -2066,6 +2067,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &export.snapshots,
             &export.operations,
         )?;
+        validate_clone_remote_snapshot_objects(&staging_paths, &remote, &export)?;
         validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
         validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
         validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
@@ -2106,6 +2108,56 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    Ok(())
+}
+
+fn validate_clone_remote_snapshot_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<()> {
+    for snapshot in &export.snapshots {
+        let metadata_manifest: SnapshotManifest = serde_json::from_str(&snapshot.manifest_json)
+            .with_context(|| format!("parse snapshot manifest metadata {}", snapshot.id))?;
+        for variant in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
+            let remote_manifest: SnapshotManifest =
+                serde_json::from_slice(&decode_object(paths, &variant.bytes)?).with_context(
+                    || {
+                        format!(
+                            "parse remote snapshot manifest {} from {}",
+                            snapshot.manifest_key, variant.remote_key
+                        )
+                    },
+                )?;
+            if !snapshot_manifest_matches(&remote_manifest, &metadata_manifest) {
+                bail!(
+                    "remote snapshot manifest object does not match metadata {} {}",
+                    snapshot.id,
+                    variant.remote_key
+                );
+            }
+        }
+        for (root_id, root_tree) in &metadata_manifest.root_trees {
+            for variant in remote_local_object_variants(paths, remote, &root_tree.tree_key)? {
+                let tree: TreeManifest =
+                    serde_json::from_slice(&decode_object(paths, &variant.bytes)?).with_context(
+                        || {
+                            format!(
+                                "parse remote tree manifest {} from {}",
+                                root_tree.tree_key, variant.remote_key
+                            )
+                        },
+                    )?;
+                if !tree_manifest_issues(&tree, root_id, root_tree).is_empty() {
+                    bail!(
+                        "remote tree manifest object does not match snapshot metadata {} {}",
+                        snapshot.id,
+                        variant.remote_key
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
