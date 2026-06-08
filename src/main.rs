@@ -3,9 +3,10 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use majutsu_core::{
-    FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, OperationLogEntry as OperationExport,
-    OperationLogEntryIssue, Payload, RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest,
-    decode_operation_log, encode_operation_log, history_graph_issues, payload_blob_ref,
+    FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, LiveMetadataReferences,
+    MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
+    RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
+    encode_operation_log, history_graph_issues, metadata_reference_issues, payload_blob_ref,
     payload_blob_ref_mut, payload_large_ref, payload_large_ref_mut,
 };
 use majutsu_crypto::EncryptionMode;
@@ -2090,6 +2091,7 @@ fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
     for issue in history_graph_issues(&export.snapshots, &export.operations) {
         issues.push(format_history_graph_issue(issue));
     }
+    validate_clone_metadata_references(export, &mut issues);
     if issues.is_empty() {
         return Ok(());
     }
@@ -2105,6 +2107,48 @@ fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
         String::new()
     };
     bail!("remote metadata is inconsistent and cannot be cloned: {sample}{suffix}")
+}
+
+fn validate_clone_metadata_references(export: &MetadataExport, issues: &mut Vec<String>) {
+    let mut live = LiveMetadataReferences::default();
+    for snapshot in &export.snapshots {
+        match serde_json::from_str::<SnapshotManifest>(&snapshot.manifest_json) {
+            Ok(manifest) => {
+                live.add_snapshot_manifest(&manifest);
+            }
+            Err(err) => {
+                issues.push(format!(
+                    "snapshot {} has invalid manifest metadata: {err}",
+                    snapshot.id
+                ));
+            }
+        }
+    }
+    let live_chunks = BTreeSet::new();
+    for issue in metadata_reference_issues(
+        export.blobs.iter().map(|blob| blob.oid.as_str()),
+        export.large_objects.iter().map(|large| large.oid.as_str()),
+        std::iter::empty::<&str>(),
+        &live.blobs,
+        &live.large_objects,
+        &live_chunks,
+    ) {
+        issues.push(format_metadata_reference_issue(issue));
+    }
+}
+
+fn format_metadata_reference_issue(issue: MetadataReferenceIssue) -> String {
+    match issue {
+        MetadataReferenceIssue::DanglingBlob { oid } => {
+            format!("dangling blob metadata {oid}")
+        }
+        MetadataReferenceIssue::DanglingLargeObject { oid } => {
+            format!("dangling large object metadata {oid}")
+        }
+        MetadataReferenceIssue::DanglingChunk { oid } => {
+            format!("dangling chunk metadata {oid}")
+        }
+    }
 }
 
 fn format_operation_entry_issue(
