@@ -438,6 +438,10 @@ pub struct OperationLogEntry {
     pub after_snapshot: Option<String>,
     pub created_at: String,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_sync_state: Option<String>,
 }
 
 impl OperationLogEntry {
@@ -1215,6 +1219,8 @@ mod tests {
                 after_snapshot: Some("snap-1".into()),
                 created_at: "2026-06-07T00:00:00Z".into(),
                 message: None,
+                error: None,
+                remote_sync_state: None,
             },
             OperationLogEntry {
                 id: "op-self".into(),
@@ -1226,6 +1232,8 @@ mod tests {
                 after_snapshot: Some("snap-2".into()),
                 created_at: "2026-06-07T00:01:00Z".into(),
                 message: None,
+                error: None,
+                remote_sync_state: None,
             },
         ];
 
@@ -1270,6 +1278,8 @@ mod tests {
             after_snapshot: Some("snap-1".into()),
             created_at: "2026-06-07T00:00:00Z".into(),
             message: None,
+            error: None,
+            remote_sync_state: None,
         }];
 
         assert!(history_graph_issues(&snapshots, &operations).is_empty());
@@ -1376,6 +1386,8 @@ mod tests {
                 after_snapshot: Some("snap-1".into()),
                 created_at: "2026-06-07T00:00:00Z".into(),
                 message: Some("initialized".into()),
+                error: None,
+                remote_sync_state: Some("synced".into()),
             },
             OperationLogEntry {
                 id: "op-2".into(),
@@ -1387,6 +1399,8 @@ mod tests {
                 after_snapshot: None,
                 created_at: "2026-06-07T00:01:00Z".into(),
                 message: Some("snapshot failed".into()),
+                error: Some("snapshot hook failed".into()),
+                remote_sync_state: Some("failed".into()),
             },
         ];
 
@@ -1409,6 +1423,8 @@ mod tests {
             after_snapshot: None,
             created_at: "not-time".into(),
             message: None,
+            error: None,
+            remote_sync_state: None,
         };
 
         let issues = entry.validation_issues();
@@ -1436,6 +1452,8 @@ mod tests {
             after_snapshot: Some("snap-1".into()),
             created_at: "2026-06-07T00:00:00Z".into(),
             message: None,
+            error: None,
+            remote_sync_state: Some("not-synced".into()),
         };
 
         assert!(entry.validation_issues().is_empty());
@@ -1455,6 +1473,8 @@ mod tests {
             after_snapshot: Some("snap-1".into()),
             created_at: "2026-06-07T00:00:00Z".into(),
             message: None,
+            error: None,
+            remote_sync_state: None,
         }];
         let mut actual = expected.clone();
         actual[0].status = "failed".into();

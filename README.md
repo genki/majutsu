@@ -460,6 +460,9 @@ mj op restore <op-id>
 The first baseline snapshot is recorded as `initial-scan`. Later manual
 snapshots are recorded as `manual-snapshot`, while watch-created snapshots are
 recorded as `file-events-batch`.
+Operations preserve status metadata for recovery auditing. Failed snapshots keep
+their error text, and remote sync operations track `remote_sync_state` as
+`queued`, `synced`, or `failed`.
 
 Diff the current snapshot against its parent:
 

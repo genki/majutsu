@@ -34,7 +34,9 @@ create table if not exists operations(
   before_snapshot text,
   after_snapshot text,
   created_at text not null,
-  message text
+  message text,
+  error text,
+  remote_sync_state text
 );
 create table if not exists refs(name text primary key, value text not null);
 create table if not exists blobs(oid text primary key, size integer not null, object_key text not null);
@@ -58,6 +60,8 @@ pub const COMPAT_MIGRATIONS: &[&str] = &[
     "alter table operations add column parent_op text",
     "alter table operations add column actor text not null default 'local'",
     "alter table operations add column status text not null default 'done'",
+    "alter table operations add column error text",
+    "alter table operations add column remote_sync_state text",
 ];
 
 pub fn schema_sql() -> &'static str {

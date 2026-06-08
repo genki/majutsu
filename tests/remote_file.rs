@@ -2742,11 +2742,32 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
 
     assert_eq!(db_ref(&state, "last-synced"), None);
     assert_eq!(db_remote_ref_count(&state), 0);
-    assert_eq!(db_operation_count(&state, "remote-sync"), 0);
+    assert_eq!(db_operation_count(&state, "remote-sync"), 1);
     assert_eq!(
         local_oplog_record_count(&state) as i64,
         db_total_operation_count(&state)
     );
+    let failed_sync_op = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    })
+    .lines()
+    .find(|line| line.contains("remote-sync"))
+    .and_then(|line| line.split('\t').next())
+    .unwrap()
+    .to_string();
+    let failed_sync_show = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("show")
+            .arg(&failed_sync_op);
+        c
+    });
+    assert!(failed_sync_show.contains("status failed"));
+    assert!(failed_sync_show.contains("remote_sync_state failed"));
 
     fs::remove_file(&remote).unwrap();
     fs::create_dir_all(&remote).unwrap();
@@ -2758,11 +2779,34 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
 
     assert!(db_ref(&state, "last-synced").is_some());
     assert_eq!(db_remote_ref_count(&state), 2);
-    assert_eq!(db_operation_count(&state, "remote-sync"), 1);
+    assert_eq!(db_operation_count(&state, "remote-sync"), 2);
     assert_eq!(
         local_oplog_record_count(&state) as i64,
         db_total_operation_count(&state)
     );
+    let sync_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    let successful_sync_op = sync_log
+        .lines()
+        .filter(|line| line.contains("remote-sync"))
+        .next()
+        .and_then(|line| line.split('\t').next())
+        .unwrap()
+        .to_string();
+    let successful_sync_show = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("show")
+            .arg(&successful_sync_op);
+        c
+    });
+    assert!(successful_sync_show.contains("status done"));
+    assert!(successful_sync_show.contains("remote_sync_state synced"));
 }
 
 #[test]
@@ -10501,6 +10545,12 @@ fn failed_snapshot_records_failed_operation_status() {
         .find(|op| op["id"] == failed_op)
         .unwrap();
     assert_eq!(op["status"], "failed");
+    assert!(
+        op["error"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot failed for root sample")
+    );
 }
 
 #[test]

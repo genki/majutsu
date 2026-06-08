@@ -42,14 +42,38 @@ pub(crate) fn record_op_with_id_and_status(
     status: &str,
     message: Option<&str>,
 ) -> Result<()> {
+    record_op_with_details(conn, id, kind, before, after, status, message, None, None)
+}
+
+pub(crate) fn record_op_with_details(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+    status: &str,
+    message: Option<&str>,
+    error: Option<&str>,
+    remote_sync_state: Option<&str>,
+) -> Result<()> {
     let created_at = Utc::now().to_rfc3339();
     let parent_op = current_operation(conn)?;
     let actor = operation_actor();
     conn.execute(
-        "insert into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "insert into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
-            id, parent_op, kind, actor, status, before, after, created_at, message
+            id,
+            parent_op,
+            kind,
+            actor,
+            status,
+            before,
+            after,
+            created_at,
+            message,
+            error,
+            remote_sync_state
         ],
     )?;
     let op = OperationExport {
@@ -62,6 +86,8 @@ pub(crate) fn record_op_with_id_and_status(
         after_snapshot: after.map(str::to_string),
         created_at,
         message: message.map(str::to_string),
+        error: error.map(str::to_string),
+        remote_sync_state: remote_sync_state.map(str::to_string),
     };
     append_local_oplog(conn, &op)?;
     append_operation_audit_log(conn, &op)?;
@@ -108,6 +134,23 @@ pub(crate) fn rewrite_local_oplog(conn: &Connection) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+pub(crate) fn update_operation_result(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    error: Option<&str>,
+    remote_sync_state: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "update operations set status=?2, error=?3, remote_sync_state=?4 where id=?1",
+        params![id, status, error, remote_sync_state],
+    )?;
+    rewrite_local_oplog(conn)?;
+    let op = query_operation(conn, id)?;
+    append_operation_audit_log(conn, &op)?;
+    Ok(())
 }
 
 pub(crate) fn local_oplog_path(conn: &Connection) -> Result<Option<PathBuf>> {
@@ -174,7 +217,7 @@ fn operation_actor() -> String {
 
 pub(crate) fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
     conn.query_row(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations where id=?1",
+        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state from operations where id=?1",
         params![op_id],
         |row| {
             Ok(OperationExport {
@@ -187,6 +230,8 @@ pub(crate) fn query_operation(conn: &Connection, op_id: &str) -> Result<Operatio
                 after_snapshot: row.get(6)?,
                 created_at: row.get(7)?,
                 message: row.get(8)?,
+                error: row.get(9)?,
+                remote_sync_state: row.get(10)?,
             })
         },
     )
@@ -196,7 +241,7 @@ pub(crate) fn query_operation(conn: &Connection, op_id: &str) -> Result<Operatio
 
 pub(crate) fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
     let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message from operations order by created_at",
+        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state from operations order by created_at",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(OperationExport {
@@ -209,6 +254,8 @@ pub(crate) fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>
             after_snapshot: row.get(6)?,
             created_at: row.get(7)?,
             message: row.get(8)?,
+            error: row.get(9)?,
+            remote_sync_state: row.get(10)?,
         })
     })?;
     let mut operations = Vec::new();

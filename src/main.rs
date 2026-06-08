@@ -92,8 +92,8 @@ use fsck_runtime::{fsck, remote_fsck};
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use object_paths::{large_chunk_base, large_chunk_base_for_key, local_object_keys};
 use operation_log::{
-    query_operation, query_operations, record_op, record_op_with_id, record_op_with_id_and_status,
-    rewrite_local_oplog,
+    query_operation, query_operations, record_op, record_op_with_details, record_op_with_id,
+    rewrite_local_oplog, update_operation_result,
 };
 use pack_runtime::pack_cmd;
 use process_runtime::{acquire_process_lock, pid_alive, read_pid};
@@ -645,14 +645,17 @@ fn record_snapshot_failure(
     root_id: &str,
     err: &anyhow::Error,
 ) -> Result<()> {
-    record_op_with_id_and_status(
+    let message = format!("snapshot failed for root {root_id}: {err:#}");
+    record_op_with_details(
         conn,
         op_id,
         kind,
         parent,
         parent,
         "failed",
-        Some(&format!("snapshot failed for root {root_id}: {err:#}")),
+        Some(&message),
+        Some(&message),
+        None,
     )
 }
 
@@ -749,6 +752,11 @@ fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
             );
             println!("created_at {}", op.created_at);
             println!("message {}", op.message.unwrap_or_default());
+            println!("error {}", op.error.unwrap_or_default());
+            println!(
+                "remote_sync_state {}",
+                op.remote_sync_state.unwrap_or_default()
+            );
             Ok(())
         }
         OpCommand::Restore { op_id } => {
@@ -1450,19 +1458,36 @@ fn sync_configured_remote(
     let previous_last_synced = ref_value(&conn, "last-synced")?;
     let synced_at = Utc::now().to_rfc3339();
     set_ref_value(&conn, "last-synced", &synced_at)?;
-    let sync_op = record_op(
-        &conn,
+    let sync_op = new_id("op");
+    record_op_with_details(
+        conn,
+        &sync_op,
         "remote-sync",
         current.as_deref(),
         current.as_deref(),
+        "running",
         Some("pushed metadata and objects"),
+        None,
+        Some("queued"),
     )?;
     let result = enqueue_and_drain_sync(paths, &conn, &config, &remote);
-    if result.is_err() {
-        restore_ref_value(&conn, "last-synced", previous_last_synced.as_deref())?;
-        delete_operation(&conn, &sync_op)?;
+    match result {
+        Ok(()) => {
+            update_operation_result(conn, &sync_op, "done", None, Some("synced"))?;
+            Ok(())
+        }
+        Err(err) => {
+            restore_ref_value(&conn, "last-synced", previous_last_synced.as_deref())?;
+            update_operation_result(
+                conn,
+                &sync_op,
+                "failed",
+                Some(&format!("{err:#}")),
+                Some("failed"),
+            )?;
+            Err(err)
+        }
     }
-    result
 }
 
 fn enqueue_and_drain_sync(
@@ -1586,12 +1611,6 @@ fn enqueue_and_drain_sync(
     persist_export_remote_refs(conn, &remote.describe(), &config.host.id, &export.refs)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
-    Ok(())
-}
-
-fn delete_operation(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("delete from operations where id=?1", params![id])?;
-    rewrite_local_oplog(conn)?;
     Ok(())
 }
 
@@ -3308,8 +3327,8 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
     }
     for op in &export.operations {
         conn.execute(
-            "insert or replace into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "insert or replace into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 op.id,
                 op.parent_op,
@@ -3319,7 +3338,9 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
                 op.before_snapshot,
                 op.after_snapshot,
                 op.created_at,
-                op.message
+                op.message,
+                op.error,
+                op.remote_sync_state
             ],
         )?;
     }
