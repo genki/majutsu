@@ -487,6 +487,7 @@ pub fn valid_operation_kind_label(kind: &str) -> bool {
             | "root-missing"
             | "root-unmounted"
             | "root-permission-denied"
+            | "initial-scan"
             | "manual-snapshot"
             | "file-events-batch"
             | "op-restore"
@@ -1335,6 +1336,7 @@ mod tests {
             "root-missing",
             "root-unmounted",
             "root-permission-denied",
+            "initial-scan",
             "manual-snapshot",
             "file-events-batch",
             "op-restore",

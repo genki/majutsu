@@ -491,7 +491,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             record_snapshot_failure(
                 &conn,
                 &op_id,
-                snapshot_operation_kind(args.message.as_deref()),
+                snapshot_operation_kind(args.message.as_deref(), parent.as_deref()),
                 parent.as_deref(),
                 &root.id,
                 &err,
@@ -535,7 +535,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 record_snapshot_failure(
                     &conn,
                     &op_id,
-                    snapshot_operation_kind(args.message.as_deref()),
+                    snapshot_operation_kind(args.message.as_deref(), parent.as_deref()),
                     parent.as_deref(),
                     &root.id,
                     &err,
@@ -547,7 +547,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             record_snapshot_failure(
                 &conn,
                 &op_id,
-                snapshot_operation_kind(args.message.as_deref()),
+                snapshot_operation_kind(args.message.as_deref(), parent.as_deref()),
                 parent.as_deref(),
                 &root.id,
                 &err,
@@ -613,7 +613,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     record_op_with_id(
         &conn,
         &op_id,
-        snapshot_operation_kind(args.message.as_deref()),
+        snapshot_operation_kind(args.message.as_deref(), manifest.parent.as_deref()),
         manifest.parent.as_deref(),
         Some(&manifest.snapshot_id),
         args.message.as_deref(),
@@ -624,12 +624,14 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_operation_kind(message: Option<&str>) -> &'static str {
+fn snapshot_operation_kind(message: Option<&str>, parent: Option<&str>) -> &'static str {
     if message
         .map(|message| message.starts_with("watch "))
         .unwrap_or(false)
     {
         "file-events-batch"
+    } else if parent.is_none() {
+        "initial-scan"
     } else {
         "manual-snapshot"
     }

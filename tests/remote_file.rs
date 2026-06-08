@@ -1826,7 +1826,7 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
     assert!(host_b.contains("operations "));
     assert!(host_b.contains("snapshot_id\tcreated_at\tparent\top_id"));
     assert!(host_b.contains("op_id\tcreated_at\tkind\tstatus\tbefore\tafter\tmessage"));
-    assert!(host_b.contains("manual-snapshot"));
+    assert!(host_b.contains("initial-scan"));
     assert!(host_b.contains("\tdone\t"));
     assert!(host_b.contains("root-added"));
 
@@ -5643,7 +5643,7 @@ fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
     });
     let snapshot_op = op_log
         .lines()
-        .find(|line| line.contains("manual-snapshot"))
+        .find(|line| line.contains("initial-scan"))
         .and_then(|line| line.split('\t').next())
         .unwrap()
         .to_string();
@@ -5656,7 +5656,7 @@ fn op_restore_prepare_resume_and_lifecycle_policy_are_available() {
             .arg(&snapshot_op);
         c
     });
-    assert!(op_show.contains("kind manual-snapshot"));
+    assert!(op_show.contains("kind initial-scan"));
     run({
         let mut c = mj();
         c.arg("--home")
@@ -5777,7 +5777,7 @@ fn op_restore_moves_current_ref_to_operation_snapshot() {
     });
     let first_snapshot_op = op_log
         .lines()
-        .filter(|line| line.contains("manual-snapshot"))
+        .filter(|line| line.contains("initial-scan"))
         .find(|line| line.contains(&format!(" -> {first_snapshot}\t")))
         .and_then(|line| line.split('\t').next())
         .unwrap()
@@ -6828,7 +6828,7 @@ fn operations_are_appended_to_local_oplog() {
     });
     let snapshot_op = op_log
         .lines()
-        .find(|line| line.contains("manual-snapshot"))
+        .find(|line| line.contains("initial-scan"))
         .and_then(|line| line.split('\t').next())
         .unwrap()
         .to_string();
@@ -7371,7 +7371,7 @@ fn fsck_detects_invalid_operation_entry() {
 
     let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
     conn.execute(
-        "update operations set status='unknown' where kind='manual-snapshot'",
+        "update operations set status='unknown' where kind='initial-scan'",
         [],
     )
     .unwrap();
@@ -10472,7 +10472,7 @@ fn failed_snapshot_records_failed_operation_status() {
     });
     let failed_op = op_log
         .lines()
-        .find(|line| line.contains("manual-snapshot"))
+        .find(|line| line.contains("initial-scan"))
         .and_then(|line| line.split('\t').next())
         .unwrap()
         .to_string();

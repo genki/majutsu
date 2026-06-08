@@ -457,6 +457,10 @@ mj op show <op-id>
 mj op restore <op-id>
 ```
 
+The first baseline snapshot is recorded as `initial-scan`. Later manual
+snapshots are recorded as `manual-snapshot`, while watch-created snapshots are
+recorded as `file-events-batch`.
+
 Diff the current snapshot against its parent:
 
 ```sh
