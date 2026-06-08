@@ -7956,6 +7956,75 @@ fn fsck_detects_broken_remote_ref_cache() {
 }
 
 #[test]
+fn clone_rejects_remote_metadata_with_invalid_refs_without_creating_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone_state = tmp.path().join("clone-state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let metadata_path = walkdir::WalkDir::new(&remote)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_type().is_file()
+                && entry.path().to_string_lossy().contains("/hosts/")
+                && entry
+                    .path()
+                    .to_string_lossy()
+                    .ends_with("metadata/export.json")
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .unwrap();
+    let mut export: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    export["refs"]["legacy"] = serde_json::Value::String("snap-legacy".into());
+    fs::write(&metadata_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_state)
+            .arg("clone")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone_state.exists());
+}
+
+#[test]
 fn fsck_detects_broken_history_graph() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

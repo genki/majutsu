@@ -2272,6 +2272,20 @@ fn validate_clone_host_summary(
 
 fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
     let mut issues = Vec::new();
+    let snapshot_ids = export
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .collect::<BTreeSet<_>>();
+    for issue in majutsu_db::local_ref_issues(
+        export
+            .refs
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+        &snapshot_ids,
+    ) {
+        issues.push(issue.message());
+    }
     for operation in &export.operations {
         for issue in operation.validation_issues() {
             issues.push(format_operation_entry_issue(operation, issue));
