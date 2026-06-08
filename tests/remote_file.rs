@@ -9051,9 +9051,16 @@ fn restore_prepare_requests_s3_archive_restore_via_provider() {
             let first = header.lines().next().unwrap_or("").to_string();
             let body = String::from_utf8_lossy(&request[header_end..]).to_string();
             let saw_restore_request = first.starts_with("POST ") && first.contains("?restore");
+            let status = if first.starts_with("HEAD ")
+                && first.contains("/archive-bucket/majutsu/v1/objects/blobs/")
+            {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
             seen.push((first, body));
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
                 .unwrap();
             if saw_restore_request {
                 break;
@@ -9109,8 +9116,9 @@ signature_version = "s3v4"
     assert!(
         restore_request
             .0
-            .contains("/archive-bucket/majutsu/v1/objects/blobs/")
+            .contains("/archive-bucket/majutsu/v1/blobs/loose/")
     );
+    assert!(restore_request.0.contains(".blob.enc?restore"));
     assert!(restore_request.1.contains("<Days>7</Days>"));
     assert!(restore_request.1.contains("<Tier>Standard</Tier>"));
 }
