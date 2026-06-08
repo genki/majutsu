@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, params};
+use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, IsTerminal};
+#[cfg(unix)]
+use std::mem;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::Path;
-#[cfg(unix)]
-use std::{io, mem};
+use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
 use crate::cli::{DiffArgs, LogArgs, OpCommand};
@@ -33,28 +36,56 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     let event_count = event_journal_records(paths)?.len();
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let width = terminal_width();
+    let height = terminal_height();
+    let mut output = String::new();
 
-    println!("Status");
-    print_kv(width, "Current snapshot", current_label);
-    print_kv(width, "Roots", &roots.len().to_string());
-    print_kv(width, "Remote", remote.summary());
-    print_kv(width, "Queued uploads", &upload_stats.total.to_string());
-    print_kv(width, "State usage", &format_bytes(storage.state_bytes));
-    println!();
+    writeln!(output, "Status").expect("write status output");
+    print_kv(&mut output, width, "Current snapshot", current_label);
+    print_kv(&mut output, width, "Roots", &roots.len().to_string());
+    print_kv(&mut output, width, "Remote", remote.summary());
+    print_kv(
+        &mut output,
+        width,
+        "Queued uploads",
+        &upload_stats.total.to_string(),
+    );
+    print_kv(
+        &mut output,
+        width,
+        "State usage",
+        &format_bytes(storage.state_bytes),
+    );
+    writeln!(output).expect("write status output");
 
-    println!("Host");
-    print_kv(width, "Name", &config.host.name);
-    print_kv(width, "ID", &config.host.id);
-    print_kv(width, "Home", &paths.home.display().to_string());
-    print_kv(width, "Config", &paths.config.display().to_string());
-    print_kv(width, "Database", &paths.db.display().to_string());
-    println!();
+    writeln!(output, "Host").expect("write status output");
+    print_kv(&mut output, width, "Name", &config.host.name);
+    print_kv(&mut output, width, "ID", &config.host.id);
+    print_kv(
+        &mut output,
+        width,
+        "Home",
+        &paths.home.display().to_string(),
+    );
+    print_kv(
+        &mut output,
+        width,
+        "Config",
+        &paths.config.display().to_string(),
+    );
+    print_kv(
+        &mut output,
+        width,
+        "Database",
+        &paths.db.display().to_string(),
+    );
+    writeln!(output).expect("write status output");
 
-    print_remote_section(width, &remote);
-    println!();
+    print_remote_section(&mut output, width, &remote);
+    writeln!(output).expect("write status output");
 
-    println!("Configuration");
+    writeln!(output, "Configuration").expect("write status output");
     print_table(
+        &mut output,
         width,
         &["AREA", "SETTING", "VALUE"],
         &[
@@ -98,28 +129,32 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
             ],
         ],
     );
-    println!();
+    writeln!(output).expect("write status output");
 
-    println!("Roots");
+    writeln!(output, "Roots").expect("write status output");
     if roots.is_empty() {
-        println!("  (none)");
+        writeln!(output, "  (none)").expect("write status output");
     } else {
         let (id_width, status_width) = root_table_widths(width);
-        println!(
+        writeln!(
+            output,
             "  {:<id_width$} {:<status_width$} PATH",
             "ID",
             "STATUS",
             id_width = id_width,
             status_width = status_width
-        );
-        println!(
+        )
+        .expect("write status output");
+        writeln!(
+            output,
             "  {:<id_width$} {:<status_width$} {}",
             "-".repeat(id_width),
             "-".repeat(status_width),
             "-".repeat(4),
             id_width = id_width,
             status_width = status_width
-        );
+        )
+        .expect("write status output");
     }
     for root in &roots {
         let state = if root.status == "active" && !root.path.exists() {
@@ -127,12 +162,19 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
         } else {
             root.status.as_str()
         };
-        print_root_row(width, &root.id, state, &root.path.display().to_string());
+        print_root_row(
+            &mut output,
+            width,
+            &root.id,
+            state,
+            &root.path.display().to_string(),
+        );
     }
-    println!();
+    writeln!(output).expect("write status output");
 
-    println!("Metadata");
+    writeln!(output, "Metadata").expect("write status output");
     print_table(
+        &mut output,
         width,
         &["ITEM", "COUNT", "LOGICAL SIZE"],
         &[
@@ -163,10 +205,11 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
             ["remote refs", &db_stats.remote_refs.to_string(), "-"],
         ],
     );
-    println!();
+    writeln!(output).expect("write status output");
 
-    println!("Storage");
+    writeln!(output, "Storage").expect("write status output");
     print_table(
+        &mut output,
         width,
         &["SCOPE", "FILES", "SIZE"],
         &[
@@ -192,10 +235,11 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
             ],
         ],
     );
-    println!();
+    writeln!(output).expect("write status output");
 
-    println!("Queues");
+    writeln!(output, "Queues").expect("write status output");
     print_table(
+        &mut output,
         width,
         &["QUEUE", "ITEMS", "DETAILS"],
         &[
@@ -227,19 +271,25 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
             ],
         ],
     );
-    println!();
+    writeln!(output).expect("write status output");
 
-    println!("Machine");
-    println!("current {current_label}");
+    writeln!(output, "Machine").expect("write status output");
+    writeln!(output, "current {current_label}").expect("write status output");
+    emit_status_output(&output, height)?;
     Ok(())
 }
 
-fn print_kv(width: usize, key: &str, value: &str) {
+fn print_kv(out: &mut String, width: usize, key: &str, value: &str) {
     let prefix = format!("  {key:<18} ");
-    print_wrapped(&prefix, value, width);
+    print_wrapped(out, &prefix, value, width);
 }
 
-fn print_table<const N: usize>(width: usize, headers: &[&str; N], rows: &[[&str; N]]) {
+fn print_table<const N: usize>(
+    out: &mut String,
+    width: usize,
+    headers: &[&str; N],
+    rows: &[[&str; N]],
+) {
     let mut widths = [0usize; N];
     for (i, column_width) in widths.iter_mut().enumerate() {
         *column_width = headers[i].len();
@@ -257,32 +307,39 @@ fn print_table<const N: usize>(width: usize, headers: &[&str; N], rows: &[[&str;
             .max(12);
         widths[N - 1] = widths[N - 1].min(max_last);
     }
-    print!("  ");
+    write!(out, "  ").expect("write status output");
     for (i, column_width) in widths.iter().enumerate() {
         if i > 0 {
-            print!("  ");
+            write!(out, "  ").expect("write status output");
         }
-        print!("{:<width$}", headers[i], width = *column_width);
+        write!(out, "{:<width$}", headers[i], width = *column_width).expect("write status output");
     }
-    println!();
-    print!("  ");
+    writeln!(out).expect("write status output");
+    write!(out, "  ").expect("write status output");
     for (i, column_width) in widths.iter().enumerate() {
         if i > 0 {
-            print!("  ");
+            write!(out, "  ").expect("write status output");
         }
-        print!(
+        write!(
+            out,
             "{:<width$}",
             "-".repeat(*column_width),
             width = *column_width
-        );
+        )
+        .expect("write status output");
     }
-    println!();
+    writeln!(out).expect("write status output");
     for row in rows {
-        print_table_row(row, &widths, width);
+        print_table_row(out, row, &widths, width);
     }
 }
 
-fn print_table_row<const N: usize>(row: &[&str; N], widths: &[usize; N], terminal_width: usize) {
+fn print_table_row<const N: usize>(
+    out: &mut String,
+    row: &[&str; N],
+    widths: &[usize; N],
+    terminal_width: usize,
+) {
     let mut line_prefix = String::from("  ");
     for i in 0..N.saturating_sub(1) {
         if i > 0 {
@@ -292,20 +349,20 @@ fn print_table_row<const N: usize>(row: &[&str; N], widths: &[usize; N], termina
     }
     if N > 1 {
         line_prefix.push_str("  ");
-        print_wrapped(&line_prefix, row[N - 1], terminal_width);
+        print_wrapped(out, &line_prefix, row[N - 1], terminal_width);
     } else if let Some(value) = row.first() {
-        print_wrapped(&line_prefix, value, terminal_width);
+        print_wrapped(out, &line_prefix, value, terminal_width);
     }
 }
 
-fn print_root_row(width: usize, id: &str, state: &str, path: &str) {
+fn print_root_row(out: &mut String, width: usize, id: &str, state: &str, path: &str) {
     let (id_width, status_width) = root_table_widths(width);
     let prefix = format!(
         "  {id:<id_width$} {state:<status_width$} ",
         id_width = id_width,
         status_width = status_width
     );
-    print_wrapped(&prefix, path, width);
+    print_wrapped(out, &prefix, path, width);
 }
 
 fn root_table_widths(width: usize) -> (usize, usize) {
@@ -318,17 +375,17 @@ fn root_table_widths(width: usize) -> (usize, usize) {
     }
 }
 
-fn print_wrapped(prefix: &str, value: &str, width: usize) {
+fn print_wrapped(out: &mut String, prefix: &str, value: &str, width: usize) {
     let available = width.saturating_sub(prefix.len()).max(16);
     let lines = wrap_text(value, available);
     if let Some((first, rest)) = lines.split_first() {
-        println!("{prefix}{first}");
+        writeln!(out, "{prefix}{first}").expect("write status output");
         let continuation = " ".repeat(prefix.len());
         for line in rest {
-            println!("{continuation}{line}");
+            writeln!(out, "{continuation}{line}").expect("write status output");
         }
     } else {
-        println!("{prefix}");
+        writeln!(out, "{prefix}").expect("write status output");
     }
 }
 
@@ -369,12 +426,65 @@ fn terminal_width() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|width| *width >= 40)
-        .or_else(detect_terminal_width)
+        .or_else(|| detect_terminal_size().map(|size| size.cols))
         .unwrap_or(100)
 }
 
+fn terminal_height() -> usize {
+    std::env::var("LINES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|height| *height >= 5)
+        .or_else(|| detect_terminal_size().map(|size| size.rows))
+        .unwrap_or(24)
+}
+
+fn emit_status_output(output: &str, height: usize) -> Result<()> {
+    if should_page_status(output, height) && write_to_pager(output).is_ok() {
+        return Ok(());
+    }
+    print!("{output}");
+    Ok(())
+}
+
+fn should_page_status(output: &str, height: usize) -> bool {
+    io::stdout().is_terminal() && output.lines().count() > height
+}
+
+fn write_to_pager(output: &str) -> Result<()> {
+    let pager = std::env::var("MJ_PAGER")
+        .or_else(|_| std::env::var("PAGER"))
+        .unwrap_or_else(|_| "less -R".into());
+    let mut parts = pager.split_whitespace();
+    let Some(program) = parts.next() else {
+        bail!("pager command is empty");
+    };
+    let mut child = Command::new(program)
+        .args(parts)
+        .env(
+            "LESS",
+            std::env::var("LESS").unwrap_or_else(|_| "-R".into()),
+        )
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("start pager: {pager}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        std::io::Write::write_all(stdin, output.as_bytes()).context("write status to pager")?;
+    }
+    let status = child.wait().context("wait for pager")?;
+    if !status.success() {
+        bail!("pager exited with {status}");
+    }
+    Ok(())
+}
+
+struct TerminalSize {
+    cols: usize,
+    rows: usize,
+}
+
 #[cfg(unix)]
-fn detect_terminal_width() -> Option<usize> {
+fn detect_terminal_size() -> Option<TerminalSize> {
     #[repr(C)]
     struct Winsize {
         ws_row: libc::c_ushort,
@@ -391,15 +501,18 @@ fn detect_terminal_width() -> Option<usize> {
             &mut winsize as *mut Winsize,
         )
     };
-    if result == 0 && winsize.ws_col >= 40 {
-        Some(winsize.ws_col as usize)
+    if result == 0 && winsize.ws_col >= 40 && winsize.ws_row >= 5 {
+        Some(TerminalSize {
+            cols: winsize.ws_col as usize,
+            rows: winsize.ws_row as usize,
+        })
     } else {
         None
     }
 }
 
 #[cfg(not(unix))]
-fn detect_terminal_width() -> Option<usize> {
+fn detect_terminal_size() -> Option<TerminalSize> {
     None
 }
 
@@ -615,21 +728,22 @@ fn read_remote_status(config: &Config) -> Result<RemoteStatus> {
     }
 }
 
-fn print_remote_section(width: usize, remote: &RemoteStatus) {
-    println!("Remote");
-    print_kv(width, "Configured", &remote.configured.to_string());
-    print_kv(width, "Backend", &remote.backend);
+fn print_remote_section(out: &mut String, width: usize, remote: &RemoteStatus) {
+    writeln!(out, "Remote").expect("write status output");
+    print_kv(out, width, "Configured", &remote.configured.to_string());
+    print_kv(out, width, "Backend", &remote.backend);
     if let Some(url) = &remote.url {
-        print_kv(width, "URL", url);
+        print_kv(out, width, "URL", url);
     }
     if let Some(resolved) = &remote.resolved {
-        print_kv(width, "Resolved", resolved);
+        print_kv(out, width, "Resolved", resolved);
     }
     if let Some(error) = &remote.open_error {
-        print_kv(width, "Open error", error);
+        print_kv(out, width, "Open error", error);
     }
     if remote.lifecycle_rules.is_some() {
         print_table(
+            out,
             width,
             &["CAPABILITY", "SUPPORTED"],
             &[
