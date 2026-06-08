@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{start_daemon_ipc, start_watch_daemon};
 use crate::process_runtime::acquire_process_lock;
-use crate::queue_runtime::record_event;
+use crate::queue_runtime::{record_event, record_file_event};
 use crate::root_state::roots;
 use crate::{
     AutoSyncResult, ensure_ready, open_db, replay_pending_journal_events, snapshot,
@@ -178,8 +179,7 @@ fn watch_notify_loop<W: Watcher>(
                 continue;
             }
         };
-        let detail = format_notify_event(&event);
-        record_event(paths, "fs-event", &detail)?;
+        record_notify_event(paths, backend_label, &active_roots, &event)?;
         if args.mode == "strict" {
             snapshot_and_maybe_sync(
                 paths,
@@ -194,7 +194,7 @@ fn watch_notify_loop<W: Watcher>(
         }
         let debounce = std::time::Duration::from_millis(args.debounce_ms.max(1));
         let settle = std::time::Duration::from_millis(args.settle_ms);
-        drain_watch_debounce(paths, &rx, debounce)?;
+        drain_watch_debounce(paths, &rx, debounce, backend_label, &active_roots)?;
         if !settle.is_zero() {
             record_event(
                 paths,
@@ -204,8 +204,8 @@ fn watch_notify_loop<W: Watcher>(
             loop {
                 match rx.recv_timeout(settle) {
                     Ok(Ok(next)) => {
-                        record_event(paths, "fs-event", &format_notify_event(&next))?;
-                        drain_watch_debounce(paths, &rx, debounce)?;
+                        record_notify_event(paths, backend_label, &active_roots, &next)?;
+                        drain_watch_debounce(paths, &rx, debounce, backend_label, &active_roots)?;
                         record_event(
                             paths,
                             "watch-settle",
@@ -278,6 +278,10 @@ pub fn recv_watch_event(
 }
 
 pub fn format_notify_event(event: &notify::Event) -> String {
+    format!("{} {}", notify_event_kind(event), notify_event_paths(event))
+}
+
+fn notify_event_kind(event: &notify::Event) -> &'static str {
     let kind = match &event.kind {
         EventKind::Create(_) => "create",
         EventKind::Modify(_) => "modify",
@@ -286,24 +290,77 @@ pub fn format_notify_event(event: &notify::Event) -> String {
         EventKind::Other => "other",
         _ => "unknown",
     };
-    let paths = event
+    kind
+}
+
+fn notify_event_paths(event: &notify::Event) -> String {
+    event
         .paths
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
-        .join(",");
-    format!("{kind} {paths}")
+        .join(",")
+}
+
+fn record_notify_event(
+    paths: &Paths,
+    backend_label: &str,
+    active_roots: &[RootConfig],
+    event: &notify::Event,
+) -> Result<()> {
+    let detail = format_notify_event(event);
+    let event_kind = notify_event_kind(event);
+    let mut recorded = false;
+    for path in &event.paths {
+        if let Some((root_id, relative_path)) = event_path_for_roots(active_roots, path) {
+            record_file_event(
+                paths,
+                &root_id,
+                &relative_path,
+                event_kind,
+                backend_label,
+                &detail,
+            )?;
+            recorded = true;
+        }
+    }
+    if !recorded {
+        record_event(paths, "fs-event", &detail)?;
+    }
+    Ok(())
+}
+
+fn event_path_for_roots(active_roots: &[RootConfig], path: &Path) -> Option<(String, String)> {
+    active_roots.iter().find_map(|root| {
+        path.strip_prefix(&root.path).ok().map(|relative| {
+            let relative = if relative.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                slash_path(relative)
+            };
+            (root.id.clone(), relative)
+        })
+    })
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn drain_watch_debounce(
     paths: &Paths,
     rx: &mpsc::Receiver<notify::Result<notify::Event>>,
     debounce: Duration,
+    backend_label: &str,
+    active_roots: &[RootConfig],
 ) -> Result<()> {
     loop {
         match rx.recv_timeout(debounce) {
             Ok(Ok(next)) => {
-                record_event(paths, "fs-event", &format_notify_event(&next))?;
+                record_notify_event(paths, backend_label, active_roots, &next)?;
             }
             Ok(Err(err)) => return Err(err.into()),
             Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),

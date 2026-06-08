@@ -769,6 +769,10 @@ debounced snapshots are created. On watch startup, majutsu scans the journal for
 filesystem events newer than the last `snapshot-finish` record and creates a
 replay snapshot before waiting for new events.
 
+Filesystem event records keep the raw human-readable `detail` field and also
+store structured watch fields when a path can be matched to a configured root:
+`root_id`, root-relative `path`, `event_kind`, and `raw_backend`.
+
 ## Safety Notes
 
 - Missing roots are skipped and logged as `root-missing`; they are not treated

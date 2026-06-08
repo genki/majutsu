@@ -9415,6 +9415,9 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         .join("\n");
     assert!(events.contains("watch-settle"));
     assert!(events.contains("settle_ms=50"));
+    assert!(events.contains("\"root_id\": \"sample\""));
+    assert!(events.contains("\"path\": \"alpha.txt\""));
+    assert!(events.contains("\"raw_backend\": \"notify\""));
 }
 
 #[test]

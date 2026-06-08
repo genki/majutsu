@@ -157,13 +157,41 @@ fn retry_backoff_secs(attempts: u32) -> i64 {
 }
 
 pub(crate) fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {
+    write_event_record(
+        paths,
+        EventJournalRecord::new(
+            new_id("event"),
+            kind.to_string(),
+            Utc::now(),
+            detail.to_string(),
+        ),
+    )
+}
+
+pub(crate) fn record_file_event(
+    paths: &Paths,
+    root_id: &str,
+    path: &str,
+    event_kind: &str,
+    raw_backend: &str,
+    detail: &str,
+) -> Result<()> {
+    write_event_record(
+        paths,
+        EventJournalRecord::new_file_event(
+            new_id("event"),
+            Utc::now(),
+            detail.to_string(),
+            root_id.to_string(),
+            path.to_string(),
+            event_kind.to_string(),
+            raw_backend.to_string(),
+        ),
+    )
+}
+
+fn write_event_record(paths: &Paths, event: EventJournalRecord) -> Result<()> {
     fs::create_dir_all(&paths.event_queue)?;
-    let event = EventJournalRecord::new(
-        new_id("event"),
-        kind.to_string(),
-        Utc::now(),
-        detail.to_string(),
-    );
     let path = paths.event_queue.join(format!("{}.json", event.event_id));
     fs::write(path, serde_json::to_vec_pretty(&event)?)?;
     Ok(())

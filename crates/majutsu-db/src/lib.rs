@@ -180,6 +180,14 @@ pub struct EventJournalRecord {
     pub kind: String,
     pub observed_at: DateTime<Utc>,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +204,31 @@ impl EventJournalRecord {
             kind,
             observed_at,
             detail,
+            root_id: None,
+            path: None,
+            event_kind: None,
+            raw_backend: None,
+        }
+    }
+
+    pub fn new_file_event(
+        event_id: String,
+        observed_at: DateTime<Utc>,
+        detail: String,
+        root_id: String,
+        path: String,
+        event_kind: String,
+        raw_backend: String,
+    ) -> Self {
+        Self {
+            event_id,
+            kind: "fs-event".into(),
+            observed_at,
+            detail,
+            root_id: Some(root_id),
+            path: Some(path),
+            event_kind: Some(event_kind),
+            raw_backend: Some(raw_backend),
         }
     }
 
@@ -650,6 +683,27 @@ mod tests {
                 EventJournalRecordIssue::EmptyDetail,
             ]
         );
+    }
+
+    #[test]
+    fn event_journal_file_event_preserves_structured_watch_fields() {
+        let event = EventJournalRecord::new_file_event(
+            "event-1".into(),
+            time(10),
+            "modify /tmp/source/alpha.txt".into(),
+            "docs".into(),
+            "alpha.txt".into(),
+            "modify".into(),
+            "inotify".into(),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+
+        assert!(json.contains("\"kind\":\"fs-event\""));
+        assert!(json.contains("\"root_id\":\"docs\""));
+        assert!(json.contains("\"path\":\"alpha.txt\""));
+        assert!(json.contains("\"event_kind\":\"modify\""));
+        assert!(json.contains("\"raw_backend\":\"inotify\""));
+        assert!(event.validation_issues().is_empty());
     }
 
     #[test]
