@@ -2027,6 +2027,7 @@ fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     validate_clone_host_summary(&metadata.host, metadata.host_index, &export)?;
     validate_clone_metadata(&export)?;
     validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
+    validate_clone_remote_gc_mark(&remote, metadata.host.as_ref(), &export)?;
     ensure_clone_objects_available(&remote, &export)?;
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
@@ -2318,6 +2319,31 @@ fn validate_clone_remote_refs(
             ),
             None => bail!("remote is missing canonical host last-synced ref {key}"),
         }
+    }
+    Ok(())
+}
+
+fn validate_clone_remote_gc_mark(
+    remote: &RemoteStore,
+    host: Option<&RemoteHostSummary>,
+    export: &MetadataExport,
+) -> Result<()> {
+    let Some(host) = host else {
+        return Ok(());
+    };
+    let key = remote_gc_mark_key(&host.id);
+    if !remote.exists(&key)? {
+        bail!("remote is missing gc mark {key}");
+    }
+    let mark: GcMarkExport = serde_json::from_slice(&remote.get(&key)?)
+        .with_context(|| format!("parse remote gc mark {key}"))?;
+    let mut expected = local_object_keys(export);
+    for object_key in expected.clone() {
+        expected.extend(canonical_remote_aliases(&object_key));
+    }
+    let expected = expected.into_iter().collect::<BTreeSet<_>>();
+    for issue in mark.validation_issues(&host.id, export.refs.get("current"), &expected) {
+        bail!("{}", issue.message(&key, &host.id));
     }
     Ok(())
 }

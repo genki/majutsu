@@ -2463,6 +2463,67 @@ fn remote_fsck_detects_unexpected_gc_mark_object() {
 }
 
 #[test]
+fn clone_rejects_unexpected_gc_mark_object_without_creating_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let mark_path = find_file_ending(&remote.join("gc/marks"), ".json");
+    let mut mark: serde_json::Value =
+        serde_json::from_slice(&fs::read(&mark_path).unwrap()).unwrap();
+    mark["object_keys"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::Value::String("objects/stale/object".into()));
+    fs::write(&mark_path, serde_json::to_vec_pretty(&mark).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone.exists());
+}
+
+#[test]
 fn remote_fsck_detects_missing_canonical_operation_log() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
