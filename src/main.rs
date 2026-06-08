@@ -698,7 +698,7 @@ fn log_ops(paths: &Paths, args: LogArgs) -> Result<()> {
 
 fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let mut stmt = conn.prepare(
-        "select id, kind, before_snapshot, after_snapshot, created_at, message
+        "select id, kind, before_snapshot, after_snapshot, created_at, message, status, remote_sync_state
          from operations order by rowid desc",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -709,11 +709,13 @@ fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
             row.get::<_, Option<String>>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     let mut printed = 0usize;
     for row in rows {
-        let (id, kind, before, after, created, message) = row?;
+        let (id, kind, before, after, created, message, status, remote_sync_state) = row?;
         if let Some(root) = &args.root {
             let matches_root = message.as_deref() == Some(root)
                 || before
@@ -732,7 +734,8 @@ fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
             break;
         }
         println!(
-            "{id}\t{created}\t{kind}\t{} -> {}\t{}",
+            "{id}\t{created}\t{kind}\t{status}\t{}\t{} -> {}\t{}",
+            remote_sync_state.unwrap_or_else(|| "-".into()),
             before.unwrap_or_default(),
             after.unwrap_or_default(),
             message.unwrap_or_default()

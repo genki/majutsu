@@ -4502,16 +4502,18 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
         local_oplog_record_count(&state) as i64,
         db_total_operation_count(&state)
     );
-    let failed_sync_op = output({
+    let failed_sync_log = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("op").arg("log");
         c
-    })
-    .lines()
-    .find(|line| line.contains("remote-sync"))
-    .and_then(|line| line.split('\t').next())
-    .unwrap()
-    .to_string();
+    });
+    let failed_sync_line = failed_sync_log
+        .lines()
+        .find(|line| line.contains("remote-sync"))
+        .unwrap()
+        .to_string();
+    assert!(failed_sync_line.contains("\tfailed\tfailed\t"));
+    let failed_sync_op = failed_sync_line.split('\t').next().unwrap().to_string();
     let failed_sync_show = output({
         let mut c = mj();
         c.arg("--home")
@@ -4544,13 +4546,14 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
         c.arg("--home").arg(&state).arg("op").arg("log");
         c
     });
-    let successful_sync_op = sync_log
+    let successful_sync_line = sync_log
         .lines()
         .filter(|line| line.contains("remote-sync"))
         .next()
-        .and_then(|line| line.split('\t').next())
         .unwrap()
         .to_string();
+    assert!(successful_sync_line.contains("\tdone\tsynced\t"));
+    let successful_sync_op = successful_sync_line.split('\t').next().unwrap().to_string();
     let successful_sync_show = output({
         let mut c = mj();
         c.arg("--home")
