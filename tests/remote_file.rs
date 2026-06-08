@@ -10325,6 +10325,86 @@ fn large_pin_filters_by_root_and_since() {
 }
 
 #[test]
+fn large_unpin_older_than_removes_only_old_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("payload.bin"), vec![7u8; 16 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--large-always")
+            .arg("*.bin");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
+    fs::write(source.join("payload.bin"), vec![8u8; 16 * 1024]).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let old_oid: String = conn
+        .query_row(
+            "select oid from large_pins order by oid limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "update large_pins set pinned_at=?2 where oid=?1",
+        rusqlite::params![old_oid, "2000-01-01T00:00:00+00:00"],
+    )
+    .unwrap();
+
+    let unpin = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("large")
+            .arg("unpin")
+            .arg("--older-than")
+            .arg("30d");
+        c
+    });
+    assert!(unpin.contains("unpinned 1"));
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("stat");
+        c
+    });
+    assert!(stat.contains("large_objects 2"));
+    assert!(stat.contains("pinned 1"));
+}
+
+#[test]
 fn large_verify_rejects_dangling_pins() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
