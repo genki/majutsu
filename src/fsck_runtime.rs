@@ -1473,6 +1473,7 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                     }
                 }
             }
+            validate_remote_host_ref_prefix(remote, &host.id, &mut missing)?;
             for snapshot in &export.snapshots {
                 let key = host_snapshot_canonical_key(&host.id, &snapshot.id);
                 if !remote.exists(&key)? {
@@ -1709,6 +1710,26 @@ fn validate_remote_host_prefix_hosts(
         {
             *missing += 1;
             eprintln!("remote hosts prefix references unknown host {host_id}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_host_ref_prefix(
+    remote: &RemoteStore,
+    host_id: &str,
+    missing: &mut usize,
+) -> Result<()> {
+    let expected_ref_keys = [
+        host_current_ref_key(host_id),
+        host_last_synced_ref_key(host_id),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for key in remote.list(&format!("hosts/{host_id}/refs/"))? {
+        if !expected_ref_keys.contains(&key) {
+            *missing += 1;
+            eprintln!("unexpected remote host ref {key}");
         }
     }
     Ok(())

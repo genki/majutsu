@@ -2321,6 +2321,17 @@ fn validate_clone_remote_refs(
     let Some(host) = host else {
         return Ok(());
     };
+    let expected_ref_keys = [
+        host_current_ref_key(&host.id),
+        host_last_synced_ref_key(&host.id),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for key in remote.list(&format!("hosts/{}/refs/", host.id))? {
+        if !expected_ref_keys.contains(&key) {
+            bail!("remote has unexpected host ref {key}");
+        }
+    }
     if let Some(current) = export.refs.get("current") {
         let key = host_current_ref_key(&host.id);
         match remote_ref(remote, &key)? {
