@@ -769,8 +769,8 @@ fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
             let op = query_operation(&conn, &op_id)?;
             let before = current_snapshot(&conn)?;
             let snapshot = op
-                .after_snapshot
-                .or(op.before_snapshot)
+                .before_snapshot
+                .or(op.after_snapshot)
                 .ok_or_else(|| anyhow!("operation has no snapshot to restore: {op_id}"))?;
             conn.execute(
                 "insert into refs(name, value) values ('current', ?1)

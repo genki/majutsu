@@ -6409,10 +6409,10 @@ fn op_restore_moves_current_ref_to_operation_snapshot() {
         c.arg("--home").arg(&state).arg("op").arg("log");
         c
     });
-    let first_snapshot_op = op_log
+    let second_snapshot_op = op_log
         .lines()
-        .filter(|line| line.contains("initial-scan"))
-        .find(|line| line.contains(&format!(" -> {first_snapshot}\t")))
+        .filter(|line| line.contains("manual-snapshot"))
+        .find(|line| line.contains(&format!("{first_snapshot} -> {second_snapshot}\t")))
         .and_then(|line| line.split('\t').next())
         .unwrap()
         .to_string();
@@ -6423,7 +6423,7 @@ fn op_restore_moves_current_ref_to_operation_snapshot() {
             .arg(&state)
             .arg("op")
             .arg("restore")
-            .arg(&first_snapshot_op);
+            .arg(&second_snapshot_op);
         c
     });
     assert!(restore_out.contains(&format!("current {first_snapshot}")));
