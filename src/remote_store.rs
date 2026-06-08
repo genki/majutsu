@@ -20,6 +20,35 @@ use crate::config::{RemoteConfig, default_large_max_parallel_uploads};
 
 pub(crate) const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 pub(crate) const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_LOCAL_MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_CLOUD_MULTIPART_PART_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_MULTIPART_PARTS: usize = 10_000;
+
+pub(crate) fn adaptive_multipart_part_size(len: usize, endpoint: &str) -> usize {
+    let requested = env::var("MAJUTSU_S3_MULTIPART_PART_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| default_part_size_for_endpoint(endpoint));
+    let max_parts = env::var("MAJUTSU_S3_MAX_MULTIPART_PARTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_MULTIPART_PARTS);
+    let required = len.div_ceil(max_parts).max(MIN_MULTIPART_PART_SIZE);
+    requested.max(required).max(MIN_MULTIPART_PART_SIZE)
+}
+
+fn default_part_size_for_endpoint(endpoint: &str) -> usize {
+    let endpoint = endpoint.to_ascii_lowercase();
+    if endpoint.contains("127.0.0.1")
+        || endpoint.contains("localhost")
+        || endpoint.contains("minio")
+    {
+        DEFAULT_LOCAL_MULTIPART_PART_SIZE
+    } else {
+        DEFAULT_CLOUD_MULTIPART_PART_SIZE
+    }
+}
 
 pub(crate) enum RemoteStore {
     File(FileRemote),
@@ -357,8 +386,9 @@ impl S3Remote {
         upload_id: &str,
         bytes: &[u8],
     ) -> Result<Vec<CompletedPart>> {
+        let part_size = self.multipart_part_size_for_len(bytes.len());
         let chunks = bytes
-            .chunks(MIN_MULTIPART_PART_SIZE)
+            .chunks(part_size)
             .enumerate()
             .map(|(idx, chunk)| (idx + 1, chunk))
             .collect::<Vec<_>>();
@@ -391,6 +421,10 @@ impl S3Remote {
             parts.extend(batch_parts);
         }
         Ok(parts)
+    }
+
+    fn multipart_part_size_for_len(&self, len: usize) -> usize {
+        adaptive_multipart_part_size(len, &self.endpoint)
     }
 
     pub(crate) fn multipart_initiate_headers(&self, key: &str) -> Result<Vec<(String, String)>> {
@@ -666,28 +700,56 @@ impl S3Remote {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
         let remote_prefix = self.remote_key(prefix);
-        let query = format!("prefix={}", uri_encode(&remote_prefix, true));
-        let url = format!(
-            "{}/{}/?{}",
-            self.endpoint.trim_end_matches('/'),
-            self.bucket,
-            query
-        );
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut query = canonical_query(&[
+                ("list-type", "2".to_string()),
+                ("prefix", remote_prefix.clone()),
+            ]);
+            if let Some(token) = continuation_token.as_deref() {
+                query = canonical_query(&[
+                    ("continuation-token", token.to_string()),
+                    ("list-type", "2".to_string()),
+                    ("prefix", remote_prefix.clone()),
+                ]);
+            }
+            let xml = self.list_objects_page(&query)?;
+            let page = parse_s3_list_objects_v2(&xml)?;
+            for key in page.keys {
+                if let Some(local) = self.local_key(&key) {
+                    keys.push(local);
+                }
+            }
+            if !page.is_truncated {
+                break;
+            }
+            continuation_token = page.next_continuation_token;
+            if continuation_token.is_none() {
+                bail!("s3 list response was truncated but did not include NextContinuationToken");
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    fn list_objects_page(&self, query: &str) -> Result<String> {
         let response = if self.uses_sigv2() {
             let date = http_date();
             let resource = format!("/{}/", self.bucket);
             let auth = self.auth_v2("GET", "", "", &date, &resource)?;
             self.client
-                .get(url)
+                .get(self.bucket_url_query(query))
                 .header(DATE, date)
                 .header(AUTHORIZATION, auth)
                 .send()?
         } else {
             let payload_hash = sha256_hex(b"");
-            let auth = self.auth_v4("GET", "", &query, &payload_hash, &[])?;
+            let auth = self.auth_v4("GET", "", query, &payload_hash, &[])?;
             self.client
-                .get(url)
+                .get(self.bucket_url_query(query))
                 .header(HOST, self.host_header()?)
                 .header("x-amz-date", auth.amz_date)
                 .header("x-amz-content-sha256", payload_hash)
@@ -697,27 +759,7 @@ impl S3Remote {
         if !response.status().is_success() {
             bail!("s3 list failed: HTTP {}", response.status());
         }
-        let xml = response.text()?;
-        let mut reader = Reader::from_str(&xml);
-        reader.config_mut().trim_text(true);
-        let mut in_key = false;
-        let mut keys = Vec::new();
-        loop {
-            match reader.read_event() {
-                Ok(Event::Start(e)) if e.name().as_ref() == b"Key" => in_key = true,
-                Ok(Event::End(e)) if e.name().as_ref() == b"Key" => in_key = false,
-                Ok(Event::Text(e)) if in_key => {
-                    let key = e.unescape()?.into_owned();
-                    if let Some(local) = self.local_key(&key) {
-                        keys.push(local);
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(err) => return Err(err.into()),
-                _ => {}
-            }
-        }
-        Ok(keys)
+        Ok(response.text()?)
     }
 
     fn auth_v2(
@@ -946,6 +988,55 @@ fn canonical_query(params: &[(&str, String)]) -> String {
         .join("&")
 }
 
+struct S3ListPage {
+    keys: Vec<String>,
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
+}
+
+fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut current = String::new();
+    let mut in_contents = false;
+    let mut keys = Vec::new();
+    let mut is_truncated = false;
+    let mut next_continuation_token = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) => {
+                current = std::str::from_utf8(event.name().as_ref())?.to_string();
+                if current == "Contents" {
+                    in_contents = true;
+                }
+            }
+            Ok(Event::End(event)) => {
+                if event.name().as_ref() == b"Contents" {
+                    in_contents = false;
+                }
+                current.clear();
+            }
+            Ok(Event::Text(text)) => {
+                let value = text.unescape()?.into_owned();
+                match current.as_str() {
+                    "Key" if in_contents => keys.push(value),
+                    "IsTruncated" => is_truncated = value == "true" || value == "1",
+                    "NextContinuationToken" => next_continuation_token = Some(value),
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => return Err(err.into()),
+            _ => {}
+        }
+    }
+    Ok(S3ListPage {
+        keys,
+        is_truncated,
+        next_continuation_token,
+    })
+}
+
 fn optional_env(name: &str) -> Result<Option<String>> {
     match env::var(name) {
         Ok(value) => {
@@ -1072,4 +1163,38 @@ fn xml_escape(input: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod storage_characteristic_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_part_size_prefers_smaller_local_parts_and_obeys_part_limit() {
+        assert_eq!(
+            adaptive_multipart_part_size(64 * 1024 * 1024, "http://127.0.0.1:9000"),
+            DEFAULT_LOCAL_MULTIPART_PART_SIZE
+        );
+        assert_eq!(
+            adaptive_multipart_part_size(64 * 1024 * 1024, "https://storage.googleapis.com"),
+            DEFAULT_CLOUD_MULTIPART_PART_SIZE
+        );
+        let huge = (DEFAULT_MAX_MULTIPART_PARTS + 1) * MIN_MULTIPART_PART_SIZE;
+        assert!(
+            adaptive_multipart_part_size(huge, "https://s3.amazonaws.com")
+                > MIN_MULTIPART_PART_SIZE
+        );
+    }
+
+    #[test]
+    fn parses_paginated_s3_list_v2_response() {
+        let xml = r#"<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>prefix/a</Key></Contents><Contents><Key>prefix/b</Key></Contents><NextContinuationToken>next-token</NextContinuationToken></ListBucketResult>"#;
+        let page = parse_s3_list_objects_v2(xml).unwrap();
+        assert!(page.is_truncated);
+        assert_eq!(
+            page.keys,
+            vec!["prefix/a".to_string(), "prefix/b".to_string()]
+        );
+        assert_eq!(page.next_continuation_token.as_deref(), Some("next-token"));
+    }
 }

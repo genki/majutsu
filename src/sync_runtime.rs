@@ -15,14 +15,16 @@ use majutsu_store::{
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::env;
 
-use crate::cli::SyncCommand;
+use crate::cli::{PackArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
 use crate::db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use crate::object_paths::local_object_keys;
 use crate::operation_log::{record_op_with_details, update_operation_result};
+use crate::pack_runtime::pack_cmd;
 use crate::queue_runtime::{
     drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, upload_queue_stats,
 };
@@ -92,6 +94,7 @@ fn sync_configured_remote(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
+    auto_pack_before_sync(paths, conn)?;
     let current = current_snapshot(conn)?;
     let previous_last_synced = ref_value(conn, "last-synced")?;
     let synced_at = Utc::now().to_rfc3339();
@@ -126,6 +129,26 @@ fn sync_configured_remote(
             Err(err)
         }
     }
+}
+
+fn auto_pack_before_sync(paths: &Paths, conn: &Connection) -> Result<()> {
+    if env::var("MAJUTSU_SYNC_AUTO_PACK").as_deref() == Ok("0") {
+        return Ok(());
+    }
+    let threshold = env::var("MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(128);
+    let unpacked_small_blobs: i64 = conn.query_row(
+        "select count(*) from blobs where pack_id is null and size <= 131072",
+        [],
+        |row| row.get(0),
+    )?;
+    if unpacked_small_blobs >= threshold {
+        println!("auto_pack unpacked_small_blobs {unpacked_small_blobs}");
+        pack_cmd(paths, PackArgs { compact: false })?;
+    }
+    Ok(())
 }
 
 fn enqueue_and_drain_sync(

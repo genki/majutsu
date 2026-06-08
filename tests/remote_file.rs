@@ -250,7 +250,11 @@ fn file_remote_clone_restores_normal_and_large_files() {
     );
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     let remote_check = output({
@@ -660,7 +664,11 @@ fn disaster_recovery_e2e_preserves_multi_root_large_dedup_and_packed_blobs() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     assert!(find_file_ending(&remote.join("packs/small"), ".mpack").exists());
@@ -1363,7 +1371,11 @@ fn remote_fsck_detects_missing_canonical_host_ref() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -1418,7 +1430,11 @@ fn remote_fsck_detects_unexpected_canonical_host_ref() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -1542,7 +1558,11 @@ fn remote_host_index_last_synced_matches_metadata_ref() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -1686,7 +1706,11 @@ fn remote_host_index_duplicate_id_is_rejected() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     fails({
@@ -1754,7 +1778,11 @@ fn remote_host_index_duplicate_metadata_key_is_rejected() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -1813,7 +1841,11 @@ fn remote_host_index_noncanonical_metadata_key_is_rejected() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     fails({
@@ -1895,7 +1927,11 @@ fn remote_fsck_accepts_canonical_only_payloads() {
 
     let fsck = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     assert!(fsck.contains("remote fsck ok"));
@@ -2278,7 +2314,11 @@ fn remote_fsck_detects_missing_canonical_object_alias() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -2325,7 +2365,11 @@ fn remote_fsck_detects_missing_chunk_index_shard() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -2441,7 +2485,11 @@ fn remote_fsck_detects_unexpected_chunk_index_shard() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -2621,7 +2669,11 @@ fn remote_fsck_and_clone_reject_corrupt_canonical_large_chunk_payload() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     fails({
@@ -2685,7 +2737,11 @@ fn remote_fsck_detects_corrupt_chunk_index_shard() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -2743,7 +2799,11 @@ fn remote_fsck_detects_missing_canonical_host_export() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -2791,7 +2851,11 @@ fn remote_fsck_detects_corrupt_gc_mark() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -2846,7 +2910,11 @@ fn remote_fsck_detects_unexpected_gc_mark_object() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -2959,7 +3027,11 @@ fn remote_fsck_detects_missing_canonical_operation_log() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3142,7 +3214,11 @@ fn remote_fsck_detects_unexpected_host_snapshot_export() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3277,7 +3353,11 @@ fn remote_fsck_detects_unexpected_host_operation_export() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3337,7 +3417,11 @@ fn remote_fsck_detects_corrupt_canonical_host_snapshot_export() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3388,7 +3472,11 @@ fn remote_fsck_detects_corrupt_snapshot_manifest_object() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3499,7 +3587,11 @@ fn remote_fsck_detects_dangling_blob_metadata() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3556,7 +3648,11 @@ fn remote_fsck_and_clone_reject_corrupt_loose_blob_object() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     fails({
@@ -3622,7 +3718,11 @@ fn remote_fsck_detects_unsupported_metadata_export_version() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3674,7 +3774,11 @@ fn remote_fsck_detects_invalid_metadata_refs() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -3726,7 +3830,11 @@ fn remote_fsck_detects_invalid_restore_archive_config() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -4287,7 +4395,11 @@ fn remote_fsck_detects_corrupt_canonical_tree_manifest_object() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -4826,7 +4938,7 @@ fn remote_check_uses_s3_range_get_probe() {
                 .map(|value| value.trim().to_string())
                 .unwrap_or_default();
             seen.push((first.clone(), range));
-            if first.starts_with("GET ") && first.contains("?prefix=") {
+            if first.starts_with("GET ") && first.contains("list-type=2") {
                 let body = concat!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                     "<ListBucketResult>",
@@ -6922,7 +7034,11 @@ fn remote_fsck_detects_corrupt_gc_tombstone() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -6982,7 +7098,11 @@ fn remote_fsck_detects_unknown_host_gc_mark() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -7031,7 +7151,11 @@ fn remote_fsck_detects_unknown_host_prefix_export() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -7090,7 +7214,11 @@ fn remote_fsck_detects_unknown_host_gc_tombstone() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -7690,7 +7818,11 @@ fn remote_fsck_detects_corrupt_canonical_pack_index() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -7822,7 +7954,11 @@ fn remote_fsck_detects_unexpected_canonical_pack_index() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -7956,7 +8092,11 @@ fn remote_fsck_detects_unexpected_canonical_pack_object() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -8646,14 +8786,22 @@ fn lifecycle_apply_stores_gcs_policy_and_remote_fsck_validates_it() {
 
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 
     fs::write(remote.join("lifecycle/policy-gcs.json"), br#"{"rules":[]}"#).unwrap();
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -8711,7 +8859,11 @@ fn remote_fsck_validates_lifecycle_artifacts() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 
@@ -8726,7 +8878,11 @@ fn remote_fsck_validates_lifecycle_artifacts() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     fails({
@@ -11035,7 +11191,11 @@ fn remote_fsck_rejects_dangling_large_pins() {
 
     fails({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
 }
@@ -11905,7 +12065,11 @@ fn large_files_can_use_content_defined_chunking() {
     assert!(remote.join("large/chunks/fastcdc").exists());
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
         c
     });
     run({

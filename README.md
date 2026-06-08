@@ -794,3 +794,16 @@ store structured watch fields when a path can be matched to a configured root:
 - Prefer `restore plan` before writing back to original roots.
 - Database directories, VM images, and live application state still require an
   application-consistent dump or filesystem snapshot before being watched.
+
+## moon root storage optimization
+
+Git working tree や小ファイルが多い root では、次の形を推奨する。
+
+```sh
+mj root add moon ~/moon --preset git-working-tree
+mj sync
+mj remote fsck
+mj remote fsck --deep
+```
+
+`mj sync` は小さな loose blob が多い場合に自動 pack してから upload する。S3 互換 remote の list は pagination に対応し、`remote fsck` は通常 quick mode、`--deep` 指定時のみ payload 検証を行う。調整項目は `docs/MOON_ROOT_STORAGE_OPTIMIZATION.md` を参照する。

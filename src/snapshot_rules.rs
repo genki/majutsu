@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -13,8 +13,138 @@ pub fn build_ignore(root: &RootConfig) -> Result<Gitignore> {
     let mut builder = GitignoreBuilder::new(&root.path);
     for pattern in &root.exclude {
         builder.add_line(None, pattern)?;
+        for expanded in expanded_directory_exclude_patterns(pattern) {
+            builder.add_line(None, &expanded)?;
+        }
     }
     Ok(builder.build()?)
+}
+
+pub fn expanded_directory_exclude_patterns(pattern: &str) -> Vec<String> {
+    let pattern = pattern.trim();
+    let Some(dir_pattern) = pattern.strip_suffix("/**") else {
+        return Vec::new();
+    };
+    let base = dir_pattern.trim_end_matches('/');
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    push_unique(&mut out, base.to_string());
+    let unanchored = base.trim_start_matches('/');
+    if !unanchored.is_empty() {
+        push_unique(&mut out, unanchored.to_string());
+    }
+    if let Some(inner) = unanchored.strip_prefix("**/") {
+        if !inner.is_empty() {
+            push_unique(&mut out, inner.to_string());
+            push_unique(&mut out, format!("/{inner}"));
+        }
+    } else if !unanchored.is_empty() {
+        push_unique(&mut out, format!("**/{unanchored}"));
+    }
+    out
+}
+
+pub fn root_preset_excludes(preset: &str) -> Result<Vec<String>> {
+    match preset {
+        "git" | "git-working-tree" => Ok(vec![
+            ".git/**",
+            "/.git/**",
+            "**/.git/**",
+            "node_modules/**",
+            "/node_modules/**",
+            "**/node_modules/**",
+            "target/**",
+            "/target/**",
+            "**/target/**",
+            "tmp/**",
+            "/tmp/**",
+            ".infracost/**",
+            "/.infracost/**",
+            ".backup-kubeconfig/**",
+            "/.backup-kubeconfig/**",
+            ".kubeconfig*",
+            "/.kubeconfig*",
+            "etc/keys/**",
+            "/etc/keys/**",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()),
+        "rust" => Ok(vec!["target/**", "/target/**", "**/target/**"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()),
+        "node" => Ok(
+            vec!["node_modules/**", "/node_modules/**", "**/node_modules/**"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        other => {
+            bail!("unknown root preset {other}; supported presets: git-working-tree, rust, node")
+        }
+    }
+}
+
+pub fn apply_root_presets(excludes: &mut Vec<String>, presets: &[String]) -> Result<()> {
+    for preset in presets {
+        for pattern in root_preset_excludes(preset)? {
+            push_unique(excludes, pattern);
+        }
+    }
+    dedup_patterns(excludes);
+    Ok(())
+}
+
+pub fn warn_sensitive_root_defaults(root_path: &Path, excludes: &[String]) {
+    for sensitive in [".git", ".infracost", ".backup-kubeconfig", "etc/keys"] {
+        if root_path.join(sensitive).exists() && !exclude_covers_path(excludes, sensitive) {
+            eprintln!(
+                "warning: root contains {sensitive}; consider --preset git-working-tree or --exclude '{sensitive}/**'"
+            );
+        }
+    }
+    if !exclude_covers_path(excludes, ".kubeconfig") {
+        let has_kubeconfig = std::fs::read_dir(root_path)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .any(|name| name.starts_with(".kubeconfig"));
+        if has_kubeconfig {
+            eprintln!(
+                "warning: root contains .kubeconfig*; consider --preset git-working-tree or --exclude '.kubeconfig*'"
+            );
+        }
+    }
+}
+
+fn exclude_covers_path(excludes: &[String], rel: &str) -> bool {
+    excludes.iter().any(|pattern| {
+        let pattern = pattern.trim();
+        pattern == rel
+            || pattern == format!("/{rel}")
+            || pattern == format!("{rel}/**")
+            || pattern == format!("/{rel}/**")
+            || pattern == format!("**/{rel}/**")
+            || path_pattern_match(pattern, rel)
+    })
+}
+
+fn push_unique(out: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !out.iter().any(|existing| existing == &value) {
+        out.push(value);
+    }
+}
+
+pub fn dedup_patterns(patterns: &mut Vec<String>) {
+    let mut deduped = Vec::with_capacity(patterns.len());
+    for pattern in patterns.drain(..) {
+        push_unique(&mut deduped, pattern);
+    }
+    *patterns = deduped;
 }
 
 pub fn is_included(patterns: &[String], rel: &Path) -> bool {
@@ -194,5 +324,33 @@ pub fn large_pointer_compression(config: &LargeConfig) -> String {
         format!("per-chunk:{}", config.compression.algorithm)
     } else {
         "none".into()
+    }
+}
+
+#[cfg(test)]
+mod moon_root_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn expands_directory_child_globs_to_directory_entries() {
+        let expanded = expanded_directory_exclude_patterns("**/.git/**");
+        assert!(expanded.contains(&".git".to_string()));
+        assert!(expanded.contains(&"/.git".to_string()));
+        assert!(expanded.contains(&"**/.git".to_string()));
+    }
+
+    #[test]
+    fn git_working_tree_preset_covers_moon_sensitive_paths() {
+        let mut excludes = Vec::new();
+        apply_root_presets(&mut excludes, &["git-working-tree".into()]).unwrap();
+        for path in [".git", ".infracost", ".backup-kubeconfig", "etc/keys"] {
+            assert!(
+                exclude_covers_path(&excludes, path),
+                "preset should cover {path}"
+            );
+        }
+        assert!(excludes.iter().any(|pattern| pattern == ".kubeconfig*"));
+        assert!(is_included(&["**".into()], Path::new("src/main.rs")));
     }
 }

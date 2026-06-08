@@ -20,6 +20,7 @@
    ```sh
    mj remote check
    mj remote fsck
+   mj remote fsck --deep
    mj restore prepare --at now --to /tmp/majutsu-restore-smoke
    ```
 

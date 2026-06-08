@@ -409,3 +409,84 @@ fn daemon_status_and_metrics_smoke() {
 
     assert_success(run_mj(&home, ["daemon", "stop"]), "daemon stop");
 }
+
+#[test]
+fn exclude_child_glob_hides_root_directory_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let restore = temp.path().join("restore");
+    fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    fs::write(repo.join(".git/config"), b"secret git config\n").unwrap();
+    fs::write(repo.join("src.txt"), b"tracked\n").unwrap();
+
+    assert_success(
+        run_mj(&home, ["init", "--host-name", "exclude-e2e"]),
+        "init",
+    );
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "root",
+                "add",
+                "repo",
+                repo.to_str().unwrap(),
+                "--exclude",
+                "**/.git/**",
+            ],
+        ),
+        "root add repo",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "exclude e2e"]),
+        "snapshot",
+    );
+    assert_success(
+        run_mj(
+            &home,
+            ["restore", "apply", "--to", restore.to_str().unwrap()],
+        ),
+        "restore apply",
+    );
+    assert_file(&restore.join("repo/src.txt"), b"tracked\n");
+    assert!(
+        !restore.join("repo/.git").exists(),
+        ".git directory entry must be excluded"
+    );
+}
+
+#[test]
+fn remote_fsck_default_is_quick_and_deep_is_available() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let remote = temp.path().join("remote");
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("file.txt"), b"remote fsck\n").unwrap();
+
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "init",
+                "--remote",
+                &format!("file://{}", remote.display()),
+                "--host-name",
+                "fsck-e2e",
+            ],
+        ),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "root", root.to_str().unwrap()]),
+        "root add",
+    );
+    assert_success(run_mj(&home, ["snapshot", "--message", "fsck"]), "snapshot");
+    assert_success(run_mj(&home, ["sync"]), "sync");
+    assert_success(run_mj(&home, ["remote", "fsck"]), "remote fsck quick");
+    assert_success(
+        run_mj(&home, ["remote", "fsck", "--deep"]),
+        "remote fsck deep",
+    );
+}

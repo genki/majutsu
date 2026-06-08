@@ -8,10 +8,11 @@ use majutsu_store::{
 use crate::cli::RemoteCommand;
 use crate::config::{MetadataExport, Paths, read_config};
 use crate::fsck_runtime::remote_fsck;
+use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
-use crate::{ensure_ready, open_db};
+use crate::{ensure_ready, export_metadata, open_db, remote_object_available};
 
 pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     ensure_ready(paths)?;
@@ -45,8 +46,12 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 println!("range_get {}", first.len());
             }
         }
-        RemoteCommand::Fsck => {
-            remote_fsck(paths, &remote)?;
+        RemoteCommand::Fsck { deep } => {
+            if deep {
+                remote_fsck(paths, &remote)?;
+            } else {
+                remote_fsck_quick(paths, &remote)?;
+            }
             let conn = open_db(paths)?;
             let current = current_snapshot(&conn)?;
             record_op(
@@ -54,7 +59,11 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 "fsck",
                 current.as_deref(),
                 current.as_deref(),
-                Some("checked remote state"),
+                Some(if deep {
+                    "checked remote state deeply"
+                } else {
+                    "checked remote object existence"
+                }),
             )?;
         }
         RemoteCommand::Capabilities => {
@@ -113,6 +122,39 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
+    let config = read_config(paths)?;
+    let conn = open_db(paths)?;
+    let export = export_metadata(&conn, &config)?;
+    if !remote.exists(REMOTE_HOST_INDEX_KEY)? && !remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
+        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    }
+    let keys = local_object_keys(&export);
+    let mut missing = 0usize;
+    let start = std::time::Instant::now();
+    for (idx, key) in keys.iter().enumerate() {
+        if !remote_object_available(remote, key)? {
+            missing += 1;
+            eprintln!("missing remote object {key}");
+        }
+        if (idx + 1) % 500 == 0 {
+            eprintln!(
+                "remote fsck quick progress checked_objects={} elapsed_secs={}",
+                idx + 1,
+                start.elapsed().as_secs()
+            );
+        }
+    }
+    if missing > 0 {
+        bail!("remote fsck quick found {missing} missing object(s)");
+    }
+    println!("remote fsck quick ok");
+    println!("checked_objects {}", keys.len());
+    println!("elapsed_secs {}", start.elapsed().as_secs());
+    println!("hint use `mj remote fsck --deep` for payload decode/hash verification");
     Ok(())
 }
 

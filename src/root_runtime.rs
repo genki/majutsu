@@ -9,7 +9,10 @@ use crate::operation_log::record_op;
 use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
 };
-use crate::snapshot_rules::{apply_root_large_set, root_large_override};
+use crate::snapshot_rules::{
+    apply_root_large_set, apply_root_presets, dedup_patterns, root_large_override,
+    warn_sensitive_root_defaults,
+};
 
 pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
     crate::ensure_ready(paths)?;
@@ -38,6 +41,9 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             if snapshot_source.is_some() && args.snapshot_mode != "transactional" {
                 bail!("--snapshot-source requires --snapshot-mode transactional");
             }
+            let mut exclude = args.exclude.clone();
+            apply_root_presets(&mut exclude, &args.presets)?;
+            warn_sensitive_root_defaults(&path, &exclude);
             let large = root_large_override(&args);
             let root = RootConfig {
                 name: args.name.unwrap_or_else(|| args.id.clone()),
@@ -48,7 +54,7 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 } else {
                     args.include
                 },
-                exclude: args.exclude,
+                exclude,
                 follow_symlinks: args.follow_symlinks,
                 require_mount: args.require_mount,
                 status: "active".into(),
@@ -88,7 +94,11 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             if args.clear_exclude {
                 root.exclude.clear();
             }
-            root.exclude.extend(args.exclude.clone());
+            let mut exclude_additions = args.exclude.clone();
+            apply_root_presets(&mut exclude_additions, &args.presets)?;
+            root.exclude.extend(exclude_additions);
+            dedup_patterns(&mut root.exclude);
+            warn_sensitive_root_defaults(&root.path, &root.exclude);
             if args.follow_symlinks && args.no_follow_symlinks {
                 bail!("use either --follow-symlinks or --no-follow-symlinks, not both");
             }

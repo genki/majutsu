@@ -168,6 +168,12 @@ pub(crate) struct RootAddArgs {
     )]
     pub(crate) exclude: Vec<String>,
     #[arg(
+        long = "preset",
+        value_name = "NAME",
+        help = "Apply exclude presets such as git-working-tree, rust, or node"
+    )]
+    pub(crate) presets: Vec<String>,
+    #[arg(
         long = "include",
         value_name = "GLOB",
         help = "Include a glob in snapshots"
@@ -260,6 +266,12 @@ pub(crate) struct RootSetArgs {
     pub(crate) clear_include: bool,
     #[arg(long = "exclude")]
     pub(crate) exclude: Vec<String>,
+    #[arg(
+        long = "preset",
+        value_name = "NAME",
+        help = "Apply exclude presets such as git-working-tree, rust, or node"
+    )]
+    pub(crate) presets: Vec<String>,
     #[arg(long, default_value_t = false)]
     pub(crate) clear_exclude: bool,
     #[arg(long, default_value_t = false)]
@@ -428,7 +440,13 @@ pub(crate) struct LargeUnpinArgs {
 #[derive(Subcommand)]
 pub(crate) enum RemoteCommand {
     Check,
-    Fsck,
+    Fsck {
+        #[arg(
+            long,
+            help = "Run full payload verification. Default remote fsck is quick metadata/existence verification."
+        )]
+        deep: bool,
+    },
     Capabilities,
     Hosts,
     Host {

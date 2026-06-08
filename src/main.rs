@@ -157,7 +157,8 @@ use queue_runtime::{has_pending_journal_events, record_event};
 use remote_runtime::remote_cmd;
 #[cfg(test)]
 use remote_store::{
-    DEFAULT_MULTIPART_THRESHOLD, FileRemote, MIN_MULTIPART_PART_SIZE, S3Remote, s3_object_class,
+    DEFAULT_LOCAL_MULTIPART_PART_SIZE, DEFAULT_MULTIPART_THRESHOLD, FileRemote, S3Remote,
+    s3_object_class,
 };
 use remote_store::{RemoteStore, open_remote};
 use restore_runtime::{
@@ -2983,7 +2984,7 @@ mod tests {
         remote.endpoint = endpoint;
         remote.prefix = "majutsu/v1".into();
         remote.max_parallel_uploads = 2;
-        let mut payload = vec![1u8; MIN_MULTIPART_PART_SIZE];
+        let mut payload = vec![1u8; DEFAULT_LOCAL_MULTIPART_PART_SIZE];
         payload.extend(vec![2u8; 3]);
         remote
             .put_multipart("large/chunks/fixed-8m/chunk-1", &payload)
@@ -3003,7 +3004,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(part_bodies.len(), 2);
         assert!(part_bodies.iter().any(|(line, body)| {
-            line.contains("partNumber=1") && body == &vec![1u8; MIN_MULTIPART_PART_SIZE]
+            line.contains("partNumber=1") && body == &vec![1u8; DEFAULT_LOCAL_MULTIPART_PART_SIZE]
         }));
         assert!(
             part_bodies
