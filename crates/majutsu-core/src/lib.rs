@@ -456,6 +456,13 @@ impl OperationLogEntry {
         if !valid_operation_status_label(&self.status) {
             issues.push(OperationLogEntryIssue::InvalidStatus(self.status.clone()));
         }
+        if let Some(remote_sync_state) = &self.remote_sync_state {
+            if !valid_remote_sync_state_label(remote_sync_state) {
+                issues.push(OperationLogEntryIssue::InvalidRemoteSyncState(
+                    remote_sync_state.clone(),
+                ));
+            }
+        }
         if self.actor.trim().is_empty() {
             issues.push(OperationLogEntryIssue::EmptyActor);
         }
@@ -474,6 +481,7 @@ pub enum OperationLogEntryIssue {
     InvalidId,
     InvalidKind(String),
     InvalidStatus(String),
+    InvalidRemoteSyncState(String),
     EmptyActor,
     InvalidCreatedAt { value: String, error: String },
 }
@@ -517,6 +525,10 @@ pub fn valid_operation_kind_label(kind: &str) -> bool {
 
 pub fn valid_operation_status_label(status: &str) -> bool {
     matches!(status, "done" | "running" | "failed")
+}
+
+pub fn valid_remote_sync_state_label(state: &str) -> bool {
+    matches!(state, "not-synced" | "queued" | "synced" | "failed")
 }
 
 pub fn encode_operation_log(operations: &[OperationLogEntry]) -> Result<Vec<u8>> {
@@ -1424,15 +1436,20 @@ mod tests {
             created_at: "not-time".into(),
             message: None,
             error: None,
-            remote_sync_state: None,
+            remote_sync_state: Some("stale".into()),
         };
 
         let issues = entry.validation_issues();
 
-        assert_eq!(issues.len(), 5);
+        assert_eq!(issues.len(), 6);
         assert!(issues.contains(&OperationLogEntryIssue::InvalidId));
         assert!(issues.contains(&OperationLogEntryIssue::InvalidKind("unknown".into())));
         assert!(issues.contains(&OperationLogEntryIssue::InvalidStatus("stuck".into())));
+        assert!(
+            issues.contains(&OperationLogEntryIssue::InvalidRemoteSyncState(
+                "stale".into()
+            ))
+        );
         assert!(issues.contains(&OperationLogEntryIssue::EmptyActor));
         assert!(issues.iter().any(|issue| matches!(
             issue,
@@ -1459,6 +1476,9 @@ mod tests {
         assert!(entry.validation_issues().is_empty());
         assert!(valid_operation_kind_label("root-permission-denied"));
         assert!(valid_operation_status_label("failed"));
+        assert!(valid_remote_sync_state_label("queued"));
+        assert!(valid_remote_sync_state_label("synced"));
+        assert!(!valid_remote_sync_state_label("stale"));
     }
 
     #[test]

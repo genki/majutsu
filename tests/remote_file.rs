@@ -7415,7 +7415,7 @@ fn fsck_detects_invalid_operation_entry() {
 
     let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
     conn.execute(
-        "update operations set status='unknown' where kind='initial-scan'",
+        "update operations set status='unknown', remote_sync_state='stale' where kind='initial-scan'",
         [],
     )
     .unwrap();

@@ -462,7 +462,8 @@ snapshots are recorded as `manual-snapshot`, while watch-created snapshots are
 recorded as `file-events-batch`.
 Operations preserve status metadata for recovery auditing. Failed snapshots keep
 their error text, and remote sync operations track `remote_sync_state` as
-`queued`, `synced`, or `failed`.
+`queued`, `synced`, or `failed`. `mj fsck` validates operation status and remote
+sync state labels so corrupted operation metadata is caught before recovery.
 
 Diff the current snapshot against its parent:
 

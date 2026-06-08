@@ -216,6 +216,12 @@ fn validate_operation_entry(operation: &OperationExport, missing: &mut usize) {
             OperationLogEntryIssue::InvalidStatus(status) => {
                 eprintln!("operation {} has invalid status {status}", operation.id);
             }
+            OperationLogEntryIssue::InvalidRemoteSyncState(state) => {
+                eprintln!(
+                    "operation {} has invalid remote_sync_state {state}",
+                    operation.id
+                );
+            }
             OperationLogEntryIssue::EmptyActor => {
                 eprintln!("operation {} has empty actor", operation.id);
             }
