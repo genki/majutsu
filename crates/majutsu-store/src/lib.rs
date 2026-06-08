@@ -500,6 +500,11 @@ impl RemoteGcMark {
                 issues.push(RemoteGcMarkIssue::MissingLiveObject(key.clone()));
             }
         }
+        for key in actual {
+            if !expected_object_keys.contains(key) {
+                issues.push(RemoteGcMarkIssue::UnexpectedObjectKey(key.clone()));
+            }
+        }
         issues
     }
 }
@@ -511,6 +516,7 @@ pub enum RemoteGcMarkIssue {
     CurrentSnapshotMismatch,
     DuplicateObjectKeys,
     MissingLiveObject(String),
+    UnexpectedObjectKey(String),
 }
 
 impl RemoteGcMarkIssue {
@@ -530,6 +536,9 @@ impl RemoteGcMarkIssue {
             }
             Self::MissingLiveObject(key) => {
                 format!("remote gc mark is missing live object {mark_key} {key}")
+            }
+            Self::UnexpectedObjectKey(key) => {
+                format!("remote gc mark contains unexpected object {mark_key} {key}")
             }
         }
     }
@@ -906,7 +915,11 @@ mod tests {
             host_id: "wrong-host".into(),
             marked_at: DateTime::<Utc>::UNIX_EPOCH,
             current_snapshot: Some("old-snap".into()),
-            object_keys: vec!["objects/a".into(), "objects/a".into()],
+            object_keys: vec![
+                "objects/a".into(),
+                "objects/a".into(),
+                "objects/extra".into(),
+            ],
         };
         let expected = ["objects/a".to_string(), "objects/b".to_string()]
             .into_iter()
@@ -920,6 +933,7 @@ mod tests {
                 RemoteGcMarkIssue::CurrentSnapshotMismatch,
                 RemoteGcMarkIssue::DuplicateObjectKeys,
                 RemoteGcMarkIssue::MissingLiveObject("objects/b".into()),
+                RemoteGcMarkIssue::UnexpectedObjectKey("objects/extra".into()),
             ]
         );
     }
@@ -947,6 +961,11 @@ mod tests {
             RemoteGcMarkIssue::MissingLiveObject("objects/a".into())
                 .message("gc/marks/host-a.json", "host-a"),
             "remote gc mark is missing live object gc/marks/host-a.json objects/a"
+        );
+        assert_eq!(
+            RemoteGcMarkIssue::UnexpectedObjectKey("objects/extra".into())
+                .message("gc/marks/host-a.json", "host-a"),
+            "remote gc mark contains unexpected object gc/marks/host-a.json objects/extra"
         );
     }
 
