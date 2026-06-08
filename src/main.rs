@@ -11,7 +11,9 @@ use majutsu_core::{
 };
 use majutsu_crypto::EncryptionMode;
 use majutsu_daemon::render_daemon_service;
-use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
+use majutsu_large::{
+    ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_pin_issues,
+};
 use majutsu_pack::{PackExport, PackIndex, PackedBlobMetadata};
 use majutsu_restore::{
     RestoreQueueItem, classify_restore_object_availability, validate_relative_filter_path,
@@ -2092,6 +2094,9 @@ fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
         issues.push(format_history_graph_issue(issue));
     }
     validate_clone_metadata_references(export, &mut issues);
+    for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
+        issues.push(format_large_pin_issue(issue));
+    }
     if issues.is_empty() {
         return Ok(());
     }
@@ -2147,6 +2152,17 @@ fn format_metadata_reference_issue(issue: MetadataReferenceIssue) -> String {
         }
         MetadataReferenceIssue::DanglingChunk { oid } => {
             format!("dangling chunk metadata {oid}")
+        }
+    }
+}
+
+fn format_large_pin_issue(issue: LargePinIssue) -> String {
+    match issue {
+        LargePinIssue::Dangling { oid, pinned_at } => {
+            format!("dangling large pin {oid} pinned_at={pinned_at}")
+        }
+        LargePinIssue::InvalidTimestamp { oid, pinned_at } => {
+            format!("invalid large pin timestamp {oid} pinned_at={pinned_at}")
         }
     }
 }
