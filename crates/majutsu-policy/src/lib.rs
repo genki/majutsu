@@ -192,6 +192,60 @@ pub fn s3_lifecycle_policy(tiering: &PolicyConfig) -> Result<serde_json::Value> 
     Ok(serde_json::json!({ "Rules": rules }))
 }
 
+pub fn s3_lifecycle_configuration_xml(policy: &serde_json::Value) -> Result<String> {
+    let rules = policy
+        .get("Rules")
+        .and_then(|rules| rules.as_array())
+        .context("S3 lifecycle policy must contain Rules array")?;
+    let mut out = String::from("<LifecycleConfiguration>");
+    for rule in rules {
+        let id = rule
+            .get("ID")
+            .and_then(|value| value.as_str())
+            .context("S3 lifecycle rule is missing ID")?;
+        let status = rule
+            .get("Status")
+            .and_then(|value| value.as_str())
+            .context("S3 lifecycle rule is missing Status")?;
+        let prefix = rule
+            .pointer("/Filter/Prefix")
+            .and_then(|value| value.as_str())
+            .context("S3 lifecycle rule is missing Filter.Prefix")?;
+        let transition = rule
+            .get("Transitions")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .context("S3 lifecycle rule is missing first Transition")?;
+        let days = transition
+            .get("Days")
+            .and_then(|value| value.as_u64())
+            .context("S3 lifecycle transition is missing Days")?;
+        let storage_class = transition
+            .get("StorageClass")
+            .and_then(|value| value.as_str())
+            .context("S3 lifecycle transition is missing StorageClass")?;
+        out.push_str("<Rule>");
+        out.push_str("<ID>");
+        out.push_str(&xml_escape(id));
+        out.push_str("</ID>");
+        out.push_str("<Status>");
+        out.push_str(&xml_escape(status));
+        out.push_str("</Status>");
+        out.push_str("<Filter><Prefix>");
+        out.push_str(&xml_escape(prefix));
+        out.push_str("</Prefix></Filter>");
+        out.push_str("<Transition>");
+        out.push_str(&format!("<Days>{days}</Days>"));
+        out.push_str("<StorageClass>");
+        out.push_str(&xml_escape(storage_class));
+        out.push_str("</StorageClass>");
+        out.push_str("</Transition>");
+        out.push_str("</Rule>");
+    }
+    out.push_str("</LifecycleConfiguration>");
+    Ok(out)
+}
+
 fn transition_tiering_rules(tiering: &PolicyConfig) -> Result<Vec<TransitionRule>> {
     let mut out = Vec::new();
     for rule in &tiering.rules {
@@ -275,6 +329,13 @@ fn sanitize_lifecycle_rule_id(name: &str) -> String {
     }
 }
 
+fn xml_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +386,28 @@ mod tests {
         assert!(gcs_text.contains("large/chunks/fastcdc/"));
         assert!(!gcs_text.contains("metadata/"));
         assert!(!gcs_text.contains("trees/"));
+    }
+
+    #[test]
+    fn s3_lifecycle_policy_can_render_rest_xml() {
+        let config = PolicyConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                name: "packs-&-large".into(),
+                prefix: "objects/packs/&normal/".into(),
+                after: Some("14d".into()),
+                storage: Some("infrequent".into()),
+            }],
+        };
+
+        let policy = s3_lifecycle_policy(&config).unwrap();
+        let xml = s3_lifecycle_configuration_xml(&policy).unwrap();
+
+        assert!(xml.starts_with("<LifecycleConfiguration>"));
+        assert!(xml.contains("<ID>packs---large</ID>"));
+        assert!(xml.contains("<Prefix>objects/packs/&amp;normal/</Prefix>"));
+        assert!(xml.contains("<Days>14</Days>"));
+        assert!(xml.contains("<StorageClass>STANDARD_IA</StorageClass>"));
     }
 
     #[test]

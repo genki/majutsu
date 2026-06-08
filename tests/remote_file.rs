@@ -5802,6 +5802,147 @@ storage = "deep-archive"
         serde_json::from_slice(&fs::read(remote.join("lifecycle/status.json")).unwrap()).unwrap();
     assert_eq!(applied_status["provider"], "s3");
     assert_eq!(applied_status["policy_key"], "lifecycle/policy-s3.json");
+    assert_eq!(applied_status["provider_applied"], false);
+}
+
+#[test]
+fn lifecycle_apply_puts_s3_bucket_lifecycle_configuration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg("s3://life-bucket/majutsu/v1");
+        c
+    });
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let started = std::time::Instant::now();
+        let mut seen = Vec::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                if started.elapsed() > Duration::from_secs(5) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+                .unwrap_or(request.len());
+            let header = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_len = line_header_value(&header, "Content-Length")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_len {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let first = header.lines().next().unwrap_or("").to_string();
+            let body = String::from_utf8_lossy(&request[header_end..]).to_string();
+            let saw_status_artifact =
+                first.starts_with("PUT ") && first.contains("/majutsu/v1/lifecycle/status.json");
+            seen.push((first, body));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            if saw_status_artifact {
+                break;
+            }
+        }
+        tx.send(seen).unwrap();
+    });
+
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let before_remote = config.split("\n[remote]\n").next().unwrap();
+    let after_remote = config.split("\n[large]\n").nth(1).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            r#"{before_remote}
+[remote]
+type = "s3"
+bucket = "life-bucket"
+prefix = "majutsu/v1"
+endpoint = "http://{addr}"
+region = "us-test-1"
+signature_version = "s3v4"
+
+[large]
+{after_remote}
+
+[[tiering.rules]]
+name = "custom-packs-to-ia"
+prefix = "objects/packs/normal/"
+after = "14d"
+storage = "infrequent"
+"#
+        ),
+    )
+    .unwrap();
+
+    let applied = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("lifecycle")
+            .arg("apply")
+            .arg("--provider")
+            .arg("s3")
+            .arg("--dry-run")
+            .arg("false")
+            .env("AWS_ACCESS_KEY_ID", "dummy")
+            .env("AWS_SECRET_ACCESS_KEY", "dummy");
+        c
+    });
+    assert!(applied.contains("applied true"));
+    assert!(applied.contains("provider_applied true"));
+
+    let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    server.join().unwrap();
+    let lifecycle_put = seen
+        .iter()
+        .find(|(line, _)| line.starts_with("PUT ") && line.contains("?lifecycle"))
+        .expect("missing S3 lifecycle PUT request");
+    assert!(lifecycle_put.0.contains("/life-bucket/"));
+    assert!(lifecycle_put.1.contains("<LifecycleConfiguration>"));
+    assert!(lifecycle_put.1.contains("<ID>custom-packs-to-ia</ID>"));
+    assert!(lifecycle_put.1.contains("<Days>14</Days>"));
+    assert!(
+        lifecycle_put
+            .1
+            .contains("<StorageClass>STANDARD_IA</StorageClass>")
+    );
+
+    let status_put = seen
+        .iter()
+        .find(|(line, _)| line.contains("/majutsu/v1/lifecycle/status.json"))
+        .expect("missing lifecycle status artifact");
+    assert!(status_put.1.contains("\"provider_applied\": true"));
 }
 
 #[test]

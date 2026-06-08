@@ -617,9 +617,11 @@ mj lifecycle apply --provider s3 --dry-run=false
 `lifecycle status` reports whether the configured remote advertises lifecycle
 support and how many provider rules will be generated. `lifecycle apply` is a
 dry run by default: it prints the policy and a provider-specific apply hint.
-With `--dry-run=false`, majutsu stores the desired policy artifact under
-`lifecycle/policy-<provider>.json` and records `lifecycle/status.json` on the
-remote so provider automation can apply the same versioned policy.
+With `--dry-run=false` on an S3-compatible remote, majutsu sends `PUT
+?lifecycle` to apply the bucket lifecycle configuration. It also stores the
+desired policy artifact under `lifecycle/policy-<provider>.json` and records
+`lifecycle/status.json` on the remote so operators can audit the same versioned
+policy.
 
 The generated rules are derived from `[tiering]` in `config.toml`. Rules without
 `after`, or rules whose storage is `standard`, are treated as keep-hot policy

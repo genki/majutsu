@@ -208,6 +208,16 @@ impl RemoteStore {
         }
     }
 
+    pub(crate) fn apply_s3_lifecycle(&self, policy_xml: &str) -> Result<bool> {
+        match self {
+            RemoteStore::File(_) => Ok(false),
+            RemoteStore::S3(remote) => {
+                remote.put_lifecycle_configuration(policy_xml)?;
+                Ok(true)
+            }
+        }
+    }
+
     pub(crate) fn capabilities(&self) -> RemoteCapabilities {
         match self {
             RemoteStore::File(_) => RemoteCapabilities::file(),
@@ -292,6 +302,33 @@ impl S3Remote {
             let _ = self.abort_multipart(&remote_key, &upload_id);
         }
         result.with_context(|| format!("multipart upload failed for {key}"))
+    }
+
+    fn put_lifecycle_configuration(&self, policy_xml: &str) -> Result<()> {
+        if self.uses_sigv2() {
+            bail!("S3 lifecycle apply requires S3 Signature V4");
+        }
+        let query = "lifecycle=".to_string();
+        let payload_hash = sha256_hex(policy_xml.as_bytes());
+        let auth = self.auth_v4("PUT", "", &query, &payload_hash, &[])?;
+        let response = self
+            .client
+            .put(self.bucket_url_query(&query))
+            .header(HOST, self.host_header()?)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(AUTHORIZATION, auth.authorization)
+            .header(CONTENT_TYPE, "application/xml")
+            .body(policy_xml.to_string())
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "s3 put lifecycle configuration failed: HTTP {} {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            );
+        }
+        Ok(())
     }
 
     fn upload_multipart_parts(
@@ -779,6 +816,15 @@ impl S3Remote {
 
     fn object_url_query(&self, remote_key: &str, query: &str) -> String {
         format!("{}?{}", self.object_url(remote_key), query)
+    }
+
+    fn bucket_url_query(&self, query: &str) -> String {
+        format!(
+            "{}/{}/?{}",
+            self.endpoint.trim_end_matches('/'),
+            self.bucket,
+            query
+        )
     }
 
     fn multipart_threshold(&self) -> usize {

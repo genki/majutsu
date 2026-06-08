@@ -822,6 +822,12 @@ fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
                 println!("{}", String::from_utf8(policy_json)?);
             } else {
                 let provider = normalize_lifecycle_provider(&provider)?;
+                let provider_applied = if provider == "s3" {
+                    let policy_xml = majutsu_policy::s3_lifecycle_configuration_xml(&policy)?;
+                    remote.apply_s3_lifecycle(&policy_xml)?
+                } else {
+                    false
+                };
                 let policy_key = format!("lifecycle/policy-{provider}.json");
                 let status_key = "lifecycle/status.json";
                 remote.put(&policy_key, &policy_json)?;
@@ -829,12 +835,14 @@ fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<()> {
                     "provider": provider.clone(),
                     "remote": remote.describe(),
                     "policy_key": policy_key.clone(),
+                    "provider_applied": provider_applied,
                     "applied_at": Utc::now().to_rfc3339(),
                     "note": "desired lifecycle policy artifact stored by majutsu"
                 });
                 remote.put(status_key, &serde_json::to_vec_pretty(&status)?)?;
                 println!("policy_key {policy_key}");
                 println!("status_key {status_key}");
+                println!("provider_applied {provider_applied}");
                 println!("applied true");
             }
         }
