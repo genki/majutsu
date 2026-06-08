@@ -519,7 +519,7 @@ mj watch --foreground=false --interval-secs 60
 Minimal background daemon management:
 
 ```sh
-mj daemon start --interval-secs 60
+mj daemon start --interval-secs 60 --debounce-ms 1500
 mj daemon status
 mj daemon metrics
 mj daemon stop

@@ -389,6 +389,8 @@ pub(crate) enum DaemonCommand {
         #[arg(long)]
         interval_secs: Option<u64>,
         #[arg(long)]
+        debounce_ms: Option<u64>,
+        #[arg(long)]
         settle_ms: Option<u64>,
         #[arg(long)]
         periodic_rescan_secs: Option<u64>,

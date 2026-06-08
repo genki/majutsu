@@ -2369,6 +2369,7 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             backend,
             mode,
             interval_secs,
+            debounce_ms,
             settle_ms,
             periodic_rescan_secs,
         } => {
@@ -2381,7 +2382,7 @@ fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 backend,
                 &mode,
                 interval_secs.unwrap_or(config.watch.interval),
-                config.watch.debounce,
+                debounce_ms.unwrap_or(config.watch.debounce),
                 settle_ms.unwrap_or(config.watch.settle),
                 periodic_rescan_secs.unwrap_or(config.watch.periodic_rescan),
             )?;

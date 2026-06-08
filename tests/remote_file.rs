@@ -12920,6 +12920,67 @@ fn watch_can_start_daemon_when_not_foreground() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_start_accepts_watch_timing_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let started = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("start")
+            .arg("--backend")
+            .arg("poll")
+            .arg("--interval-secs")
+            .arg("60")
+            .arg("--debounce-ms")
+            .arg("25")
+            .arg("--settle-ms")
+            .arg("25")
+            .arg("--periodic-rescan-secs")
+            .arg("0");
+        c
+    });
+    assert!(started.contains("started daemon pid"));
+    for _ in 0..50 {
+        if state.join("runtime/daemon.sock").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("status");
+        c
+    });
+    assert!(status.contains("ipc ok") || status.contains("running pid"));
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
