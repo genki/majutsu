@@ -81,13 +81,13 @@ use cli::{
 };
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, LazyMountEntry,
-    MetadataExport, MountViewMetadata, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig,
-    SecurityConfig, TieringConfig, WatchConfig, default_chunk_size, default_include,
-    default_large_binary_min_size, default_large_chunking, default_large_max_parallel_uploads,
-    default_large_min_size, default_security_hash, default_security_key_id, encryption_enabled,
-    encryption_mode, policy_config, read_config, resolve_paths, validate_config,
-    validate_large_chunking, validate_restore_archive_config, validate_snapshot_mode,
-    validate_watch_mode, write_config,
+    METADATA_EXPORT_VERSION, MetadataExport, MountViewMetadata, PackConfig, Paths, RemoteConfig,
+    RestoreConfig, RootConfig, SecurityConfig, TieringConfig, WatchConfig, default_chunk_size,
+    default_include, default_large_binary_min_size, default_large_chunking,
+    default_large_max_parallel_uploads, default_large_min_size, default_security_hash,
+    default_security_key_id, encryption_enabled, encryption_mode, policy_config, read_config,
+    resolve_paths, validate_config, validate_large_chunking, validate_restore_archive_config,
+    validate_snapshot_mode, validate_watch_mode, write_config,
 };
 use daemon_runtime::{daemon_ipc_request, start_watch_daemon};
 use db_refs::{
@@ -2272,6 +2272,12 @@ fn validate_clone_host_summary(
 
 fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
     let mut issues = Vec::new();
+    if export.version != METADATA_EXPORT_VERSION {
+        issues.push(format!(
+            "unsupported metadata export version {}",
+            export.version
+        ));
+    }
     let snapshot_ids = export
         .snapshots
         .iter()
@@ -3672,7 +3678,7 @@ fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport>
     }
 
     Ok(MetadataExport {
-        version: 1,
+        version: METADATA_EXPORT_VERSION,
         exported_at: Utc::now(),
         config: Config {
             host: HostConfig {

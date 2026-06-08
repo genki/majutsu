@@ -36,7 +36,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
-use crate::config::{Config, HostConfig, Paths, RootConfig, read_config, validate_config};
+use crate::config::{
+    Config, HostConfig, METADATA_EXPORT_VERSION, Paths, RootConfig, read_config, validate_config,
+};
 use crate::object_paths::local_object_keys;
 use crate::operation_log::{local_oplog_path, query_operations, record_op};
 use crate::remote_store::RemoteStore;
@@ -1503,6 +1505,13 @@ fn remote_fsck_export(
 ) -> Result<crate::MetadataExport> {
     let export: crate::MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
+    if export.version != METADATA_EXPORT_VERSION {
+        *missing += 1;
+        eprintln!(
+            "unsupported remote metadata version {} in {metadata_key}",
+            export.version
+        );
+    }
     if let Err(err) = validate_config(&export.config) {
         *missing += 1;
         eprintln!("invalid remote config in {metadata_key}: {err}");

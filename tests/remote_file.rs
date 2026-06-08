@@ -60,6 +60,12 @@ fn find_file_ending(root: &std::path::Path, suffix: &str) -> std::path::PathBuf 
         .unwrap_or_else(|| panic!("missing file ending with {suffix} under {}", root.display()))
 }
 
+fn host_metadata_export_path(remote: &std::path::Path) -> std::path::PathBuf {
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
+    remote.join(index["hosts"][0]["metadata_key"].as_str().unwrap())
+}
+
 fn assert_canonical_cbor_zstd(path: &std::path::Path) {
     let compressed = fs::read(path).unwrap();
     let cbor = zstd::stream::decode_all(compressed.as_slice()).unwrap();
@@ -2662,6 +2668,62 @@ fn remote_fsck_detects_dangling_blob_metadata() {
     dangling["oid"] = serde_json::Value::String("dangling-remote-blob".into());
     export["blobs"].as_array_mut().unwrap().push(dangling);
     fs::write(&export_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_detects_unsupported_metadata_export_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    for export_path in [
+        remote.join("metadata/export.json"),
+        host_metadata_export_path(&remote),
+    ] {
+        let mut export: serde_json::Value =
+            serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
+        export["version"] = serde_json::Value::Number(999.into());
+        fs::write(&export_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
+    }
 
     fails({
         let mut c = mj();
@@ -7995,22 +8057,67 @@ fn clone_rejects_remote_metadata_with_invalid_refs_without_creating_home() {
         c
     });
 
-    let metadata_path = walkdir::WalkDir::new(&remote)
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|entry| {
-            entry.file_type().is_file()
-                && entry.path().to_string_lossy().contains("/hosts/")
-                && entry
-                    .path()
-                    .to_string_lossy()
-                    .ends_with("metadata/export.json")
-        })
-        .map(|entry| entry.path().to_path_buf())
-        .unwrap();
+    let metadata_path = host_metadata_export_path(&remote);
     let mut export: serde_json::Value =
         serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
     export["refs"]["legacy"] = serde_json::Value::String("snap-legacy".into());
+    fs::write(&metadata_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_state)
+            .arg("clone")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone_state.exists());
+}
+
+#[test]
+fn clone_rejects_unsupported_metadata_export_version_without_creating_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone_state = tmp.path().join("clone-state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let metadata_path = host_metadata_export_path(&remote);
+    let mut export: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    export["version"] = serde_json::Value::Number(999.into());
     fs::write(&metadata_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
 
     fails({

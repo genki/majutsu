@@ -204,6 +204,8 @@ pub(crate) struct TieringRule {
     pub(crate) storage: Option<String>,
 }
 
+pub(crate) const METADATA_EXPORT_VERSION: u32 = 1;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct MetadataExport {
     pub(crate) version: u32,
