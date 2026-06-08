@@ -2173,6 +2173,20 @@ fn validate_clone_remote_timeline_exports(
     let Some(host) = host else {
         return Ok(());
     };
+    let expected_snapshot_keys = snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            [
+                host_snapshot_key(&host.id, &snapshot.id),
+                host_snapshot_canonical_key(&host.id, &snapshot.id),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    for key in remote.list(&host_snapshots_prefix(&host.id))? {
+        if !expected_snapshot_keys.contains(&key) {
+            bail!("remote has unexpected host snapshot export {key}");
+        }
+    }
     for snapshot in snapshots {
         let key = host_snapshot_canonical_key(&host.id, &snapshot.id);
         if !remote.exists(&key)? {
@@ -2182,6 +2196,21 @@ fn validate_clone_remote_timeline_exports(
             .with_context(|| format!("parse remote snapshot export {key}"))?;
         if !snapshot_export_matches(&actual, snapshot) {
             bail!("remote snapshot export does not match metadata {key}");
+        }
+    }
+    let expected_operation_keys = operations
+        .iter()
+        .flat_map(|operation| {
+            [
+                host_operation_key(&host.id, &operation.id),
+                host_operation_canonical_key(&host.id, &operation.id),
+            ]
+        })
+        .chain([host_oplog_key(&host.id), host_oplog_canonical_key(&host.id)])
+        .collect::<BTreeSet<_>>();
+    for key in remote.list(&host_ops_prefix(&host.id))? {
+        if !expected_operation_keys.contains(&key) {
+            bail!("remote has unexpected host operation export {key}");
         }
     }
     for operation in operations {

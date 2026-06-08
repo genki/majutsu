@@ -27,8 +27,8 @@ use majutsu_store::{
     canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
     host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
     host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
-    host_snapshot_canonical_key, host_snapshot_key, remote_gc_mark_key, remote_gc_tombstone_prefix,
-    remote_object_availability_issues,
+    host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
+    remote_gc_mark_key, remote_gc_tombstone_prefix, remote_object_availability_issues,
 };
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1578,6 +1578,7 @@ fn remote_fsck_export(
     validate_remote_metadata_references(paths, remote, &export, missing)?;
     if let Some(host_id) = host_id {
         validate_remote_oplog(paths, remote, host_id, &export.operations, missing)?;
+        validate_remote_timeline_prefixes(remote, host_id, &export, missing)?;
         for snapshot in &export.snapshots {
             let key = host_snapshot_key(host_id, &snapshot.id);
             if remote.exists(&key)? {
@@ -1624,4 +1625,47 @@ fn remote_fsck_export(
         }
     }
     Ok(export)
+}
+
+fn validate_remote_timeline_prefixes(
+    remote: &RemoteStore,
+    host_id: &str,
+    export: &crate::MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    let expected_snapshot_keys = export
+        .snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            [
+                host_snapshot_key(host_id, &snapshot.id),
+                host_snapshot_canonical_key(host_id, &snapshot.id),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    for key in remote.list(&host_snapshots_prefix(host_id))? {
+        if !expected_snapshot_keys.contains(&key) {
+            *missing += 1;
+            eprintln!("unexpected host snapshot export {key}");
+        }
+    }
+
+    let expected_operation_keys = export
+        .operations
+        .iter()
+        .flat_map(|operation| {
+            [
+                host_operation_key(host_id, &operation.id),
+                host_operation_canonical_key(host_id, &operation.id),
+            ]
+        })
+        .chain([host_oplog_key(host_id), host_oplog_canonical_key(host_id)])
+        .collect::<BTreeSet<_>>();
+    for key in remote.list(&host_ops_prefix(host_id))? {
+        if !expected_operation_keys.contains(&key) {
+            *missing += 1;
+            eprintln!("unexpected host operation export {key}");
+        }
+    }
+    Ok(())
 }
