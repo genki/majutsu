@@ -41,6 +41,7 @@ use crate::config::{
 };
 use crate::object_paths::local_object_keys;
 use crate::operation_log::{local_oplog_path, query_operations, record_op};
+use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
@@ -48,8 +49,7 @@ use crate::util::{blake3_hex, parse_db_time};
 use crate::{
     decode_canonical_remote_export, decode_canonical_remote_oplog, decode_large_chunk_stored_bytes,
     decode_object, export_metadata, open_db, packed_blob_metadata, read_blob_payload,
-    read_large_chunk, read_object, read_remote_host_index, remote_local_object_variants,
-    remote_ref,
+    read_large_chunk, read_object, remote_local_object_variants, remote_ref,
 };
 
 pub(crate) fn fsck(paths: &Paths) -> Result<()> {

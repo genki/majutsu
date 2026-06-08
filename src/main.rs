@@ -68,6 +68,7 @@ mod pack_runtime;
 mod process_runtime;
 mod prune_runtime;
 mod queue_runtime;
+mod remote_runtime;
 mod remote_store;
 mod restore_apply;
 mod restore_runtime;
@@ -82,8 +83,8 @@ use atomic_io::{write_atomic, write_atomic_with};
 use cli::PackArgs;
 use cli::{
     Cli, CloneArgs, Command, DaemonCommand, DiffArgs, HydrateArgs, InitArgs, KeyCommand,
-    LifecycleCommand, LogArgs, MountArgs, OpCommand, RemoteCommand, RestoreArgs, RestoreCommand,
-    RestoreTopArgs, RootCommand, SnapshotArgs, SyncCommand, UnmountArgs,
+    LifecycleCommand, LogArgs, MountArgs, OpCommand, RestoreArgs, RestoreCommand, RestoreTopArgs,
+    RootCommand, SnapshotArgs, SyncCommand, UnmountArgs,
 };
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, LazyMountEntry,
@@ -100,7 +101,7 @@ use db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
-use fsck_runtime::{fsck, remote_fsck};
+use fsck_runtime::fsck;
 use fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use large_runtime::large_cmd;
 use object_paths::{large_chunk_base, large_chunk_base_for_key, local_object_keys};
@@ -115,6 +116,7 @@ use queue_runtime::{
     drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, has_pending_journal_events,
     record_event, upload_queue_stats,
 };
+use remote_runtime::{read_remote_host_index, remote_cmd, remote_host_index_with_legacy};
 #[cfg(test)]
 use remote_store::{
     DEFAULT_MULTIPART_THRESHOLD, FileRemote, MIN_MULTIPART_PART_SIZE, S3Remote, s3_object_class,
@@ -1738,32 +1740,6 @@ fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> 
     )
 }
 
-pub(crate) fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
-    if remote.exists(REMOTE_HOST_INDEX_KEY)? {
-        let mut index: RemoteHostIndex =
-            serde_json::from_slice(&remote.get(REMOTE_HOST_INDEX_KEY)?)?;
-        index.sort_hosts();
-        return Ok(index);
-    }
-    Ok(RemoteHostIndex::empty(Utc::now()))
-}
-
-fn remote_host_index_with_legacy(remote: &RemoteStore) -> Result<RemoteHostIndex> {
-    let mut index = read_remote_host_index(remote)?;
-    if index.hosts.is_empty() && remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-        let export: MetadataExport =
-            serde_json::from_slice(&remote.get(LEGACY_METADATA_EXPORT_KEY)?)?;
-        index.hosts.push(RemoteHostSummary {
-            id: export.config.host.id.clone(),
-            name: export.config.host.name.clone(),
-            last_synced_at: export.exported_at,
-            current_snapshot: export.refs.get("current").cloned(),
-            metadata_key: LEGACY_METADATA_EXPORT_KEY.into(),
-        });
-    }
-    Ok(index)
-}
-
 fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
     if !has_pending_journal_events(paths)? {
         return Ok(false);
@@ -1780,138 +1756,6 @@ fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
         },
     )?;
     Ok(true)
-}
-
-fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
-    ensure_ready(paths)?;
-    let config = read_config(paths)?;
-    let remote = open_remote_with_upload_policy(
-        config
-            .remote
-            .as_ref()
-            .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?,
-        config.large.multipart,
-        config.large.max_parallel_uploads,
-    )?;
-    match command {
-        RemoteCommand::Check => {
-            let keys = remote.list("")?;
-            println!("remote {}", remote.describe());
-            println!("objects {}", keys.len());
-            let metadata_key = if remote.exists(REMOTE_HOST_INDEX_KEY)? {
-                REMOTE_HOST_INDEX_KEY
-            } else if remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-                LEGACY_METADATA_EXPORT_KEY
-            } else {
-                bail!(
-                    "remote metadata is missing: metadata/export.json and hosts/index.json not found"
-                );
-            };
-            if remote.exists(metadata_key)? {
-                println!("metadata ok");
-                println!("metadata_key {metadata_key}");
-                let first = remote.get_range(metadata_key, 0, 1)?;
-                println!("range_get {}", first.len());
-            }
-        }
-        RemoteCommand::Fsck => {
-            remote_fsck(paths, &remote)?;
-            let conn = open_db(paths)?;
-            let current = current_snapshot(&conn)?;
-            record_op(
-                &conn,
-                "fsck",
-                current.as_deref(),
-                current.as_deref(),
-                Some("checked remote state"),
-            )?;
-        }
-        RemoteCommand::Capabilities => {
-            let capabilities = remote.capabilities();
-            println!("remote {}", remote.describe());
-            println!("lifecycle_rules {}", capabilities.lifecycle_rules);
-            println!("object_tags {}", capabilities.object_tags);
-            println!("storage_class_on_put {}", capabilities.storage_class_on_put);
-            println!(
-                "restore_archived_object {}",
-                capabilities.restore_archived_object
-            );
-            println!("multipart_upload {}", capabilities.multipart_upload);
-            println!("range_get {}", capabilities.range_get);
-            println!("conditional_put {}", capabilities.conditional_put);
-        }
-        RemoteCommand::Hosts => {
-            let index = remote_host_index_with_legacy(&remote)?;
-            println!("remote {}", remote.describe());
-            println!("hosts {}", index.hosts.len());
-            for host in index.hosts {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    host.id,
-                    host.name,
-                    host.last_synced_at.to_rfc3339(),
-                    host.current_snapshot.unwrap_or_else(|| "(none)".into()),
-                    host.metadata_key
-                );
-            }
-        }
-        RemoteCommand::Host {
-            id,
-            snapshots,
-            operations,
-        } => {
-            let index = remote_host_index_with_legacy(&remote)?;
-            let host = select_remote_host(index.hosts, &id)?;
-            let export: MetadataExport = serde_json::from_slice(&remote.get(&host.metadata_key)?)?;
-            println!("id {}", host.id);
-            println!("name {}", host.name);
-            println!("last_synced_at {}", host.last_synced_at.to_rfc3339());
-            println!(
-                "current_snapshot {}",
-                host.current_snapshot.unwrap_or_else(|| "(none)".into())
-            );
-            println!("metadata_key {}", host.metadata_key);
-            println!("roots {}", export.roots.len());
-            println!("snapshots {}", export.snapshots.len());
-            println!("operations {}", export.operations.len());
-            if snapshots {
-                print_remote_host_snapshots(&export);
-            }
-            if operations {
-                print_remote_host_operations(&export);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn print_remote_host_snapshots(export: &MetadataExport) {
-    println!("snapshot_id\tcreated_at\tparent\top_id");
-    for snapshot in &export.snapshots {
-        println!(
-            "{}\t{}\t{}\t{}",
-            snapshot.id,
-            snapshot.created_at,
-            snapshot.parent_id.as_deref().unwrap_or("-"),
-            snapshot.op_id
-        );
-    }
-}
-
-fn print_remote_host_operations(export: &MetadataExport) {
-    println!("op_id\tcreated_at\tkind\tstatus\tbefore\tafter\tmessage");
-    for operation in &export.operations {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            operation.id,
-            operation.created_at,
-            operation.kind,
-            operation.status,
-            operation.before_snapshot.as_deref().unwrap_or("-"),
-            operation.after_snapshot.as_deref().unwrap_or("-"),
-            operation.message.as_deref().unwrap_or("")
-        );
-    }
 }
 
 fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
