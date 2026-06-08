@@ -6,19 +6,21 @@
    scripts/check-completion.sh
    ```
 
-2. Podman で S3 互換 MinIO E2E を実行する。
+2. Podman で S3 互換 MinIO E2E まで含めた completion check を実行する。
 
    ```sh
    podman info
-   scripts/e2e-minio.sh
+   MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh
    ```
 
-3. 暗号化 disaster recovery を検証する。
+3. 実 provider を release ごとに検証し、`docs/PROVIDER_MATRIX.md` に provider 名、検証日、結果を追記する。
+
+   最低限、release candidate ごとに以下を確認する。
 
    ```sh
-   mj init --encrypt --remote file:///tmp/majutsu-remote
-   mj key export > /tmp/majutsu-master-key.txt
-   # snapshot、sync、MAJUTSU_MASTER_KEY を使った clone、restore、fsck を確認する
+   mj remote check
+   mj remote fsck
+   mj restore prepare --at now --to /tmp/majutsu-restore-smoke
    ```
 
 4. release package を生成する。
@@ -34,4 +36,4 @@
    git push origin v0.1.0
    ```
 
-6. release workflow artifact をダウンロードでき、`mj --version` が動作することを確認する。
+6. release workflow artifact をダウンロードでき、展開後の `mj --version` が動作することを確認する。

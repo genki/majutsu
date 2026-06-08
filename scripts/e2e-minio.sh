@@ -95,16 +95,27 @@ work="$(mktemp -d)"
 home="$work/home"
 recovered="$work/recovered"
 root="$work/root"
+multipart_root="$work/multipart-root"
 restore="$work/restore"
-mkdir -p "$root"
+mkdir -p "$root" "$multipart_root"
+
 printf 'hello from minio e2e\n' > "$root/file.txt"
+
+# Large-object route: this should be stored through a manifest and chunk objects.
 dd if=/dev/zero of="$root/large.bin" bs=1M count=6 status=none
+
+# Normal-blob multipart route: thresholds keep this as a normal blob while the
+# S3 multipart threshold above forces multipart upload for the object payload.
+dd if=/dev/zero of="$multipart_root/multipart-normal.bin" bs=1M count=6 status=none
 
 "$mj_bin" --home "$home" init --remote s3://majutsu/e2e --host-name minio-e2e
 "$mj_bin" --home "$home" root add sample "$root" \
   --large-min-size $((1 * 1024 * 1024)) \
   --large-binary-min-size $((1 * 1024 * 1024)) \
   --large-chunk-size $((1 * 1024 * 1024))
+"$mj_bin" --home "$home" root add multipart "$multipart_root" \
+  --large-min-size $((16 * 1024 * 1024)) \
+  --large-binary-min-size $((16 * 1024 * 1024))
 "$mj_bin" --home "$home" snapshot --message minio-e2e
 "$mj_bin" --home "$home" sync
 "$mj_bin" --home "$home" remote check
@@ -116,4 +127,5 @@ dd if=/dev/zero of="$root/large.bin" bs=1M count=6 status=none
 
 diff -u "$root/file.txt" "$restore/sample/file.txt"
 cmp "$root/large.bin" "$restore/sample/large.bin"
+cmp "$multipart_root/multipart-normal.bin" "$restore/multipart/multipart-normal.bin"
 echo "MinIO E2E が通過しました"

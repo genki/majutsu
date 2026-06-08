@@ -2,11 +2,33 @@
 
 このファイルは majutsu を完成と呼ぶための受け入れ条件を定義する。
 
+## 自動完了ゲート
+
+次を通過した release candidate は、ローカル機能、file remote、Podman MinIO S3 互換 remote、release package について完成判定できる。
+
+```sh
+MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh
+```
+
+このゲートには次が含まれる。
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --locked`
+- `cargo test --workspace --all-targets --locked`
+- local file-remote E2E
+- encrypted disaster recovery E2E
+- large object manifest/chunk E2E
+- prune/gc safety E2E
+- daemon status/metrics smoke E2E
+- release package smoke
+- Podman MinIO S3-compatible E2E
+
 ## 機能受け入れ条件
 
 - [ ] `mj init`、`root add`、`snapshot`、`status`、`log`、`diff`、`restore plan`、`restore apply` がローカル E2E を通過する。
 - [ ] 複数 root の timeline を空の state directory に clone し、別 target へ restore できる。
 - [ ] large object が pointer manifest と chunk 経由で保存され、byte-for-byte で復元できる。
+- [ ] normal blob の multipart upload が S3 互換 remote で通過する。
 - [ ] file remote で `sync`、`remote check`、`remote fsck`、`clone`、`restore apply` が通過する。
 - [ ] S3 互換 remote が Podman ベースの MinIO E2E スクリプトを通過する。
 - [ ] 暗号化 state を remote metadata と export 済み master key だけで clone / restore できる。

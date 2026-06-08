@@ -2,9 +2,9 @@
 set -euo pipefail
 
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-RUST_TEST_THREADS=1 cargo test --workspace --all-targets -- --nocapture
-RUST_TEST_THREADS=1 cargo test --test e2e_local -- --nocapture
+cargo clippy --workspace --all-targets --locked
+RUST_TEST_THREADS=1 cargo test --workspace --all-targets --locked -- --nocapture
+RUST_TEST_THREADS=1 cargo test --test e2e_local --locked -- --nocapture
 scripts/package-release.sh smoke
 
 if [[ "${MAJUTSU_RUN_MINIO_E2E:-0}" == "1" ]]; then
