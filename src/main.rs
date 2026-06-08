@@ -56,7 +56,52 @@ mod daemon_runtime;
 mod db_refs;
 mod fs_meta;
 mod fsck_runtime;
+#[cfg(target_os = "linux")]
 mod fuse_mount;
+#[cfg(not(target_os = "linux"))]
+mod fuse_mount {
+    use anyhow::{Result, bail};
+    use rusqlite::Connection;
+    use std::fs;
+    use std::path::Path;
+
+    use crate::config::Paths;
+    use crate::restore_runtime::RestorePlan;
+
+    pub(crate) fn mount_fuse_cmd(
+        _paths: &Paths,
+        _conn: &Connection,
+        _plan: &RestorePlan,
+    ) -> Result<()> {
+        bail!("fuse mount backend is only supported on Linux")
+    }
+
+    pub(crate) fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
+        if !mountpoint.exists() {
+            fs::create_dir_all(mountpoint)?;
+            return Ok(());
+        }
+        let meta = fs::symlink_metadata(mountpoint)?;
+        if !meta.file_type().is_dir() {
+            bail!("mountpoint is not a directory: {}", mountpoint.display());
+        }
+        if fs::read_dir(mountpoint)?.next().is_some() {
+            bail!("mountpoint is not empty: {}", mountpoint.display());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_mountpoint(_path: &Path) -> Result<bool> {
+        Ok(false)
+    }
+
+    pub(crate) fn unmount_fuse(path: &Path) -> Result<()> {
+        bail!(
+            "fuse unmount is only supported on Linux: {}",
+            path.display()
+        )
+    }
+}
 mod history_runtime;
 mod key_runtime;
 mod large_runtime;
@@ -3139,6 +3184,7 @@ tier = "Bulk"
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fuse_read_file_can_read_packed_blob_without_loose_object() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3182,6 +3228,7 @@ tier = "Bulk"
         assert_eq!(fs.read_file(&record, 6, 6).unwrap(), b"packed".to_vec());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fuse_large_read_only_requires_overlapping_chunks() {
         let tmp = tempfile::tempdir().unwrap();
