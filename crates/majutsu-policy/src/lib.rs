@@ -73,7 +73,7 @@ pub fn build_snapshot_prune_plan(
     let delete = snapshots_newest_first
         .iter()
         .map(|snapshot| snapshot.id.clone())
-        .filter(|id| !keep.binary_search(id).is_ok())
+        .filter(|id| keep.binary_search(id).is_err())
         .collect::<Vec<_>>();
     SnapshotPrunePlan { keep, delete }
 }

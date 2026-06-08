@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use majutsu_daemon::render_daemon_service;
+use majutsu_daemon::{DaemonServiceConfig, render_daemon_service};
 use majutsu_restore::RestoreQueueItem;
 use std::collections::BTreeMap;
 use std::env;
@@ -67,17 +67,17 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         DaemonCommand::Service { provider } => {
             let exe = env::current_exe()?;
             let backend = normalize_watch_backend(&config.watch.backend)?;
-            let service = render_daemon_service(
-                &provider,
-                &exe,
-                &paths.home,
+            let service = render_daemon_service(DaemonServiceConfig {
+                provider: &provider,
+                exe: &exe,
+                home: &paths.home,
                 backend,
-                &config.watch.mode,
-                config.watch.interval,
-                config.watch.debounce,
-                config.watch.settle,
-                config.watch.periodic_rescan,
-            )
+                mode: &config.watch.mode,
+                interval_secs: config.watch.interval,
+                debounce_ms: config.watch.debounce,
+                settle_ms: config.watch.settle,
+                periodic_rescan_secs: config.watch.periodic_rescan,
+            })
             .map_err(anyhow::Error::msg)?;
             print!("{service}");
         }

@@ -41,6 +41,17 @@ pub struct StoredLargeChunk {
     pub compression: String,
 }
 
+pub struct CompressionInput<'a> {
+    pub bytes: &'a [u8],
+    pub enabled: bool,
+    pub algorithm: &'a str,
+    pub level: i32,
+    pub sample_bytes: usize,
+    pub min_gain_ratio: f64,
+    pub skip_extensions: &'a [String],
+    pub file_name: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LargeObjectExport {
     pub oid: String,
@@ -222,44 +233,40 @@ pub fn content_defined_ranges(bytes: &[u8], target: usize) -> Vec<(usize, usize)
     ranges
 }
 
-pub fn compress_chunk_if_useful(
-    bytes: &[u8],
-    enabled: bool,
-    algorithm: &str,
-    level: i32,
-    sample_bytes: usize,
-    min_gain_ratio: f64,
-    skip_extensions: &[String],
-    file_name: &str,
-) -> Result<StoredLargeChunk> {
-    if !should_compress(enabled, algorithm, skip_extensions, file_name) {
+pub fn compress_chunk_if_useful(input: CompressionInput<'_>) -> Result<StoredLargeChunk> {
+    if !should_compress(
+        input.enabled,
+        input.algorithm,
+        input.skip_extensions,
+        input.file_name,
+    ) {
         return Ok(StoredLargeChunk {
-            bytes: bytes.to_vec(),
+            bytes: input.bytes.to_vec(),
             compression: "none".into(),
         });
     }
-    let sample_len = sample_bytes.min(bytes.len());
-    if sample_len > 0 && sample_len < bytes.len() {
-        let sample = &bytes[..sample_len];
-        let compressed_sample = zstd::stream::encode_all(sample, level)?;
+    let sample_len = input.sample_bytes.min(input.bytes.len());
+    if sample_len > 0 && sample_len < input.bytes.len() {
+        let sample = &input.bytes[..sample_len];
+        let compressed_sample = zstd::stream::encode_all(sample, input.level)?;
         let sample_gain = compression_gain(sample.len(), compressed_sample.len());
-        if sample_gain < min_gain_ratio {
+        if sample_gain < input.min_gain_ratio {
             return Ok(StoredLargeChunk {
-                bytes: bytes.to_vec(),
+                bytes: input.bytes.to_vec(),
                 compression: "none".into(),
             });
         }
     }
-    let compressed = zstd::stream::encode_all(bytes, level)?;
-    let gain = compression_gain(bytes.len(), compressed.len());
-    if gain >= min_gain_ratio {
+    let compressed = zstd::stream::encode_all(input.bytes, input.level)?;
+    let gain = compression_gain(input.bytes.len(), compressed.len());
+    if gain >= input.min_gain_ratio {
         Ok(StoredLargeChunk {
             bytes: compressed,
             compression: "zstd".into(),
         })
     } else {
         Ok(StoredLargeChunk {
-            bytes: bytes.to_vec(),
+            bytes: input.bytes.to_vec(),
             compression: "none".into(),
         })
     }
@@ -395,9 +402,17 @@ mod tests {
         }
         bytes.extend(std::iter::repeat_n(b'a', 32 * 1024));
 
-        let stored =
-            compress_chunk_if_useful(&bytes, true, "zstd", 3, 2048, 0.05, &[], "payload.dat")
-                .unwrap();
+        let stored = compress_chunk_if_useful(CompressionInput {
+            bytes: &bytes,
+            enabled: true,
+            algorithm: "zstd",
+            level: 3,
+            sample_bytes: 2048,
+            min_gain_ratio: 0.05,
+            skip_extensions: &[],
+            file_name: "payload.dat",
+        })
+        .unwrap();
 
         assert_eq!(stored.compression, "none");
         assert_eq!(stored.bytes, bytes);
@@ -407,9 +422,17 @@ mod tests {
     fn compression_sample_allows_useful_full_chunk_compression() {
         let bytes = vec![b'a'; 32 * 1024];
 
-        let stored =
-            compress_chunk_if_useful(&bytes, true, "zstd", 3, 2048, 0.05, &[], "payload.dat")
-                .unwrap();
+        let stored = compress_chunk_if_useful(CompressionInput {
+            bytes: &bytes,
+            enabled: true,
+            algorithm: "zstd",
+            level: 3,
+            sample_bytes: 2048,
+            min_gain_ratio: 0.05,
+            skip_extensions: &[],
+            file_name: "payload.dat",
+        })
+        .unwrap();
 
         assert_eq!(stored.compression, "zstd");
         assert!(stored.bytes.len() < bytes.len());

@@ -733,7 +733,10 @@ pub(crate) fn validate_clone_remote_pack_objects(
                     pack.index_key, variant.remote_key
                 )
             })?;
-            for issue in pack_index_issues(pack, &index, &expected_blob_metadata) {
+            if let Some(issue) = pack_index_issues(pack, &index, &expected_blob_metadata)
+                .into_iter()
+                .next()
+            {
                 match issue {
                     PackIndexIssue::PackMetadataMismatch => {
                         bail!(
@@ -767,8 +770,10 @@ pub(crate) fn validate_clone_remote_pack_objects(
             }
         }
         for variant in remote_local_object_variants(paths, remote, &pack.pack_key)? {
-            for issue in
+            if let Some(issue) =
                 pack_object_issues(pack, variant.bytes.len() as u64, &expected_blob_metadata)
+                    .into_iter()
+                    .next()
             {
                 match issue {
                     PackObjectIssue::SizeMismatch => {
@@ -803,10 +808,13 @@ pub(crate) fn validate_clone_remote_pack_objects(
             }
         }
     }
-    for pack_id in missing_pack_metadata_ids(
+    if let Some(pack_id) = missing_pack_metadata_ids(
         blobs_by_pack.keys().copied(),
         export.packs.iter().map(|pack| pack.pack_id.as_str()),
-    ) {
+    )
+    .into_iter()
+    .next()
+    {
         bail!("packed blob references missing remote pack metadata {pack_id}");
     }
     Ok(())
@@ -974,7 +982,10 @@ pub(crate) fn validate_clone_remote_oplog(
     }
     let actual = decode_canonical_remote_oplog(paths, &remote.get(&key)?)
         .with_context(|| format!("parse remote operation log {key}"))?;
-    for issue in operation_log_comparison_issues(&actual, expected) {
+    if let Some(issue) = operation_log_comparison_issues(&actual, expected)
+        .into_iter()
+        .next()
+    {
         match issue {
             majutsu_core::OperationLogComparisonIssue::CountMismatch { expected, actual } => {
                 bail!(
@@ -1108,7 +1119,11 @@ pub(crate) fn validate_clone_remote_gc_mark(
         expected.extend(canonical_remote_aliases(&object_key));
     }
     let expected = expected.into_iter().collect::<BTreeSet<_>>();
-    for issue in mark.validation_issues(&host.id, export.refs.get("current"), &expected) {
+    if let Some(issue) = mark
+        .validation_issues(&host.id, export.refs.get("current"), &expected)
+        .into_iter()
+        .next()
+    {
         bail!("{}", issue.message(&key, &host.id));
     }
     validate_clone_remote_gc_tombstones(remote, &host.id)?;
@@ -2196,14 +2211,16 @@ fn compress_large_chunk(
 ) -> Result<majutsu_large::StoredLargeChunk> {
     let name = rel.file_name().and_then(OsStr::to_str).unwrap_or_default();
     Ok(majutsu_large::compress_chunk_if_useful(
-        bytes,
-        config.compression.enabled,
-        &config.compression.algorithm,
-        config.compression.level,
-        config.compression.sample_bytes,
-        config.compression.min_gain_ratio,
-        &config.compression.skip_extensions,
-        name,
+        majutsu_large::CompressionInput {
+            bytes,
+            enabled: config.compression.enabled,
+            algorithm: &config.compression.algorithm,
+            level: config.compression.level,
+            sample_bytes: config.compression.sample_bytes,
+            min_gain_ratio: config.compression.min_gain_ratio,
+            skip_extensions: &config.compression.skip_extensions,
+            file_name: name,
+        },
     )?)
 }
 

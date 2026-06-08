@@ -752,15 +752,9 @@ mod tests {
     #[test]
     fn archive_restore_status_maps_s3_responses() {
         for status in [200, 202, 204, 409] {
-            assert_eq!(
-                archive_restore_status("objects/large/chunk", status).unwrap(),
-                true
-            );
+            assert!(archive_restore_status("objects/large/chunk", status).unwrap());
         }
-        assert_eq!(
-            archive_restore_status("objects/large/chunk", 404).unwrap(),
-            false
-        );
+        assert!(!archive_restore_status("objects/large/chunk", 404).unwrap());
         let err = archive_restore_status("objects/large/chunk", 500)
             .unwrap_err()
             .to_string();

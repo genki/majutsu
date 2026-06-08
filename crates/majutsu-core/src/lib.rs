@@ -457,12 +457,12 @@ impl OperationLogEntry {
         if !valid_operation_status_label(&self.status) {
             issues.push(OperationLogEntryIssue::InvalidStatus(self.status.clone()));
         }
-        if let Some(remote_sync_state) = &self.remote_sync_state {
-            if !valid_remote_sync_state_label(remote_sync_state) {
-                issues.push(OperationLogEntryIssue::InvalidRemoteSyncState(
-                    remote_sync_state.clone(),
-                ));
-            }
+        if let Some(remote_sync_state) = &self.remote_sync_state
+            && !valid_remote_sync_state_label(remote_sync_state)
+        {
+            issues.push(OperationLogEntryIssue::InvalidRemoteSyncState(
+                remote_sync_state.clone(),
+            ));
         }
         if self.status == "failed" && self.error.as_deref().unwrap_or_default().trim().is_empty() {
             issues.push(OperationLogEntryIssue::FailedWithoutError);
@@ -607,14 +607,13 @@ pub fn operation_log_comparison_issues(
         .iter()
         .zip(expected.iter())
         .enumerate()
-        .filter_map(|(index, (actual, expected))| {
-            (!operation_log_entry_matches(actual, expected)).then(|| {
-                OperationLogComparisonIssue::EntryMismatch {
-                    index,
-                    id: actual.id.clone(),
-                }
-            })
-        })
+        .filter(|(_, (actual, expected))| !operation_log_entry_matches(actual, expected))
+        .map(
+            |(index, (actual, _))| OperationLogComparisonIssue::EntryMismatch {
+                index,
+                id: actual.id.clone(),
+            },
+        )
         .collect()
 }
 

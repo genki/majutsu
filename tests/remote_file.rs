@@ -4635,8 +4635,7 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
     });
     let successful_sync_line = sync_log
         .lines()
-        .filter(|line| line.contains("remote-sync"))
-        .next()
+        .find(|line| line.contains("remote-sync"))
         .unwrap()
         .to_string();
     assert!(successful_sync_line.contains("\tdone\tsynced\t"));
@@ -12644,7 +12643,7 @@ fn permission_denied_root_is_skipped_without_mass_deletion() {
     });
     let original_mode = fs::metadata(&blocked).unwrap().permissions().mode();
     let mut perms = fs::metadata(&blocked).unwrap().permissions();
-    perms.set_mode(0);
+    perms.set_mode(0o0);
     fs::set_permissions(&blocked, perms).unwrap();
     let snapshot = output({
         let mut c = mj();
