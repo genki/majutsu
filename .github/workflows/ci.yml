@@ -47,7 +47,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: docker compose確認
-        run: docker compose version
+      - name: Podman install
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+      - name: Podman確認
+        run: sudo podman info
       - name: MinIO E2E実行
-        run: scripts/e2e-minio.sh
+        run: MAJUTSU_PODMAN_SUDO=1 scripts/e2e-minio.sh
