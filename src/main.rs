@@ -72,6 +72,7 @@ mod remote_runtime;
 mod remote_store;
 mod restore_apply;
 mod restore_runtime;
+mod root_runtime;
 mod root_state;
 mod snapshot_rules;
 mod snapshot_state;
@@ -82,16 +83,15 @@ mod watch_runtime;
 use atomic_io::write_atomic_with;
 #[cfg(test)]
 use cli::PackArgs;
-use cli::{Cli, Command, InitArgs, RestoreArgs, RootCommand, SnapshotArgs};
+use cli::{Cli, Command, InitArgs, RestoreArgs, SnapshotArgs};
 use clone_runtime::clone_cmd;
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
     MetadataExport, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig, SecurityConfig,
-    TieringConfig, WatchConfig, default_chunk_size, default_include, default_large_binary_min_size,
+    TieringConfig, WatchConfig, default_chunk_size, default_large_binary_min_size,
     default_large_chunking, default_large_max_parallel_uploads, default_large_min_size,
     default_security_hash, default_security_key_id, encryption_enabled, encryption_mode,
-    read_config, resolve_paths, validate_large_chunking, validate_restore_archive_config,
-    validate_snapshot_mode, write_config,
+    read_config, resolve_paths, validate_restore_archive_config, write_config,
 };
 use daemon_runtime::daemon_cmd;
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
@@ -119,13 +119,11 @@ use restore_runtime::{
     RestoreDelete, RestorePlan, required_object_keys_for_plan, restore_cmd, restore_root_base,
     write_restore_job,
 };
-use root_state::{
-    root_by_id, root_by_id_optional, roots, save_root, sync_config_roots, sync_roots_to_config,
-    update_root_status,
-};
+use root_runtime::root_cmd;
+use root_state::{roots, sync_config_roots, sync_roots_to_config, update_root_status};
 use snapshot_rules::{
-    apply_root_large_set, build_ignore, classify_large, effective_large_config, is_ignored,
-    is_included, large_pointer_compression, looks_binary, root_large_override,
+    build_ignore, classify_large, effective_large_config, is_ignored, is_included,
+    large_pointer_compression, looks_binary,
 };
 use snapshot_state::{
     carry_forward_root_snapshot, current_snapshot, load_snapshot, load_snapshot_by_id,
@@ -223,179 +221,6 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
     record_op(&conn, "init", None, None, Some("initialized majutsu home"))?;
     println!("initialized {}", paths.home.display());
     println!("host {} {}", config.host.name, config.host.id);
-    Ok(())
-}
-
-fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
-    ensure_ready(paths)?;
-    let conn = open_db(paths)?;
-    match command {
-        RootCommand::Add(args) => {
-            let path = absolutize(&args.path)?;
-            if !path.exists() {
-                bail!("root path does not exist: {}", path.display());
-            }
-            if root_by_id_optional(&conn, &args.id)?.is_some() {
-                bail!(
-                    "root already exists: {}; use `mj root set` to change it",
-                    args.id
-                );
-            }
-            validate_snapshot_mode(&args.snapshot_mode)?;
-            if let Some(chunking) = &args.large_chunking {
-                validate_large_chunking(chunking)?;
-            }
-            let snapshot_source = args
-                .snapshot_source
-                .as_deref()
-                .map(absolutize)
-                .transpose()?;
-            if snapshot_source.is_some() && args.snapshot_mode != "transactional" {
-                bail!("--snapshot-source requires --snapshot-mode transactional");
-            }
-            let large = root_large_override(&args);
-            let root = RootConfig {
-                name: args.name.unwrap_or_else(|| args.id.clone()),
-                id: args.id,
-                path,
-                include: if args.include.is_empty() {
-                    default_include()
-                } else {
-                    args.include
-                },
-                exclude: args.exclude,
-                follow_symlinks: args.follow_symlinks,
-                require_mount: args.require_mount,
-                status: "active".into(),
-                snapshot_mode: args.snapshot_mode,
-                pre_snapshot: args.pre_snapshot,
-                post_snapshot: args.post_snapshot,
-                snapshot_source,
-                application_plugin: args.application_plugin,
-                large,
-            };
-            conn.execute(
-                "insert into roots(id, data_json) values (?1, ?2)",
-                params![root.id, serde_json::to_string(&root)?],
-            )?;
-            sync_roots_to_config(paths, &conn)?;
-            record_op(&conn, "root-added", None, None, Some(&root.id))?;
-            println!("added root {} -> {}", root.id, root.path.display());
-        }
-        RootCommand::Set(args) => {
-            let mut root = root_by_id(&conn, &args.id)?;
-            if let Some(path) = &args.path {
-                let path = absolutize(path)?;
-                if !path.exists() {
-                    bail!("root path does not exist: {}", path.display());
-                }
-                root.path = path;
-            }
-            if let Some(name) = &args.name {
-                root.name = name.clone();
-            }
-            if args.clear_include {
-                root.include = default_include();
-            }
-            if !args.include.is_empty() {
-                root.include = args.include.clone();
-            }
-            if args.clear_exclude {
-                root.exclude.clear();
-            }
-            root.exclude.extend(args.exclude.clone());
-            if args.follow_symlinks && args.no_follow_symlinks {
-                bail!("use either --follow-symlinks or --no-follow-symlinks, not both");
-            }
-            if args.follow_symlinks {
-                root.follow_symlinks = true;
-            }
-            if args.no_follow_symlinks {
-                root.follow_symlinks = false;
-            }
-            if args.require_mount && args.no_require_mount {
-                bail!("use either --require-mount or --no-require-mount, not both");
-            }
-            if args.require_mount {
-                root.require_mount = true;
-            }
-            if args.no_require_mount {
-                root.require_mount = false;
-            }
-            if let Some(mode) = &args.snapshot_mode {
-                validate_snapshot_mode(&mode)?;
-                root.snapshot_mode = mode.clone();
-            }
-            if args.clear_pre_snapshot {
-                root.pre_snapshot = None;
-            }
-            if let Some(pre_snapshot) = &args.pre_snapshot {
-                root.pre_snapshot = Some(pre_snapshot.clone());
-            }
-            if args.clear_post_snapshot {
-                root.post_snapshot = None;
-            }
-            if let Some(post_snapshot) = &args.post_snapshot {
-                root.post_snapshot = Some(post_snapshot.clone());
-            }
-            if args.clear_snapshot_source {
-                root.snapshot_source = None;
-            }
-            if let Some(snapshot_source) = &args.snapshot_source {
-                root.snapshot_source = Some(absolutize(snapshot_source)?);
-            }
-            if args.clear_application_plugin {
-                root.application_plugin = None;
-            }
-            if let Some(application_plugin) = &args.application_plugin {
-                root.application_plugin = Some(application_plugin.clone());
-            }
-            if root.snapshot_source.is_some() && root.snapshot_mode != "transactional" {
-                bail!("--snapshot-source requires snapshot_mode transactional");
-            }
-            apply_root_large_set(&mut root, &args)?;
-            save_root(&conn, &root)?;
-            sync_roots_to_config(paths, &conn)?;
-            record_op(&conn, "config-change", None, None, Some(&root.id))?;
-            println!("updated root {} -> {}", root.id, root.path.display());
-        }
-        RootCommand::List => {
-            for root in roots(&conn)? {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    root.id,
-                    root.status,
-                    root.name,
-                    root.path.display()
-                );
-            }
-        }
-        RootCommand::Remove { id } => {
-            let _ = root_by_id(&conn, &id)?;
-            conn.execute("delete from roots where id=?1", params![id])?;
-            sync_roots_to_config(paths, &conn)?;
-            record_op(&conn, "root-removed", None, None, Some(&id))?;
-            println!("removed root {id}");
-        }
-        RootCommand::Pause { id } => {
-            update_root_status(&conn, &id, "paused")?;
-            sync_roots_to_config(paths, &conn)?;
-            record_op(&conn, "root-paused", None, None, Some(&id))?;
-            println!("paused root {id}");
-        }
-        RootCommand::Resume { id } => {
-            update_root_status(&conn, &id, "active")?;
-            sync_roots_to_config(paths, &conn)?;
-            record_op(&conn, "root-resumed", None, None, Some(&id))?;
-            println!("resumed root {id}");
-        }
-        RootCommand::MarkDeleted { id } => {
-            update_root_status(&conn, &id, "deleted")?;
-            sync_roots_to_config(paths, &conn)?;
-            record_op(&conn, "root-mark-deleted", None, None, Some(&id))?;
-            println!("marked root {id} deleted");
-        }
-    }
     Ok(())
 }
 
