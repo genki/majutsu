@@ -11,9 +11,9 @@
 
 ## 外部証跡が必要なもの
 
-- GitHub Actions の latest main CI green 確認。
-- release workflow artifact のダウンロード / 展開 / `mj --version` 確認。
+- ローカル release artifact の展開 / `mj --version` 確認。
 - archive / cold tier restore を supported とする場合の実 provider drill。
 
-これらは repository code だけでは完了できないため、`scripts/verify-release-artifacts.sh` と
-`scripts/e2e-aws-archive-restore.sh` で証跡取得を自動化する。
+GitHub Actions は利用しない。ローカル artifact の証跡は `scripts/check-completion.sh`
+と `scripts/package-release.sh`、archive restore の証跡は
+`scripts/e2e-aws-archive-restore.sh` で取得する。

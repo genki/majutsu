@@ -33,15 +33,19 @@
    git push origin v0.1.0
    ```
 
-6. GitHub Actions と release artifact を検証する。
+6. release artifact をローカルで展開して smoke test を実行する。
 
    ```sh
-   GH_TOKEN=... MAJUTSU_RELEASE_TAG=v0.1.0 scripts/verify-release-artifacts.sh
+   tar -tf dist/majutsu-*.tar.gz
+   tmp=$(mktemp -d)
+   tar -xzf dist/majutsu-*.tar.gz -C "$tmp"
+   "$tmp"/majutsu-*/mj --version
+   "$tmp"/majutsu-*/mj --help
    ```
 
 7. provider matrix を更新する。
 
-   - File remote と MinIO は CI evidence を記録する。
+   - File remote と MinIO はローカル completion gate の evidence を記録する。
    - GCS S3-compatible endpoint を supported にする場合は実 backend の検証日とコマンドを記録する。
    - AWS S3 / Cloudflare R2 は、その release candidate で実検証していない限り experimental のままにする。
 
@@ -53,4 +57,4 @@
    MAJUTSU_AWS_ARCHIVE_BUCKET=... MAJUTSU_AWS_ARCHIVE_PREFIX=... scripts/e2e-aws-archive-restore.sh --resume
    ```
 
-9. release workflow artifact をダウンロードでき、`mj --version` と `mj --help` が動作することを release note に記録する。
+9. ローカル生成した release artifact で `mj --version` と `mj --help` が動作することを release note に記録する。

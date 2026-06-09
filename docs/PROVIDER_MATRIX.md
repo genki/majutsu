@@ -2,22 +2,22 @@
 
 `Status` は release 判定での扱いを示す。
 
-- `CI verified`: GitHub Actions / local completion gate で毎回確認する。
+- `local gate verified`: ローカル completion gate で毎回確認する。
 - `verified YYYY-MM-DD`: 実 provider で検証済み。release ごとに再確認する。
 - `experimental`: 実装上は動く可能性があるが、該当 release の supported provider には含めない。
 - `provider-specific`: provider 側仕様差が大きいため、運用前に個別確認する。
 
 | Provider | Put/Get | Range GET | Multipart | Conditional PUT | Tags | Storage class | Lifecycle apply | Archive restore | Status | Evidence |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
-| File remote | yes | yes | n/a | yes | n/a | n/a | n/a | n/a | CI verified | `cargo test --test e2e_local` |
-| MinIO via Podman | yes | yes | yes | yes | partial | partial | partial | n/a | CI verified | `scripts/e2e-minio.sh` |
+| File remote | yes | yes | n/a | yes | n/a | n/a | n/a | n/a | local gate verified | `cargo test --test e2e_local` |
+| MinIO via Podman | yes | yes | yes | yes | partial | partial | partial | n/a | local gate verified | `scripts/e2e-minio.sh` |
 | GCS S3-compatible endpoint | yes | yes | yes | provider-specific | provider-specific | provider-specific | prefer native GCS lifecycle | provider-specific | verified 2026-06-09 | `~/moon` root: sync, remote check, remote fsck, clone, restore |
 | AWS S3 | yes | yes | yes | yes | yes | yes | yes | yes | experimental until release validation | `scripts/e2e-aws-archive-restore.sh` |
 | Cloudflare R2 | yes | yes | yes | provider-specific | provider-specific | limited | provider-specific | no Glacier-style restore | experimental | manual validation required |
 
 ## release 判定方針
 
-release は `Status` が `CI verified` または当該 release candidate で
+release は `Status` が `local gate verified` または当該 release candidate で
 `verified <date>` になっている provider について complete と呼べる。
 `experimental` の provider は、その release の supported provider set には含めない。
 

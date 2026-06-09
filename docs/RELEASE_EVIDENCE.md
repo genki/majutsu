@@ -19,16 +19,14 @@ MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh
 - host:
 - 補足:
 
-## GitHub Actions
+## local release artifact
 
 ```sh
-GH_TOKEN=... MAJUTSU_RELEASE_TAG=<tag> scripts/verify-release-artifacts.sh
+scripts/package-release.sh
+tar -tf dist/majutsu-*.tar.gz
 ```
 
-- CI workflow run id:
-- release workflow run id:
-- Linux artifact:
-- macOS artifact:
+- artifact:
 - `mj --version`:
 - `mj --help` 確認: yes/no
 
@@ -36,8 +34,8 @@ GH_TOKEN=... MAJUTSU_RELEASE_TAG=<tag> scripts/verify-release-artifacts.sh
 
 | Provider | Status | Evidence |
 |---|---|---|
-| File remote | CI verified | |
-| MinIO via Podman | CI verified | |
+| File remote | local gate verified | |
+| MinIO via Podman | local gate verified | |
 | GCS S3-compatible endpoint | verified / not used | |
 | AWS S3 | supported / experimental | |
 | Cloudflare R2 | supported / experimental | |
