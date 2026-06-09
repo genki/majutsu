@@ -49,6 +49,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod atomic_io;
+mod branch_runtime;
 mod cli;
 mod clone_runtime;
 mod config;
@@ -126,6 +127,7 @@ mod util;
 mod watch_runtime;
 
 use atomic_io::write_atomic_with;
+use branch_runtime::branch_cmd;
 #[cfg(test)]
 use cli::PackArgs;
 use cli::{Cli, Command, InitArgs, RestoreArgs, SnapshotArgs};
@@ -187,6 +189,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init(args) => init(&paths, args),
         Command::Root { command } => root_cmd(&paths, command),
+        Command::Branch { command } => branch_cmd(&paths, command),
         Command::Snapshot(args) => snapshot(&paths, args),
         Command::Status => status_cmd(&paths),
         Command::Log(args) => log_cmd(&paths, args),
@@ -495,6 +498,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     println!("snapshot {}", manifest.snapshot_id);
     println!("files {total_files}, large {large_files}");
     record_event(paths, "snapshot-finish", &manifest.snapshot_id)?;
+    branch_runtime::update_active_branch_head(&conn, &snapshot_id)?;
     Ok(())
 }
 

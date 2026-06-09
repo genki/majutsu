@@ -320,6 +320,19 @@ where
                     });
                 }
             }
+            "current-branch" => {
+                if value.trim().is_empty() || value.contains('/') || value.contains('\\') {
+                    issues.push(LocalRefIssue::Unknown { name });
+                }
+            }
+            name if name.starts_with("branches/") => {
+                if !snapshot_ids.contains(&value) {
+                    issues.push(LocalRefIssue::MissingSnapshot {
+                        name: name.to_string(),
+                        value,
+                    });
+                }
+            }
             _ => issues.push(LocalRefIssue::Unknown { name }),
         }
     }

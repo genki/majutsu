@@ -71,12 +71,45 @@ fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrune
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(build_snapshot_prune_plan(
+    let mut plan = build_snapshot_prune_plan(
         &snapshots,
         current.as_deref(),
         args.keep_daily,
         args.keep_monthly,
-    ))
+    );
+    let protected = protected_ref_snapshots(conn, &snapshots)?;
+    let mut still_delete = Vec::new();
+    for snapshot_id in plan.delete {
+        if protected.contains(&snapshot_id) {
+            plan.keep.push(snapshot_id);
+        } else {
+            still_delete.push(snapshot_id);
+        }
+    }
+    plan.keep.sort();
+    plan.keep.dedup();
+    plan.delete = still_delete;
+    Ok(plan)
+}
+
+fn protected_ref_snapshots(
+    conn: &Connection,
+    snapshots: &[SnapshotPruneInput],
+) -> Result<BTreeSet<String>> {
+    let snapshot_ids = snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut protected = BTreeSet::new();
+    let mut stmt = conn.prepare("select value from refs")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let value = row?;
+        if snapshot_ids.contains(&value) {
+            protected.insert(value);
+        }
+    }
+    Ok(protected)
 }
 
 fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<PrunedMetadata> {

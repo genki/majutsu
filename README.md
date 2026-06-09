@@ -210,6 +210,22 @@ silently overwritten; use `root set` for intentional changes.
 `root set` records a `config-change` operation so root policy changes are
 visible in the operation log.
 
+
+## Branching
+
+Majutsu は host snapshot 上の軽量な logical branch をサポートする。過去時点へ戻り、
+より新しい snapshot を失わずに別 timeline として作業を続けたい場合に利用する。
+
+```sh
+mj branch list
+mj branch create experiment --at "2026-06-06 10:30:00" --switch --restore --force
+mj snapshot --message "experiment from old state"
+mj branch switch main --restore --force
+```
+
+branch は metadata refs (`current-branch` と `branches/<name>`) として保存されるため、
+sync / clone metadata に含まれる。コマンド全体は `docs/BRANCHING.md` を参照する。
+
 ## Remote Sync
 
 `mj sync` writes hot metadata and all referenced local objects to the configured

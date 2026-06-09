@@ -1221,6 +1221,7 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
                  on conflict(name) do update set value=excluded.value",
                 params![snapshot],
             )?;
+            crate::branch_runtime::update_active_branch_head(&conn, &snapshot)?;
             record_op(
                 &conn,
                 "op-restore",

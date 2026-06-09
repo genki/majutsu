@@ -51,6 +51,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RootCommand,
     },
+    #[command(about = "Create, list, switch, or delete logical history branches")]
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
+    },
     #[command(about = "Snapshot the current state of configured roots")]
     Snapshot(SnapshotArgs),
     #[command(about = "Show roots, current snapshot, queues, and daemon state")]
@@ -151,6 +156,136 @@ pub(crate) enum RootCommand {
     Resume { id: String },
     #[command(about = "Record a root as deleted")]
     MarkDeleted { id: String },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BranchCommand {
+    #[command(about = "List logical history branches")]
+    List,
+    #[command(about = "Show the active branch")]
+    Current,
+    #[command(about = "Create a branch at the current, specified, or time-selected snapshot")]
+    Create(BranchCreateArgs),
+    #[command(about = "Switch the active branch and optionally restore its files")]
+    Switch(BranchSwitchArgs),
+    #[command(about = "Move an existing branch head to another snapshot")]
+    SetHead(BranchSetHeadArgs),
+    #[command(about = "Delete a branch ref")]
+    Delete(BranchDeleteArgs),
+    #[command(about = "Rename a branch ref")]
+    Rename(BranchRenameArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct BranchCreateArgs {
+    #[arg(help = "Branch name")]
+    pub(crate) name: String,
+    #[arg(
+        long,
+        alias = "from",
+        value_name = "SNAPSHOT",
+        help = "Create the branch at this snapshot"
+    )]
+    pub(crate) snapshot: Option<String>,
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "Create the branch at the latest snapshot at or before this time"
+    )]
+    pub(crate) at: Option<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Switch to the new branch after creating it"
+    )]
+    pub(crate) switch: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Restore files from the branch head after switching"
+    )]
+    pub(crate) restore: bool,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Restore into this directory instead of configured roots"
+    )]
+    pub(crate) to: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Move an existing branch or allow destructive restore"
+    )]
+    pub(crate) force: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct BranchSwitchArgs {
+    #[arg(help = "Branch name")]
+    pub(crate) name: String,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Restore configured roots to the branch head"
+    )]
+    pub(crate) restore: bool,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Restore into this directory instead of configured roots"
+    )]
+    pub(crate) to: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow overwriting/deleting during restore"
+    )]
+    pub(crate) force: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct BranchSetHeadArgs {
+    #[arg(help = "Branch name")]
+    pub(crate) name: String,
+    #[arg(
+        long,
+        alias = "to",
+        value_name = "SNAPSHOT",
+        help = "Move the branch to this snapshot"
+    )]
+    pub(crate) snapshot: Option<String>,
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "Move the branch to the latest snapshot at or before this time"
+    )]
+    pub(crate) at: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct BranchDeleteArgs {
+    #[arg(help = "Branch name")]
+    pub(crate) name: String,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow deleting the active branch"
+    )]
+    pub(crate) force: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct BranchRenameArgs {
+    #[arg(help = "Old branch name")]
+    pub(crate) old: String,
+    #[arg(help = "New branch name")]
+    pub(crate) new: String,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Overwrite an existing destination branch"
+    )]
+    pub(crate) force: bool,
 }
 
 #[derive(Args)]

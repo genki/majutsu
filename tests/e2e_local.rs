@@ -490,3 +490,94 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
         "remote fsck deep",
     );
 }
+
+#[test]
+fn branch_switch_restores_selected_timeline_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let recovered_home = temp.path().join("recovered-home");
+    let remote = temp.path().join("remote");
+    let root = temp.path().join("workspace");
+    let restore = temp.path().join("restore");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("story.txt"), b"main baseline\n").unwrap();
+
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "init",
+                "--remote",
+                &format!("file://{}", remote.display()),
+                "--host-name",
+                "branch-e2e-host",
+            ],
+        ),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "workspace", root.to_str().unwrap()]),
+        "root add workspace",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "main baseline"]),
+        "first snapshot",
+    );
+    assert_success(
+        run_mj(&home, ["branch", "create", "feature", "--switch"]),
+        "branch create feature",
+    );
+    fs::write(root.join("story.txt"), b"feature work\n").unwrap();
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "feature work"]),
+        "feature snapshot",
+    );
+    assert_success(
+        run_mj(&home, ["branch", "switch", "main", "--restore", "--force"]),
+        "switch main",
+    );
+    assert_file(&root.join("story.txt"), b"main baseline\n");
+    assert_success(
+        run_mj(
+            &home,
+            ["branch", "switch", "feature", "--restore", "--force"],
+        ),
+        "switch feature",
+    );
+    assert_file(&root.join("story.txt"), b"feature work\n");
+    assert_success(
+        run_mj(&home, ["prune", "--keep-daily", "0", "--keep-monthly", "0"]),
+        "branch heads are protected from prune",
+    );
+    assert_success(run_mj(&home, ["branch", "list"]), "branch list");
+    assert_success(run_mj(&home, ["fsck"]), "fsck with branch refs");
+    assert_success(run_mj(&home, ["sync"]), "sync with branch refs");
+    assert_success(
+        run_mj(
+            &recovered_home,
+            ["clone", "--remote", &format!("file://{}", remote.display())],
+        ),
+        "clone with branch refs",
+    );
+    let branch_list = successful_stdout(
+        run_mj(&recovered_home, ["branch", "list"]),
+        "branch list after clone",
+    );
+    assert!(branch_list.contains("main"), "{branch_list}");
+    assert!(branch_list.contains("feature"), "{branch_list}");
+    assert_success(
+        run_mj(
+            &recovered_home,
+            [
+                "branch",
+                "switch",
+                "feature",
+                "--restore",
+                "--to",
+                restore.to_str().unwrap(),
+            ],
+        ),
+        "switch cloned feature branch",
+    );
+    assert_file(&restore.join("workspace/story.txt"), b"feature work\n");
+}

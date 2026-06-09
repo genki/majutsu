@@ -68,3 +68,16 @@ mj restore resume <restore-job-id>
 ```
 
 provider が非同期 restore window を必要とする場合は、provider 側の restore 完了を待ってから resume する。
+
+
+## branch / timeline operation
+
+```sh
+mj branch list
+mj branch create recovery-test --at '2026-06-06 10:30:00' --switch --restore --force
+mj snapshot --message 'recovery-test branch'
+mj branch switch main --restore --force
+```
+
+working directory を上書きせずに古い branch を確認したい場合は、configured roots への
+`--restore` ではなく `--to <dir>` を指定する。
