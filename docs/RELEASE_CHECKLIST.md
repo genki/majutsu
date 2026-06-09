@@ -29,8 +29,8 @@
 5. release tag を作成する。
 
    ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.2.0
+   git push origin v0.2.0
    ```
 
 6. release artifact をローカルで展開して smoke test を実行する。
