@@ -644,7 +644,11 @@ pub(crate) fn daemon_ipc_request(paths: &Paths, command: &str) -> Result<String>
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
-    Ok(reply.trim_end().to_string())
+    let reply = reply.trim_end().to_string();
+    if reply.is_empty() {
+        bail!("empty daemon IPC reply");
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
