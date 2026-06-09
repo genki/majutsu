@@ -37,9 +37,10 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let width = terminal_width();
     let height = terminal_height();
+    let ui = StatusUi::new();
     let mut output = String::new();
 
-    writeln!(output, "Status").expect("write status output");
+    writeln!(output, "{}", ui.heading("Status")).expect("write status output");
     print_kv(&mut output, width, "Current snapshot", current_label);
     print_kv(&mut output, width, "Roots", &roots.len().to_string());
     print_kv(&mut output, width, "Remote", remote.summary());
@@ -57,7 +58,35 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     );
     writeln!(output).expect("write status output");
 
-    writeln!(output, "Host").expect("write status output");
+    print_status_overview(
+        &mut output,
+        width,
+        &ui,
+        StatusOverview {
+            current: current_label,
+            roots_total: roots.len(),
+            roots_active: roots.iter().filter(|root| root.status == "active").count(),
+            roots_problem: roots
+                .iter()
+                .filter(|root| root.status != "active" || !root.path.exists())
+                .count(),
+            remote: &remote,
+            upload_total: upload_stats.total,
+            upload_retrying: upload_stats.retrying,
+            upload_delayed: upload_stats.delayed,
+            upload_backpressure: upload_stats.has_backpressure(),
+            encryption: config.security.encryption.as_str(),
+            state_bytes: storage.state_bytes,
+            object_bytes: storage.objects_bytes,
+            queue_bytes: storage.queue_bytes,
+            blob_bytes: db_stats.blob_bytes as u64,
+            pack_bytes: db_stats.pack_bytes as u64,
+            chunk_bytes: db_stats.chunk_bytes as u64,
+        },
+    );
+    writeln!(output).expect("write status output");
+
+    writeln!(output, "{}", ui.heading("Host")).expect("write status output");
     print_kv(&mut output, width, "Name", &config.host.name);
     print_kv(&mut output, width, "ID", &config.host.id);
     print_kv(
@@ -80,10 +109,10 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     );
     writeln!(output).expect("write status output");
 
-    print_remote_section(&mut output, width, &remote);
+    print_remote_section(&mut output, width, &ui, &remote);
     writeln!(output).expect("write status output");
 
-    writeln!(output, "Configuration").expect("write status output");
+    writeln!(output, "{}", ui.heading("Configuration")).expect("write status output");
     print_table(
         &mut output,
         width,
@@ -131,7 +160,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     );
     writeln!(output).expect("write status output");
 
-    writeln!(output, "Roots").expect("write status output");
+    writeln!(output, "{}", ui.heading("Roots")).expect("write status output");
     if roots.is_empty() {
         writeln!(output, "  (none)").expect("write status output");
     } else {
@@ -172,7 +201,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     }
     writeln!(output).expect("write status output");
 
-    writeln!(output, "Metadata").expect("write status output");
+    writeln!(output, "{}", ui.heading("Metadata")).expect("write status output");
     print_table(
         &mut output,
         width,
@@ -207,7 +236,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     );
     writeln!(output).expect("write status output");
 
-    writeln!(output, "Storage").expect("write status output");
+    writeln!(output, "{}", ui.heading("Storage")).expect("write status output");
     print_table(
         &mut output,
         width,
@@ -237,7 +266,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     );
     writeln!(output).expect("write status output");
 
-    writeln!(output, "Queues").expect("write status output");
+    writeln!(output, "{}", ui.heading("Queues")).expect("write status output");
     print_table(
         &mut output,
         width,
@@ -277,6 +306,305 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     writeln!(output, "current {current_label}").expect("write status output");
     emit_status_output(&output, height)?;
     Ok(())
+}
+
+struct StatusUi {
+    color: bool,
+}
+
+impl StatusUi {
+    fn new() -> Self {
+        let color = std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("MJ_COLOR").as_deref() != Ok("never")
+            && (std::env::var("MJ_COLOR").as_deref() == Ok("always")
+                || (io::stdout().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb")));
+        Self { color }
+    }
+
+    fn heading(&self, value: &str) -> String {
+        self.paint(value, "1;36")
+    }
+
+    fn severity(&self, value: &str, severity: Severity) -> String {
+        let code = match severity {
+            Severity::Good => "1;32",
+            Severity::Warn => "1;33",
+            Severity::Bad => "1;31",
+            Severity::Info => "1;34",
+        };
+        self.paint(value, code)
+    }
+
+    fn paint(&self, value: &str, code: &str) -> String {
+        if self.color {
+            format!("\x1b[{code}m{value}\x1b[0m")
+        } else {
+            value.to_string()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Severity {
+    Good,
+    Warn,
+    Bad,
+    Info,
+}
+
+struct StatusOverview<'a> {
+    current: &'a str,
+    roots_total: usize,
+    roots_active: usize,
+    roots_problem: usize,
+    remote: &'a RemoteStatus,
+    upload_total: usize,
+    upload_retrying: usize,
+    upload_delayed: usize,
+    upload_backpressure: bool,
+    encryption: &'a str,
+    state_bytes: u64,
+    object_bytes: u64,
+    queue_bytes: u64,
+    blob_bytes: u64,
+    pack_bytes: u64,
+    chunk_bytes: u64,
+}
+
+struct StatusCard {
+    title: String,
+    state: String,
+    detail: String,
+    severity: Severity,
+}
+
+fn print_status_overview(
+    out: &mut String,
+    width: usize,
+    ui: &StatusUi,
+    overview: StatusOverview<'_>,
+) {
+    writeln!(out, "{}", ui.heading("Overview")).expect("write status output");
+    let remote_severity = if !overview.remote.configured {
+        Severity::Warn
+    } else if overview.remote.open_error.is_some() {
+        Severity::Bad
+    } else {
+        Severity::Good
+    };
+    let upload_severity = if overview.upload_backpressure {
+        Severity::Bad
+    } else if overview.upload_total > 0 {
+        Severity::Warn
+    } else {
+        Severity::Good
+    };
+    let encryption_severity = if overview.encryption == "none" {
+        Severity::Warn
+    } else {
+        Severity::Good
+    };
+    let root_severity = if overview.roots_problem > 0 {
+        Severity::Warn
+    } else {
+        Severity::Good
+    };
+    let cards = [
+        StatusCard {
+            title: "snapshot".into(),
+            state: shorten_middle(overview.current, 24),
+            detail: "current ref".into(),
+            severity: Severity::Info,
+        },
+        StatusCard {
+            title: "roots".into(),
+            state: format!("{}/{} active", overview.roots_active, overview.roots_total),
+            detail: format!("problem={}", overview.roots_problem),
+            severity: root_severity,
+        },
+        StatusCard {
+            title: "remote".into(),
+            state: overview.remote.summary().into(),
+            detail: overview.remote.backend.clone(),
+            severity: remote_severity,
+        },
+        StatusCard {
+            title: "uploads".into(),
+            state: if overview.upload_total == 0 {
+                "clear".into()
+            } else {
+                format!("{} queued", overview.upload_total)
+            },
+            detail: format!(
+                "retrying={} delayed={}",
+                overview.upload_retrying, overview.upload_delayed
+            ),
+            severity: upload_severity,
+        },
+        StatusCard {
+            title: "encryption".into(),
+            state: overview.encryption.into(),
+            detail: if overview.encryption == "none" {
+                "unencrypted state".into()
+            } else {
+                "encrypted state".into()
+            },
+            severity: encryption_severity,
+        },
+        StatusCard {
+            title: "state".into(),
+            state: format_bytes_compact(overview.state_bytes),
+            detail: format!("objects {}", format_bytes_compact(overview.object_bytes)),
+            severity: Severity::Info,
+        },
+    ];
+    print_card_grid(out, width, ui, &cards);
+    print_usage_bars(
+        out,
+        width,
+        &[
+            ("state", overview.state_bytes),
+            ("objects", overview.object_bytes),
+            ("queue", overview.queue_bytes),
+        ],
+    );
+    print_usage_bars(
+        out,
+        width,
+        &[
+            ("blobs", overview.blob_bytes),
+            ("packs", overview.pack_bytes),
+            ("chunks", overview.chunk_bytes),
+        ],
+    );
+}
+
+fn print_card_grid(out: &mut String, width: usize, ui: &StatusUi, cards: &[StatusCard]) {
+    let columns = if width >= 108 {
+        3
+    } else if width >= 74 {
+        2
+    } else {
+        1
+    };
+    let gap = if columns > 1 { 2 } else { 0 };
+    let card_width = ((width.saturating_sub(2 + gap * (columns - 1))) / columns).max(28);
+    for (row_index, row) in cards.chunks(columns).enumerate() {
+        let first_line = if row_index == 0 { 0 } else { 1 };
+        for line_index in first_line..4 {
+            write!(out, "  ").expect("write status output");
+            for (i, card) in row.iter().enumerate() {
+                if i > 0 {
+                    write!(out, "{:gap$}", "", gap = gap).expect("write status output");
+                }
+                let line = card_line(card, card_width, line_index);
+                let rendered = if line_index == 1 {
+                    color_card_state(ui, card, &line)
+                } else {
+                    line
+                };
+                write!(out, "{rendered}").expect("write status output");
+            }
+            writeln!(out).expect("write status output");
+        }
+    }
+}
+
+fn card_line(card: &StatusCard, width: usize, line_index: usize) -> String {
+    let inner = width.saturating_sub(2).max(10);
+    match line_index {
+        0 => format!("+{}+", "-".repeat(inner)),
+        1 => {
+            let title = truncate_text(&card.title.to_uppercase(), 10);
+            let state_space = inner.saturating_sub(title.len() + 1);
+            let state = truncate_text(&card.state, state_space);
+            format!("|{title} {state:<state_space$}|")
+        }
+        2 => {
+            let detail = truncate_text(&card.detail, inner);
+            format!("|{detail:<inner$}|")
+        }
+        _ => format!("+{}+", "-".repeat(inner)),
+    }
+}
+
+fn color_card_state(ui: &StatusUi, card: &StatusCard, line: &str) -> String {
+    if !ui.color {
+        return line.to_string();
+    }
+    let trimmed_state = card.state.trim();
+    if trimmed_state.is_empty() {
+        return line.to_string();
+    }
+    line.replacen(trimmed_state, &ui.severity(trimmed_state, card.severity), 1)
+}
+
+fn print_usage_bars(out: &mut String, width: usize, values: &[(&str, u64)]) {
+    let max_value = values
+        .iter()
+        .map(|(_, value)| *value)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let label_width = values
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let value_width = values
+        .iter()
+        .map(|(_, value)| format_bytes_compact(*value).len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let bar_width = width
+        .saturating_sub(2 + label_width + 2 + value_width + 3)
+        .clamp(8, 32);
+    for (label, value) in values {
+        let filled = ((*value as f64 / max_value as f64) * bar_width as f64).round() as usize;
+        let filled = filled.min(bar_width);
+        writeln!(
+            out,
+            "  {label:<label_width$} [{}{}] {:>value_width$}",
+            "#".repeat(filled),
+            "-".repeat(bar_width - filled),
+            format_bytes_compact(*value),
+            label_width = label_width,
+            value_width = value_width
+        )
+        .expect("write status output");
+    }
+}
+
+fn truncate_text(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return value.chars().take(width).collect();
+    }
+    let mut out = value.chars().take(width - 1).collect::<String>();
+    out.push('~');
+    out
+}
+
+fn shorten_middle(value: &str, width: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return truncate_text(value, width);
+    }
+    let prefix = (width - 1) / 2;
+    let suffix = width - 1 - prefix;
+    let left = chars.iter().take(prefix).collect::<String>();
+    let right = chars
+        .iter()
+        .skip(chars.len().saturating_sub(suffix))
+        .collect::<String>();
+    format!("{left}~{right}")
 }
 
 fn print_kv(out: &mut String, width: usize, key: &str, value: &str) {
@@ -531,6 +859,23 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_bytes_compact(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[derive(Default)]
 struct StatusDbStats {
     snapshots: i64,
@@ -728,8 +1073,8 @@ fn read_remote_status(config: &Config) -> Result<RemoteStatus> {
     }
 }
 
-fn print_remote_section(out: &mut String, width: usize, remote: &RemoteStatus) {
-    writeln!(out, "Remote").expect("write status output");
+fn print_remote_section(out: &mut String, width: usize, ui: &StatusUi, remote: &RemoteStatus) {
+    writeln!(out, "{}", ui.heading("Remote")).expect("write status output");
     print_kv(out, width, "Configured", &remote.configured.to_string());
     print_kv(out, width, "Backend", &remote.backend);
     if let Some(url) = &remote.url {
