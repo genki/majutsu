@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -11,7 +12,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-use crate::cli::{DiffArgs, LogArgs, OpCommand};
+use crate::cli::{DiffArgs, LogArgs, OpCommand, StateArgs};
 use crate::config::{Config, Paths, read_config};
 use crate::operation_log::{query_operation, record_op};
 use crate::queue_runtime::{event_journal_records, upload_queue_stats};
@@ -306,6 +307,509 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     writeln!(output, "current {current_label}").expect("write status output");
     emit_status_output(&output, height)?;
     Ok(())
+}
+
+pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
+    crate::ensure_ready(paths)?;
+    let conn = crate::open_db(paths)?;
+    let config = read_config(paths)?;
+    let current = current_snapshot(&conn)?;
+    let active_branch = ref_value_for_state(&conn, "current-branch")?;
+    let latest = latest_snapshot_for_state(&conn)?;
+    let refs = state_refs(&conn)?;
+    let branches = state_branches(&refs, active_branch.as_deref());
+    let db_stats = read_status_db_stats(&conn)?;
+    let storage = read_storage_stats(paths)?;
+    let upload_stats = upload_queue_stats(paths)?;
+    let event_count = event_journal_records(paths)?.len();
+    let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
+    let remote = read_remote_status(&config)?;
+
+    let state = StateReport {
+        host: StateHost {
+            name: config.host.name.clone(),
+            id: config.host.id.clone(),
+        },
+        paths: StatePaths {
+            home: paths.home.display().to_string(),
+            config: paths.config.display().to_string(),
+            database: paths.db.display().to_string(),
+            objects: paths.objects.display().to_string(),
+            logs: paths.logs.display().to_string(),
+            runtime: paths.runtime.display().to_string(),
+            upload_queue: paths.upload_queue.display().to_string(),
+            event_queue: paths.event_queue.display().to_string(),
+        },
+        timeline: StateTimeline {
+            current_snapshot: current.clone(),
+            current_branch: active_branch.clone(),
+            latest_snapshot: latest.as_ref().map(|snapshot| snapshot.id.clone()),
+            latest_created_at: latest.as_ref().map(|snapshot| snapshot.created_at.clone()),
+            latest_parent: latest.and_then(|snapshot| snapshot.parent_id),
+            branch_count: branches.len(),
+        },
+        remote: StateRemote {
+            configured: remote.configured,
+            backend: remote.backend.clone(),
+            url: remote.url.clone(),
+            resolved: remote.resolved.clone(),
+            available: remote.configured && remote.open_error.is_none(),
+            open_error: remote.open_error.clone(),
+        },
+        security: StateSecurity {
+            encryption: config.security.encryption.clone(),
+            hash: config.security.hash.clone(),
+            master_key_path: paths.master_key.display().to_string(),
+        },
+        metadata: StateMetadata {
+            snapshots: db_stats.snapshots,
+            operations: db_stats.operations,
+            refs: db_stats.refs,
+            remote_refs: db_stats.remote_refs,
+            blobs: db_stats.blobs,
+            blob_bytes: db_stats.blob_bytes,
+            large_objects: db_stats.large_objects,
+            large_object_bytes: db_stats.large_object_bytes,
+            chunks: db_stats.chunks,
+            chunk_bytes: db_stats.chunk_bytes,
+            packs: db_stats.packs,
+            pack_bytes: db_stats.pack_bytes,
+            large_pins: db_stats.large_pins,
+        },
+        storage: StateStorage {
+            state_files: storage.state_files,
+            state_bytes: storage.state_bytes,
+            objects_files: storage.objects_files,
+            objects_bytes: storage.objects_bytes,
+            logs_files: storage.logs_files,
+            logs_bytes: storage.logs_bytes,
+            queue_files: storage.queue_files,
+            queue_bytes: storage.queue_bytes,
+        },
+        queues: StateQueues {
+            uploads: upload_stats.total as u64,
+            uploads_retrying: upload_stats.retrying as u64,
+            uploads_delayed: upload_stats.delayed as u64,
+            upload_backpressure: upload_stats.has_backpressure(),
+            event_journal: event_count as u64,
+            restore_jobs: restore_queue_count as u64,
+        },
+        branches,
+        refs,
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    } else {
+        print_state_report(&state)?;
+    }
+    Ok(())
+}
+
+fn print_state_report(state: &StateReport) -> Result<()> {
+    let width = terminal_width();
+    let height = terminal_height();
+    let ui = StatusUi::new();
+    let mut output = String::new();
+
+    writeln!(output, "{}", ui.heading("State")).expect("write state output");
+    print_kv(&mut output, width, "Home", &state.paths.home);
+    print_kv(
+        &mut output,
+        width,
+        "Host",
+        &format!("{} {}", state.host.name, state.host.id),
+    );
+    print_kv(
+        &mut output,
+        width,
+        "Current",
+        state
+            .timeline
+            .current_snapshot
+            .as_deref()
+            .unwrap_or("(none)"),
+    );
+    print_kv(
+        &mut output,
+        width,
+        "Branch",
+        state.timeline.current_branch.as_deref().unwrap_or("(none)"),
+    );
+    print_kv(
+        &mut output,
+        width,
+        "Remote",
+        if state.remote.configured {
+            if state.remote.available {
+                "configured"
+            } else {
+                "configured, unavailable"
+            }
+        } else {
+            "not configured"
+        },
+    );
+    print_kv(&mut output, width, "Encryption", &state.security.encryption);
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Paths")).expect("write state output");
+    print_table(
+        &mut output,
+        width,
+        &["ITEM", "PATH"],
+        &[
+            ["config", state.paths.config.as_str()],
+            ["database", state.paths.database.as_str()],
+            ["objects", state.paths.objects.as_str()],
+            ["logs", state.paths.logs.as_str()],
+            ["runtime", state.paths.runtime.as_str()],
+            ["upload queue", state.paths.upload_queue.as_str()],
+            ["event queue", state.paths.event_queue.as_str()],
+            ["master key", state.security.master_key_path.as_str()],
+        ],
+    );
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Timeline")).expect("write state output");
+    print_table(
+        &mut output,
+        width,
+        &["ITEM", "VALUE"],
+        &[
+            [
+                "current snapshot",
+                state
+                    .timeline
+                    .current_snapshot
+                    .as_deref()
+                    .unwrap_or("(none)"),
+            ],
+            [
+                "current branch",
+                state.timeline.current_branch.as_deref().unwrap_or("(none)"),
+            ],
+            [
+                "latest snapshot",
+                state
+                    .timeline
+                    .latest_snapshot
+                    .as_deref()
+                    .unwrap_or("(none)"),
+            ],
+            [
+                "latest created",
+                state
+                    .timeline
+                    .latest_created_at
+                    .as_deref()
+                    .unwrap_or("(none)"),
+            ],
+            [
+                "latest parent",
+                state.timeline.latest_parent.as_deref().unwrap_or("(none)"),
+            ],
+            ["branches", &state.timeline.branch_count.to_string()],
+        ],
+    );
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Branches")).expect("write state output");
+    if state.branches.is_empty() {
+        writeln!(output, "  (none)").expect("write state output");
+    } else {
+        let rows = state
+            .branches
+            .iter()
+            .map(|branch| {
+                [
+                    if branch.active { "*" } else { " " },
+                    branch.name.as_str(),
+                    branch.snapshot.as_str(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&mut output, width, &["", "NAME", "SNAPSHOT"], &rows);
+    }
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Refs")).expect("write state output");
+    if state.refs.is_empty() {
+        writeln!(output, "  (none)").expect("write state output");
+    } else {
+        let rows = state
+            .refs
+            .iter()
+            .map(|reference| [reference.name.as_str(), reference.value.as_str()])
+            .collect::<Vec<_>>();
+        print_table(&mut output, width, &["NAME", "VALUE"], &rows);
+    }
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Metadata")).expect("write state output");
+    print_table(
+        &mut output,
+        width,
+        &["ITEM", "COUNT", "SIZE"],
+        &[
+            ["snapshots", &state.metadata.snapshots.to_string(), "-"],
+            ["operations", &state.metadata.operations.to_string(), "-"],
+            ["refs", &state.metadata.refs.to_string(), "-"],
+            ["remote refs", &state.metadata.remote_refs.to_string(), "-"],
+            [
+                "blobs",
+                &state.metadata.blobs.to_string(),
+                &format_bytes(state.metadata.blob_bytes.max(0) as u64),
+            ],
+            [
+                "large objects",
+                &state.metadata.large_objects.to_string(),
+                &format_bytes(state.metadata.large_object_bytes.max(0) as u64),
+            ],
+            [
+                "chunks",
+                &state.metadata.chunks.to_string(),
+                &format_bytes(state.metadata.chunk_bytes.max(0) as u64),
+            ],
+            [
+                "packs",
+                &state.metadata.packs.to_string(),
+                &format_bytes(state.metadata.pack_bytes.max(0) as u64),
+            ],
+            ["large pins", &state.metadata.large_pins.to_string(), "-"],
+        ],
+    );
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Storage")).expect("write state output");
+    print_table(
+        &mut output,
+        width,
+        &["SCOPE", "FILES", "SIZE"],
+        &[
+            [
+                "state",
+                &state.storage.state_files.to_string(),
+                &format_bytes(state.storage.state_bytes),
+            ],
+            [
+                "objects",
+                &state.storage.objects_files.to_string(),
+                &format_bytes(state.storage.objects_bytes),
+            ],
+            [
+                "logs",
+                &state.storage.logs_files.to_string(),
+                &format_bytes(state.storage.logs_bytes),
+            ],
+            [
+                "queue",
+                &state.storage.queue_files.to_string(),
+                &format_bytes(state.storage.queue_bytes),
+            ],
+        ],
+    );
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Queues")).expect("write state output");
+    print_table(
+        &mut output,
+        width,
+        &["QUEUE", "COUNT", "STATE"],
+        &[
+            [
+                "uploads",
+                &state.queues.uploads.to_string(),
+                &format!(
+                    "retrying={}, delayed={}, backpressure={}",
+                    state.queues.uploads_retrying,
+                    state.queues.uploads_delayed,
+                    state.queues.upload_backpressure
+                ),
+            ],
+            [
+                "event journal",
+                &state.queues.event_journal.to_string(),
+                "pending observations",
+            ],
+            [
+                "restore jobs",
+                &state.queues.restore_jobs.to_string(),
+                "prepared jobs",
+            ],
+        ],
+    );
+
+    emit_status_output(&output, height)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct StateReport {
+    host: StateHost,
+    paths: StatePaths,
+    timeline: StateTimeline,
+    remote: StateRemote,
+    security: StateSecurity,
+    metadata: StateMetadata,
+    storage: StateStorage,
+    queues: StateQueues,
+    branches: Vec<StateBranch>,
+    refs: Vec<StateRef>,
+}
+
+#[derive(Serialize)]
+struct StateHost {
+    name: String,
+    id: String,
+}
+
+#[derive(Serialize)]
+struct StatePaths {
+    home: String,
+    config: String,
+    database: String,
+    objects: String,
+    logs: String,
+    runtime: String,
+    upload_queue: String,
+    event_queue: String,
+}
+
+#[derive(Serialize)]
+struct StateTimeline {
+    current_snapshot: Option<String>,
+    current_branch: Option<String>,
+    latest_snapshot: Option<String>,
+    latest_created_at: Option<String>,
+    latest_parent: Option<String>,
+    branch_count: usize,
+}
+
+#[derive(Serialize)]
+struct StateRemote {
+    configured: bool,
+    backend: String,
+    url: Option<String>,
+    resolved: Option<String>,
+    available: bool,
+    open_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StateSecurity {
+    encryption: String,
+    hash: String,
+    master_key_path: String,
+}
+
+#[derive(Serialize)]
+struct StateMetadata {
+    snapshots: i64,
+    operations: i64,
+    refs: i64,
+    remote_refs: i64,
+    blobs: i64,
+    blob_bytes: i64,
+    large_objects: i64,
+    large_object_bytes: i64,
+    chunks: i64,
+    chunk_bytes: i64,
+    packs: i64,
+    pack_bytes: i64,
+    large_pins: i64,
+}
+
+#[derive(Serialize)]
+struct StateStorage {
+    state_files: u64,
+    state_bytes: u64,
+    objects_files: u64,
+    objects_bytes: u64,
+    logs_files: u64,
+    logs_bytes: u64,
+    queue_files: u64,
+    queue_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct StateQueues {
+    uploads: u64,
+    uploads_retrying: u64,
+    uploads_delayed: u64,
+    upload_backpressure: bool,
+    event_journal: u64,
+    restore_jobs: u64,
+}
+
+#[derive(Serialize)]
+struct StateBranch {
+    name: String,
+    snapshot: String,
+    active: bool,
+}
+
+#[derive(Serialize)]
+struct StateRef {
+    name: String,
+    value: String,
+}
+
+struct StateSnapshot {
+    id: String,
+    created_at: String,
+    parent_id: Option<String>,
+}
+
+fn state_refs(conn: &Connection) -> Result<Vec<StateRef>> {
+    let mut stmt = conn.prepare("select name, value from refs order by name")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(StateRef {
+            name: row.get(0)?,
+            value: row.get(1)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn state_branches(refs: &[StateRef], active_branch: Option<&str>) -> Vec<StateBranch> {
+    refs.iter()
+        .filter_map(|reference| {
+            let name = reference.name.strip_prefix("branches/")?;
+            Some(StateBranch {
+                name: name.to_string(),
+                snapshot: reference.value.clone(),
+                active: active_branch == Some(name),
+            })
+        })
+        .collect()
+}
+
+fn ref_value_for_state(conn: &Connection, name: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "select value from refs where name=?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn latest_snapshot_for_state(conn: &Connection) -> Result<Option<StateSnapshot>> {
+    conn.query_row(
+        "select id, created_at, parent_id from snapshots order by created_at desc limit 1",
+        [],
+        |row| {
+            Ok(StateSnapshot {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                parent_id: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 struct StatusUi {

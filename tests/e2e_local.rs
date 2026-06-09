@@ -581,3 +581,75 @@ fn branch_switch_restores_selected_timeline_head() {
     );
     assert_file(&restore.join("workspace/story.txt"), b"feature work\n");
 }
+
+#[test]
+fn state_reports_paths_refs_branches_and_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let remote = temp.path().join("remote");
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.txt"), b"main\n").unwrap();
+
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "init",
+                "--remote",
+                &format!("file://{}", remote.display()),
+                "--host-name",
+                "state-e2e-host",
+            ],
+        ),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "workspace", root.to_str().unwrap()]),
+        "root add workspace",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "main"]),
+        "main snapshot",
+    );
+    assert_success(
+        run_mj(&home, ["branch", "create", "feature", "--switch"]),
+        "create feature branch",
+    );
+    fs::write(root.join("note.txt"), b"feature\n").unwrap();
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "feature"]),
+        "feature snapshot",
+    );
+
+    let text = successful_stdout(run_mj(&home, ["state"]), "state text");
+    assert!(text.contains("State"), "{text}");
+    assert!(text.contains("Branches"), "{text}");
+    assert!(text.contains("Refs"), "{text}");
+    assert!(text.contains("current-branch"), "{text}");
+    assert!(text.contains("feature"), "{text}");
+    assert!(text.contains(home.to_str().unwrap()), "{text}");
+
+    let json = successful_stdout(run_mj(&home, ["state", "--json"]), "state json");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["host"]["name"], "state-e2e-host");
+    assert_eq!(value["timeline"]["current_branch"], "feature");
+    assert_eq!(value["timeline"]["branch_count"], 2);
+    assert_eq!(value["remote"]["backend"], "file");
+    assert_eq!(value["remote"]["available"], true);
+    assert!(
+        value["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| branch["name"] == "feature" && branch["active"] == true)
+    );
+    assert!(
+        value["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reference| reference["name"] == "current-branch"
+                && reference["value"] == "feature")
+    );
+}

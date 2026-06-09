@@ -60,6 +60,8 @@ pub(crate) enum Command {
     Snapshot(SnapshotArgs),
     #[command(about = "Show roots, current snapshot, queues, and daemon state")]
     Status,
+    #[command(about = "Inspect state home paths, refs, branches, and metadata")]
+    State(StateArgs),
     #[command(about = "Show snapshot history")]
     Log(LogArgs),
     #[command(about = "Inspect or restore operation-log entries")]
@@ -286,6 +288,16 @@ pub(crate) struct BranchRenameArgs {
         help = "Overwrite an existing destination branch"
     )]
     pub(crate) force: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct StateArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Emit machine-readable JSON instead of the terminal summary"
+    )]
+    pub(crate) json: bool,
 }
 
 #[derive(Args)]

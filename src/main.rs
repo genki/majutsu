@@ -143,7 +143,7 @@ use config::{
 use daemon_runtime::daemon_cmd;
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::fsck;
-use history_runtime::{diff_cmd, log_cmd, op_cmd, status_cmd};
+use history_runtime::{diff_cmd, log_cmd, op_cmd, state_cmd, status_cmd};
 use key_runtime::key_cmd;
 use large_runtime::large_cmd;
 use lifecycle_runtime::lifecycle_cmd;
@@ -192,6 +192,7 @@ fn main() -> Result<()> {
         Command::Branch { command } => branch_cmd(&paths, command),
         Command::Snapshot(args) => snapshot(&paths, args),
         Command::Status => status_cmd(&paths),
+        Command::State(args) => state_cmd(&paths, args),
         Command::Log(args) => log_cmd(&paths, args),
         Command::Op { command } => op_cmd(&paths, command),
         Command::Diff(args) => diff_cmd(&paths, args),

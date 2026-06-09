@@ -95,6 +95,15 @@ Example XDG config:
 home = "/var/lib/majutsu"
 ```
 
+State home の内部状態を確認するには `mj state` を使う。`status` が運用上の要点を
+ダッシュボード表示するのに対し、`state` は paths、refs、branch heads、metadata
+件数、local storage を確認するためのコマンドである。
+
+```sh
+mj state
+mj state --json
+```
+
 ## Quick Start
 
 ```sh

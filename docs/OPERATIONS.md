@@ -4,6 +4,7 @@
 
 ```sh
 mj status
+mj state
 mj sync status
 mj fsck
 mj remote check
@@ -11,6 +12,10 @@ mj remote fsck
 mj daemon status
 mj daemon metrics
 ```
+
+`mj status` は運用上の要点確認、`mj state` は state home の paths、refs、
+branch heads、metadata 件数を確認する用途で使い分ける。自動確認では
+`mj state --json` を使う。
 
 ## 災害復旧 drill
 
