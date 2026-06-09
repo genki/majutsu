@@ -317,6 +317,13 @@ pub(crate) struct WatchConfig {
     )]
     pub(crate) settle: u64,
     #[serde(
+        default = "default_watch_buffer_max_ms",
+        deserialize_with = "deserialize_millis"
+    )]
+    pub(crate) buffer_max: u64,
+    #[serde(default = "default_watch_buffer_max_events")]
+    pub(crate) buffer_max_events: usize,
+    #[serde(
         default = "default_watch_periodic_rescan_secs",
         deserialize_with = "deserialize_seconds"
     )]
@@ -335,6 +342,8 @@ impl Default for WatchConfig {
             mode: default_watch_mode(),
             debounce: default_watch_debounce_ms(),
             settle: default_watch_settle_ms(),
+            buffer_max: default_watch_buffer_max_ms(),
+            buffer_max_events: default_watch_buffer_max_events(),
             periodic_rescan: default_watch_periodic_rescan_secs(),
             interval: default_watch_interval_secs(),
         }
@@ -783,6 +792,14 @@ fn default_watch_debounce_ms() -> u64 {
 
 fn default_watch_settle_ms() -> u64 {
     majutsu_watch::default_settle().as_millis() as u64
+}
+
+fn default_watch_buffer_max_ms() -> u64 {
+    majutsu_watch::default_buffer_max().as_millis() as u64
+}
+
+fn default_watch_buffer_max_events() -> usize {
+    majutsu_watch::default_buffer_max_events()
 }
 
 fn default_watch_periodic_rescan_secs() -> u64 {

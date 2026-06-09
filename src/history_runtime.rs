@@ -147,6 +147,16 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
                 &format!("{} ms", config.watch.debounce),
             ],
             ["watch", "settle", &format!("{} ms", config.watch.settle)],
+            [
+                "watch",
+                "buffer-max",
+                &format!("{} ms", config.watch.buffer_max),
+            ],
+            [
+                "watch",
+                "buffer-events",
+                &config.watch.buffer_max_events.to_string(),
+            ],
             ["large", "enabled", &config.large.enabled.to_string()],
             ["large", "min-size", &format_bytes(config.large.min_size)],
             [

@@ -81,6 +81,8 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             interval_secs,
             debounce_ms,
             settle_ms,
+            buffer_max_ms,
+            buffer_max_events,
             periodic_rescan_secs,
         } => {
             let configured_backend = backend.unwrap_or_else(|| config.watch.backend.clone());
@@ -94,6 +96,8 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 interval_secs.unwrap_or(config.watch.interval),
                 debounce_ms.unwrap_or(config.watch.debounce),
                 settle_ms.unwrap_or(config.watch.settle),
+                buffer_max_ms.unwrap_or(config.watch.buffer_max),
+                buffer_max_events.unwrap_or(config.watch.buffer_max_events),
                 periodic_rescan_secs.unwrap_or(config.watch.periodic_rescan),
             )?;
             println!("started daemon pid {pid}");
@@ -110,6 +114,8 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 interval_secs: config.watch.interval,
                 debounce_ms: config.watch.debounce,
                 settle_ms: config.watch.settle,
+                buffer_max_ms: config.watch.buffer_max,
+                buffer_max_events: config.watch.buffer_max_events,
                 periodic_rescan_secs: config.watch.periodic_rescan,
             })
             .map_err(anyhow::Error::msg)?;
@@ -211,6 +217,8 @@ pub(crate) fn ensure_daemon_running(paths: &Paths) -> Result<Option<u32>> {
         config.watch.interval,
         config.watch.debounce,
         config.watch.settle,
+        config.watch.buffer_max,
+        config.watch.buffer_max_events,
         config.watch.periodic_rescan,
     )
     .map(Some)
@@ -241,6 +249,8 @@ pub(crate) fn start_watch_daemon(
     interval_secs: u64,
     debounce_ms: u64,
     settle_ms: u64,
+    buffer_max_ms: u64,
+    buffer_max_events: usize,
     periodic_rescan_secs: u64,
 ) -> Result<u32> {
     if let Some(pid) = read_pid(&paths.daemon_pid)? {
@@ -271,6 +281,10 @@ pub(crate) fn start_watch_daemon(
         .arg(debounce_ms.to_string())
         .arg("--settle-ms")
         .arg(settle_ms.to_string())
+        .arg("--buffer-max-ms")
+        .arg(buffer_max_ms.to_string())
+        .arg("--buffer-max-events")
+        .arg(buffer_max_events.to_string())
         .arg("--periodic-rescan-secs")
         .arg(periodic_rescan_secs.to_string())
         .stdout(Stdio::from(log.try_clone()?))

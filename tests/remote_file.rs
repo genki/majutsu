@@ -13277,8 +13277,9 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(events.contains("watch-settle"));
-    assert!(events.contains("settle_ms=50"));
+    assert!(events.contains("watch-buffer-flush"));
+    assert!(events.contains("reason=quiet"));
+    assert!(events.contains("events=1"));
     #[cfg(target_os = "linux")]
     {
         assert!(events.contains("\"root_id\": \"sample\""));

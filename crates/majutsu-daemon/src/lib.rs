@@ -22,6 +22,8 @@ pub struct DaemonServiceConfig<'a> {
     pub interval_secs: u64,
     pub debounce_ms: u64,
     pub settle_ms: u64,
+    pub buffer_max_ms: u64,
+    pub buffer_max_events: usize,
     pub periodic_rescan_secs: u64,
 }
 
@@ -52,6 +54,10 @@ fn daemon_watch_args(config: &DaemonServiceConfig<'_>) -> Vec<String> {
         config.debounce_ms.to_string(),
         "--settle-ms".into(),
         config.settle_ms.to_string(),
+        "--buffer-max-ms".into(),
+        config.buffer_max_ms.to_string(),
+        "--buffer-max-events".into(),
+        config.buffer_max_events.to_string(),
         "--periodic-rescan-secs".into(),
         config.periodic_rescan_secs.to_string(),
     ]
@@ -157,6 +163,8 @@ mod tests {
             interval_secs: 60,
             debounce_ms: 1500,
             settle_ms: 500,
+            buffer_max_ms: 60000,
+            buffer_max_events: 1000,
             periodic_rescan_secs: 3600,
         })
         .unwrap();
@@ -182,6 +190,8 @@ mod tests {
             interval_secs: 30,
             debounce_ms: 25,
             settle_ms: 15,
+            buffer_max_ms: 1000,
+            buffer_max_events: 20,
             periodic_rescan_secs: 0,
         })
         .unwrap();
@@ -204,6 +214,8 @@ mod tests {
                 interval_secs: 60,
                 debounce_ms: 1500,
                 settle_ms: 500,
+                buffer_max_ms: 60000,
+                buffer_max_events: 1000,
                 periodic_rescan_secs: 3600,
             })
             .is_err()

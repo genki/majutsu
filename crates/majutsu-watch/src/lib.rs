@@ -71,6 +71,8 @@ pub struct WatchPolicy {
     pub backend: WatchBackend,
     pub debounce: Duration,
     pub settle: Duration,
+    pub buffer_max: Duration,
+    pub buffer_max_events: usize,
     pub periodic_rescan: Option<Duration>,
 }
 
@@ -80,6 +82,8 @@ impl WatchPolicy {
             backend: WatchBackend::default_native(),
             debounce: default_debounce(),
             settle: default_settle(),
+            buffer_max: default_buffer_max(),
+            buffer_max_events: default_buffer_max_events(),
             periodic_rescan: Some(default_periodic_rescan()),
         }
     }
@@ -99,6 +103,14 @@ pub fn default_debounce() -> Duration {
 
 pub fn default_settle() -> Duration {
     Duration::from_millis(500)
+}
+
+pub fn default_buffer_max() -> Duration {
+    Duration::from_secs(60)
+}
+
+pub fn default_buffer_max_events() -> usize {
+    1000
 }
 
 pub fn default_periodic_rescan() -> Duration {
@@ -148,6 +160,8 @@ mod tests {
         let policy = WatchPolicy::native_default();
         assert_eq!(policy.debounce, Duration::from_millis(1500));
         assert_eq!(policy.settle, Duration::from_millis(500));
+        assert_eq!(policy.buffer_max, Duration::from_secs(60));
+        assert_eq!(policy.buffer_max_events, 1000);
         assert_eq!(policy.periodic_rescan, Some(Duration::from_secs(3600)));
     }
 }

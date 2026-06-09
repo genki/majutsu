@@ -676,10 +676,26 @@ pub(crate) struct WatchArgs {
     pub(crate) mode: Option<String>,
     #[arg(long)]
     pub(crate) interval_secs: Option<u64>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Quiet time after the last filesystem event before flushing a watch snapshot"
+    )]
     pub(crate) debounce_ms: Option<u64>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Additional quiet time folded into watch snapshot buffering"
+    )]
     pub(crate) settle_ms: Option<u64>,
+    #[arg(
+        long,
+        help = "Maximum time to buffer filesystem events before forcing a watch snapshot"
+    )]
+    pub(crate) buffer_max_ms: Option<u64>,
+    #[arg(
+        long,
+        help = "Maximum number of buffered filesystem events before forcing a watch snapshot"
+    )]
+    pub(crate) buffer_max_events: Option<usize>,
     #[arg(long)]
     pub(crate) periodic_rescan_secs: Option<u64>,
     #[arg(long)]
@@ -695,6 +711,8 @@ pub(crate) struct ResolvedWatchArgs {
     pub(crate) interval_secs: u64,
     pub(crate) debounce_ms: u64,
     pub(crate) settle_ms: u64,
+    pub(crate) buffer_max_ms: u64,
+    pub(crate) buffer_max_events: usize,
     pub(crate) periodic_rescan_secs: u64,
     pub(crate) backend: String,
     pub(crate) once: bool,
@@ -709,10 +727,26 @@ pub(crate) enum DaemonCommand {
         mode: Option<String>,
         #[arg(long)]
         interval_secs: Option<u64>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Quiet time after the last filesystem event before flushing a watch snapshot"
+        )]
         debounce_ms: Option<u64>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Additional quiet time folded into watch snapshot buffering"
+        )]
         settle_ms: Option<u64>,
+        #[arg(
+            long,
+            help = "Maximum time to buffer filesystem events before forcing a watch snapshot"
+        )]
+        buffer_max_ms: Option<u64>,
+        #[arg(
+            long,
+            help = "Maximum number of buffered filesystem events before forcing a watch snapshot"
+        )]
+        buffer_max_events: Option<usize>,
         #[arg(long)]
         periodic_rescan_secs: Option<u64>,
     },

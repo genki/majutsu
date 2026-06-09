@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
@@ -40,6 +40,8 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
             args.interval_secs,
             args.debounce_ms,
             args.settle_ms,
+            args.buffer_max_ms,
+            args.buffer_max_events,
             args.periodic_rescan_secs,
         )?;
         println!("started daemon pid {pid}");
@@ -64,6 +66,8 @@ fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedW
         interval_secs: args.interval_secs.unwrap_or(config.interval),
         debounce_ms: args.debounce_ms.unwrap_or(config.debounce),
         settle_ms: args.settle_ms.unwrap_or(config.settle),
+        buffer_max_ms: args.buffer_max_ms.unwrap_or(config.buffer_max),
+        buffer_max_events: args.buffer_max_events.unwrap_or(config.buffer_max_events),
         periodic_rescan_secs: args.periodic_rescan_secs.unwrap_or(config.periodic_rescan),
         backend: args.backend.unwrap_or_else(|| config.backend.clone()),
         once: args.once,
@@ -108,8 +112,14 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
         paths,
         "watch-start",
         &format!(
-            "backend={} mode={} debounce_ms={} settle_ms={} periodic_rescan_secs={}",
-            backend_label, args.mode, args.debounce_ms, args.settle_ms, args.periodic_rescan_secs
+            "backend={} mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={}",
+            backend_label,
+            args.mode,
+            args.debounce_ms,
+            args.settle_ms,
+            args.buffer_max_ms,
+            args.buffer_max_events,
+            args.periodic_rescan_secs
         ),
     )?;
     let (tx, rx) = mpsc::channel();
@@ -193,38 +203,21 @@ fn watch_notify_loop<W: Watcher>(
             }
             continue;
         }
-        let debounce = std::time::Duration::from_millis(args.debounce_ms.max(1));
-        let settle = std::time::Duration::from_millis(args.settle_ms);
-        drain_watch_debounce(paths, &rx, debounce, backend_label, &active_roots)?;
-        if !settle.is_zero() {
-            record_event(
-                paths,
-                "watch-settle",
-                &format!("settle_ms={}", args.settle_ms),
-            )?;
-            loop {
-                match rx.recv_timeout(settle) {
-                    Ok(Ok(next)) => {
-                        if !snapshot_relevant_event(&next) {
-                            continue;
-                        }
-                        record_notify_event(paths, backend_label, &active_roots, &next)?;
-                        drain_watch_debounce(paths, &rx, debounce, backend_label, &active_roots)?;
-                        record_event(
-                            paths,
-                            "watch-settle",
-                            &format!("settle_ms={}", args.settle_ms),
-                        )?;
-                        continue;
-                    }
-                    Ok(Err(err)) => return Err(err.into()),
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        bail!("watch channel disconnected")
-                    }
-                }
-            }
-        }
+        let buffer = WatchEventBufferConfig {
+            quiet: Duration::from_millis(args.debounce_ms.saturating_add(args.settle_ms).max(1)),
+            settle: Duration::ZERO,
+            max_latency: Duration::from_millis(args.buffer_max_ms.max(1)),
+            max_events: args.buffer_max_events.max(1),
+        };
+        let outcome = drain_watch_event_buffer(paths, &rx, buffer, backend_label, &active_roots)?;
+        record_event(
+            paths,
+            "watch-buffer-flush",
+            &format!(
+                "reason={} events={} elapsed_ms={}",
+                outcome.reason, outcome.events, outcome.elapsed_ms
+            ),
+        )?;
         snapshot_and_maybe_sync(
             paths,
             SnapshotArgs {
@@ -375,25 +368,162 @@ fn slash_path(path: &Path) -> String {
         .join("/")
 }
 
-fn drain_watch_debounce(
+#[derive(Debug, Clone, Copy)]
+struct WatchEventBufferConfig {
+    quiet: Duration,
+    settle: Duration,
+    max_latency: Duration,
+    max_events: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchEventBufferOutcome {
+    reason: &'static str,
+    events: usize,
+    elapsed_ms: u128,
+}
+
+fn drain_watch_event_buffer(
     paths: &Paths,
     rx: &mpsc::Receiver<notify::Result<notify::Event>>,
-    debounce: Duration,
+    config: WatchEventBufferConfig,
     backend_label: &str,
     active_roots: &[RootConfig],
-) -> Result<()> {
+) -> Result<WatchEventBufferOutcome> {
+    let started = Instant::now();
+    let mut last_event = started;
+    let mut events = 1usize;
     loop {
-        match rx.recv_timeout(debounce) {
+        if events >= config.max_events {
+            return settle_before_flush(
+                paths,
+                rx,
+                config,
+                backend_label,
+                active_roots,
+                started,
+                events,
+                "max-events",
+            );
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= config.max_latency {
+            return settle_before_flush(
+                paths,
+                rx,
+                config,
+                backend_label,
+                active_roots,
+                started,
+                events,
+                "max-latency",
+            );
+        }
+        let quiet_remaining = config
+            .quiet
+            .checked_sub(last_event.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if quiet_remaining.is_zero() {
+            return settle_before_flush(
+                paths,
+                rx,
+                config,
+                backend_label,
+                active_roots,
+                started,
+                events,
+                "quiet",
+            );
+        }
+        let max_remaining = config.max_latency.saturating_sub(elapsed);
+        let timeout = quiet_remaining
+            .min(max_remaining)
+            .max(Duration::from_millis(1));
+        match rx.recv_timeout(timeout) {
             Ok(Ok(next)) => {
                 if !snapshot_relevant_event(&next) {
                     continue;
                 }
                 record_notify_event(paths, backend_label, active_roots, &next)?;
+                events += 1;
+                last_event = Instant::now();
             }
             Ok(Err(err)) => return Err(err.into()),
-            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let reason = if started.elapsed() >= config.max_latency {
+                    "max-latency"
+                } else {
+                    "quiet"
+                };
+                return settle_before_flush(
+                    paths,
+                    rx,
+                    config,
+                    backend_label,
+                    active_roots,
+                    started,
+                    events,
+                    reason,
+                );
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
         }
+    }
+}
+
+fn settle_before_flush(
+    paths: &Paths,
+    rx: &mpsc::Receiver<notify::Result<notify::Event>>,
+    config: WatchEventBufferConfig,
+    backend_label: &str,
+    active_roots: &[RootConfig],
+    started: Instant,
+    mut events: usize,
+    reason: &'static str,
+) -> Result<WatchEventBufferOutcome> {
+    if !config.settle.is_zero() && reason == "quiet" {
+        record_event(
+            paths,
+            "watch-settle",
+            &format!("settle_ms={}", config.settle.as_millis()),
+        )?;
+        loop {
+            if events >= config.max_events {
+                return Ok(buffer_outcome(started, events, "max-events"));
+            }
+            if started.elapsed() >= config.max_latency {
+                return Ok(buffer_outcome(started, events, "max-latency"));
+            }
+            let timeout = config
+                .settle
+                .min(config.max_latency.saturating_sub(started.elapsed()))
+                .max(Duration::from_millis(1));
+            match rx.recv_timeout(timeout) {
+                Ok(Ok(next)) => {
+                    if !snapshot_relevant_event(&next) {
+                        continue;
+                    }
+                    record_notify_event(paths, backend_label, active_roots, &next)?;
+                    events += 1;
+                }
+                Ok(Err(err)) => return Err(err.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
+            }
+        }
+    }
+    Ok(buffer_outcome(started, events, reason))
+}
+
+fn buffer_outcome(
+    started: Instant,
+    events: usize,
+    reason: &'static str,
+) -> WatchEventBufferOutcome {
+    WatchEventBufferOutcome {
+        reason,
+        events,
+        elapsed_ms: started.elapsed().as_millis(),
     }
 }
 
@@ -402,6 +532,7 @@ mod tests {
     use super::*;
     use notify::{Event, EventKind};
     use std::path::PathBuf;
+    use std::thread;
 
     #[test]
     fn formats_notify_event_kind_and_paths() {
@@ -442,5 +573,128 @@ mod tests {
         };
 
         assert!(snapshot_relevant_event(&event));
+    }
+
+    #[test]
+    fn event_buffer_flushes_after_sliding_quiet_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            tx.send(Ok(test_event("a.txt"))).unwrap();
+            thread::sleep(Duration::from_millis(15));
+            tx.send(Ok(test_event("b.txt"))).unwrap();
+            thread::sleep(Duration::from_millis(80));
+        });
+
+        let outcome = drain_watch_event_buffer(
+            &paths,
+            &rx,
+            WatchEventBufferConfig {
+                quiet: Duration::from_millis(30),
+                settle: Duration::ZERO,
+                max_latency: Duration::from_millis(500),
+                max_events: 100,
+            },
+            "test",
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.reason, "quiet");
+        assert_eq!(outcome.events, 3);
+        assert!(
+            outcome.elapsed_ms >= 55,
+            "quiet window should slide after later events: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn event_buffer_flushes_at_max_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(test_event("a.txt"))).unwrap();
+
+        let outcome = drain_watch_event_buffer(
+            &paths,
+            &rx,
+            WatchEventBufferConfig {
+                quiet: Duration::from_secs(1),
+                settle: Duration::ZERO,
+                max_latency: Duration::from_secs(5),
+                max_events: 2,
+            },
+            "test",
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.reason, "max-events");
+        assert_eq!(outcome.events, 2);
+    }
+
+    #[test]
+    fn event_buffer_flushes_at_max_latency() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for index in 0..10 {
+                thread::sleep(Duration::from_millis(15));
+                tx.send(Ok(test_event(&format!("file-{index}.txt"))))
+                    .unwrap();
+            }
+        });
+
+        let outcome = drain_watch_event_buffer(
+            &paths,
+            &rx,
+            WatchEventBufferConfig {
+                quiet: Duration::from_millis(50),
+                settle: Duration::ZERO,
+                max_latency: Duration::from_millis(70),
+                max_events: 100,
+            },
+            "test",
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.reason, "max-latency");
+        assert!(outcome.events > 1, "{outcome:?}");
+    }
+
+    fn test_event(path: &str) -> Event {
+        Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![PathBuf::from(path)],
+            attrs: Default::default(),
+        }
+    }
+
+    fn test_paths(home: PathBuf) -> Paths {
+        Paths {
+            db: home.join("db/majutsu.sqlite"),
+            config: home.join("config.toml"),
+            host: home.join("host"),
+            objects: home.join("objects"),
+            trees: home.join("trees"),
+            large_chunks: home.join("large/chunks"),
+            large_manifests: home.join("large/manifests"),
+            packs: home.join("packs"),
+            pack_indexes: home.join("pack-indexes"),
+            logs: home.join("logs"),
+            runtime: home.join("runtime"),
+            daemon_pid: home.join("runtime/daemon.pid"),
+            daemon_lock: home.join("runtime/daemon.lock"),
+            snapshot_lock: home.join("runtime/snapshot.lock"),
+            sync_lock: home.join("runtime/sync.lock"),
+            upload_queue: home.join("queue/uploads"),
+            event_queue: home.join("queue/events"),
+            master_key: home.join("keys/master"),
+            home,
+        }
     }
 }
