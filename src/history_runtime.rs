@@ -1764,6 +1764,7 @@ pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
 fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let operations = recent_operations(conn)?;
     let mut printed = 0usize;
+    let mut output = String::new();
     for op in operations {
         if printed >= args.limit {
             break;
@@ -1773,20 +1774,21 @@ fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
             continue;
         }
         let summary = summarize_changes(&changes);
-        println!(
+        writeln!(
+            output,
             "{}\t{}\t{}\t{}\t{}",
             op.created_at,
             op.id,
             op.kind,
             summary,
             op.message.as_deref().unwrap_or_default()
-        );
+        )?;
         for change in changes {
-            println!("{}\t{}", change.status, change.path);
+            writeln!(output, "{}\t{}", change.status, change.path)?;
         }
         printed += 1;
     }
-    Ok(())
+    emit_status_output(&output, terminal_height())
 }
 
 fn recent_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
@@ -1894,6 +1896,7 @@ fn summarize_changes(changes: &[FileChange]) -> String {
 fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let rows = recent_operations(conn)?;
     let mut printed = 0usize;
+    let mut output = String::new();
     for row in rows {
         let id = row.id;
         let kind = row.kind;
@@ -1920,16 +1923,17 @@ fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
         if printed >= args.limit {
             break;
         }
-        println!(
+        writeln!(
+            output,
             "{id}\t{created}\t{kind}\t{status}\t{}\t{} -> {}\t{}",
             remote_sync_state.unwrap_or_else(|| "-".into()),
             before.unwrap_or_default(),
             after.unwrap_or_default(),
             message.unwrap_or_default()
-        );
+        )?;
         printed += 1;
     }
-    Ok(())
+    emit_status_output(&output, terminal_height())
 }
 
 pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
