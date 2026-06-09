@@ -109,12 +109,18 @@ fn create_branch(paths: &Paths, conn: &Connection, args: BranchCreateArgs) -> Re
         );
     }
     load_snapshot_by_id(conn, &snapshot_id)?;
+    let before = current_snapshot(conn)?;
     set_ref_value(conn, &branch_ref_name(&args.name), &snapshot_id)?;
+    let mut after = before.clone();
+    if active_branch(conn)?.as_deref() == Some(args.name.as_str()) {
+        set_ref_value(conn, "current", &snapshot_id)?;
+        after = Some(snapshot_id.clone());
+    }
     record_op(
         conn,
         "config-change",
-        current_snapshot(conn)?.as_deref(),
-        current_snapshot(conn)?.as_deref(),
+        before.as_deref(),
+        after.as_deref(),
         Some(&format!("branch-create {} -> {}", args.name, snapshot_id)),
     )?;
     println!("created branch {} -> {}", args.name, snapshot_id);
@@ -211,6 +217,12 @@ fn delete_branch(conn: &Connection, args: BranchDeleteArgs) -> Result<()> {
 fn rename_branch(conn: &Connection, args: BranchRenameArgs) -> Result<()> {
     validate_branch_name(&args.old)?;
     validate_branch_name(&args.new)?;
+    if args.old == args.new {
+        bail!("new branch name must differ from old branch name");
+    }
+    let active = active_branch(conn)?;
+    let source_was_active = active.as_deref() == Some(args.old.as_str());
+    let destination_was_active = active.as_deref() == Some(args.new.as_str());
     if branch_head(conn, &args.new)?.is_some() && !args.force {
         bail!(
             "branch already exists: {}; use --force to overwrite",
@@ -220,19 +232,27 @@ fn rename_branch(conn: &Connection, args: BranchRenameArgs) -> Result<()> {
     let Some(head) = branch_head(conn, &args.old)? else {
         bail!("unknown branch: {}", args.old);
     };
+    if destination_was_active && !source_was_active && !args.force {
+        bail!("cannot overwrite active branch {}; use --force", args.new);
+    }
+    let before = current_snapshot(conn)?;
     set_ref_value(conn, &branch_ref_name(&args.new), &head)?;
     conn.execute(
         "delete from refs where name=?1",
         params![branch_ref_name(&args.old)],
     )?;
-    if active_branch(conn)?.as_deref() == Some(args.old.as_str()) {
+    if source_was_active {
         set_ref_value(conn, CURRENT_BRANCH_REF, &args.new)?;
     }
+    if source_was_active || destination_was_active {
+        set_ref_value(conn, "current", &head)?;
+    }
+    let after = current_snapshot(conn)?;
     record_op(
         conn,
         "config-change",
-        current_snapshot(conn)?.as_deref(),
-        current_snapshot(conn)?.as_deref(),
+        before.as_deref(),
+        after.as_deref(),
         Some(&format!("branch-rename {} -> {}", args.old, args.new)),
     )?;
     println!("renamed branch {} -> {}", args.old, args.new);
@@ -256,6 +276,13 @@ fn switch_to_branch(
     };
     load_snapshot_by_id(conn, &snapshot_id)?;
     let before = current_snapshot(conn)?;
+    if options.restore {
+        apply_branch_restore(paths, &snapshot_id, options.to, options.force).map_err(|err| {
+            anyhow!(
+                "branch restore failed while switching to {name}; active branch refs were left unchanged: {err:#}"
+            )
+        })?;
+    }
     set_ref_value(conn, CURRENT_BRANCH_REF, name)?;
     set_ref_value(conn, "current", &snapshot_id)?;
     record_op(
@@ -266,9 +293,6 @@ fn switch_to_branch(
         Some(&format!("branch-switch {name}")),
     )?;
     println!("switched branch {} -> {}", name, snapshot_id);
-    if options.restore {
-        apply_branch_restore(paths, &snapshot_id, options.to, options.force)?;
-    }
     Ok(())
 }
 

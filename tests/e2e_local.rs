@@ -714,3 +714,180 @@ fn op_diff_reports_file_changes_for_snapshot_operation() {
     );
     assert!(root_filtered.contains("M\tworkspace/alpha.txt"));
 }
+
+fn branch_current_snapshot(home: &Path) -> String {
+    let output = run_mj(home, ["branch", "current"]);
+    let context = "branch current";
+    if !output.status.success() {
+        panic!(
+            "{context} が失敗しました\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("snapshot ").map(str::to_string))
+        .expect("branch current should print snapshot")
+}
+
+fn assert_mj_failure(output: std::process::Output, context: &str, expected_stderr: &str) {
+    assert!(
+        !output.status.success(),
+        "{context} should fail\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected_stderr),
+        "{context} stderr should contain {expected_stderr:?}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn branch_switch_restore_advances_and_preserves_branch_heads() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join("data");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("state.txt"), b"main-v1\n").unwrap();
+
+    assert_success(
+        run_mj(&home, ["init", "--host-name", "branch-e2e-host"]),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "data", root.to_str().unwrap()]),
+        "root add",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "main v1"]),
+        "snapshot main v1",
+    );
+    let snap_v1 = branch_current_snapshot(&home);
+
+    fs::write(root.join("state.txt"), b"main-v2\n").unwrap();
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "main v2"]),
+        "snapshot main v2",
+    );
+    let snap_v2 = branch_current_snapshot(&home);
+    assert_ne!(
+        snap_v1, snap_v2,
+        "active branch head should advance after snapshot"
+    );
+
+    assert_success(
+        run_mj(&home, ["branch", "create", "old", "--snapshot", &snap_v1]),
+        "branch create old",
+    );
+    assert_success(
+        run_mj(&home, ["branch", "switch", "old", "--restore", "--force"]),
+        "branch switch old",
+    );
+    assert_file(&root.join("state.txt"), b"main-v1\n");
+
+    fs::write(root.join("state.txt"), b"old-branch-work\n").unwrap();
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "old branch work"]),
+        "snapshot old branch",
+    );
+    let old_head = branch_current_snapshot(&home);
+    assert_ne!(
+        old_head, snap_v1,
+        "old branch head should advance independently"
+    );
+
+    assert_success(
+        run_mj(&home, ["branch", "switch", "main", "--restore", "--force"]),
+        "branch switch main",
+    );
+    assert_file(&root.join("state.txt"), b"main-v2\n");
+    assert_eq!(branch_current_snapshot(&home), snap_v2);
+
+    assert_success(
+        run_mj(&home, ["branch", "switch", "old", "--restore", "--force"]),
+        "branch switch old again",
+    );
+    assert_file(&root.join("state.txt"), b"old-branch-work\n");
+    assert_eq!(branch_current_snapshot(&home), old_head);
+
+    assert_success(
+        run_mj(
+            &home,
+            ["branch", "create", "old", "--snapshot", &snap_v1, "--force"],
+        ),
+        "force move active branch",
+    );
+    assert_eq!(
+        branch_current_snapshot(&home),
+        snap_v1,
+        "force-moving the active branch should keep current aligned"
+    );
+}
+
+#[test]
+fn branch_rename_rejects_same_name_and_keeps_active_refs_consistent() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join("data");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("state.txt"), b"main\n").unwrap();
+
+    assert_success(
+        run_mj(&home, ["init", "--host-name", "branch-rename-e2e"]),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "data", root.to_str().unwrap()]),
+        "root add",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "main"]),
+        "snapshot main",
+    );
+    let main_head = branch_current_snapshot(&home);
+
+    assert_mj_failure(
+        run_mj(&home, ["branch", "rename", "main", "main"]),
+        "same-name rename",
+        "new branch name must differ",
+    );
+
+    assert_success(
+        run_mj(&home, ["branch", "create", "topic", "--switch"]),
+        "create topic",
+    );
+    fs::write(root.join("state.txt"), b"topic\n").unwrap();
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "topic"]),
+        "snapshot topic",
+    );
+    let topic_head = branch_current_snapshot(&home);
+    assert_ne!(main_head, topic_head);
+
+    assert_success(
+        run_mj(&home, ["branch", "switch", "main"]),
+        "switch main without restore",
+    );
+    assert_eq!(branch_current_snapshot(&home), main_head);
+
+    assert_mj_failure(
+        run_mj(&home, ["branch", "rename", "topic", "main"]),
+        "rename over active branch without force",
+        "use --force",
+    );
+
+    assert_success(
+        run_mj(&home, ["branch", "rename", "topic", "main", "--force"]),
+        "force rename over active branch",
+    );
+    assert_eq!(
+        branch_current_snapshot(&home),
+        topic_head,
+        "overwriting the active destination should move current to the new head"
+    );
+}

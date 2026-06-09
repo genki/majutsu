@@ -57,3 +57,11 @@ branches/<name>         branch head snapshot
 
 このため、branch state は他の host timeline metadata と同様に `mj sync` と
 `mj clone` をまたいで復元できる。
+
+
+## 安全性と整合性
+
+- `mj snapshot` が成功すると、active branch head は新しい snapshot へ進む。
+- `mj branch switch --restore` は restore が成功してから `current` / `current-branch` を切り替える。restore が失敗した場合、branch refs は旧状態のまま残る。
+- `mj prune` は `current`、`current-branch`、`branches/<name>` など、refs が指す snapshot を削除対象から保護する。
+- `mj branch rename <old> <old>` は拒否される。`--force` で active destination branch を上書きした場合も `current` は新しい head と整合する。
