@@ -26,6 +26,7 @@ use crate::db_refs::{
 use crate::object_paths::local_object_keys;
 use crate::operation_log::{record_op_with_details, update_operation_result};
 use crate::pack_runtime::pack_cmd;
+use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{
     drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, upload_queue_stats,
 };
@@ -95,6 +96,7 @@ fn sync_configured_remote(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
+    let _lock = acquire_process_lock(&paths.sync_lock, "sync")?;
     auto_pack_before_sync(paths, conn)?;
     let current = current_snapshot(conn)?;
     let previous_last_synced = ref_value(conn, "last-synced")?;

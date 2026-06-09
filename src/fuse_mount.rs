@@ -61,6 +61,7 @@ impl MajutsuFuseFs {
                 daemon_pid: paths.daemon_pid.clone(),
                 daemon_lock: paths.daemon_lock.clone(),
                 snapshot_lock: paths.snapshot_lock.clone(),
+                sync_lock: paths.sync_lock.clone(),
                 upload_queue: paths.upload_queue.clone(),
                 event_queue: paths.event_queue.clone(),
                 master_key: paths.master_key.clone(),
