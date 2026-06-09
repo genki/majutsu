@@ -11,6 +11,12 @@ use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 fn mj() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
+    command.env("MAJUTSU_AUTO_DAEMON", "0");
+    command
+}
+
+fn mj_auto() -> Command {
     Command::new(env!("CARGO_BIN_EXE_mj"))
 }
 
@@ -13554,6 +13560,9 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(systemd.contains("watch"));
     assert!(systemd.contains("--backend"));
     assert!(systemd.contains("--mode"));
+    assert!(systemd.contains("EnvironmentFile="));
+    assert!(systemd.contains("/daemon.env"));
+    assert!(systemd.contains("/s3.env"));
     assert!(systemd.contains("Restart=on-failure"));
 
     let launchd = output({
@@ -13570,6 +13579,51 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(launchd.contains("<string>--home</string>"));
     assert!(launchd.contains(&format!("<string>{}</string>", state.display())));
     assert!(launchd.contains("<key>KeepAlive</key>"));
+}
+
+#[cfg(unix)]
+#[test]
+fn root_add_auto_starts_daemon_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let added = output({
+        let mut c = mj_auto();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    assert!(added.contains("added root sample"));
+    assert!(added.contains("started daemon pid"));
+    for _ in 0..50 {
+        if state.join("runtime/daemon.sock").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = output({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    assert!(status.contains("Daemon"));
+    assert!(status.contains("running"));
+    run({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
 }
 
 #[cfg(unix)]

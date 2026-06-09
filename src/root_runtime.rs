@@ -5,6 +5,7 @@ use crate::cli::RootCommand;
 use crate::config::{
     Paths, RootConfig, default_include, validate_large_chunking, validate_snapshot_mode,
 };
+use crate::daemon_runtime::ensure_daemon_running;
 use crate::operation_log::record_op;
 use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
@@ -72,6 +73,11 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             sync_roots_to_config(paths, &conn)?;
             record_op(&conn, "root-added", None, None, Some(&root.id))?;
             println!("added root {} -> {}", root.id, root.path.display());
+            match ensure_daemon_running(paths) {
+                Ok(Some(pid)) => println!("started daemon pid {pid}"),
+                Ok(None) => {}
+                Err(err) => eprintln!("warning: daemon auto-start failed: {err:#}"),
+            }
         }
         RootCommand::Set(args) => {
             let mut root = root_by_id(&conn, &args.id)?;

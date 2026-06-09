@@ -57,12 +57,20 @@ fn daemon_watch_args(config: &DaemonServiceConfig<'_>) -> Vec<String> {
     ]
 }
 
-fn render_systemd_user_service(_config: &DaemonServiceConfig<'_>, args: Vec<String>) -> String {
+fn render_systemd_user_service(config: &DaemonServiceConfig<'_>, args: Vec<String>) -> String {
     let args = args
         .into_iter()
         .map(|arg| systemd_quote(&arg))
         .collect::<Vec<_>>()
         .join(" ");
+    let daemon_env = format!(
+        "-{}",
+        systemd_quote(&format!("{}/daemon.env", config.home.display()))
+    );
+    let s3_env = format!(
+        "-{}",
+        systemd_quote(&format!("{}/s3.env", config.home.display()))
+    );
     format!(
         "[Unit]\n\
          Description=Majutsu watch daemon\n\
@@ -70,6 +78,8 @@ fn render_systemd_user_service(_config: &DaemonServiceConfig<'_>, args: Vec<Stri
          Wants=network-online.target\n\n\
          [Service]\n\
          Type=simple\n\
+         EnvironmentFile={daemon_env}\n\
+         EnvironmentFile={s3_env}\n\
          ExecStart={args}\n\
          Restart=on-failure\n\
          RestartSec=10s\n\n\
@@ -82,7 +92,7 @@ fn systemd_quote(value: &str) -> String {
     let escaped = value.replace('%', "%%");
     if value
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || "/._:-=+".contains(ch))
+        .all(|ch| ch.is_ascii_alphanumeric() || "/._:-=+-".contains(ch))
     {
         escaped
     } else {
@@ -153,6 +163,9 @@ mod tests {
 
         assert!(service.contains("[Service]"));
         assert!(service.contains("ExecStart="));
+        assert!(service.contains("EnvironmentFile=-"));
+        assert!(service.contains("/home/alice/.majutsu%%prod/daemon.env"));
+        assert!(service.contains("/home/alice/.majutsu%%prod/s3.env"));
         assert!(service.contains("\"/opt/Majutsu Bin/mj\""));
         assert!(service.contains("/home/alice/.majutsu%%prod"));
         assert!(service.contains("Restart=on-failure"));

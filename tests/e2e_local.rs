@@ -14,7 +14,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(mj_bin())
+    let mut command = Command::new(mj_bin());
+    command.env("MAJUTSU_AUTO_DAEMON", "0");
+    command
         .arg("--home")
         .arg(home)
         .args(args)
@@ -210,6 +212,7 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = Command::new(mj_bin());
+    command.env("MAJUTSU_AUTO_DAEMON", "0");
     command.arg("--home").arg(home).args(args);
     for (key, value) in envs {
         command.env(key, value);

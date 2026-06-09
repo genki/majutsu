@@ -140,7 +140,7 @@ use config::{
     default_security_hash, default_security_key_id, encryption_enabled, encryption_mode,
     read_config, resolve_paths, validate_restore_archive_config, write_config,
 };
-use daemon_runtime::daemon_cmd;
+use daemon_runtime::{apply_env_files, daemon_cmd};
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::fsck;
 use history_runtime::{diff_cmd, log_cmd, op_cmd, state_cmd, status_cmd};
@@ -186,6 +186,7 @@ use watch_runtime::watch_cmd;
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = resolve_paths(cli.home)?;
+    apply_env_files(&paths)?;
     match cli.command {
         Command::Init(args) => init(&paths, args),
         Command::Root { command } => root_cmd(&paths, command),
@@ -283,7 +284,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         args.message.as_deref().unwrap_or("manual"),
     )?;
     let config = read_config(paths)?;
-    let conn = open_db(paths)?;
+    let mut conn = open_db(paths)?;
     let parent = current_snapshot(&conn)?;
     let parent_manifest = parent
         .as_deref()
@@ -471,7 +472,8 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
     let manifest_oid = blake3_hex(&manifest_json);
     let manifest_key = store_bytes(paths, &paths.objects, &manifest_oid, &manifest_json)?;
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute(
         "insert into snapshots(id, parent_id, op_id, created_at, manifest_key, manifest_json)
          values (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -483,23 +485,24 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             String::from_utf8(manifest_json)?
         ],
     )?;
-    conn.execute(
+    tx.execute(
         "insert into refs(name, value) values ('current', ?1)
          on conflict(name) do update set value=excluded.value",
         params![manifest.snapshot_id],
     )?;
     record_op_with_id(
-        &conn,
+        &tx,
         &op_id,
         snapshot_operation_kind(args.message.as_deref(), manifest.parent.as_deref()),
         manifest.parent.as_deref(),
         Some(&manifest.snapshot_id),
         args.message.as_deref(),
     )?;
+    branch_runtime::update_active_branch_head(&tx, &snapshot_id)?;
+    tx.commit()?;
     println!("snapshot {}", manifest.snapshot_id);
     println!("files {total_files}, large {large_files}");
     record_event(paths, "snapshot-finish", &manifest.snapshot_id)?;
-    branch_runtime::update_active_branch_head(&conn, &snapshot_id)?;
     Ok(())
 }
 

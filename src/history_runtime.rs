@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 
 use crate::cli::{DiffArgs, LogArgs, OpCommand, StateArgs};
 use crate::config::{Config, Paths, read_config};
+use crate::daemon_runtime::{DaemonHealth, DaemonHealthState, daemon_health};
 use crate::operation_log::{query_operation, record_op};
 use crate::queue_runtime::{event_journal_records, upload_queue_stats};
 use crate::remote_store::open_remote;
@@ -37,6 +38,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     let upload_stats = upload_queue_stats(paths)?;
     let event_count = event_journal_records(paths)?.len();
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
+    let daemon = daemon_health(paths)?;
     let width = terminal_width();
     let height = terminal_height();
     let ui = StatusUi::new();
@@ -45,6 +47,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     writeln!(output, "{}", ui.heading("Status")).expect("write status output");
     print_kv(&mut output, width, "Current snapshot", current_label);
     print_kv(&mut output, width, "Roots", &roots.len().to_string());
+    print_kv(&mut output, width, "Daemon", daemon.label());
     print_kv(&mut output, width, "Remote", remote.summary());
     print_kv(
         &mut output,
@@ -72,6 +75,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
                 .iter()
                 .filter(|root| root.status != "active" || !root.path.exists())
                 .count(),
+            daemon: &daemon,
             remote: &remote,
             upload_total: upload_stats.total,
             upload_retrying: upload_stats.retrying,
@@ -112,6 +116,15 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     writeln!(output).expect("write status output");
 
     print_remote_section(&mut output, width, &ui, &remote);
+    writeln!(output).expect("write status output");
+
+    print_daemon_section(
+        &mut output,
+        width,
+        &ui,
+        &daemon,
+        roots.iter().filter(|root| root.status == "active").count(),
+    );
     writeln!(output).expect("write status output");
 
     writeln!(output, "{}", ui.heading("Configuration")).expect("write status output");
@@ -325,6 +338,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let event_count = event_journal_records(paths)?.len();
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let remote = read_remote_status(&config)?;
+    let daemon = daemon_health(paths)?;
 
     let state = StateReport {
         host: StateHost {
@@ -356,6 +370,12 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
             resolved: remote.resolved.clone(),
             available: remote.configured && remote.open_error.is_none(),
             open_error: remote.open_error.clone(),
+        },
+        daemon: StateDaemon {
+            state: daemon_state_label(&daemon).to_string(),
+            pid: daemon.pid,
+            ipc_available: daemon.ipc_available,
+            healthy: daemon.is_healthy(),
         },
         security: StateSecurity {
             encryption: config.security.encryption.clone(),
@@ -451,6 +471,7 @@ fn print_state_report(state: &StateReport) -> Result<()> {
             "not configured"
         },
     );
+    print_kv(&mut output, width, "Daemon", &state.daemon.state);
     print_kv(&mut output, width, "Encryption", &state.security.encryption);
     writeln!(output).expect("write state output");
 
@@ -511,6 +532,27 @@ fn print_state_report(state: &StateReport) -> Result<()> {
                 state.timeline.latest_parent.as_deref().unwrap_or("(none)"),
             ],
             ["branches", &state.timeline.branch_count.to_string()],
+        ],
+    );
+    writeln!(output).expect("write state output");
+
+    writeln!(output, "{}", ui.heading("Daemon")).expect("write state output");
+    let daemon_pid = state
+        .daemon
+        .pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "(none)".into());
+    let daemon_ipc = state.daemon.ipc_available.to_string();
+    let daemon_healthy = state.daemon.healthy.to_string();
+    print_table(
+        &mut output,
+        width,
+        &["ITEM", "VALUE"],
+        &[
+            ["state", state.daemon.state.as_str()],
+            ["pid", daemon_pid.as_str()],
+            ["ipc", daemon_ipc.as_str()],
+            ["healthy", daemon_healthy.as_str()],
         ],
     );
     writeln!(output).expect("write state output");
@@ -651,6 +693,7 @@ struct StateReport {
     paths: StatePaths,
     timeline: StateTimeline,
     remote: StateRemote,
+    daemon: StateDaemon,
     security: StateSecurity,
     metadata: StateMetadata,
     storage: StateStorage,
@@ -695,6 +738,14 @@ struct StateRemote {
     resolved: Option<String>,
     available: bool,
     open_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StateDaemon {
+    state: String,
+    pid: Option<u32>,
+    ipc_available: bool,
+    healthy: bool,
 }
 
 #[derive(Serialize)]
@@ -862,6 +913,7 @@ struct StatusOverview<'a> {
     roots_total: usize,
     roots_active: usize,
     roots_problem: usize,
+    daemon: &'a DaemonHealth,
     remote: &'a RemoteStatus,
     upload_total: usize,
     upload_retrying: usize,
@@ -914,12 +966,23 @@ fn print_status_overview(
     } else {
         Severity::Good
     };
+    let daemon_severity = daemon_severity(overview.daemon, overview.roots_active);
     let cards = [
         StatusCard {
             title: "snapshot".into(),
             state: shorten_middle(overview.current, 24),
             detail: "current ref".into(),
             severity: Severity::Info,
+        },
+        StatusCard {
+            title: "daemon".into(),
+            state: daemon_state_label(overview.daemon).into(),
+            detail: overview
+                .daemon
+                .pid
+                .map(|pid| format!("pid={pid} ipc={}", overview.daemon.ipc_available))
+                .unwrap_or_else(|| "no process".into()),
+            severity: daemon_severity,
         },
         StatusCard {
             title: "roots".into(),
@@ -1575,6 +1638,64 @@ fn read_remote_status(config: &Config) -> Result<RemoteStatus> {
             range_get: None,
             conditional_put: None,
         }),
+    }
+}
+
+fn daemon_state_label(daemon: &DaemonHealth) -> &'static str {
+    match daemon.state {
+        DaemonHealthState::Running => {
+            if daemon.ipc_available {
+                "running"
+            } else {
+                "running, ipc unavailable"
+            }
+        }
+        DaemonHealthState::Stopped => "stopped",
+        DaemonHealthState::Stale => "stale pid",
+    }
+}
+
+fn daemon_severity(daemon: &DaemonHealth, active_roots: usize) -> Severity {
+    match daemon.state {
+        DaemonHealthState::Running if daemon.ipc_available => Severity::Good,
+        DaemonHealthState::Running => Severity::Warn,
+        DaemonHealthState::Stopped | DaemonHealthState::Stale if active_roots > 0 => Severity::Bad,
+        DaemonHealthState::Stopped | DaemonHealthState::Stale => Severity::Warn,
+    }
+}
+
+fn print_daemon_section(
+    out: &mut String,
+    width: usize,
+    ui: &StatusUi,
+    daemon: &DaemonHealth,
+    root_count: usize,
+) {
+    writeln!(out, "{}", ui.heading("Daemon")).expect("write status output");
+    let severity = daemon_severity(daemon, root_count);
+    print_kv(
+        out,
+        width,
+        "State",
+        &ui.severity(daemon_state_label(daemon), severity),
+    );
+    print_kv(
+        out,
+        width,
+        "PID",
+        &daemon
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "(none)".into()),
+    );
+    print_kv(out, width, "IPC", &daemon.ipc_available.to_string());
+    if !daemon.is_healthy() && root_count > 0 {
+        print_kv(
+            out,
+            width,
+            "Attention",
+            "active roots are not protected by the watch daemon",
+        );
     }
 }
 

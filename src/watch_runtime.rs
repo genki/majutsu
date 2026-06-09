@@ -177,6 +177,9 @@ fn watch_notify_loop<W: Watcher>(
                 continue;
             }
         };
+        if !snapshot_relevant_event(&event) {
+            continue;
+        }
         record_notify_event(paths, backend_label, &active_roots, &event)?;
         if args.mode == "strict" {
             snapshot_and_maybe_sync(
@@ -202,6 +205,9 @@ fn watch_notify_loop<W: Watcher>(
             loop {
                 match rx.recv_timeout(settle) {
                     Ok(Ok(next)) => {
+                        if !snapshot_relevant_event(&next) {
+                            continue;
+                        }
                         record_notify_event(paths, backend_label, &active_roots, &next)?;
                         drain_watch_debounce(paths, &rx, debounce, backend_label, &active_roots)?;
                         record_event(
@@ -291,6 +297,10 @@ fn notify_event_kind(event: &notify::Event) -> &'static str {
     kind
 }
 
+fn snapshot_relevant_event(event: &notify::Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
+}
+
 fn notify_event_paths(event: &notify::Event) -> String {
     event
         .paths
@@ -306,6 +316,9 @@ fn record_notify_event(
     active_roots: &[RootConfig],
     event: &notify::Event,
 ) -> Result<()> {
+    if !snapshot_relevant_event(event) {
+        return Ok(());
+    }
     let detail = format_notify_event(event);
     let event_kind = notify_event_kind(event);
     let mut recorded = false;
@@ -358,6 +371,9 @@ fn drain_watch_debounce(
     loop {
         match rx.recv_timeout(debounce) {
             Ok(Ok(next)) => {
+                if !snapshot_relevant_event(&next) {
+                    continue;
+                }
                 record_notify_event(paths, backend_label, active_roots, &next)?;
             }
             Ok(Err(err)) => return Err(err.into()),

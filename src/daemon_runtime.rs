@@ -37,6 +37,40 @@ struct DaemonStats {
     restore_statuses: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DaemonHealthState {
+    Running,
+    Stopped,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonHealth {
+    pub(crate) state: DaemonHealthState,
+    pub(crate) pid: Option<u32>,
+    pub(crate) ipc_available: bool,
+}
+
+impl DaemonHealth {
+    pub(crate) fn label(&self) -> &'static str {
+        match self.state {
+            DaemonHealthState::Running => {
+                if self.ipc_available {
+                    "running"
+                } else {
+                    "running, ipc unavailable"
+                }
+            }
+            DaemonHealthState::Stopped => "stopped",
+            DaemonHealthState::Stale => "stale pid",
+        }
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.state == DaemonHealthState::Running && self.ipc_available
+    }
+}
+
 pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     crate::ensure_ready(paths)?;
     let config = read_config(paths)?;
@@ -89,19 +123,23 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             println!("stopped daemon pid {pid}");
         }
         DaemonCommand::Status => {
-            if let Some(pid) = read_pid(&paths.daemon_pid)? {
-                if pid_alive(pid) {
+            let health = daemon_health(paths)?;
+            match health.state {
+                DaemonHealthState::Running => {
+                    let pid = health.pid.unwrap_or_default();
                     if let Ok(reply) = daemon_ipc_request(paths, "status") {
                         println!("{reply}");
                     } else {
                         println!("running pid {pid}");
                         println!("ipc unavailable");
                     }
-                } else {
-                    println!("stale pid {pid}");
                 }
-            } else {
-                println!("stopped");
+                DaemonHealthState::Stale => {
+                    println!("stale pid {}", health.pid.unwrap_or_default());
+                }
+                DaemonHealthState::Stopped => {
+                    println!("stopped");
+                }
             }
         }
         DaemonCommand::Metrics => {
@@ -125,6 +163,77 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn daemon_health(paths: &Paths) -> Result<DaemonHealth> {
+    let Some(pid) = read_pid(&paths.daemon_pid)? else {
+        return Ok(DaemonHealth {
+            state: DaemonHealthState::Stopped,
+            pid: None,
+            ipc_available: false,
+        });
+    };
+    if !pid_alive(pid) {
+        return Ok(DaemonHealth {
+            state: DaemonHealthState::Stale,
+            pid: Some(pid),
+            ipc_available: false,
+        });
+    }
+    Ok(DaemonHealth {
+        state: DaemonHealthState::Running,
+        pid: Some(pid),
+        ipc_available: daemon_ipc_request(paths, "status").is_ok(),
+    })
+}
+
+pub(crate) fn ensure_daemon_running(paths: &Paths) -> Result<Option<u32>> {
+    if !auto_daemon_enabled() {
+        return Ok(None);
+    }
+    let conn = open_db(paths)?;
+    let has_active_roots = roots(&conn)?.iter().any(|root| root.status == "active");
+    if !has_active_roots {
+        return Ok(None);
+    }
+    let health = daemon_health(paths)?;
+    if health.state == DaemonHealthState::Running {
+        return Ok(None);
+    }
+    if health.state == DaemonHealthState::Stale {
+        cleanup_daemon_runtime(paths);
+    }
+    let config = read_config(paths)?;
+    let backend = normalize_watch_backend(&config.watch.backend)?;
+    validate_watch_mode(&config.watch.mode)?;
+    start_watch_daemon(
+        paths,
+        backend,
+        &config.watch.mode,
+        config.watch.interval,
+        config.watch.debounce,
+        config.watch.settle,
+        config.watch.periodic_rescan,
+    )
+    .map(Some)
+}
+
+pub(crate) fn apply_env_files(paths: &Paths) -> Result<()> {
+    for (key, value) in daemon_env(paths)? {
+        if env::var_os(&key).is_none() {
+            // 起動直後の単一スレッド領域で、子プロセスや remote backend が参照する環境を補完する。
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn auto_daemon_enabled() -> bool {
+    std::env::var("MAJUTSU_AUTO_DAEMON")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
+}
+
 pub(crate) fn start_watch_daemon(
     paths: &Paths,
     backend: &str,
@@ -145,7 +254,8 @@ pub(crate) fn start_watch_daemon(
         .create(true)
         .append(true)
         .open(paths.logs.join("majutsu.log"))?;
-    let child = ProcessCommand::new(env::current_exe()?)
+    let mut command = ProcessCommand::new(env::current_exe()?);
+    command
         .arg("--home")
         .arg(&paths.home)
         .arg("watch")
@@ -164,11 +274,96 @@ pub(crate) fn start_watch_daemon(
         .arg("--periodic-rescan-secs")
         .arg(periodic_rescan_secs.to_string())
         .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .spawn()?;
+        .stderr(Stdio::from(log));
+    for (key, value) in daemon_env(paths)? {
+        command.env(key, value);
+    }
+    detach_daemon_process(&mut command);
+    let child = command.spawn()?;
     let pid = child.id();
     fs::write(&paths.daemon_pid, pid.to_string())?;
     Ok(pid)
+}
+
+#[cfg(unix)]
+fn detach_daemon_process(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    // daemon 子プロセスを呼び出し元の端末・セッションから切り離し、親終了時の SIGHUP に巻き込まれないようにする。
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_daemon_process(_: &mut ProcessCommand) {}
+
+fn daemon_env(paths: &Paths) -> Result<BTreeMap<String, String>> {
+    let mut envs = BTreeMap::new();
+    let mut files = Vec::new();
+    if let Ok(value) = env::var("MAJUTSU_DAEMON_ENV_FILE") {
+        files.extend(
+            value
+                .split(':')
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from),
+        );
+    }
+    files.push(paths.home.join("daemon.env"));
+    files.push(paths.home.join("s3.env"));
+    for file in files {
+        if !file.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&file)?;
+        for (key, value) in parse_daemon_env_file(&content) {
+            envs.insert(key, value);
+        }
+    }
+    Ok(envs)
+}
+
+fn parse_daemon_env_file(content: &str) -> BTreeMap<String, String> {
+    let mut envs = BTreeMap::new();
+    for line in content.lines() {
+        let mut line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export ") {
+            line = rest.trim_start();
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            continue;
+        }
+        let value = unquote_env_value(value.trim());
+        envs.insert(key.to_string(), value);
+    }
+    envs
+}
+
+fn unquote_env_value(value: &str) -> String {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 fn stop_daemon_process(pid: u32) -> Result<()> {
@@ -450,6 +645,33 @@ pub(crate) fn daemon_ipc_request(paths: &Paths, command: &str) -> Result<String>
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
     Ok(reply.trim_end().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_daemon_env_file;
+
+    #[test]
+    fn parses_daemon_env_files() {
+        let envs = parse_daemon_env_file(
+            r#"
+# comment
+export AWS_ACCESS_KEY_ID=example
+AWS_SECRET_ACCESS_KEY='secret value'
+AWS_ENDPOINT_URL="http://127.0.0.1:9000"
+invalid line
+BAD-NAME=ignored
+"#,
+        );
+
+        assert_eq!(envs.get("AWS_ACCESS_KEY_ID").unwrap(), "example");
+        assert_eq!(envs.get("AWS_SECRET_ACCESS_KEY").unwrap(), "secret value");
+        assert_eq!(
+            envs.get("AWS_ENDPOINT_URL").unwrap(),
+            "http://127.0.0.1:9000"
+        );
+        assert!(!envs.contains_key("BAD-NAME"));
+    }
 }
 
 #[cfg(not(unix))]
