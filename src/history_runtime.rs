@@ -1754,29 +1754,155 @@ fn display_option_bool(value: Option<bool>) -> String {
 pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
-    print_op_log(&conn, &args)
+    if args.operations {
+        print_op_log(&conn, &args)
+    } else {
+        print_change_log(&conn, &args)
+    }
+}
+
+fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
+    let operations = recent_operations(conn)?;
+    let mut printed = 0usize;
+    for op in operations {
+        if printed >= args.limit {
+            break;
+        }
+        let changes = operation_file_changes(conn, &op, args.root.as_deref())?;
+        if changes.is_empty() {
+            continue;
+        }
+        let summary = summarize_changes(&changes);
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            op.created_at,
+            op.id,
+            op.kind,
+            summary,
+            op.message.as_deref().unwrap_or_default()
+        );
+        for change in changes {
+            println!("{}\t{}", change.status, change.path);
+        }
+        printed += 1;
+    }
+    Ok(())
+}
+
+fn recent_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
+    let mut stmt = conn.prepare(
+        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
+         from operations order by rowid desc",
+    )?;
+    let rows = stmt.query_map([], operation_from_row)?;
+    let mut operations = Vec::new();
+    for row in rows {
+        operations.push(row?);
+    }
+    Ok(operations)
+}
+
+fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationExport> {
+    Ok(OperationExport {
+        id: row.get(0)?,
+        parent_op: row.get(1)?,
+        kind: row.get(2)?,
+        actor: row.get(3)?,
+        status: row.get(4)?,
+        before_snapshot: row.get(5)?,
+        after_snapshot: row.get(6)?,
+        created_at: row.get(7)?,
+        message: row.get(8)?,
+        error: row.get(9)?,
+        remote_sync_state: row.get(10)?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileChange {
+    status: &'static str,
+    path: String,
+}
+
+fn operation_file_changes(
+    conn: &Connection,
+    op: &OperationExport,
+    root: Option<&str>,
+) -> Result<Vec<FileChange>> {
+    let Some(after_id) = op.after_snapshot.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let after = load_snapshot_by_id(conn, after_id)?;
+    let before = op
+        .before_snapshot
+        .as_deref()
+        .map(|id| load_snapshot_by_id(conn, id))
+        .transpose()?;
+    snapshot_file_changes(before.as_ref(), &after, root)
+}
+
+fn snapshot_file_changes(
+    from: Option<&majutsu_core::SnapshotManifest>,
+    to: &majutsu_core::SnapshotManifest,
+    root: Option<&str>,
+) -> Result<Vec<FileChange>> {
+    let from_files = from.map(snapshot_file_map).transpose()?.unwrap_or_default();
+    let to_files = snapshot_file_map(to)?;
+    let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
+    paths_all.extend(
+        to_files
+            .keys()
+            .filter(|key| !from_files.contains_key(*key))
+            .cloned(),
+    );
+    paths_all.sort();
+    let mut changes = Vec::new();
+    for key in paths_all {
+        if let Some(root) = root
+            && !key.starts_with(&format!("{root}/"))
+        {
+            continue;
+        }
+        match (from_files.get(&key), to_files.get(&key)) {
+            (None, Some(_)) => changes.push(FileChange {
+                status: "A",
+                path: key,
+            }),
+            (Some(_), None) => changes.push(FileChange {
+                status: "D",
+                path: key,
+            }),
+            (Some(a), Some(b)) if serde_json::to_value(a)? != serde_json::to_value(b)? => {
+                changes.push(FileChange {
+                    status: "M",
+                    path: key,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(changes)
+}
+
+fn summarize_changes(changes: &[FileChange]) -> String {
+    let added = changes.iter().filter(|change| change.status == "A").count();
+    let modified = changes.iter().filter(|change| change.status == "M").count();
+    let deleted = changes.iter().filter(|change| change.status == "D").count();
+    format!("A:{added} M:{modified} D:{deleted}")
 }
 
 fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "select id, kind, before_snapshot, after_snapshot, created_at, message, status, remote_sync_state
-         from operations order by rowid desc",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Option<String>>(7)?,
-        ))
-    })?;
+    let rows = recent_operations(conn)?;
     let mut printed = 0usize;
     for row in rows {
-        let (id, kind, before, after, created, message, status, remote_sync_state) = row?;
+        let id = row.id;
+        let kind = row.kind;
+        let before = row.before_snapshot;
+        let after = row.after_snapshot;
+        let created = row.created_at;
+        let message = row.message;
+        let status = row.status;
+        let remote_sync_state = row.remote_sync_state;
         if let Some(root) = &args.root {
             let matches_root = message.as_deref() == Some(root)
                 || before
@@ -1910,30 +2036,8 @@ fn print_snapshot_diff(
     to: &majutsu_core::SnapshotManifest,
     root: Option<&str>,
 ) -> Result<()> {
-    let from_files = from.map(snapshot_file_map).transpose()?.unwrap_or_default();
-    let to_files = snapshot_file_map(to)?;
-    let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
-    paths_all.extend(
-        to_files
-            .keys()
-            .filter(|key| !from_files.contains_key(*key))
-            .cloned(),
-    );
-    paths_all.sort();
-    for key in paths_all {
-        if let Some(root) = root
-            && !key.starts_with(&format!("{root}/"))
-        {
-            continue;
-        }
-        match (from_files.get(&key), to_files.get(&key)) {
-            (None, Some(_)) => println!("A\t{key}"),
-            (Some(_), None) => println!("D\t{key}"),
-            (Some(a), Some(b)) if serde_json::to_value(a)? != serde_json::to_value(b)? => {
-                println!("M\t{key}");
-            }
-            _ => {}
-        }
+    for change in snapshot_file_changes(from, to, root)? {
+        println!("{}\t{}", change.status, change.path);
     }
     Ok(())
 }

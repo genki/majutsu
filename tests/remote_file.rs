@@ -4785,6 +4785,78 @@ fn failed_sync_does_not_advance_last_synced_or_record_success_operation() {
 }
 
 #[test]
+fn log_defaults_to_managed_file_changes_not_sync_operations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("baseline");
+        c
+    });
+    let mut config = fs::read_to_string(state.join("config.toml")).unwrap();
+    config.push_str(&format!(
+        "\n[remote]\ntype = \"file\"\npath = \"{}\"\n",
+        remote.display()
+    ));
+    fs::write(state.join("config.toml"), config).unwrap();
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("edit alpha");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let change_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("log");
+        c
+    });
+    assert!(change_log.contains("edit alpha"));
+    assert!(change_log.contains("M\tsample/alpha.txt"));
+    assert!(!change_log.contains("remote-sync"));
+
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("log").arg("--operations");
+        c
+    });
+    assert!(op_log.contains("remote-sync"));
+}
+
+#[test]
 fn split_remote_config_supports_file_and_s3_forms() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -6271,6 +6343,7 @@ fn diff_reports_added_modified_and_deleted_paths() {
         c.arg("--home")
             .arg(&state)
             .arg("log")
+            .arg("--operations")
             .arg("--limit")
             .arg("1");
         c
@@ -6372,6 +6445,7 @@ fn log_root_filter_applies_limit_after_filtering() {
             .arg("log")
             .arg("--root")
             .arg("sample")
+            .arg("--operations")
             .arg("--limit")
             .arg("1");
         c

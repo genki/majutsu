@@ -62,7 +62,7 @@ pub(crate) enum Command {
     Status,
     #[command(about = "Inspect state home paths, refs, branches, and metadata")]
     State(StateArgs),
-    #[command(about = "Show snapshot history")]
+    #[command(about = "Show recent managed file changes")]
     Log(LogArgs),
     #[command(about = "Inspect or restore operation-log entries")]
     Op {
@@ -479,6 +479,12 @@ pub(crate) struct LogArgs {
     pub(crate) limit: usize,
     #[arg(long)]
     pub(crate) root: Option<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Show internal operation records instead of managed file changes"
+    )]
+    pub(crate) operations: bool,
 }
 
 #[derive(Args)]
@@ -607,7 +613,7 @@ pub(crate) enum RemoteCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum OpCommand {
-    #[command(about = "List recent operations")]
+    #[command(about = "List recent internal operations")]
     Log(LogArgs),
     #[command(about = "Show operation metadata and optionally file changes")]
     Show(OpShowArgs),
