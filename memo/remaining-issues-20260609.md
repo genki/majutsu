@@ -2,6 +2,8 @@
 
 このメモは、現時点で majutsu を「100% complete」と宣言する前に残っている課題をまとめる。コード上の主要仕様は `MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh` で通過済みだが、release 完成宣言には外部 CI、実 provider、release artifact の証跡がまだ必要。
 
+追記: 解消方針と自動化スクリプトは `memo/remaining-issues-20260609-resolution.md` に分離した。completion gate で確認済みの機能項目は `docs/COMPLETION_SCORECARD.md`、provider ごとの supported / experimental 判定は `docs/PROVIDER_MATRIX.md` を参照する。
+
 ## 現時点で確認済みの範囲
 
 - `MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh` はワークスペース環境で通過済み。
@@ -115,4 +117,3 @@ CI 状態や workflow artifact を CLI で確認するには、認証情報を s
 4. release workflow artifact を確認する。
 5. archive / cold tier restore を AWS S3 などで実検証する。
 6. production 用 `~/.majutsu` の encryption 移行を計画する。
-

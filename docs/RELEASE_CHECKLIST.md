@@ -4,24 +4,20 @@
 
    ```sh
    scripts/check-completion.sh
-   ```
-
-2. Podman で S3 互換 MinIO E2E まで含めた completion check を実行する。
-
-   ```sh
-   podman info
    MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh
    ```
 
-3. 実 provider を release ごとに検証し、`docs/PROVIDER_MATRIX.md` に provider 名、検証日、結果を追記する。
-
-   最低限、release candidate ごとに以下を確認する。
+2. production と同じ種類の remote で暗号化 disaster recovery を検証する。
 
    ```sh
-   mj remote check
-   mj remote fsck
-   mj remote fsck --deep
-   mj restore prepare --at now --to /tmp/majutsu-restore-smoke
+   MAJUTSU_ENCRYPTED_REMOTE=s3://bucket/prefix scripts/verify-encrypted-remote-recovery.sh
+   ```
+
+3. Podman で S3 互換 MinIO E2E を実行する。
+
+   ```sh
+   podman info
+   scripts/e2e-minio.sh
    ```
 
 4. release package を生成する。
@@ -37,4 +33,24 @@
    git push origin v0.1.0
    ```
 
-6. release workflow artifact をダウンロードでき、展開後の `mj --version` が動作することを確認する。
+6. GitHub Actions と release artifact を検証する。
+
+   ```sh
+   GH_TOKEN=... MAJUTSU_RELEASE_TAG=v0.1.0 scripts/verify-release-artifacts.sh
+   ```
+
+7. provider matrix を更新する。
+
+   - File remote と MinIO は CI evidence を記録する。
+   - GCS S3-compatible endpoint を supported にする場合は実 backend の検証日とコマンドを記録する。
+   - AWS S3 / Cloudflare R2 は、その release candidate で実検証していない限り experimental のままにする。
+
+8. archive restore を supported とする場合だけ、実 provider で cold-tier drill を実行する。
+
+   ```sh
+   MAJUTSU_AWS_ARCHIVE_BUCKET=... scripts/e2e-aws-archive-restore.sh
+   # provider restore 完了後
+   MAJUTSU_AWS_ARCHIVE_BUCKET=... MAJUTSU_AWS_ARCHIVE_PREFIX=... scripts/e2e-aws-archive-restore.sh --resume
+   ```
+
+9. release workflow artifact をダウンロードでき、`mj --version` と `mj --help` が動作することを release note に記録する。
