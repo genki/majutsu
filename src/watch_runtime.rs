@@ -299,6 +299,20 @@ fn notify_event_kind(event: &notify::Event) -> &'static str {
 
 fn snapshot_relevant_event(event: &notify::Event) -> bool {
     !matches!(event.kind, EventKind::Access(_))
+        && event
+            .paths
+            .iter()
+            .any(|path| !is_transient_watch_path(path))
+}
+
+fn is_transient_watch_path(path: &Path) -> bool {
+    path.components()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|window| {
+            window[0].as_os_str() == ".git"
+                && window[1].as_os_str().to_string_lossy().ends_with(".lock")
+        })
 }
 
 fn notify_event_paths(event: &notify::Event) -> String {
@@ -404,5 +418,29 @@ mod tests {
     fn normalizes_watch_backend_for_cli() {
         assert_eq!(normalize_watch_backend("notify").unwrap(), "notify");
         assert_eq!(normalize_watch_backend("poll").unwrap(), "poll");
+    }
+
+    #[test]
+    fn ignores_git_transient_lock_events() {
+        let event = Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![PathBuf::from("/repo/.git/index.lock")],
+            attrs: Default::default(),
+        };
+
+        assert!(!snapshot_relevant_event(&event));
+    }
+
+    #[test]
+    fn keeps_git_index_events_relevant() {
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            paths: vec![PathBuf::from("/repo/.git/index")],
+            attrs: Default::default(),
+        };
+
+        assert!(snapshot_relevant_event(&event));
     }
 }

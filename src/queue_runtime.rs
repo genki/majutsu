@@ -4,6 +4,7 @@ use majutsu_db::{EventJournalRecord, UploadQueueItem, expected_upload_queue_item
 use majutsu_store::is_content_addressed_remote_key;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::config::Paths;
@@ -73,7 +74,12 @@ pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQu
         if entry.file_type()?.is_file()
             && entry.path().extension().and_then(OsStr::to_str) == Some("json")
         {
-            let item: UploadQueueItem = serde_json::from_slice(&fs::read(entry.path())?)?;
+            let bytes = match fs::read(entry.path()) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            let item: UploadQueueItem = serde_json::from_slice(&bytes)?;
             items.push((entry.path(), item));
         }
     }
@@ -207,7 +213,12 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
         if entry.file_type()?.is_file()
             && entry.path().extension().and_then(OsStr::to_str) == Some("json")
         {
-            records.push(serde_json::from_slice(&fs::read(entry.path())?)?);
+            let bytes = match fs::read(entry.path()) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            records.push(serde_json::from_slice(&bytes)?);
         }
     }
     records.sort_by(|a, b| a.observed_at.cmp(&b.observed_at));
