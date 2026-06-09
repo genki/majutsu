@@ -4854,6 +4854,20 @@ fn log_defaults_to_managed_file_changes_not_sync_operations() {
         c
     });
     assert!(op_log.contains("remote-sync"));
+
+    let colored_log = output({
+        let mut c = mj();
+        c.env("MJ_COLOR", "always")
+            .env_remove("NO_COLOR")
+            .arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("1");
+        c
+    });
+    assert!(colored_log.contains("\u{1b}[1;34m20"));
+    assert!(colored_log.contains("\u{1b}[1;33mM\u{1b}[0m\tsample/alpha.txt"));
 }
 
 #[test]

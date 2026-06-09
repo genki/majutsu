@@ -1765,6 +1765,7 @@ fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let operations = recent_operations(conn)?;
     let mut printed = 0usize;
     let mut output = String::new();
+    let ui = StatusUi::new();
     for op in operations {
         if printed >= args.limit {
             break;
@@ -1777,14 +1778,19 @@ fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
         writeln!(
             output,
             "{}\t{}\t{}\t{}\t{}",
-            op.created_at,
+            ui.paint(&op.created_at, "1;34"),
             op.id,
-            op.kind,
+            ui.paint(&op.kind, "36"),
             summary,
             op.message.as_deref().unwrap_or_default()
         )?;
         for change in changes {
-            writeln!(output, "{}\t{}", change.status, change.path)?;
+            writeln!(
+                output,
+                "{}\t{}",
+                color_change_status(&ui, change.status),
+                change.path
+            )?;
         }
         printed += 1;
     }
@@ -1893,10 +1899,21 @@ fn summarize_changes(changes: &[FileChange]) -> String {
     format!("A:{added} M:{modified} D:{deleted}")
 }
 
+fn color_change_status(ui: &StatusUi, status: &str) -> String {
+    let severity = match status {
+        "A" => Severity::Good,
+        "M" => Severity::Warn,
+        "D" => Severity::Bad,
+        _ => Severity::Info,
+    };
+    ui.severity(status, severity)
+}
+
 fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let rows = recent_operations(conn)?;
     let mut printed = 0usize;
     let mut output = String::new();
+    let ui = StatusUi::new();
     for row in rows {
         let id = row.id;
         let kind = row.kind;
@@ -1923,6 +1940,8 @@ fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
         if printed >= args.limit {
             break;
         }
+        let created = ui.paint(&created, "1;34");
+        let kind = ui.paint(&kind, "36");
         writeln!(
             output,
             "{id}\t{created}\t{kind}\t{status}\t{}\t{} -> {}\t{}",
