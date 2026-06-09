@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use majutsu_core::OperationLogEntry as OperationExport;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::fmt::Write as _;
@@ -1689,28 +1690,34 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
     let conn = crate::open_db(paths)?;
     match command {
         OpCommand::Log(args) => print_op_log(&conn, &args),
-        OpCommand::Show { op_id } => {
-            let op = query_operation(&conn, &op_id)?;
+        OpCommand::Show(args) => {
+            let op = query_operation(&conn, &args.op_id)?;
             println!("id {}", op.id);
-            println!("parent {}", op.parent_op.unwrap_or_else(|| "(none)".into()));
+            println!("parent {}", op.parent_op.as_deref().unwrap_or("(none)"));
             println!("kind {}", op.kind);
             println!("actor {}", op.actor);
             println!("status {}", op.status);
             println!(
                 "before {}",
-                op.before_snapshot.unwrap_or_else(|| "(none)".into())
+                op.before_snapshot.as_deref().unwrap_or("(none)")
             );
-            println!(
-                "after {}",
-                op.after_snapshot.unwrap_or_else(|| "(none)".into())
-            );
+            println!("after {}", op.after_snapshot.as_deref().unwrap_or("(none)"));
             println!("created_at {}", op.created_at);
-            println!("message {}", op.message.unwrap_or_default());
-            println!("error {}", op.error.unwrap_or_default());
+            println!("message {}", op.message.as_deref().unwrap_or_default());
+            println!("error {}", op.error.as_deref().unwrap_or_default());
             println!(
                 "remote_sync_state {}",
-                op.remote_sync_state.unwrap_or_default()
+                op.remote_sync_state.as_deref().unwrap_or_default()
             );
+            if args.files {
+                println!("files");
+                print_op_diff(&conn, &op, args.root.as_deref())?;
+            }
+            Ok(())
+        }
+        OpCommand::Diff(args) => {
+            let op = query_operation(&conn, &args.op_id)?;
+            print_op_diff(&conn, &op, args.root.as_deref())?;
             Ok(())
         }
         OpCommand::Restore { op_id } => {
@@ -1739,6 +1746,19 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
     }
 }
 
+fn print_op_diff(conn: &Connection, op: &OperationExport, root: Option<&str>) -> Result<()> {
+    let Some(after_id) = op.after_snapshot.as_deref() else {
+        bail!("operation has no after snapshot to diff: {}", op.id);
+    };
+    let after = load_snapshot_by_id(conn, after_id)?;
+    let before = op
+        .before_snapshot
+        .as_deref()
+        .map(|id| load_snapshot_by_id(conn, id))
+        .transpose()?;
+    print_snapshot_diff(before.as_ref(), &after, root)
+}
+
 pub(crate) fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
@@ -1761,12 +1781,16 @@ pub(crate) fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
     } else {
         None
     };
-    let from_files = from
-        .as_ref()
-        .map(snapshot_file_map)
-        .transpose()?
-        .unwrap_or_default();
-    let to_files = snapshot_file_map(&to)?;
+    print_snapshot_diff(from.as_ref(), &to, args.root.as_deref())
+}
+
+fn print_snapshot_diff(
+    from: Option<&majutsu_core::SnapshotManifest>,
+    to: &majutsu_core::SnapshotManifest,
+    root: Option<&str>,
+) -> Result<()> {
+    let from_files = from.map(snapshot_file_map).transpose()?.unwrap_or_default();
+    let to_files = snapshot_file_map(to)?;
     let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
     paths_all.extend(
         to_files
@@ -1776,10 +1800,10 @@ pub(crate) fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
     );
     paths_all.sort();
     for key in paths_all {
-        if let Some(root) = &args.root {
-            if !key.starts_with(&format!("{root}/")) {
-                continue;
-            }
+        if let Some(root) = root
+            && !key.starts_with(&format!("{root}/"))
+        {
+            continue;
         }
         match (from_files.get(&key), to_files.get(&key)) {
             (None, Some(_)) => println!("A\t{key}"),

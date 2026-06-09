@@ -607,9 +607,36 @@ pub(crate) enum RemoteCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum OpCommand {
+    #[command(about = "List recent operations")]
     Log(LogArgs),
-    Show { op_id: String },
+    #[command(about = "Show operation metadata and optionally file changes")]
+    Show(OpShowArgs),
+    #[command(about = "Show file changes caused by one operation")]
+    Diff(OpDiffArgs),
+    #[command(about = "Move current to the snapshot referenced by an operation")]
     Restore { op_id: String },
+}
+
+#[derive(Args)]
+pub(crate) struct OpShowArgs {
+    #[arg(help = "Operation id from `mj op log`")]
+    pub(crate) op_id: String,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Show file changes for this operation"
+    )]
+    pub(crate) files: bool,
+    #[arg(long, help = "Limit --files output to one root id")]
+    pub(crate) root: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct OpDiffArgs {
+    #[arg(help = "Operation id from `mj op log`")]
+    pub(crate) op_id: String,
+    #[arg(long, help = "Limit output to one root id")]
+    pub(crate) root: Option<String>,
 }
 
 #[derive(Subcommand)]

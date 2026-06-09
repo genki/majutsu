@@ -485,6 +485,8 @@ mj log
 mj log --root home-notes
 mj op log
 mj op show <op-id>
+mj op show <op-id> --files
+mj op diff <op-id>
 mj op restore <op-id>
 ```
 
@@ -507,6 +509,14 @@ Diff explicit snapshots:
 ```sh
 mj diff snap-old snap-new --root home-notes
 mj diff --at "10 minutes ago"
+```
+
+To inspect the file changes caused by a specific snapshot operation, take the
+operation id from `mj op log` and run:
+
+```sh
+mj op diff op-...
+mj op show op-... --files --root home-notes
 ```
 
 Snapshot manifests keep a compatibility file list and also point each root at a

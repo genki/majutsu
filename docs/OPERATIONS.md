@@ -86,3 +86,17 @@ mj branch switch main --restore --force
 
 working directory を上書きせずに古い branch を確認したい場合は、configured roots への
 `--restore` ではなく `--to <dir>` を指定する。
+
+## operation file diff
+
+snapshot operation が管理対象ファイルに与えた差分を確認する。
+
+```sh
+mj op log
+mj op diff <op-id>
+mj op show <op-id> --files
+mj op diff <op-id> --root moon
+```
+
+`mj op log` は操作単位の履歴、`mj op diff` はその操作の before / after snapshot から
+導出した file-level diff を表示する。

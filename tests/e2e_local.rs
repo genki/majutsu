@@ -653,3 +653,61 @@ fn state_reports_paths_refs_branches_and_json() {
                 && reference["value"] == "feature")
     );
 }
+
+#[test]
+fn op_diff_reports_file_changes_for_snapshot_operation() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha v1\n").unwrap();
+    fs::write(root.join("gamma.txt"), b"remove me\n").unwrap();
+
+    assert_success(
+        run_mj(&home, ["init", "--host-name", "op-diff-e2e-host"]),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "workspace", root.to_str().unwrap()]),
+        "root add workspace",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "baseline"]),
+        "baseline snapshot",
+    );
+
+    fs::write(root.join("alpha.txt"), b"alpha v2\n").unwrap();
+    fs::write(root.join("beta.txt"), b"beta\n").unwrap();
+    fs::remove_file(root.join("gamma.txt")).unwrap();
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "file changes"]),
+        "changed snapshot",
+    );
+
+    let op_log = successful_stdout(run_mj(&home, ["op", "log"]), "op log");
+    let op_id = op_log
+        .lines()
+        .find(|line| line.contains("file changes"))
+        .and_then(|line| line.split('\t').next())
+        .unwrap();
+
+    let op_diff = successful_stdout(run_mj(&home, ["op", "diff", op_id]), "op diff");
+    assert!(op_diff.contains("M\tworkspace/alpha.txt"), "{op_diff}");
+    assert!(op_diff.contains("A\tworkspace/beta.txt"), "{op_diff}");
+    assert!(op_diff.contains("D\tworkspace/gamma.txt"), "{op_diff}");
+
+    let op_show = successful_stdout(
+        run_mj(&home, ["op", "show", op_id, "--files"]),
+        "op show --files",
+    );
+    assert!(op_show.contains("files"), "{op_show}");
+    assert!(op_show.contains("M\tworkspace/alpha.txt"), "{op_show}");
+    assert!(op_show.contains("A\tworkspace/beta.txt"), "{op_show}");
+    assert!(op_show.contains("D\tworkspace/gamma.txt"), "{op_show}");
+
+    let root_filtered = successful_stdout(
+        run_mj(&home, ["op", "diff", op_id, "--root", "workspace"]),
+        "op diff --root",
+    );
+    assert!(root_filtered.contains("M\tworkspace/alpha.txt"));
+}
