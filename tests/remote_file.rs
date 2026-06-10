@@ -5893,7 +5893,7 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
     let chunk_oid = export["chunks"][0]["oid"].as_str().unwrap();
     let chunk_key = export["chunks"][0]["object_key"].as_str().unwrap();
     assert!(!chunk_key.contains(chunk_oid));
-    assert!(remote.join(chunk_key).exists());
+    assert!(!remote.join(chunk_key).exists());
     let chunk_alias = chunk_key
         .strip_prefix("objects/large/chunks/fixed/")
         .map(|rest| format!("large/chunks/fixed-8m/{rest}.chunk.enc"))

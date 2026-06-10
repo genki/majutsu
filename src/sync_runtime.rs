@@ -23,7 +23,9 @@ use crate::config::{Config, MetadataExport, Paths, read_config};
 use crate::db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
-use crate::object_paths::local_object_keys;
+use crate::object_paths::{
+    local_object_keys, prefer_canonical_remote_only, remote_live_object_keys,
+};
 use crate::operation_log::{record_op_with_details, update_operation_result};
 use crate::pack_runtime::pack_cmd;
 use crate::process_runtime::acquire_process_lock;
@@ -256,7 +258,9 @@ fn enqueue_and_drain_sync(
     for key in local_object_keys(&export) {
         let local = paths.home.join(&key);
         if local.exists() {
-            enqueue_file_upload_if_needed(paths, remote, &key, &local)?;
+            if !prefer_canonical_remote_only(&key) {
+                enqueue_file_upload_if_needed(paths, remote, &key, &local)?;
+            }
             for alias in canonical_remote_aliases(&key) {
                 if canonical_alias_uses_structured_encoding(&key) {
                     enqueue_inline_upload_if_needed(paths, remote, &alias, || {
@@ -407,17 +411,11 @@ fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
 }
 
 fn build_gc_mark_export(config: &Config, export: &MetadataExport) -> GcMarkExport {
-    let mut object_keys = local_object_keys(export);
-    for key in object_keys.clone() {
-        object_keys.extend(canonical_remote_aliases(&key));
-    }
-    object_keys.sort();
-    object_keys.dedup();
     GcMarkExport::new(
         config.host.id.clone(),
         Utc::now(),
         export.refs.get("current").cloned(),
-        object_keys,
+        remote_live_object_keys(export),
     )
 }
 

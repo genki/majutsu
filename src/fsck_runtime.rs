@@ -39,7 +39,7 @@ use std::path::Path;
 use crate::config::{
     Config, HostConfig, METADATA_EXPORT_VERSION, Paths, RootConfig, read_config, validate_config,
 };
-use crate::object_paths::local_object_keys;
+use crate::object_paths::{local_object_keys, remote_live_object_keys};
 use crate::operation_log::{local_oplog_path, query_operations, record_op};
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::RemoteStore;
@@ -932,11 +932,7 @@ pub(crate) fn validate_remote_gc_records(
 }
 
 fn expected_gc_mark_object_keys(export: &crate::MetadataExport) -> BTreeSet<String> {
-    let mut object_keys = local_object_keys(export);
-    for key in object_keys.clone() {
-        object_keys.extend(canonical_remote_aliases(&key));
-    }
-    object_keys.into_iter().collect()
+    remote_live_object_keys(export).into_iter().collect()
 }
 
 fn validate_remote_gc_tombstones(

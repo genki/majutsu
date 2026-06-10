@@ -5,6 +5,7 @@ use walkdir::WalkDir;
 
 use crate::config::{MetadataExport, Paths};
 use crate::util::path_to_slash;
+use majutsu_store::canonical_remote_aliases;
 
 pub(crate) fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     let mut keys = Vec::new();
@@ -30,6 +31,25 @@ pub(crate) fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     }
     for chunk in &export.chunks {
         keys.push(chunk.object_key.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+pub(crate) fn prefer_canonical_remote_only(key: &str) -> bool {
+    key.starts_with("objects/large/chunks/fixed/")
+        || key.starts_with("objects/large/chunks/fastcdc/")
+}
+
+pub(crate) fn remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
+    let local_keys = local_object_keys(export);
+    let mut keys = Vec::new();
+    for key in &local_keys {
+        if !prefer_canonical_remote_only(key) {
+            keys.push(key.clone());
+        }
+        keys.extend(canonical_remote_aliases(key));
     }
     keys.sort();
     keys.dedup();

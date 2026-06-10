@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use majutsu_db::{EventJournalRecord, UploadQueueItem, expected_upload_queue_item_id};
-use majutsu_store::is_content_addressed_remote_key;
+use majutsu_store::{canonical_remote_aliases, is_content_addressed_remote_key};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::config::Paths;
+use crate::object_paths::prefer_canonical_remote_only;
 use crate::remote_store::RemoteStore;
 use crate::util::{new_id, path_to_slash};
 
@@ -147,6 +148,10 @@ pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<
             );
             last_progress = Instant::now();
         }
+        if queued_upload_can_be_skipped(paths, remote, &item) {
+            fs::remove_file(path)?;
+            continue;
+        }
         let bytes = if let Some(bytes) = item.inline.clone() {
             bytes
         } else if let Some(source) = &item.source {
@@ -182,6 +187,23 @@ pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<
         eprintln!("sync upload progress {}/{} done", uploaded, total);
     }
     Ok(uploaded)
+}
+
+fn queued_upload_can_be_skipped(
+    paths: &Paths,
+    remote: &RemoteStore,
+    item: &UploadQueueItem,
+) -> bool {
+    if !prefer_canonical_remote_only(&item.key) {
+        return false;
+    }
+    let alias_exists = canonical_remote_aliases(&item.key)
+        .into_iter()
+        .any(|alias| remote.exists(&alias).unwrap_or(false));
+    if alias_exists {
+        let _ = remove_upload_payload(paths, &item.id);
+    }
+    alias_exists
 }
 
 fn upload_payload_dir(paths: &Paths) -> PathBuf {
