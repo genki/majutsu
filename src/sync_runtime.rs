@@ -13,8 +13,8 @@ use majutsu_store::{
     is_content_addressed_remote_key, remote_gc_mark_key, remote_gc_tombstone_key,
 };
 use rusqlite::Connection;
-use serde::Serialize;
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 
@@ -35,7 +35,7 @@ use crate::queue_runtime::{
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
-use crate::util::{new_id, parse_db_time};
+use crate::util::{blake3_hex, new_id, parse_db_time};
 use crate::{
     encode_object, ensure_ready, export_metadata, open_db, read_object, remote_object_available,
     remote_ref,
@@ -101,6 +101,19 @@ fn sync_configured_remote(
     let _lock = acquire_process_lock(&paths.sync_lock, "sync")?;
     auto_pack_before_sync(paths, conn)?;
     let current = current_snapshot(conn)?;
+    let export = export_metadata(conn, config)?;
+    let sync_cache = read_remote_sync_cache(paths, remote)?;
+    let state_fingerprint = remote_sync_state_fingerprint(config, &export)?;
+    let upload_stats = upload_queue_stats(paths)?;
+    if upload_stats.total == 0
+        && sync_cache.state_fingerprint.as_deref() == Some(state_fingerprint.as_str())
+    {
+        println!("synced 0 objects to {}", remote.describe());
+        println!("pruned_remote_exports 0");
+        println!("pruned_remote_objects 0");
+        println!("pruned_local_objects 0");
+        return Ok(());
+    }
     let previous_last_synced = ref_value(conn, "last-synced")?;
     let synced_at = Utc::now().to_rfc3339();
     set_ref_value(conn, "last-synced", &synced_at)?;
@@ -163,6 +176,9 @@ fn enqueue_and_drain_sync(
     remote: &RemoteStore,
 ) -> Result<()> {
     let export = export_metadata(conn, config)?;
+    let sync_cache = read_remote_sync_cache(paths, remote)?;
+    let sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &export)?;
+    let state_fingerprint = remote_sync_state_fingerprint(config, &export)?;
     enqueue_inline_upload(
         paths,
         "metadata/export.json",
@@ -171,27 +187,15 @@ fn enqueue_and_drain_sync(
     let host_metadata = host_metadata_key(&config.host.id);
     enqueue_inline_upload(paths, &host_metadata, serde_json::to_vec_pretty(&export)?)?;
     for snapshot in &export.snapshots {
-        enqueue_inline_upload(
-            paths,
-            &host_snapshot_key(&config.host.id, &snapshot.id),
-            serde_json::to_vec_pretty(snapshot)?,
-        )?;
-        enqueue_inline_upload(
-            paths,
-            &host_snapshot_canonical_key(&config.host.id, &snapshot.id),
-            encode_canonical_remote_export(paths, snapshot)?,
-        )?;
+        enqueue_snapshot_uploads_if_needed(paths, remote, &sync_cache, &config.host.id, snapshot)?;
     }
     for operation in &export.operations {
-        enqueue_inline_upload(
+        enqueue_operation_uploads_if_needed(
             paths,
-            &host_operation_key(&config.host.id, &operation.id),
-            serde_json::to_vec_pretty(operation)?,
-        )?;
-        enqueue_inline_upload(
-            paths,
-            &host_operation_canonical_key(&config.host.id, &operation.id),
-            encode_canonical_remote_export(paths, operation)?,
+            remote,
+            &sync_cache,
+            &config.host.id,
+            operation,
         )?;
     }
     enqueue_inline_upload(
@@ -273,6 +277,7 @@ fn enqueue_and_drain_sync(
         }
     }
     let uploaded = drain_upload_queue(paths, remote)?;
+    write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
     let pruned_remote_exports = prune_remote_host_exports(remote, &config.host.id, &export)?;
     let pruned_remote_objects = prune_remote_packed_blob_objects(
         remote,
@@ -304,6 +309,64 @@ where
     enqueue_inline_upload(paths, key, payload()?)
 }
 
+fn enqueue_snapshot_uploads_if_needed(
+    paths: &Paths,
+    remote: &RemoteStore,
+    cache: &RemoteSyncCache,
+    host_id: &str,
+    snapshot: &majutsu_core::SnapshotExport,
+) -> Result<()> {
+    let legacy_key = host_snapshot_key(host_id, &snapshot.id);
+    let canonical_key = host_snapshot_canonical_key(host_id, &snapshot.id);
+    let legacy_bytes = serde_json::to_vec_pretty(snapshot)?;
+    let fingerprint = payload_fingerprint(&legacy_bytes);
+    if cache_matches(cache, &legacy_key, &fingerprint)
+        && cache_matches(cache, &canonical_key, &fingerprint)
+    {
+        return Ok(());
+    }
+    if remote_bytes_match(remote, &legacy_key, &legacy_bytes)
+        && remote_key_exists(remote, &canonical_key)
+    {
+        return Ok(());
+    }
+    enqueue_inline_upload(paths, &legacy_key, legacy_bytes)?;
+    enqueue_inline_upload(
+        paths,
+        &canonical_key,
+        encode_canonical_remote_export(paths, snapshot)?,
+    )
+}
+
+fn enqueue_operation_uploads_if_needed(
+    paths: &Paths,
+    remote: &RemoteStore,
+    cache: &RemoteSyncCache,
+    host_id: &str,
+    operation: &OperationExport,
+) -> Result<()> {
+    let legacy_key = host_operation_key(host_id, &operation.id);
+    let canonical_key = host_operation_canonical_key(host_id, &operation.id);
+    let legacy_bytes = serde_json::to_vec_pretty(operation)?;
+    let fingerprint = payload_fingerprint(&legacy_bytes);
+    if cache_matches(cache, &legacy_key, &fingerprint)
+        && cache_matches(cache, &canonical_key, &fingerprint)
+    {
+        return Ok(());
+    }
+    if remote_bytes_match(remote, &legacy_key, &legacy_bytes)
+        && remote_key_exists(remote, &canonical_key)
+    {
+        return Ok(());
+    }
+    enqueue_inline_upload(paths, &legacy_key, legacy_bytes)?;
+    enqueue_inline_upload(
+        paths,
+        &canonical_key,
+        encode_canonical_remote_export(paths, operation)?,
+    )
+}
+
 fn enqueue_file_upload_if_needed(
     paths: &Paths,
     remote: &RemoteStore,
@@ -320,7 +383,138 @@ fn remote_key_can_be_skipped(remote: &RemoteStore, key: &str) -> bool {
     if !is_content_addressed_remote_key(key) {
         return false;
     }
+    remote_key_exists(remote, key)
+}
+
+fn remote_key_exists(remote: &RemoteStore, key: &str) -> bool {
     remote.exists(key).unwrap_or(false)
+}
+
+fn remote_bytes_match(remote: &RemoteStore, key: &str, expected: &[u8]) -> bool {
+    if !remote_key_exists(remote, key) {
+        return false;
+    }
+    remote
+        .get(key)
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RemoteSyncCache {
+    version: u32,
+    remote: String,
+    #[serde(default)]
+    state_fingerprint: Option<String>,
+    entries: BTreeMap<String, String>,
+}
+
+fn remote_sync_cache_path(paths: &Paths) -> std::path::PathBuf {
+    paths.home.join("cache/remote-sync.json")
+}
+
+fn read_remote_sync_cache(paths: &Paths, remote: &RemoteStore) -> Result<RemoteSyncCache> {
+    let path = remote_sync_cache_path(paths);
+    if !path.exists() {
+        return Ok(empty_remote_sync_cache(remote));
+    }
+    let cache: RemoteSyncCache = serde_json::from_slice(&fs::read(path)?)?;
+    if cache.version == 1 && cache.remote == remote.describe() {
+        Ok(cache)
+    } else {
+        Ok(empty_remote_sync_cache(remote))
+    }
+}
+
+fn empty_remote_sync_cache(remote: &RemoteStore) -> RemoteSyncCache {
+    RemoteSyncCache {
+        version: 1,
+        remote: remote.describe(),
+        state_fingerprint: None,
+        entries: BTreeMap::new(),
+    }
+}
+
+fn write_remote_sync_cache(
+    paths: &Paths,
+    remote: &RemoteStore,
+    entries: BTreeMap<String, String>,
+    state_fingerprint: String,
+) -> Result<()> {
+    let path = remote_sync_cache_path(paths);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let cache = RemoteSyncCache {
+        version: 1,
+        remote: remote.describe(),
+        state_fingerprint: Some(state_fingerprint),
+        entries,
+    };
+    fs::write(&tmp, serde_json::to_vec_pretty(&cache)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn build_remote_sync_fingerprints(
+    host_id: &str,
+    export: &MetadataExport,
+) -> Result<BTreeMap<String, String>> {
+    let mut entries = BTreeMap::new();
+    for snapshot in &export.snapshots {
+        let fingerprint = payload_fingerprint(&serde_json::to_vec_pretty(snapshot)?);
+        entries.insert(
+            host_snapshot_key(host_id, &snapshot.id),
+            fingerprint.clone(),
+        );
+        entries.insert(
+            host_snapshot_canonical_key(host_id, &snapshot.id),
+            fingerprint,
+        );
+    }
+    for operation in &export.operations {
+        let fingerprint = payload_fingerprint(&serde_json::to_vec_pretty(operation)?);
+        entries.insert(
+            host_operation_key(host_id, &operation.id),
+            fingerprint.clone(),
+        );
+        entries.insert(
+            host_operation_canonical_key(host_id, &operation.id),
+            fingerprint,
+        );
+    }
+    Ok(entries)
+}
+
+fn remote_sync_state_fingerprint(config: &Config, export: &MetadataExport) -> Result<String> {
+    let mut export_value = serde_json::to_value(export)?;
+    if let Some(object) = export_value.as_object_mut() {
+        object.remove("exported_at");
+        object.remove("operations");
+        if let Some(refs) = object
+            .get_mut("refs")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            refs.remove("last-synced");
+        }
+    }
+    let value = serde_json::json!({
+        "config": config,
+        "export": export_value,
+    });
+    Ok(payload_fingerprint(&serde_json::to_vec(&value)?))
+}
+
+fn cache_matches(cache: &RemoteSyncCache, key: &str, fingerprint: &str) -> bool {
+    cache
+        .entries
+        .get(key)
+        .is_some_and(|cached| cached == fingerprint)
+}
+
+fn payload_fingerprint(bytes: &[u8]) -> String {
+    blake3_hex(bytes)
 }
 
 fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {

@@ -45,6 +45,16 @@ fn output(mut command: Command) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn synced_object_count(output: &str) -> usize {
+    output
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("synced ")?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .unwrap_or_else(|| panic!("missing synced object count in output:\n{output}"))
+}
+
 fn fails(mut command: Command) {
     let output = command.output().expect("run command");
     assert!(
@@ -13886,6 +13896,66 @@ fn watch_can_start_daemon_when_not_foreground() {
     assert!(stopped.contains("stopped"));
     assert!(!state.join("runtime/daemon.pid").exists());
     assert!(!state.join("runtime/daemon.sock").exists());
+}
+
+#[test]
+fn repeated_sync_skips_existing_snapshot_and_operation_exports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("one.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    for i in 0..4 {
+        fs::write(source.join("one.txt"), format!("one {i}\n")).unwrap();
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(&state)
+                .arg("snapshot")
+                .arg("--message")
+                .arg(format!("snapshot {i}"));
+            c
+        });
+    }
+
+    let first = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let second = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let first_count = synced_object_count(&first);
+    let second_count = synced_object_count(&second);
+
+    assert!(
+        second_count < first_count / 2,
+        "expected repeated sync to skip immutable exports: first={first_count} second={second_count}\nfirst:\n{first}\nsecond:\n{second}"
+    );
 }
 
 #[cfg(unix)]
