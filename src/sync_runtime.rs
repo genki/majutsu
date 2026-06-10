@@ -10,7 +10,7 @@ use majutsu_store::{
     host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
     host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
     host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
-    remote_gc_mark_key, remote_gc_tombstone_key,
+    is_content_addressed_remote_key, remote_gc_mark_key, remote_gc_tombstone_key,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -256,16 +256,14 @@ fn enqueue_and_drain_sync(
     for key in local_object_keys(&export) {
         let local = paths.home.join(&key);
         if local.exists() {
-            enqueue_file_upload(paths, &key, &local)?;
+            enqueue_file_upload_if_needed(paths, remote, &key, &local)?;
             for alias in canonical_remote_aliases(&key) {
                 if canonical_alias_uses_structured_encoding(&key) {
-                    enqueue_inline_upload(
-                        paths,
-                        &alias,
-                        encode_canonical_local_object(paths, &key)?,
-                    )?;
+                    enqueue_inline_upload_if_needed(paths, remote, &alias, || {
+                        encode_canonical_local_object(paths, &key)
+                    })?;
                 } else {
-                    enqueue_file_upload(paths, &alias, &local)?;
+                    enqueue_file_upload_if_needed(paths, remote, &alias, &local)?;
                 }
             }
         }
@@ -285,6 +283,40 @@ fn enqueue_and_drain_sync(
     println!("pruned_remote_objects {}", pruned_remote_objects);
     println!("pruned_local_objects {}", pruned_local_objects);
     Ok(())
+}
+
+fn enqueue_inline_upload_if_needed<F>(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+    payload: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<Vec<u8>>,
+{
+    if remote_key_can_be_skipped(remote, key) {
+        return Ok(());
+    }
+    enqueue_inline_upload(paths, key, payload()?)
+}
+
+fn enqueue_file_upload_if_needed(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+    source: &std::path::Path,
+) -> Result<()> {
+    if remote_key_can_be_skipped(remote, key) {
+        return Ok(());
+    }
+    enqueue_file_upload(paths, key, source)
+}
+
+fn remote_key_can_be_skipped(remote: &RemoteStore, key: &str) -> bool {
+    if !is_content_addressed_remote_key(key) {
+        return false;
+    }
+    remote.exists(key).unwrap_or(false)
 }
 
 fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {

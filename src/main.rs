@@ -2326,6 +2326,7 @@ pub(crate) fn create_layout(paths: &Paths) -> Result<()> {
     for dir in [
         "ops",
         "queue/events",
+        "queue/upload-payloads",
         "queue/uploads",
         "queue/restores",
         "cache",

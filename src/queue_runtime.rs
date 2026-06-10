@@ -28,18 +28,27 @@ impl UploadQueueStats {
 }
 
 pub(crate) fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()> {
+    let id = expected_upload_queue_item_id(key);
+    let payload_path = upload_payload_path(paths, &id);
+    if let Some(parent) = payload_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = payload_path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &payload_path)?;
     write_upload_item(
         paths,
-        UploadQueueItem::inline(
-            expected_upload_queue_item_id(key),
+        UploadQueueItem::file(
+            id,
             key.to_string(),
-            bytes,
+            path_to_slash(&payload_path),
             Utc::now(),
         ),
     )
 }
 
 pub(crate) fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Result<()> {
+    remove_upload_payload(paths, &expected_upload_queue_item_id(key))?;
     write_upload_item(
         paths,
         UploadQueueItem::file(
@@ -120,7 +129,7 @@ pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
 pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
     let mut uploaded = 0usize;
     for (path, mut item) in upload_queue_items(paths)? {
-        let bytes = if let Some(bytes) = item.inline.take() {
+        let bytes = if let Some(bytes) = item.inline.clone() {
             bytes
         } else if let Some(source) = &item.source {
             fs::read(source).with_context(|| format!("read queued upload source {source}"))?
@@ -139,6 +148,7 @@ pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<
         };
         match upload_result {
             Ok(()) => {
+                remove_upload_payload(paths, &item.id)?;
                 fs::remove_file(path)?;
                 uploaded += 1;
             }
@@ -151,6 +161,27 @@ pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<
         }
     }
     Ok(uploaded)
+}
+
+fn upload_payload_dir(paths: &Paths) -> PathBuf {
+    paths
+        .upload_queue
+        .parent()
+        .unwrap_or(&paths.upload_queue)
+        .join("upload-payloads")
+}
+
+fn upload_payload_path(paths: &Paths, id: &str) -> PathBuf {
+    upload_payload_dir(paths).join(format!("{id}.bin"))
+}
+
+fn remove_upload_payload(paths: &Paths, id: &str) -> Result<()> {
+    let payload_path = upload_payload_path(paths, id);
+    match fs::remove_file(payload_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub(crate) fn next_retry_after(now: DateTime<Utc>, attempts: u32) -> DateTime<Utc> {
