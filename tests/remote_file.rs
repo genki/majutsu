@@ -4881,6 +4881,122 @@ fn log_defaults_to_managed_file_changes_not_sync_operations() {
 }
 
 #[test]
+fn log_folds_large_change_sets_unless_full_is_requested() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..130 {
+        fs::write(source.join(format!("file-{i:03}.txt")), format!("{i}\n")).unwrap();
+    }
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("large baseline");
+        c
+    });
+
+    let folded = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("1");
+        c
+    });
+    assert!(folded.contains("more changed files hidden"));
+    assert!(!folded.contains("sample/file-129.txt"));
+
+    let full = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("1")
+            .arg("--full");
+        c
+    });
+    assert!(full.contains("sample/file-129.txt"));
+    assert!(!full.contains("more changed files hidden"));
+}
+
+#[test]
+fn sync_wait_reports_status_when_existing_sync_lock_is_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fs::create_dir_all(state.join("locks")).unwrap();
+    fs::write(
+        state.join("locks/sync.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    let waited = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("--wait")
+            .arg("--timeout-secs")
+            .arg("1");
+        c
+    });
+    assert!(waited.contains("sync already running pid"));
+    assert!(waited.contains("missing_remote_objects 0"));
+    assert!(waited.contains("queued_uploads 0"));
+}
+
+#[test]
 fn split_remote_config_supports_file_and_s3_forms() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -13804,6 +13920,8 @@ fn daemon_status_uses_ipc_socket() {
         c
     });
     assert!(status.contains("ipc ok"));
+    assert!(status.contains("rss_kib "));
+    assert!(status.contains("vm_size_kib "));
     assert!(status.contains("roots 1"));
     assert!(status.contains("root_status active 1"));
     assert!(status.contains("journal_events "));
@@ -13824,6 +13942,8 @@ fn daemon_status_uses_ipc_socket() {
     });
     assert!(metrics.contains("majutsu_daemon_up 1"));
     assert!(metrics.contains("majutsu_daemon_ipc_up 1"));
+    assert!(metrics.contains("majutsu_daemon_rss_kib "));
+    assert!(metrics.contains("majutsu_daemon_vm_size_kib "));
     assert!(metrics.contains("majutsu_daemon_roots 1"));
     assert!(metrics.contains("majutsu_daemon_queued_uploads 1"));
     assert!(metrics.contains("majutsu_daemon_queued_uploads_delayed 1"));

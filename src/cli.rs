@@ -85,10 +85,7 @@ pub(crate) enum Command {
         command: LargeCommand,
     },
     #[command(about = "Sync metadata and objects to the configured remote")]
-    Sync {
-        #[command(subcommand)]
-        command: Option<SyncCommand>,
-    },
+    Sync(SyncArgs),
     #[command(about = "Check remote reachability, integrity, and host timelines")]
     Remote {
         #[command(subcommand)]
@@ -485,6 +482,12 @@ pub(crate) struct LogArgs {
         help = "Show internal operation records instead of managed file changes"
     )]
     pub(crate) operations: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Show every changed file instead of folding large change sets"
+    )]
+    pub(crate) full: bool,
 }
 
 #[derive(Args)]
@@ -573,7 +576,27 @@ pub(crate) enum LargeCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum SyncCommand {
+    #[command(about = "Show local and remote sync state without uploading")]
     Status,
+}
+
+#[derive(Args)]
+pub(crate) struct SyncArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Wait until the configured remote catches up with the local current snapshot"
+    )]
+    pub(crate) wait: bool,
+    #[arg(
+        long,
+        default_value_t = 300,
+        value_name = "SECONDS",
+        help = "Maximum time to wait with --wait"
+    )]
+    pub(crate) timeout_secs: u64,
+    #[command(subcommand)]
+    pub(crate) command: Option<SyncCommand>,
 }
 
 #[derive(Args)]

@@ -21,6 +21,8 @@ use crate::{open_db, resolve_paths};
 
 struct DaemonStats {
     pid: u32,
+    rss_kib: u64,
+    vm_size_kib: u64,
     roots: usize,
     current: String,
     journal_events: usize,
@@ -459,6 +461,8 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
             let stats = daemon_stats(&paths)?;
             writeln!(stream, "running pid {}", stats.pid)?;
             writeln!(stream, "ipc ok")?;
+            writeln!(stream, "rss_kib {}", stats.rss_kib)?;
+            writeln!(stream, "vm_size_kib {}", stats.vm_size_kib)?;
             writeln!(stream, "roots {}", stats.roots)?;
             writeln!(stream, "current {}", stats.current)?;
             writeln!(stream, "journal_events {}", stats.journal_events)?;
@@ -512,6 +516,10 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
             writeln!(stream, "majutsu_daemon_up 1")?;
             writeln!(stream, "# TYPE majutsu_daemon_ipc_up gauge")?;
             writeln!(stream, "majutsu_daemon_ipc_up 1")?;
+            writeln!(stream, "# TYPE majutsu_daemon_rss_kib gauge")?;
+            writeln!(stream, "majutsu_daemon_rss_kib {}", stats.rss_kib)?;
+            writeln!(stream, "# TYPE majutsu_daemon_vm_size_kib gauge")?;
+            writeln!(stream, "majutsu_daemon_vm_size_kib {}", stats.vm_size_kib)?;
             writeln!(stream, "# TYPE majutsu_daemon_roots gauge")?;
             writeln!(stream, "majutsu_daemon_roots {}", stats.roots)?;
             writeln!(stream, "# TYPE majutsu_daemon_journal_events gauge")?;
@@ -602,6 +610,8 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
 
     Ok(DaemonStats {
         pid: std::process::id(),
+        rss_kib: self_proc_status_kib("VmRSS").unwrap_or(0),
+        vm_size_kib: self_proc_status_kib("VmSize").unwrap_or(0),
         roots: roots.len(),
         current,
         journal_events: journal_records.len(),
@@ -620,6 +630,21 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
         root_statuses,
         restore_statuses,
     })
+}
+
+fn self_proc_status_kib(name: &str) -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let (key, rest) = line.split_once(':')?;
+        if key != name {
+            continue;
+        }
+        return rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok());
+    }
+    None
 }
 
 fn bool_metric(value: bool) -> u8 {

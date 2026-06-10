@@ -57,6 +57,22 @@ pub(crate) fn acquire_process_lock(path: &Path, name: &str) -> Result<ProcessLoc
     }
 }
 
+pub(crate) fn process_lock_owner(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let owner = fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    if let Some(pid) = owner {
+        if pid_alive(pid) {
+            return Ok(Some(pid));
+        }
+    }
+    let _ = fs::remove_file(path);
+    Ok(None)
+}
+
 pub(crate) fn pid_alive(pid: u32) -> bool {
     ProcessCommand::new("kill")
         .arg("-0")

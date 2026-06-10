@@ -202,7 +202,7 @@ fn main() -> Result<()> {
         Command::Unmount(args) => unmount_cmd(&paths, args),
         Command::Hydrate(args) => hydrate_cmd(&paths, args),
         Command::Large { command } => large_cmd(&paths, command),
-        Command::Sync { command } => sync_cmd(&paths, command),
+        Command::Sync(args) => sync_cmd(&paths, args),
         Command::Remote { command } => remote_cmd(&paths, command),
         Command::Lifecycle { command } => lifecycle_cmd(&paths, command),
         Command::Clone(args) => clone_cmd(&paths, args),

@@ -1776,6 +1776,7 @@ fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
     let mut printed = 0usize;
     let mut output = String::new();
     let ui = StatusUi::new();
+    let file_limit = if args.full { usize::MAX } else { 120 };
     for op in operations {
         if printed >= args.limit {
             break;
@@ -1794,12 +1795,26 @@ fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
             summary,
             op.message.as_deref().unwrap_or_default()
         )?;
-        for change in changes {
+        let change_count = changes.len();
+        for change in changes.into_iter().take(file_limit) {
             writeln!(
                 output,
                 "{}\t{}",
                 color_change_status(&ui, change.status),
                 change.path
+            )?;
+        }
+        if change_count > file_limit {
+            writeln!(
+                output,
+                "{}",
+                ui.paint(
+                    &format!(
+                        "... {} more changed files hidden; use --full to show all",
+                        change_count - file_limit
+                    ),
+                    "2"
+                )
             )?;
         }
         printed += 1;

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use majutsu_core::{LargeManifest, OperationLogEntry as OperationExport, TreeManifest};
 use majutsu_pack::PackIndex;
@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::time::{Duration, Instant};
 
-use crate::cli::{PackArgs, SyncCommand};
+use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
 use crate::db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
@@ -28,7 +29,7 @@ use crate::object_paths::{
 };
 use crate::operation_log::{record_op_with_details, update_operation_result};
 use crate::pack_runtime::pack_cmd;
-use crate::process_runtime::acquire_process_lock;
+use crate::process_runtime::{acquire_process_lock, process_lock_owner};
 use crate::queue_runtime::{
     drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, upload_queue_stats,
 };
@@ -41,7 +42,7 @@ use crate::{
     remote_ref,
 };
 
-pub(crate) fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()> {
+pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
     let conn = open_db(paths)?;
@@ -53,10 +54,23 @@ pub(crate) fn sync_cmd(paths: &Paths, command: Option<SyncCommand>) -> Result<()
         config.large.multipart,
         config.large.max_parallel_uploads,
     )?;
-    if let Some(SyncCommand::Status) = command {
+    if let Some(SyncCommand::Status) = args.command {
         return sync_status(paths, &conn, &remote);
     }
-    sync_configured_remote(paths, &conn, &config, &remote)
+    if let Some(pid) = process_lock_owner(&paths.sync_lock)? {
+        if args.wait {
+            println!("sync already running pid {pid}; waiting");
+            return wait_for_sync_catchup(paths, &conn, &remote, args.timeout_secs);
+        }
+        println!("sync already running pid {pid}");
+        sync_status(paths, &conn, &remote)?;
+        bail!("sync already running with pid {pid}; use `mj sync --wait` to wait for completion");
+    }
+    sync_configured_remote(paths, &conn, &config, &remote)?;
+    if args.wait {
+        wait_for_sync_catchup(paths, &conn, &remote, args.timeout_secs)?;
+    }
+    Ok(())
 }
 
 pub(crate) enum AutoSyncResult {
@@ -146,6 +160,27 @@ fn sync_configured_remote(
             )?;
             Err(err)
         }
+    }
+}
+
+fn wait_for_sync_catchup(
+    paths: &Paths,
+    conn: &Connection,
+    remote: &RemoteStore,
+    timeout_secs: u64,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let status = sync_status_snapshot(paths, conn, remote)?;
+        if status.is_caught_up() {
+            print_sync_status(&status);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            print_sync_status(&status);
+            bail!("timed out waiting for sync after {timeout_secs}s");
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -518,6 +553,40 @@ fn payload_fingerprint(bytes: &[u8]) -> String {
 }
 
 fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {
+    let status = sync_status_snapshot(paths, conn, remote)?;
+    print_sync_status(&status);
+    Ok(())
+}
+
+struct SyncStatusSnapshot {
+    remote: String,
+    local_current: String,
+    remote_current: String,
+    remote_last_synced: String,
+    local_objects: usize,
+    missing_remote_objects: usize,
+    queued_uploads: usize,
+    queued_uploads_retrying: usize,
+    queued_uploads_delayed: usize,
+    queued_upload_next_retry_after: String,
+    queued_upload_attempts: u64,
+    queued_upload_max_attempts: u32,
+    upload_queue_backpressure: bool,
+}
+
+impl SyncStatusSnapshot {
+    fn is_caught_up(&self) -> bool {
+        self.local_current == self.remote_current
+            && self.missing_remote_objects == 0
+            && self.queued_uploads == 0
+    }
+}
+
+fn sync_status_snapshot(
+    paths: &Paths,
+    conn: &Connection,
+    remote: &RemoteStore,
+) -> Result<SyncStatusSnapshot> {
     let local_current = current_snapshot(conn)?;
     let config = read_config(paths)?;
     let canonical_current = host_current_ref_key(&config.host.id);
@@ -542,38 +611,49 @@ fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result
         }
     }
     let upload_stats = upload_queue_stats(paths)?;
-    println!("remote {}", remote.describe());
-    println!(
-        "local_current {}",
-        local_current.unwrap_or_else(|| "(none)".into())
-    );
-    println!(
-        "remote_current {}",
-        remote_current.unwrap_or_else(|| "(none)".into())
-    );
-    println!(
-        "remote_last_synced {}",
-        remote_last_synced.unwrap_or_else(|| "(none)".into())
-    );
-    println!("local_objects {}", local_keys.len());
-    println!("missing_remote_objects {}", missing_remote);
-    println!("queued_uploads {}", upload_stats.total);
-    println!("queued_uploads_retrying {}", upload_stats.retrying);
-    println!("queued_uploads_delayed {}", upload_stats.delayed);
-    println!(
-        "queued_upload_next_retry_after {}",
-        upload_stats
+    Ok(SyncStatusSnapshot {
+        remote: remote.describe(),
+        local_current: local_current.unwrap_or_else(|| "(none)".into()),
+        remote_current: remote_current.unwrap_or_else(|| "(none)".into()),
+        remote_last_synced: remote_last_synced.unwrap_or_else(|| "(none)".into()),
+        local_objects: local_keys.len(),
+        missing_remote_objects: missing_remote,
+        queued_uploads: upload_stats.total,
+        queued_uploads_retrying: upload_stats.retrying,
+        queued_uploads_delayed: upload_stats.delayed,
+        queued_upload_next_retry_after: upload_stats
             .next_retry_after
             .map(|retry_after| retry_after.to_rfc3339())
-            .unwrap_or_else(|| "(none)".into())
+            .unwrap_or_else(|| "(none)".into()),
+        queued_upload_attempts: upload_stats.attempts,
+        queued_upload_max_attempts: upload_stats.max_attempts,
+        upload_queue_backpressure: upload_stats.has_backpressure(),
+    })
+}
+
+fn print_sync_status(status: &SyncStatusSnapshot) {
+    println!("remote {}", status.remote);
+    println!("local_current {}", status.local_current);
+    println!("remote_current {}", status.remote_current);
+    println!("remote_last_synced {}", status.remote_last_synced);
+    println!("local_objects {}", status.local_objects);
+    println!("missing_remote_objects {}", status.missing_remote_objects);
+    println!("queued_uploads {}", status.queued_uploads);
+    println!("queued_uploads_retrying {}", status.queued_uploads_retrying);
+    println!("queued_uploads_delayed {}", status.queued_uploads_delayed);
+    println!(
+        "queued_upload_next_retry_after {}",
+        status.queued_upload_next_retry_after
     );
-    println!("queued_upload_attempts {}", upload_stats.attempts);
-    println!("queued_upload_max_attempts {}", upload_stats.max_attempts);
+    println!("queued_upload_attempts {}", status.queued_upload_attempts);
+    println!(
+        "queued_upload_max_attempts {}",
+        status.queued_upload_max_attempts
+    );
     println!(
         "upload_queue_backpressure {}",
-        upload_stats.has_backpressure()
+        status.upload_queue_backpressure
     );
-    Ok(())
 }
 
 fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Result<Vec<u8>> {
