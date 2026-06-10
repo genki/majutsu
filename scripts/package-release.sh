@@ -18,8 +18,9 @@ if [[ ! -x "$bin" ]]; then
 fi
 
 version="$($bin --version | awk '{print $2}')"
+package_version="${version/+/-}"
 platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
-stage="dist/majutsu-${version}-${platform}"
+stage="dist/majutsu-${package_version}-${platform}"
 rm -rf "$stage"
 mkdir -p "$stage"
 cp "$bin" "$stage/mj"

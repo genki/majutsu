@@ -1442,7 +1442,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "majutsu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1486,14 +1486,14 @@ dependencies = [
 
 [[package]]
 name = "majutsu-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "majutsu-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "majutsu-crypto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "anyhow",
@@ -1517,11 +1517,11 @@ dependencies = [
 
 [[package]]
 name = "majutsu-daemon"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "majutsu-db"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "majutsu-large"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "majutsu-pack"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "majutsu-core",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "majutsu-policy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "majutsu-restore"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "majutsu-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "majutsu-watch"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "memchr"

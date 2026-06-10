@@ -24,7 +24,7 @@ State home is resolved in this order: `--home`, `MAJUTSU_HOME`, XDG config, then
 #[derive(Parser)]
 #[command(
     name = "mj",
-    version,
+    version = env!("MAJUTSU_VERSION"),
     about = "Host-level multi-root snapshot history tool",
     long_about = CLI_LONG_ABOUT,
     after_help = "See README.md and docs/OPERATIONS.md for detailed usage."

@@ -26,14 +26,21 @@
    scripts/package-release.sh
    ```
 
-5. release tag を作成する。
+5. `BUILD_NUMBER` を確認し、ある程度まとまった実装単位・検証単位ごとにインクリメントする。
 
    ```sh
-   git tag v0.2.0
-   git push origin v0.2.0
+   cat BUILD_NUMBER
+   mj --version
    ```
 
-6. release artifact をローカルで展開して smoke test を実行する。
+6. release tag を作成する。
+
+   ```sh
+   git tag v0.3.0
+   git push origin v0.3.0
+   ```
+
+7. release artifact をローカルで展開して smoke test を実行する。
 
    ```sh
    tar -tf dist/majutsu-*.tar.gz
@@ -43,13 +50,13 @@
    "$tmp"/majutsu-*/mj --help
    ```
 
-7. provider matrix を更新する。
+8. provider matrix を更新する。
 
    - File remote と MinIO はローカル completion gate の evidence を記録する。
    - GCS S3-compatible endpoint を supported にする場合は実 backend の検証日とコマンドを記録する。
    - AWS S3 / Cloudflare R2 は、その release candidate で実検証していない限り experimental のままにする。
 
-8. archive restore を supported とする場合だけ、実 provider で cold-tier drill を実行する。
+9. archive restore を supported とする場合だけ、実 provider で cold-tier drill を実行する。
 
    ```sh
    MAJUTSU_AWS_ARCHIVE_BUCKET=... scripts/e2e-aws-archive-restore.sh
@@ -57,4 +64,4 @@
    MAJUTSU_AWS_ARCHIVE_BUCKET=... MAJUTSU_AWS_ARCHIVE_PREFIX=... scripts/e2e-aws-archive-restore.sh --resume
    ```
 
-9. ローカル生成した release artifact で `mj --version` と `mj --help` が動作することを release note に記録する。
+10. ローカル生成した release artifact で `mj --version` と `mj --help` が動作することを release note に記録する。
