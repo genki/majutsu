@@ -59,8 +59,15 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     }
     if let Some(pid) = process_lock_owner(&paths.sync_lock)? {
         if args.wait {
+            let target_current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
             println!("sync already running pid {pid}; waiting");
-            return wait_for_sync_catchup(paths, &conn, &remote, args.timeout_secs);
+            return wait_for_sync_catchup(
+                paths,
+                &conn,
+                &remote,
+                &target_current,
+                args.timeout_secs,
+            );
         }
         println!("sync already running pid {pid}");
         sync_status(paths, &conn, &remote)?;
@@ -68,7 +75,8 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     }
     sync_configured_remote(paths, &conn, &config, &remote)?;
     if args.wait {
-        wait_for_sync_catchup(paths, &conn, &remote, args.timeout_secs)?;
+        let target_current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
+        wait_for_sync_catchup(paths, &conn, &remote, &target_current, args.timeout_secs)?;
     }
     Ok(())
 }
@@ -167,18 +175,22 @@ fn wait_for_sync_catchup(
     paths: &Paths,
     conn: &Connection,
     remote: &RemoteStore,
+    target_current: &str,
     timeout_secs: u64,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let status = sync_status_snapshot(paths, conn, remote)?;
-        if status.is_caught_up() {
+        if status.is_caught_up_to(target_current) {
             print_sync_status(&status);
+            if status.local_current != target_current {
+                println!("wait_target_current {target_current}");
+            }
             return Ok(());
         }
         if Instant::now() >= deadline {
             print_sync_status(&status);
-            bail!("timed out waiting for sync after {timeout_secs}s");
+            bail!("timed out waiting for sync target {target_current} after {timeout_secs}s");
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -575,10 +587,13 @@ struct SyncStatusSnapshot {
 }
 
 impl SyncStatusSnapshot {
-    fn is_caught_up(&self) -> bool {
-        self.local_current == self.remote_current
-            && self.missing_remote_objects == 0
-            && self.queued_uploads == 0
+    fn is_caught_up_to(&self, target_current: &str) -> bool {
+        if target_current == "(none)" {
+            return self.local_current == self.remote_current
+                && self.missing_remote_objects == 0
+                && self.queued_uploads == 0;
+        }
+        self.remote_current == target_current
     }
 }
 
