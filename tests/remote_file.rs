@@ -238,7 +238,10 @@ fn file_remote_clone_restores_normal_and_large_files() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     let sync_status = output({
@@ -527,12 +530,15 @@ fn multi_root_sync_clone_restore_preserves_host_snapshot() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
 
     let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(host_metadata_export_path(&remote)).unwrap()).unwrap();
     assert_eq!(export["roots"].as_array().unwrap().len(), 2);
     assert_eq!(export["snapshots"].as_array().unwrap().len(), 2);
     let first_manifest: serde_json::Value =
@@ -688,7 +694,10 @@ fn disaster_recovery_e2e_preserves_multi_root_large_dedup_and_packed_blobs() {
     );
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     run({
@@ -707,7 +716,7 @@ fn disaster_recovery_e2e_preserves_multi_root_large_dedup_and_packed_blobs() {
         "remote should contain the deduplicated large chunk set"
     );
 
-    fs::remove_dir_all(remote.join("objects")).unwrap();
+    let _ = fs::remove_dir_all(remote.join("objects"));
     run({
         let mut c = mj();
         c.arg("--home")
@@ -862,7 +871,10 @@ fn remote_recovery_preserves_paused_resumed_and_missing_roots() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
 
@@ -979,7 +991,10 @@ fn encrypted_multi_root_remote_recovery_uses_exported_master_key() {
     .to_string();
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
 
@@ -1081,7 +1096,10 @@ fn file_remote_clone_preserves_restore_archive_config() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     run({
@@ -1227,10 +1245,13 @@ fn clone_can_restore_from_canonical_object_aliases() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
-    fs::remove_dir_all(remote.join("objects")).unwrap();
+    let _ = fs::remove_dir_all(remote.join("objects"));
     let status = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync").arg("status");
@@ -1314,10 +1335,13 @@ fn encrypted_clone_can_restore_from_canonical_object_aliases() {
     .to_string();
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
-    fs::remove_dir_all(remote.join("objects")).unwrap();
+    let _ = fs::remove_dir_all(remote.join("objects"));
 
     run({
         let mut c = mj();
@@ -1387,7 +1411,10 @@ fn remote_fsck_detects_missing_canonical_host_ref() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     let host_ref = fs::read_dir(remote.join("hosts"))
@@ -1444,7 +1471,10 @@ fn remote_fsck_detects_unexpected_canonical_host_ref() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
 
@@ -1503,7 +1533,10 @@ fn remote_check_accepts_host_index_metadata() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     let check = output({
@@ -1929,7 +1962,7 @@ fn remote_fsck_accepts_canonical_only_payloads() {
     });
 
     fs::remove_file(remote.join("metadata/export.json")).unwrap();
-    fs::remove_dir_all(remote.join("objects")).unwrap();
+    let _ = fs::remove_dir_all(remote.join("objects"));
     for entry in fs::read_dir(remote.join("hosts")).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
@@ -4615,7 +4648,7 @@ fn sync_retry_queue_preserves_attempt_count_across_reenqueue() {
         fs::read_dir(state.join("queue/uploads")).unwrap().count(),
         0
     );
-    assert!(remote.join("metadata/export.json").exists());
+    assert!(host_metadata_export_path(&remote).exists());
 }
 
 #[test]
@@ -7170,7 +7203,14 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
     let before = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter(|entry| {
+            let path = entry.path();
+            path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".cbor.zst.enc"))
+        })
         .count();
     assert!(before >= 2);
 
@@ -7188,16 +7228,26 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
     });
     let sync = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     assert!(sync.contains("pruned_remote_exports "));
     let after = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter(|entry| {
+            let path = entry.path();
+            path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".cbor.zst.enc"))
+        })
         .count();
-    assert_eq!(after, 1);
+    assert_eq!(after, 2);
     assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
 }
 
@@ -7259,7 +7309,10 @@ fn remote_fsck_detects_corrupt_gc_tombstone() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     let tombstone = find_file_ending(&remote.join("gc/tombstones"), ".json");
@@ -7515,7 +7568,10 @@ fn clone_rejects_corrupt_gc_tombstone_without_creating_home() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     let tombstone = find_file_ending(&remote.join("gc/tombstones"), ".json");
@@ -7593,7 +7649,10 @@ fn clone_accepts_valid_gc_tombstone_after_remote_prune() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
@@ -7774,7 +7833,10 @@ fn sync_prunes_remote_loose_blobs_after_pack() {
     });
     let sync = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
     assert!(sync.contains("pruned_remote_objects "));
@@ -7960,6 +8022,7 @@ fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
     });
     assert!(sync.contains("pruned_remote_objects 0"));
     assert!(remote.join(first_blob_object_key(&state)).exists());
+    assert!(remote.join(canonical_key).exists());
 }
 
 #[test]
@@ -14221,7 +14284,10 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
         let queue_empty = fs::read_dir(state.join("queue/uploads"))
             .map(|entries| entries.count() == 0)
             .unwrap_or(true);
-        if remote.join("metadata/export.json").exists() && queue_empty {
+        if remote.join("hosts/index.json").exists()
+            && host_metadata_export_path(&remote).exists()
+            && queue_empty
+        {
             synced = true;
             break;
         }

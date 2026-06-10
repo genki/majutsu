@@ -223,8 +223,13 @@ fn enqueue_and_drain_sync(
     remote: &RemoteStore,
 ) -> Result<()> {
     let export = export_metadata(conn, config)?;
+    let export = if remote_prefers_canonical_only(remote) {
+        remote_metadata_export(export)
+    } else {
+        export
+    };
     let sync_cache = read_remote_sync_cache(paths, remote)?;
-    let sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &export)?;
+    let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &export)?;
     let state_fingerprint = remote_sync_state_fingerprint(config, &export)?;
     enqueue_inline_upload(
         paths,
@@ -245,23 +250,29 @@ fn enqueue_and_drain_sync(
             operation,
         )?;
     }
-    enqueue_inline_upload(
-        paths,
-        &host_oplog_key(&config.host.id),
-        majutsu_core::encode_operation_log(&export.operations)?,
-    )?;
+    if matches!(remote, RemoteStore::File(_)) {
+        enqueue_inline_upload(
+            paths,
+            &host_oplog_key(&config.host.id),
+            majutsu_core::encode_operation_log(&export.operations)?,
+        )?;
+    }
     enqueue_inline_upload(
         paths,
         &host_oplog_canonical_key(&config.host.id),
         encode_canonical_remote_oplog(paths, &export.operations)?,
     )?;
-    enqueue_inline_upload(
+    enqueue_cached_inline_upload(
         paths,
+        &sync_cache,
+        &mut sync_fingerprints,
         "config.toml",
         toml::to_string_pretty(config)?.into_bytes(),
     )?;
-    enqueue_inline_upload(
+    enqueue_cached_inline_upload(
         paths,
+        &sync_cache,
+        &mut sync_fingerprints,
         "host.toml",
         toml::to_string_pretty(&config.host)?.into_bytes(),
     )?;
@@ -298,40 +309,63 @@ fn enqueue_and_drain_sync(
     )?;
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
-        enqueue_file_upload(paths, "keys/recipients.toml", &recipients)?;
+        enqueue_cached_inline_upload(
+            paths,
+            &sync_cache,
+            &mut sync_fingerprints,
+            "keys/recipients.toml",
+            fs::read(&recipients)?,
+        )?;
     }
-    enqueue_inline_upload(
-        paths,
-        REMOTE_CHUNK_INDEX_SHARD_KEY,
-        encode_canonical_remote_export(paths, &build_chunk_index_shard(&export))?,
-    )?;
+    if !export.chunks.is_empty() {
+        enqueue_inline_upload(
+            paths,
+            REMOTE_CHUNK_INDEX_SHARD_KEY,
+            encode_canonical_remote_export(paths, &build_chunk_index_shard(&export))?,
+        )?;
+    }
 
     for key in local_object_keys(&export) {
         let local = paths.home.join(&key);
         if local.exists() {
-            if !prefer_canonical_remote_only(&key) {
+            let canonical_only =
+                remote_prefers_canonical_only(remote) && s3_prefers_canonical_remote_only(&key);
+            if !canonical_only {
                 enqueue_file_upload_if_needed(paths, remote, &key, &local)?;
             }
             for alias in canonical_remote_aliases(&key) {
+                let fingerprint = content_object_fingerprint(&alias);
+                sync_fingerprints.insert(alias.clone(), fingerprint.clone());
+                if cache_matches(&sync_cache, &alias, &fingerprint) {
+                    continue;
+                }
                 if canonical_alias_uses_structured_encoding(&key) {
-                    enqueue_inline_upload_if_needed(paths, remote, &alias, || {
-                        encode_canonical_local_object(paths, &key)
-                    })?;
+                    enqueue_inline_upload(
+                        paths,
+                        &alias,
+                        encode_canonical_local_object(paths, &key)?,
+                    )?;
                 } else {
-                    enqueue_file_upload_if_needed(paths, remote, &alias, &local)?;
+                    enqueue_file_upload(paths, &alias, &local)?;
                 }
             }
         }
     }
     let uploaded = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
-    let pruned_remote_exports = prune_remote_host_exports(remote, &config.host.id, &export)?;
-    let pruned_remote_objects = prune_remote_packed_blob_objects(
-        remote,
-        &config.host.id,
-        &export,
-        config.large.max_parallel_uploads,
-    )?;
+    let (pruned_remote_exports, pruned_remote_objects) = if sync_remote_prune_enabled() {
+        (
+            prune_remote_host_exports(remote, &config.host.id, &export)?,
+            prune_remote_packed_blob_objects(
+                remote,
+                &config.host.id,
+                &export,
+                config.large.max_parallel_uploads,
+            )?,
+        )
+    } else {
+        (0, 0)
+    };
     let pruned_local_objects = prune_local_packed_blob_objects(paths, &export)?;
     persist_export_remote_refs(conn, &remote.describe(), &config.host.id, &export.refs)?;
     println!("synced {} objects to {}", uploaded, remote.describe());
@@ -341,19 +375,70 @@ fn enqueue_and_drain_sync(
     Ok(())
 }
 
-fn enqueue_inline_upload_if_needed<F>(
+fn remote_prefers_canonical_only(remote: &RemoteStore) -> bool {
+    matches!(remote, RemoteStore::S3(_))
+}
+
+fn s3_prefers_canonical_remote_only(key: &str) -> bool {
+    prefer_canonical_remote_only(key)
+        || key.starts_with("objects/trees/")
+        || key.starts_with("objects/blobs/")
+        || key.starts_with("objects/packs/")
+        || key.starts_with("objects/indexes/pack/")
+        || key.starts_with("objects/large/manifests/")
+}
+
+fn content_object_fingerprint(key: &str) -> String {
+    format!("content:{key}")
+}
+
+fn sync_remote_prune_enabled() -> bool {
+    std::env::var("MAJUTSU_SYNC_REMOTE_PRUNE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn remote_metadata_export(mut export: MetadataExport) -> MetadataExport {
+    let skipped_parents = export
+        .operations
+        .iter()
+        .filter(|operation| operation.kind == "remote-sync")
+        .map(|operation| (operation.id.clone(), operation.parent_op.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for operation in &mut export.operations {
+        let mut parent = operation.parent_op.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(parent_id) = parent.clone() {
+            if !seen.insert(parent_id.clone()) {
+                parent = None;
+                break;
+            }
+            match skipped_parents.get(&parent_id) {
+                Some(next_parent) => parent = next_parent.clone(),
+                None => break,
+            }
+        }
+        operation.parent_op = parent;
+    }
+    export
+        .operations
+        .retain(|operation| operation.kind != "remote-sync");
+    export
+}
+
+fn enqueue_cached_inline_upload(
     paths: &Paths,
-    remote: &RemoteStore,
+    cache: &RemoteSyncCache,
+    fingerprints: &mut BTreeMap<String, String>,
     key: &str,
-    payload: F,
-) -> Result<()>
-where
-    F: FnOnce() -> Result<Vec<u8>>,
-{
-    if remote_key_can_be_skipped(remote, key) {
+    bytes: Vec<u8>,
+) -> Result<()> {
+    let fingerprint = payload_fingerprint(&bytes);
+    fingerprints.insert(key.to_string(), fingerprint.clone());
+    if cache_matches(cache, key, &fingerprint) {
         return Ok(());
     }
-    enqueue_inline_upload(paths, key, payload()?)
+    enqueue_inline_upload(paths, key, bytes)
 }
 
 fn enqueue_snapshot_uploads_if_needed(
@@ -363,26 +448,22 @@ fn enqueue_snapshot_uploads_if_needed(
     host_id: &str,
     snapshot: &majutsu_core::SnapshotExport,
 ) -> Result<()> {
-    let legacy_key = host_snapshot_key(host_id, &snapshot.id);
     let canonical_key = host_snapshot_canonical_key(host_id, &snapshot.id);
-    let legacy_bytes = serde_json::to_vec_pretty(snapshot)?;
-    let fingerprint = payload_fingerprint(&legacy_bytes);
-    if cache_matches(cache, &legacy_key, &fingerprint)
-        && cache_matches(cache, &canonical_key, &fingerprint)
-    {
+    let fingerprint = payload_fingerprint(&serde_json::to_vec(snapshot)?);
+    let canonical_bytes = encode_canonical_remote_export(paths, snapshot)?;
+    if matches!(remote, RemoteStore::File(_)) {
+        let legacy_key = host_snapshot_key(host_id, &snapshot.id);
+        enqueue_inline_upload(paths, &legacy_key, serde_json::to_vec_pretty(snapshot)?)?;
+        enqueue_inline_upload(paths, &canonical_key, canonical_bytes)?;
         return Ok(());
     }
-    if remote_bytes_match(remote, &legacy_key, &legacy_bytes)
-        && remote_key_exists(remote, &canonical_key)
-    {
+    if cache_matches(cache, &canonical_key, &fingerprint) {
         return Ok(());
     }
-    enqueue_inline_upload(paths, &legacy_key, legacy_bytes)?;
-    enqueue_inline_upload(
-        paths,
-        &canonical_key,
-        encode_canonical_remote_export(paths, snapshot)?,
-    )
+    if remote_key_exists(remote, &canonical_key) {
+        return Ok(());
+    }
+    enqueue_inline_upload(paths, &canonical_key, canonical_bytes)
 }
 
 fn enqueue_operation_uploads_if_needed(
@@ -392,26 +473,22 @@ fn enqueue_operation_uploads_if_needed(
     host_id: &str,
     operation: &OperationExport,
 ) -> Result<()> {
-    let legacy_key = host_operation_key(host_id, &operation.id);
     let canonical_key = host_operation_canonical_key(host_id, &operation.id);
-    let legacy_bytes = serde_json::to_vec_pretty(operation)?;
-    let fingerprint = payload_fingerprint(&legacy_bytes);
-    if cache_matches(cache, &legacy_key, &fingerprint)
-        && cache_matches(cache, &canonical_key, &fingerprint)
-    {
+    let fingerprint = payload_fingerprint(&serde_json::to_vec(operation)?);
+    let canonical_bytes = encode_canonical_remote_export(paths, operation)?;
+    if matches!(remote, RemoteStore::File(_)) {
+        let legacy_key = host_operation_key(host_id, &operation.id);
+        enqueue_inline_upload(paths, &legacy_key, serde_json::to_vec_pretty(operation)?)?;
+        enqueue_inline_upload(paths, &canonical_key, canonical_bytes)?;
         return Ok(());
     }
-    if remote_bytes_match(remote, &legacy_key, &legacy_bytes)
-        && remote_key_exists(remote, &canonical_key)
-    {
+    if cache_matches(cache, &canonical_key, &fingerprint) {
         return Ok(());
     }
-    enqueue_inline_upload(paths, &legacy_key, legacy_bytes)?;
-    enqueue_inline_upload(
-        paths,
-        &canonical_key,
-        encode_canonical_remote_export(paths, operation)?,
-    )
+    if remote_key_exists(remote, &canonical_key) {
+        return Ok(());
+    }
+    enqueue_inline_upload(paths, &canonical_key, canonical_bytes)
 }
 
 fn enqueue_file_upload_if_needed(
@@ -435,16 +512,6 @@ fn remote_key_can_be_skipped(remote: &RemoteStore, key: &str) -> bool {
 
 fn remote_key_exists(remote: &RemoteStore, key: &str) -> bool {
     remote.exists(key).unwrap_or(false)
-}
-
-fn remote_bytes_match(remote: &RemoteStore, key: &str, expected: &[u8]) -> bool {
-    if !remote_key_exists(remote, key) {
-        return false;
-    }
-    remote
-        .get(key)
-        .map(|actual| actual == expected)
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -510,22 +577,14 @@ fn build_remote_sync_fingerprints(
 ) -> Result<BTreeMap<String, String>> {
     let mut entries = BTreeMap::new();
     for snapshot in &export.snapshots {
-        let fingerprint = payload_fingerprint(&serde_json::to_vec_pretty(snapshot)?);
-        entries.insert(
-            host_snapshot_key(host_id, &snapshot.id),
-            fingerprint.clone(),
-        );
+        let fingerprint = payload_fingerprint(&serde_json::to_vec(snapshot)?);
         entries.insert(
             host_snapshot_canonical_key(host_id, &snapshot.id),
             fingerprint,
         );
     }
     for operation in &export.operations {
-        let fingerprint = payload_fingerprint(&serde_json::to_vec_pretty(operation)?);
-        entries.insert(
-            host_operation_key(host_id, &operation.id),
-            fingerprint.clone(),
-        );
+        let fingerprint = payload_fingerprint(&serde_json::to_vec(operation)?);
         entries.insert(
             host_operation_canonical_key(host_id, &operation.id),
             fingerprint,

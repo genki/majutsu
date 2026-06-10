@@ -240,7 +240,10 @@ fn upload_queue_parallelism(remote: &RemoteStore, max_parallel_uploads: usize) -
     let configured = std::env::var("MAJUTSU_UPLOAD_QUEUE_PARALLELISM")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(max_parallel_uploads);
+        .unwrap_or_else(|| match remote {
+            RemoteStore::S3(_) => max_parallel_uploads.max(32),
+            RemoteStore::File(_) => max_parallel_uploads,
+        });
     match remote {
         RemoteStore::S3(_) => configured.max(1),
         RemoteStore::File(_) => 1,
