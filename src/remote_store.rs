@@ -23,6 +23,7 @@ pub(crate) const DEFAULT_MULTIPART_THRESHOLD: usize = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_LOCAL_MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 pub(crate) const DEFAULT_CLOUD_MULTIPART_PART_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_MULTIPART_PARTS: usize = 10_000;
+pub(crate) const DEFAULT_METADATA_MULTIPART_PARALLELISM: usize = 2;
 
 pub(crate) fn adaptive_multipart_part_size(len: usize, endpoint: &str) -> usize {
     let requested = env::var("MAJUTSU_S3_MULTIPART_PART_SIZE")
@@ -332,7 +333,7 @@ impl S3Remote {
         let remote_key = self.remote_key(key);
         let upload_id = self.initiate_multipart(key, &remote_key)?;
         let result = (|| {
-            let mut parts = self.upload_multipart_parts(&remote_key, &upload_id, bytes)?;
+            let mut parts = self.upload_multipart_parts(key, &remote_key, &upload_id, bytes)?;
             parts.sort_by_key(|part| part.part_number);
             self.complete_multipart(&remote_key, &upload_id, &parts)
         })();
@@ -390,6 +391,7 @@ impl S3Remote {
 
     fn upload_multipart_parts(
         &self,
+        key: &str,
         remote_key: &str,
         upload_id: &str,
         bytes: &[u8],
@@ -401,7 +403,7 @@ impl S3Remote {
             .map(|(idx, chunk)| (idx + 1, chunk))
             .collect::<Vec<_>>();
         let mut parts = Vec::with_capacity(chunks.len());
-        let parallelism = self.max_parallel_uploads.max(1);
+        let parallelism = self.multipart_parallelism_for_key(key);
         for batch in chunks.chunks(parallelism) {
             let batch_parts = std::thread::scope(|scope| {
                 let handles = batch
@@ -433,6 +435,18 @@ impl S3Remote {
 
     fn multipart_part_size_for_len(&self, len: usize) -> usize {
         adaptive_multipart_part_size(len, &self.endpoint)
+    }
+
+    fn multipart_parallelism_for_key(&self, key: &str) -> usize {
+        if s3_object_class(key) == "metadata" {
+            return env::var("MAJUTSU_S3_METADATA_MAX_PARALLEL_UPLOADS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_METADATA_MULTIPART_PARALLELISM)
+                .min(self.max_parallel_uploads.max(1));
+        }
+        self.max_parallel_uploads.max(1)
     }
 
     pub(crate) fn multipart_initiate_headers(&self, key: &str) -> Result<Vec<(String, String)>> {
@@ -1191,6 +1205,36 @@ mod storage_characteristic_tests {
         assert!(
             adaptive_multipart_part_size(huge, "https://s3.amazonaws.com")
                 > MIN_MULTIPART_PART_SIZE
+        );
+    }
+
+    #[test]
+    fn metadata_multipart_parallelism_is_capped_by_default() {
+        let remote = S3Remote {
+            bucket: "bucket".into(),
+            prefix: String::new(),
+            endpoint: "https://storage.googleapis.com".into(),
+            region: "auto".into(),
+            signature_version: "s3v4".into(),
+            access_key: "key".into(),
+            secret_key: "secret".into(),
+            storage_class: None,
+            object_tags: Vec::new(),
+            multipart_enabled: true,
+            max_parallel_uploads: 8,
+            client: Client::new(),
+        };
+        assert_eq!(
+            remote.multipart_parallelism_for_key("metadata/export.json"),
+            DEFAULT_METADATA_MULTIPART_PARALLELISM
+        );
+        assert_eq!(
+            remote.multipart_parallelism_for_key("hosts/host-id/metadata/export.json"),
+            DEFAULT_METADATA_MULTIPART_PARALLELISM
+        );
+        assert_eq!(
+            remote.multipart_parallelism_for_key("blobs/loose/aa/blob.enc"),
+            8
         );
     }
 
