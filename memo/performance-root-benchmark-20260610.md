@@ -78,3 +78,4 @@ pruned_local_objects 2000
 - file remote を実バックアップ先として使う場合、`MAJUTSU_FSYNC_REMOTE_FILE=1` を指定するとより保守的になる。ただし小ファイル多数では遅くなる。
 - 今回の測定は `/tmp` 上の file remote であり、S3/GCS 互換 backend では通信レイテンシ、multipart 設定、bucket 側 throttling を別途測る必要がある。
 - pack/index ファイル書き出し後、DB 更新前にプロセスが落ちると未参照 pack が残り得る。参照前の孤立 object と同じく `fsck`/`gc` で扱う対象として整理できる。
+- 実 root では、単一 memo 追加後でも暗号化 tree metadata の inline upload queue が数百件、数百 MiB 以上に膨らむことがある。`mj sync` は直列 upload で進捗表示もないため、S3 backend では「止まっている」ように見えやすい。今後は upload queue の並列化、進捗表示、既知 remote object のローカル cache による enqueue 抑制を検討する。
