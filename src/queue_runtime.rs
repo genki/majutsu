@@ -128,58 +128,58 @@ pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
     Ok(stats)
 }
 
-pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
+pub(crate) fn drain_upload_queue(
+    paths: &Paths,
+    remote: &RemoteStore,
+    max_parallel_uploads: usize,
+) -> Result<usize> {
     let mut uploaded = 0usize;
-    let items = upload_queue_items(paths)?;
+    let mut items = upload_queue_items(paths)?;
+    items.sort_by(|a, b| {
+        upload_publish_priority(&a.1.key)
+            .cmp(&upload_publish_priority(&b.1.key))
+            .then_with(|| a.1.key.cmp(&b.1.key))
+    });
     let total = items.len();
     let progress_enabled = total >= 16;
+    let parallelism = upload_queue_parallelism(remote, max_parallel_uploads);
     let mut last_progress = Instant::now()
         .checked_sub(StdDuration::from_secs(10))
         .unwrap_or_else(Instant::now);
-    for (path, mut item) in items {
+    for batch in items.chunks(parallelism) {
         if progress_enabled
             && (uploaded == 0
                 || uploaded % 25 == 0
                 || last_progress.elapsed() >= StdDuration::from_secs(5))
         {
-            eprintln!(
-                "sync upload progress {}/{} key={}",
-                uploaded, total, item.key
-            );
+            let key = batch
+                .first()
+                .map(|(_, item)| item.key.as_str())
+                .unwrap_or("(none)");
+            eprintln!("sync upload progress {uploaded}/{total} key={key}");
             last_progress = Instant::now();
         }
-        if queued_upload_can_be_skipped(paths, remote, &item) {
-            fs::remove_file(path)?;
-            continue;
-        }
-        let bytes = if let Some(bytes) = item.inline.clone() {
-            bytes
-        } else if let Some(source) = &item.source {
-            fs::read(source).with_context(|| format!("read queued upload source {source}"))?
-        } else {
-            bail!(
-                "queued upload has neither inline payload nor source: {}",
-                item.key
-            );
-        };
-        let upload_result = if is_content_addressed_remote_key(&item.key)
-            && remote.capabilities().conditional_put
-        {
-            remote.put_if_absent(&item.key, &bytes).map(|_| ())
-        } else {
-            remote.put(&item.key, &bytes)
-        };
-        match upload_result {
-            Ok(()) => {
-                remove_upload_payload(paths, &item.id)?;
-                fs::remove_file(path)?;
-                uploaded += 1;
-            }
-            Err(err) => {
-                let next_attempt = item.attempts.saturating_add(1);
-                item.record_attempt(Some(next_retry_after(Utc::now(), next_attempt)));
-                fs::write(&path, serde_json::to_vec_pretty(&item)?)?;
-                return Err(err).with_context(|| format!("upload failed for {}", item.key));
+
+        let results = std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|(path, item)| {
+                    scope.spawn(move || upload_queue_item(paths, remote, path, item.clone()))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("upload queue worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for result in results {
+            match result {
+                UploadQueueItemResult::Uploaded => uploaded += 1,
+                UploadQueueItemResult::Skipped => {}
             }
         }
     }
@@ -187,6 +187,81 @@ pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<
         eprintln!("sync upload progress {}/{} done", uploaded, total);
     }
     Ok(uploaded)
+}
+
+enum UploadQueueItemResult {
+    Uploaded,
+    Skipped,
+}
+
+fn upload_queue_item(
+    paths: &Paths,
+    remote: &RemoteStore,
+    path: &Path,
+    item: UploadQueueItem,
+) -> Result<UploadQueueItemResult> {
+    if queued_upload_can_be_skipped(paths, remote, &item) {
+        fs::remove_file(path)?;
+        return Ok(UploadQueueItemResult::Skipped);
+    }
+    let bytes = if let Some(bytes) = item.inline.clone() {
+        bytes
+    } else if let Some(source) = &item.source {
+        fs::read(source).with_context(|| format!("read queued upload source {source}"))?
+    } else {
+        bail!(
+            "queued upload has neither inline payload nor source: {}",
+            item.key
+        );
+    };
+    let upload_result =
+        if is_content_addressed_remote_key(&item.key) && remote.capabilities().conditional_put {
+            remote.put_if_absent(&item.key, &bytes).map(|_| ())
+        } else {
+            remote.put(&item.key, &bytes)
+        };
+    match upload_result {
+        Ok(()) => {
+            remove_upload_payload(paths, &item.id)?;
+            fs::remove_file(path)?;
+            Ok(UploadQueueItemResult::Uploaded)
+        }
+        Err(err) => {
+            let mut item = item;
+            let next_attempt = item.attempts.saturating_add(1);
+            item.record_attempt(Some(next_retry_after(Utc::now(), next_attempt)));
+            fs::write(path, serde_json::to_vec_pretty(&item)?)?;
+            Err(err).with_context(|| format!("upload failed for {}", item.key))
+        }
+    }
+}
+
+fn upload_queue_parallelism(remote: &RemoteStore, max_parallel_uploads: usize) -> usize {
+    let configured = std::env::var("MAJUTSU_UPLOAD_QUEUE_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(max_parallel_uploads);
+    match remote {
+        RemoteStore::S3(_) => configured.max(1),
+        RemoteStore::File(_) => 1,
+    }
+}
+
+fn upload_publish_priority(key: &str) -> u8 {
+    if key == "hosts/current" || key.starts_with("refs/") || key.contains("/refs/") {
+        return 3;
+    }
+    if key.ends_with("/current") || key.contains("/refs/current") {
+        return 3;
+    }
+    if key.starts_with("metadata/")
+        || key.ends_with("/metadata/export.json")
+        || key == "metadata/export.json"
+        || key.starts_with("hosts/")
+    {
+        return 2;
+    }
+    1
 }
 
 fn queued_upload_can_be_skipped(
@@ -234,6 +309,27 @@ pub(crate) fn next_retry_after(now: DateTime<Utc>, attempts: u32) -> DateTime<Ut
 fn retry_backoff_secs(attempts: u32) -> i64 {
     let exponent = attempts.saturating_sub(1).min(6);
     (5 * 2_i64.pow(exponent)).min(300)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_publish_priority;
+
+    #[test]
+    fn upload_publish_priority_keeps_current_refs_last() {
+        assert!(
+            upload_publish_priority("blobs/loose/aa/blob.enc")
+                < upload_publish_priority("metadata/export.json")
+        );
+        assert!(
+            upload_publish_priority("metadata/export.json")
+                < upload_publish_priority("hosts/current")
+        );
+        assert!(
+            upload_publish_priority("hosts/example/metadata/export.json")
+                < upload_publish_priority("hosts/example/refs/current")
+        );
+    }
 }
 
 pub(crate) fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {

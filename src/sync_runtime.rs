@@ -323,7 +323,7 @@ fn enqueue_and_drain_sync(
             }
         }
     }
-    let uploaded = drain_upload_queue(paths, remote)?;
+    let uploaded = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
     let pruned_remote_exports = prune_remote_host_exports(remote, &config.host.id, &export)?;
     let pruned_remote_objects = prune_remote_packed_blob_objects(
