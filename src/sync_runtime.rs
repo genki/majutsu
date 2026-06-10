@@ -593,7 +593,13 @@ impl SyncStatusSnapshot {
                 && self.missing_remote_objects == 0
                 && self.queued_uploads == 0;
         }
-        self.remote_current == target_current
+        if self.remote_current != target_current {
+            return false;
+        }
+        if self.local_current == target_current {
+            return self.missing_remote_objects == 0 && self.queued_uploads == 0;
+        }
+        true
     }
 }
 
