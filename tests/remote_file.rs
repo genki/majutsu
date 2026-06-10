@@ -1254,7 +1254,11 @@ fn clone_can_restore_from_canonical_object_aliases() {
     let _ = fs::remove_dir_all(remote.join("objects"));
     let status = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync").arg("status");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("status")
+            .arg("--deep");
         c
     });
     assert!(status.contains("missing_remote_objects 0"));
@@ -5025,7 +5029,7 @@ fn sync_wait_reports_status_when_existing_sync_lock_is_held() {
         c
     });
     assert!(waited.contains("sync already running pid"));
-    assert!(waited.contains("missing_remote_objects 0"));
+    assert!(waited.contains("status_mode quick"));
     assert!(waited.contains("queued_uploads 0"));
 }
 
@@ -14584,7 +14588,7 @@ fn daemon_watch_large_snapshot_sync_clone_restore_preserves_chunks() {
 
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home").arg(&state).arg("sync").arg("--wait");
         c
     });
     assert_eq!(

@@ -8,7 +8,7 @@ use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{start_daemon_ipc, start_watch_daemon};
 use crate::process_runtime::acquire_process_lock;
-use crate::queue_runtime::{record_event, record_file_event};
+use crate::queue_runtime::{record_event, record_file_event, upload_queue_stats};
 use crate::root_state::roots;
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
 use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
@@ -237,25 +237,78 @@ fn watch_notify_loop<W: Watcher>(
 }
 
 fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
-    snapshot(paths, args)?;
-    match sync_current_if_remote(paths) {
-        Ok(AutoSyncResult::Synced) => {
-            record_event(paths, "watch-sync", "synced current snapshot to remote")?
-        }
-        Ok(AutoSyncResult::Deferred {
-            delayed,
-            next_retry_after,
-        }) => record_event(
-            paths,
-            "watch-sync-deferred",
-            &format!(
-                "delayed_uploads={} next_retry_after={}",
+    if std::env::var("MAJUTSU_WATCH_INLINE_SNAPSHOT").as_deref() == Ok("1") {
+        snapshot(paths, args)?;
+        match sync_current_if_remote(paths) {
+            Ok(AutoSyncResult::Synced) => {
+                record_event(paths, "watch-sync", "synced current snapshot to remote")?
+            }
+            Ok(AutoSyncResult::Deferred {
                 delayed,
-                next_retry_after.unwrap_or_else(|| "(unknown)".into())
-            ),
-        )?,
-        Ok(AutoSyncResult::NoRemote) => {}
-        Err(err) => record_event(paths, "watch-sync-error", &format!("{err:#}"))?,
+                next_retry_after,
+            }) => record_event(
+                paths,
+                "watch-sync-deferred",
+                &format!(
+                    "delayed_uploads={} next_retry_after={}",
+                    delayed,
+                    next_retry_after.unwrap_or_else(|| "(unknown)".into())
+                ),
+            )?,
+            Ok(AutoSyncResult::NoRemote) => {}
+            Err(err) => record_event(paths, "watch-sync-error", &format!("{err:#}"))?,
+        }
+        return Ok(());
+    }
+
+    let message = args.message.unwrap_or_else(|| "watch snapshot".into());
+    let exe = std::env::current_exe()?;
+    let status = std::process::Command::new(&exe)
+        .arg("--home")
+        .arg(&paths.home)
+        .arg("snapshot")
+        .arg("--message")
+        .arg(&message)
+        .status()?;
+    if !status.success() {
+        bail!("watch snapshot child process failed with status {status}");
+    }
+    record_event(paths, "watch-snapshot-child", &message)?;
+
+    if read_config(paths)?.remote.is_some() {
+        let upload_stats = upload_queue_stats(paths)?;
+        if upload_stats.delayed > 0 {
+            record_event(
+                paths,
+                "watch-sync-deferred",
+                &format!(
+                    "delayed_uploads={} next_retry_after={}",
+                    upload_stats.delayed,
+                    upload_stats
+                        .next_retry_after
+                        .map(|retry_after| retry_after.to_rfc3339())
+                        .unwrap_or_else(|| "(unknown)".into())
+                ),
+            )?;
+            return Ok(());
+        }
+        let status = std::process::Command::new(&exe)
+            .arg("--home")
+            .arg(&paths.home)
+            .arg("sync")
+            .arg("--wait")
+            .arg("--timeout-secs")
+            .arg("300")
+            .status()?;
+        if status.success() {
+            record_event(paths, "watch-sync", "external sync completed")?;
+        } else {
+            record_event(
+                paths,
+                "watch-sync-error",
+                &format!("external sync exited with status {status}"),
+            )?;
+        }
     }
     Ok(())
 }

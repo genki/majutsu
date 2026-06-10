@@ -891,3 +891,52 @@ fn branch_rename_rejects_same_name_and_keeps_active_refs_consistent() {
         "overwriting the active destination should move current to the new head"
     );
 }
+
+#[test]
+fn sync_status_quick_and_wait_target_advancement() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let remote = temp.path().join("remote");
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("file.txt"), b"v1\n").unwrap();
+
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "init",
+                "--remote",
+                &format!("file://{}", remote.display()),
+                "--host-name",
+                "sync-status-e2e",
+            ],
+        ),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "root", root.to_str().unwrap()]),
+        "root add",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "v1"]),
+        "snapshot v1",
+    );
+    assert_success(run_mj(&home, ["sync"]), "sync v1");
+
+    let quick = run_mj(&home, ["sync", "status"]);
+    assert_success(quick, "sync status quick");
+
+    let deep = run_mj(&home, ["sync", "status", "--deep"]);
+    assert_success(deep, "sync status deep");
+
+    fs::write(root.join("file.txt"), b"v2\n").unwrap();
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "v2"]),
+        "snapshot v2",
+    );
+    assert_success(
+        run_mj(&home, ["sync", "--wait", "--timeout-secs", "30"]),
+        "sync wait follows latest current",
+    );
+}

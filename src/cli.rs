@@ -576,8 +576,18 @@ pub(crate) enum LargeCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum SyncCommand {
-    #[command(about = "Show local and remote sync state without uploading")]
-    Status,
+    #[command(about = "Show sync status; quick by default, use --deep for object availability")]
+    Status(SyncStatusArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct SyncStatusArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Check every referenced remote object instead of only refs and queues"
+    )]
+    pub(crate) deep: bool,
 }
 
 #[derive(Args)]

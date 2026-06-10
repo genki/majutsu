@@ -54,6 +54,32 @@ mj lifecycle apply --provider s3 --dry-run false
 
 metadata は hot に維持し、archive 対象は pack や large chunk などの payload に限定する。
 
+
+## sync status mode
+
+通常確認では高速な status を使う。
+
+```sh
+mj sync status
+```
+
+deep status は参照 object ごとに remote 存在確認 request を発行しうるため、
+監査目的の場合だけ使う。
+
+```sh
+mj sync status --deep
+```
+
+## watch daemon memory mode
+
+watch daemon は既定で snapshot / sync を子 process で実行する。大きな snapshot や
+sync 後も長寿命 daemon の RSS を低く保つための設定である。調査目的で旧来の
+inline mode を使う場合は次の環境変数を指定する。
+
+```sh
+MAJUTSU_WATCH_INLINE_SNAPSHOT=1 mj watch --foreground true
+```
+
 ## queue backpressure
 
 `mj daemon metrics` は次の値を公開する。

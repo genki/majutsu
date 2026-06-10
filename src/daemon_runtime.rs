@@ -26,6 +26,8 @@ struct DaemonStats {
     roots: usize,
     current: String,
     journal_events: usize,
+    processed_journal_events: usize,
+    pending_journal_event_count: usize,
     pending_journal_events: bool,
     queued_uploads: usize,
     queued_uploads_retrying: usize,
@@ -468,6 +470,16 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
             writeln!(stream, "journal_events {}", stats.journal_events)?;
             writeln!(
                 stream,
+                "processed_journal_events {}",
+                stats.processed_journal_events
+            )?;
+            writeln!(
+                stream,
+                "pending_journal_event_count {}",
+                stats.pending_journal_event_count
+            )?;
+            writeln!(
+                stream,
                 "pending_journal_events {}",
                 stats.pending_journal_events
             )?;
@@ -527,6 +539,16 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
                 stream,
                 "majutsu_daemon_journal_events {}",
                 stats.journal_events
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_processed_journal_events {}",
+                stats.processed_journal_events
+            )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_pending_journal_event_count {}",
+                stats.pending_journal_event_count
             )?;
             writeln!(
                 stream,
@@ -599,7 +621,24 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
     }
     let current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
     let journal_records = event_journal_records(paths)?;
-    let pending_journal_events = majutsu_db::has_pending_journal_events(&journal_records);
+    let last_snapshot_finish = journal_records
+        .iter()
+        .filter(|event| event.is_snapshot_finish())
+        .map(|event| event.observed_at)
+        .max();
+    let pending_journal_event_count = journal_records
+        .iter()
+        .filter(|event| {
+            event.is_pending_trigger()
+                && last_snapshot_finish
+                    .map(|finished_at| event.observed_at > finished_at)
+                    .unwrap_or(true)
+        })
+        .count();
+    let pending_journal_events = pending_journal_event_count > 0;
+    let processed_journal_events = journal_records
+        .len()
+        .saturating_sub(pending_journal_event_count);
     let upload_stats = upload_queue_stats(paths)?;
     let restore_statuses = restore_queue_status_counts(paths)?;
     let restore_jobs = restore_statuses
@@ -615,6 +654,8 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
         roots: roots.len(),
         current,
         journal_events: journal_records.len(),
+        processed_journal_events,
+        pending_journal_event_count,
         pending_journal_events,
         queued_uploads: upload_stats.total,
         queued_uploads_retrying: upload_stats.retrying,

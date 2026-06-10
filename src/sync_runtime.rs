@@ -54,8 +54,11 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
         config.large.multipart,
         config.large.max_parallel_uploads,
     )?;
-    if let Some(SyncCommand::Status) = args.command {
-        return sync_status(paths, &conn, &remote);
+    if let Some(SyncCommand::Status(status_args)) = args.command {
+        if status_args.deep {
+            return sync_status(paths, &conn, &remote);
+        }
+        return sync_status_quick(paths, &conn, &remote);
     }
     if let Some(pid) = process_lock_owner(&paths.sync_lock)? {
         if args.wait {
@@ -70,7 +73,7 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
             );
         }
         println!("sync already running pid {pid}");
-        sync_status(paths, &conn, &remote)?;
+        sync_status_quick(paths, &conn, &remote)?;
         bail!("sync already running with pid {pid}; use `mj sync --wait` to wait for completion");
     }
     sync_configured_remote(paths, &conn, &config, &remote)?;
@@ -171,6 +174,103 @@ fn sync_configured_remote(
     }
 }
 
+fn sync_status_quick(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {
+    let status = sync_wait_status(paths, conn, remote)?;
+    print_sync_wait_status(&status);
+    println!("status_mode quick");
+    println!("local_objects skipped");
+    println!("missing_remote_objects skipped");
+    println!("hint run `mj sync status --deep` to verify every referenced object");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SyncWaitStatus {
+    remote: String,
+    local_current: String,
+    remote_current: String,
+    remote_last_synced: String,
+    queued_uploads: usize,
+    queued_uploads_retrying: usize,
+    queued_uploads_delayed: usize,
+    queued_upload_next_retry_after: String,
+    queued_upload_attempts: u64,
+    queued_upload_max_attempts: u32,
+    upload_queue_backpressure: bool,
+    sync_lock_pid: Option<u32>,
+}
+
+impl SyncWaitStatus {
+    fn is_caught_up(&self) -> bool {
+        self.local_current == self.remote_current && self.queued_uploads == 0
+    }
+}
+
+fn sync_wait_status(
+    paths: &Paths,
+    conn: &Connection,
+    remote: &RemoteStore,
+) -> Result<SyncWaitStatus> {
+    let local_current = current_snapshot(conn)?.unwrap_or_else(|| "(none)".into());
+    let config = read_config(paths)?;
+    let canonical_current = host_current_ref_key(&config.host.id);
+    let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
+    let mut remote_current = remote_ref(remote, &canonical_current)?;
+    if remote_current.is_none() {
+        remote_current = remote_ref(remote, "hosts/current")?;
+    }
+    let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
+    let upload_stats = upload_queue_stats(paths)?;
+    let sync_lock_pid = process_lock_owner(&paths.sync_lock).ok().flatten();
+    Ok(SyncWaitStatus {
+        remote: remote.describe(),
+        local_current,
+        remote_current: remote_current.unwrap_or_else(|| "(none)".into()),
+        remote_last_synced: remote_last_synced.unwrap_or_else(|| "(none)".into()),
+        queued_uploads: upload_stats.total,
+        queued_uploads_retrying: upload_stats.retrying,
+        queued_uploads_delayed: upload_stats.delayed,
+        queued_upload_next_retry_after: upload_stats
+            .next_retry_after
+            .map(|retry_after| retry_after.to_rfc3339())
+            .unwrap_or_else(|| "(none)".into()),
+        queued_upload_attempts: upload_stats.attempts,
+        queued_upload_max_attempts: upload_stats.max_attempts,
+        upload_queue_backpressure: upload_stats.has_backpressure(),
+        sync_lock_pid,
+    })
+}
+
+fn print_sync_wait_status(status: &SyncWaitStatus) {
+    println!("remote {}", status.remote);
+    println!("local_current {}", status.local_current);
+    println!("remote_current {}", status.remote_current);
+    println!("remote_last_synced {}", status.remote_last_synced);
+    println!("queued_uploads {}", status.queued_uploads);
+    println!("queued_uploads_retrying {}", status.queued_uploads_retrying);
+    println!("queued_uploads_delayed {}", status.queued_uploads_delayed);
+    println!(
+        "queued_upload_next_retry_after {}",
+        status.queued_upload_next_retry_after
+    );
+    println!("queued_upload_attempts {}", status.queued_upload_attempts);
+    println!(
+        "queued_upload_max_attempts {}",
+        status.queued_upload_max_attempts
+    );
+    println!(
+        "upload_queue_backpressure {}",
+        status.upload_queue_backpressure
+    );
+    println!(
+        "sync_lock_pid {}",
+        status
+            .sync_lock_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "(none)".into())
+    );
+}
+
 fn wait_for_sync_catchup(
     paths: &Paths,
     conn: &Connection,
@@ -179,18 +279,39 @@ fn wait_for_sync_catchup(
     timeout_secs: u64,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut target_current = target_current.to_string();
     loop {
-        let status = sync_status_snapshot(paths, conn, remote)?;
-        if status.is_caught_up_to(target_current) {
-            print_sync_status(&status);
-            if status.local_current != target_current {
-                println!("wait_target_current {target_current}");
+        if let Some(latest_current) = current_snapshot(conn)? {
+            if latest_current != target_current {
+                println!(
+                    "wait_target_updated {} -> {}",
+                    target_current, latest_current
+                );
+                target_current = latest_current;
             }
+        }
+        let status = sync_wait_status(paths, conn, remote)?;
+        if status.is_caught_up() {
+            print_sync_wait_status(&status);
+            println!("wait_target_current {}", target_current);
+            println!("status_mode quick");
             return Ok(());
         }
         if Instant::now() >= deadline {
-            print_sync_status(&status);
-            bail!("timed out waiting for sync target {target_current} after {timeout_secs}s");
+            print_sync_wait_status(&status);
+            bail!(
+                "timed out waiting for sync target {} after {}s; local_current={} remote_current={} queued_uploads={} delayed={} lock_pid={}",
+                target_current,
+                timeout_secs,
+                status.local_current,
+                status.remote_current,
+                status.queued_uploads,
+                status.queued_uploads_delayed,
+                status
+                    .sync_lock_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "(none)".into())
+            );
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -643,23 +764,6 @@ struct SyncStatusSnapshot {
     queued_upload_attempts: u64,
     queued_upload_max_attempts: u32,
     upload_queue_backpressure: bool,
-}
-
-impl SyncStatusSnapshot {
-    fn is_caught_up_to(&self, target_current: &str) -> bool {
-        if target_current == "(none)" {
-            return self.local_current == self.remote_current
-                && self.missing_remote_objects == 0
-                && self.queued_uploads == 0;
-        }
-        if self.remote_current != target_current {
-            return false;
-        }
-        if self.local_current == target_current {
-            return self.missing_remote_objects == 0 && self.queued_uploads == 0;
-        }
-        true
-    }
 }
 
 fn sync_status_snapshot(
