@@ -59,6 +59,12 @@ pub(crate) struct FileRemote {
     pub(crate) root: PathBuf,
 }
 
+fn file_remote_fsync_enabled() -> bool {
+    std::env::var("MAJUTSU_FSYNC_REMOTE_FILE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 pub(crate) struct S3Remote {
     pub(crate) bucket: String,
     pub(crate) prefix: String,
@@ -171,7 +177,9 @@ impl RemoteStore {
                 {
                     Ok(mut file) => {
                         file.write_all(bytes)?;
-                        file.sync_all()?;
+                        if file_remote_fsync_enabled() {
+                            file.sync_all()?;
+                        }
                         Ok(true)
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),

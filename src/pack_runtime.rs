@@ -25,7 +25,7 @@ pub(crate) fn pack_cmd(paths: &Paths, args: PackArgs) -> Result<()> {
 fn pack_loose_blobs(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
-    let conn = open_db(paths)?;
+    let mut conn = open_db(paths)?;
     let blobs = query_blobs(&conn)?
         .into_iter()
         .filter(|blob| blob.pack_id.is_none())
@@ -34,9 +34,10 @@ fn pack_loose_blobs(paths: &Paths) -> Result<()> {
         println!("packed 0 objects");
         return Ok(());
     }
-    let packed = write_tiered_blob_packs(paths, &conn, &config.pack, &blobs, |blob| {
+    let packed = write_tiered_blob_packs(paths, &config.pack, &blobs, |blob| {
         read_object(paths, &blob.object_key)
     })?;
+    persist_written_packs(&mut conn, &packed)?;
     record_op(
         &conn,
         "pack",
@@ -54,12 +55,11 @@ fn pack_loose_blobs(paths: &Paths) -> Result<()> {
 
 fn write_blob_packs<F>(
     paths: &Paths,
-    conn: &Connection,
     blobs: &[BlobExport],
     tier: PackTier,
     target_size: u64,
     mut payload_for: F,
-) -> Result<Vec<PackIndex>>
+) -> Result<Vec<WrittenPack>>
 where
     F: FnMut(&BlobExport) -> Result<Vec<u8>>,
 {
@@ -71,28 +71,19 @@ where
     let mut index_key = majutsu_pack::index_key(&prefixes.index_prefix, &pack_id);
     let mut pack_bytes = Vec::new();
     let mut entries = Vec::new();
-    let mut object_count = 0usize;
     for blob in blobs {
         let payload = payload_for(blob)?;
         let stored = encode_object(paths, &payload)?;
         let record_len = 8 + stored.len() as u64;
         if !entries.is_empty() && pack_bytes.len() as u64 + record_len > target_size {
             indexes.push(finish_pack(
-                paths,
-                conn,
-                pack_id,
-                pack_key,
-                index_key,
-                pack_bytes,
-                entries,
-                object_count,
+                paths, pack_id, pack_key, index_key, pack_bytes, entries,
             )?);
             pack_id = new_id("pack");
             pack_key = majutsu_pack::pack_key(&prefixes.pack_prefix, &pack_id);
             index_key = majutsu_pack::index_key(&prefixes.index_prefix, &pack_id);
             pack_bytes = Vec::new();
             entries = Vec::new();
-            object_count = 0;
         }
         let offset = pack_bytes.len() as u64;
         pack_bytes.extend_from_slice(&(stored.len() as u64).to_le_bytes());
@@ -102,18 +93,10 @@ where
             offset,
             len: 8 + stored.len() as u64,
         });
-        object_count += 1;
     }
     if !entries.is_empty() {
         indexes.push(finish_pack(
-            paths,
-            conn,
-            pack_id,
-            pack_key,
-            index_key,
-            pack_bytes,
-            entries,
-            object_count,
+            paths, pack_id, pack_key, index_key, pack_bytes, entries,
         )?);
     }
     Ok(indexes)
@@ -121,11 +104,10 @@ where
 
 fn write_tiered_blob_packs<F>(
     paths: &Paths,
-    conn: &Connection,
     config: &PackConfig,
     blobs: &[BlobExport],
     mut payload_for: F,
-) -> Result<Vec<PackIndex>>
+) -> Result<Vec<WrittenPack>>
 where
     F: FnMut(&BlobExport) -> Result<Vec<u8>>,
 {
@@ -136,7 +118,6 @@ where
     let mut indexes = Vec::new();
     indexes.extend(write_blob_packs(
         paths,
-        conn,
         &small_blobs,
         PackTier::Small,
         config.small_pack_target,
@@ -144,7 +125,6 @@ where
     )?);
     indexes.extend(write_blob_packs(
         paths,
-        conn,
         &normal_blobs,
         PackTier::Normal,
         config.normal_pack_target,
@@ -153,16 +133,20 @@ where
     Ok(indexes)
 }
 
+struct WrittenPack {
+    index: PackIndex,
+    index_key: String,
+    size: u64,
+}
+
 fn finish_pack(
     paths: &Paths,
-    conn: &Connection,
     pack_id: String,
     pack_key: String,
     index_key: String,
     pack_bytes: Vec<u8>,
     entries: Vec<PackEntry>,
-    object_count: usize,
-) -> Result<PackIndex> {
+) -> Result<WrittenPack> {
     let pack_path = paths.home.join(&pack_key);
     if let Some(parent) = pack_path.parent() {
         fs::create_dir_all(parent)?;
@@ -179,23 +163,46 @@ fn finish_pack(
         fs::create_dir_all(parent)?;
     }
     fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
-    conn.execute(
-        "insert or replace into packs(pack_id, pack_key, index_key, object_count, size) values (?1, ?2, ?3, ?4, ?5)",
-        params![pack_id, pack_key, index_key, object_count, pack_bytes.len() as u64],
-    )?;
-    for entry in &index.entries {
-        conn.execute(
-            "update blobs set pack_id=?2, pack_offset=?3, pack_len=?4 where oid=?1",
-            params![entry.oid, index.pack_id, entry.offset, entry.len],
+    Ok(WrittenPack {
+        index,
+        index_key,
+        size: pack_bytes.len() as u64,
+    })
+}
+
+fn persist_written_packs(conn: &mut Connection, packs: &[WrittenPack]) -> Result<()> {
+    let tx = conn.transaction()?;
+    for pack in packs {
+        tx.execute(
+            "insert or replace into packs(pack_id, pack_key, index_key, object_count, size) values (?1, ?2, ?3, ?4, ?5)",
+            params![
+                pack.index.pack_id.as_str(),
+                pack.index.pack_key.as_str(),
+                pack.index_key.as_str(),
+                pack.index.entries.len(),
+                pack.size,
+            ],
         )?;
+        for entry in &pack.index.entries {
+            tx.execute(
+                "update blobs set pack_id=?2, pack_offset=?3, pack_len=?4 where oid=?1",
+                params![
+                    entry.oid.as_str(),
+                    pack.index.pack_id.as_str(),
+                    entry.offset,
+                    entry.len
+                ],
+            )?;
+        }
     }
-    Ok(index)
+    tx.commit()?;
+    Ok(())
 }
 
 fn pack_compact_cmd(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
-    let conn = open_db(paths)?;
+    let mut conn = open_db(paths)?;
     let blobs = query_blobs(&conn)?;
     let packed = blobs.iter().filter(|blob| blob.pack_id.is_some()).count();
     if packed == 0 {
@@ -213,15 +220,16 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
             read_blob_payload(paths, &conn, &blob.oid, &blob.object_key)?,
         );
     }
-    let indexes = write_tiered_blob_packs(paths, &conn, &config.pack, &blobs, |blob| {
+    let indexes = write_tiered_blob_packs(paths, &config.pack, &blobs, |blob| {
         payloads
             .get(&blob.oid)
             .cloned()
             .ok_or_else(|| anyhow!("missing compact payload {}", blob.oid))
     })?;
+    persist_written_packs(&mut conn, &indexes)?;
     let new_pack_ids = indexes
         .iter()
-        .map(|index| index.pack_id.clone())
+        .map(|pack| pack.index.pack_id.clone())
         .collect::<BTreeSet<_>>();
     for old_pack_id in old_pack_ids.difference(&new_pack_ids) {
         conn.execute("delete from packs where pack_id=?1", params![old_pack_id])?;

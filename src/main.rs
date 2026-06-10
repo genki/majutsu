@@ -296,6 +296,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let mut root_trees = BTreeMap::new();
     let mut total_files = 0usize;
     let mut large_files = 0usize;
+    let mut pending_blob_inserts = Vec::new();
     for root in roots(&conn)? {
         if root.status != "active" {
             eprintln!("root {}, skipped: status={}", root.id, root.status);
@@ -378,10 +379,10 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             return Err(err);
         }
         let scan_root_config = snapshot_scan_root(paths, &root)?;
-        let records_result = scan_root(paths, &config, &scan_root_config);
+        let scan_result = scan_root(paths, &config, &scan_root_config);
         let post_result = run_post_snapshot_hook(paths, &root);
-        let records = match records_result {
-            Ok(records) => records,
+        let scanned = match scan_result {
+            Ok(scanned) => scanned,
             Err(err) if is_permission_denied_error(&err) => {
                 update_root_status(&conn, &root.id, "permission-denied")?;
                 sync_roots_to_config(paths, &conn)?;
@@ -422,6 +423,8 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 return Err(err);
             }
         };
+        let records = scanned.records;
+        pending_blob_inserts.extend(scanned.blobs);
         if let Err(err) = post_result {
             record_snapshot_failure(
                 &conn,
@@ -473,6 +476,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let manifest_oid = blake3_hex(&manifest_json);
     let manifest_key = store_bytes(paths, &paths.objects, &manifest_oid, &manifest_json)?;
     let tx = conn.transaction()?;
+    for blob in &pending_blob_inserts {
+        tx.execute(
+            "insert or ignore into blobs(oid, size, object_key) values (?1, ?2, ?3)",
+            params![blob.oid.as_str(), blob.size, blob.object_key.as_str()],
+        )?;
+    }
     tx.execute(
         "insert into snapshots(id, parent_id, op_id, created_at, manifest_key, manifest_json)
          values (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1922,9 +1931,21 @@ fn pack_entry_payload<'a>(oid: &str, entry: &'a [u8]) -> Result<&'a [u8]> {
     Ok(&entry[8..])
 }
 
-fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<FileRecord>> {
+struct ScannedRoot {
+    records: Vec<FileRecord>,
+    blobs: Vec<BlobInsert>,
+}
+
+struct BlobInsert {
+    oid: String,
+    size: u64,
+    object_key: String,
+}
+
+fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<ScannedRoot> {
     let ignore = build_ignore(root)?;
     let mut records = Vec::new();
+    let mut blobs = Vec::new();
     let walker = WalkDir::new(&root.path)
         .follow_links(root.follow_symlinks)
         .sort_by_file_name();
@@ -2030,11 +2051,11 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
             let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
             let oid = blake3_hex(&bytes);
             let object_key = store_bytes(paths, &paths.objects, &oid, &bytes)?;
-            let conn = open_db(paths)?;
-            conn.execute(
-                "insert or ignore into blobs(oid, size, object_key) values (?1, ?2, ?3)",
-                params![oid, bytes.len() as u64, object_key],
-            )?;
+            blobs.push(BlobInsert {
+                oid: oid.clone(),
+                size: bytes.len() as u64,
+                object_key: object_key.clone(),
+            });
             if bytes.len() as u64 <= majutsu_pack::SMALL_BLOB_MAX_SIZE {
                 Payload::InlineSmall { oid, object_key }
             } else {
@@ -2054,7 +2075,7 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Vec<Fi
             payload,
         });
     }
-    Ok(records)
+    Ok(ScannedRoot { records, blobs })
 }
 
 fn is_permission_denied_error(err: &anyhow::Error) -> bool {
@@ -2697,11 +2718,19 @@ pub(crate) fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -
         let tmp = path.with_extension("tmp");
         let mut f = File::create(&tmp)?;
         f.write_all(&encode_object(paths, bytes)?)?;
-        f.sync_all()?;
+        if fsync_objects_enabled() {
+            f.sync_all()?;
+        }
         fs::rename(tmp, &path)?;
     }
     let rel = path.strip_prefix(&paths.home).unwrap_or(&path);
     Ok(path_to_slash(rel))
+}
+
+fn fsync_objects_enabled() -> bool {
+    env::var("MAJUTSU_FSYNC_OBJECTS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn object_storage_id(paths: &Paths, oid: &str) -> Result<String> {
