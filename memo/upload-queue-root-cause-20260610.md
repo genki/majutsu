@@ -112,6 +112,23 @@ queue JSON 肥大化はほぼ解消した。重複 upload は content-addressed 
 - `cargo test --locked --test remote_file`
 - `cargo test --locked`
 
+## event journal compact と sync 進捗 2026-06-10
+
+追加対応:
+
+- `compact_event_journal` を追加し、snapshot 完了後に best-effort で実行する。
+- デフォルトでは event journal が 1024 件以下なら compact しない。少数イベントを調査・テストで確認しやすくするため。
+- 閾値は `MAJUTSU_EVENT_COMPACT_MIN_RECORDS` で変更可能。
+- compact 対象は最新 `snapshot-finish` より古い event。pending 判定に必要な最新 snapshot 完了後の `fs-event` / `periodic-rescan` は残る。
+- `drain_upload_queue` に stderr 進捗を追加した。16 件以上の queue で開始時、25 件ごと、または 5 秒ごと、完了時に表示する。
+
+検証:
+
+- 一時 home で 202 件の event を作成し、`MAJUTSU_EVENT_COMPACT_MIN_RECORDS=10` の snapshot 後に 1 件まで compact されることを確認。
+- 同じ検証で `mj sync` が `sync upload progress 0/68 ...`、`25/68`、`50/68`、`68/68 done` を stderr に出すことを確認。
+- 実環境では `queue/events` が 38,720 件 / 155 MiB から、snapshot 後に 1 件、daemon 再起動後の確認で 4 件 / 3.1 MiB になった。
+- `cargo test --locked` は成功。
+
 ## 注意
 
 今回の snapshot/pack SQLite autocommit 改善とは別系統の問題。ローカル snapshot/pack は改善済みだが、remote sync はまだ「全体を再 queue 化して直列 upload する」ため、S3 backend では小変更でも時間がかかる。

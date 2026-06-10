@@ -155,7 +155,7 @@ use operation_log::{
 use pack_runtime::pack_cmd;
 use process_runtime::acquire_process_lock;
 use prune_runtime::{gc_cmd, prune_cmd};
-use queue_runtime::{has_pending_journal_events, record_event};
+use queue_runtime::{compact_event_journal, has_pending_journal_events, record_event};
 use remote_runtime::remote_cmd;
 #[cfg(test)]
 use remote_store::{
@@ -512,6 +512,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     println!("snapshot {}", manifest.snapshot_id);
     println!("files {total_files}, large {large_files}");
     record_event(paths, "snapshot-finish", &manifest.snapshot_id)?;
+    let _ = compact_event_journal(paths);
     Ok(())
 }
 

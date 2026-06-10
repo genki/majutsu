@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 
 use crate::config::Paths;
 use crate::remote_store::RemoteStore;
@@ -128,7 +129,24 @@ pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
 
 pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<usize> {
     let mut uploaded = 0usize;
-    for (path, mut item) in upload_queue_items(paths)? {
+    let items = upload_queue_items(paths)?;
+    let total = items.len();
+    let progress_enabled = total >= 16;
+    let mut last_progress = Instant::now()
+        .checked_sub(StdDuration::from_secs(10))
+        .unwrap_or_else(Instant::now);
+    for (path, mut item) in items {
+        if progress_enabled
+            && (uploaded == 0
+                || uploaded % 25 == 0
+                || last_progress.elapsed() >= StdDuration::from_secs(5))
+        {
+            eprintln!(
+                "sync upload progress {}/{} key={}",
+                uploaded, total, item.key
+            );
+            last_progress = Instant::now();
+        }
         let bytes = if let Some(bytes) = item.inline.clone() {
             bytes
         } else if let Some(source) = &item.source {
@@ -159,6 +177,9 @@ pub(crate) fn drain_upload_queue(paths: &Paths, remote: &RemoteStore) -> Result<
                 return Err(err).with_context(|| format!("upload failed for {}", item.key));
             }
         }
+    }
+    if progress_enabled {
+        eprintln!("sync upload progress {}/{} done", uploaded, total);
     }
     Ok(uploaded)
 }
@@ -259,4 +280,49 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
 pub(crate) fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
     let records = event_journal_records(paths)?;
     Ok(majutsu_db::has_pending_journal_events(&records))
+}
+
+pub(crate) fn compact_event_journal(paths: &Paths) -> Result<usize> {
+    if !paths.event_queue.exists() {
+        return Ok(0);
+    }
+    let records = event_journal_records(paths)?;
+    let min_records = std::env::var("MAJUTSU_EVENT_COMPACT_MIN_RECORDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1024);
+    if records.len() <= min_records {
+        return Ok(0);
+    }
+    let Some(last_snapshot_finish) = records
+        .iter()
+        .filter(|event| event.is_snapshot_finish())
+        .map(|event| event.observed_at)
+        .max()
+    else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    for entry in fs::read_dir(&paths.event_queue)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let bytes = match fs::read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let event: EventJournalRecord = serde_json::from_slice(&bytes)?;
+        if event.observed_at < last_snapshot_finish {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    Ok(removed)
 }
