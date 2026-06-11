@@ -133,7 +133,7 @@ fn sync_configured_remote(
     let current = current_snapshot(conn)?;
     let export = export_metadata(paths, conn, config)?;
     let sync_cache = read_remote_sync_cache(paths, remote)?;
-    let remote_export = metadata_export_for_remote(remote, export);
+    let remote_export = metadata_export_for_remote(paths, remote, export)?;
     let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
     let upload_stats = upload_queue_stats(paths)?;
     if upload_stats.total == 0
@@ -351,7 +351,8 @@ fn enqueue_and_drain_sync(
     remote: &RemoteStore,
 ) -> Result<()> {
     let content_export = export_metadata(paths, conn, config)?;
-    let remote_export = metadata_export_for_remote(remote, export_metadata(paths, conn, config)?);
+    let remote_export =
+        metadata_export_for_remote(paths, remote, export_metadata(paths, conn, config)?)?;
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &remote_export)?;
     let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
@@ -540,16 +541,28 @@ fn sync_remote_prune_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn metadata_export_for_remote(remote: &RemoteStore, export: MetadataExport) -> MetadataExport {
+fn metadata_export_for_remote(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: MetadataExport,
+) -> Result<MetadataExport> {
     if remote_prefers_canonical_only(remote) {
-        return compact_remote_metadata_export(export);
+        return compact_remote_metadata_export(paths, export);
     }
-    export
+    Ok(export)
 }
 
-fn compact_remote_metadata_export(mut export: MetadataExport) -> MetadataExport {
+fn compact_remote_metadata_export(
+    paths: &Paths,
+    mut export: MetadataExport,
+) -> Result<MetadataExport> {
     for snapshot in &mut export.snapshots {
-        snapshot.manifest_json.clear();
+        snapshot.manifest_json = compact_snapshot_manifest_json_for_metadata(
+            paths,
+            &snapshot.id,
+            &snapshot.manifest_key,
+            &snapshot.manifest_json,
+        )?;
     }
     let skipped_parents = export
         .operations
@@ -575,7 +588,37 @@ fn compact_remote_metadata_export(mut export: MetadataExport) -> MetadataExport 
     export
         .operations
         .retain(|operation| operation.kind != "remote-sync");
-    export
+    Ok(export)
+}
+
+fn compact_snapshot_manifest_json_for_metadata(
+    paths: &Paths,
+    snapshot_id: &str,
+    manifest_key: &str,
+    manifest_json: &str,
+) -> Result<String> {
+    let mut value = if manifest_json.trim().is_empty() {
+        let bytes = fs::read(paths.home.join(manifest_key)).with_context(|| {
+            format!("read snapshot manifest object {snapshot_id} {manifest_key}")
+        })?;
+        serde_json::to_value(serde_json::from_slice::<SnapshotManifest>(
+            &crate::decode_object(paths, &bytes)?,
+        )?)?
+    } else {
+        serde_json::from_str(manifest_json)?
+    };
+    compact_snapshot_manifest_value(&mut value);
+    serde_json::to_string(&value).map_err(Into::into)
+}
+
+fn compact_snapshot_manifest_value(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "roots".into(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+        object.insert("roots_omitted".into(), serde_json::Value::Bool(true));
+    }
 }
 
 fn enqueue_cached_inline_upload(
@@ -923,11 +966,19 @@ fn encode_snapshot_export_for_remote<T: Serialize>(
 fn compact_manifest_json_fields(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(object) => {
-            if object.contains_key("manifest_json") {
+            if let Some(serde_json::Value::String(manifest_json)) = object.get_mut("manifest_json")
+                && !manifest_json.trim().is_empty()
+                && let Ok(mut manifest) = serde_json::from_str::<serde_json::Value>(manifest_json)
+            {
+                compact_snapshot_manifest_value(&mut manifest);
+                if let Ok(compacted) = serde_json::to_string(&manifest) {
+                    *manifest_json = compacted;
+                }
                 object.insert(
-                    "manifest_json".into(),
-                    serde_json::Value::String(String::new()),
+                    "manifest_json_omitted".into(),
+                    serde_json::Value::Bool(true),
                 );
+            } else if object.contains_key("manifest_json") {
                 object.insert(
                     "manifest_json_omitted".into(),
                     serde_json::Value::Bool(true),

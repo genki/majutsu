@@ -1514,6 +1514,20 @@ pub(crate) fn download_local_object_from_remote(
     remote: &RemoteStore,
     key: &str,
 ) -> Result<Vec<u8>> {
+    if matches!(remote, RemoteStore::S3(_))
+        && let Some(alias) = canonical_remote_alias(key)
+        && alias != key
+    {
+        match remote.get(&alias) {
+            Ok(bytes) => return canonical_remote_object_to_local_bytes(paths, key, &bytes),
+            Err(alias_err) => {
+                let bytes = remote.get(key).with_context(|| {
+                    format!("download {key} after canonical alias {alias} failed: {alias_err}")
+                })?;
+                return Ok(bytes);
+            }
+        }
+    }
     if remote.exists(key)? {
         return remote.get(key).with_context(|| format!("download {key}"));
     }

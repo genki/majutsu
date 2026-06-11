@@ -3,6 +3,8 @@ use majutsu_store::{LEGACY_METADATA_EXPORT_KEY, RemoteHostSummary, select_remote
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use uuid::Uuid;
 
 use crate::cli::CloneArgs;
@@ -24,10 +26,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let export_bytes = remote.get(&metadata.key)?;
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
-    let compact_snapshot_metadata = export
-        .snapshots
-        .iter()
-        .any(|snapshot| snapshot.manifest_json.trim().is_empty());
+    let compact_snapshot_metadata = export.snapshots.iter().any(snapshot_metadata_is_compact);
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
     validate_config(&export.config)?;
@@ -71,33 +70,21 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             metadata.host.as_ref(),
             &export.operations,
         )?;
-        crate::validate_clone_remote_timeline_exports(
-            &staging_paths,
-            &remote,
-            metadata.host.as_ref(),
-            &export.snapshots,
-            &export.operations,
-        )?;
         if !matches!(remote, RemoteStore::S3(_)) {
+            crate::validate_clone_remote_timeline_exports(
+                &staging_paths,
+                &remote,
+                metadata.host.as_ref(),
+                &export.snapshots,
+                &export.operations,
+            )?;
             crate::validate_clone_remote_snapshot_objects(&staging_paths, &remote, &export)?;
             crate::validate_clone_remote_blob_objects(&staging_paths, &remote, &export)?;
             crate::validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
             crate::validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
             crate::validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
         }
-        for key in local_object_keys(&staging_paths, &export)? {
-            let dest = staging_paths.home.join(&key);
-            if dest.exists() {
-                continue;
-            }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(
-                dest,
-                crate::download_local_object_from_remote(&staging_paths, &remote, &key)?,
-            )?;
-        }
+        materialize_clone_objects(&staging_paths, &remote, &export)?;
         let conn = crate::open_db(&staging_paths)?;
         crate::import_metadata(&conn, &export)?;
         persist_export_remote_refs(
@@ -126,6 +113,15 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
     Ok(())
+}
+
+fn snapshot_metadata_is_compact(snapshot: &majutsu_core::SnapshotExport) -> bool {
+    if snapshot.manifest_json.trim().is_empty() {
+        return true;
+    }
+    serde_json::from_str::<majutsu_core::SnapshotManifest>(&snapshot.manifest_json)
+        .map(|manifest| manifest.roots.is_empty() && !manifest.root_trees.is_empty())
+        .unwrap_or(false)
 }
 
 struct CloneMetadataSelection {
@@ -189,20 +185,107 @@ fn download_compact_snapshot_manifests(
     remote: &RemoteStore,
     export: &MetadataExport,
 ) -> Result<()> {
-    for snapshot in &export.snapshots {
-        if !snapshot.manifest_json.trim().is_empty() {
-            continue;
-        }
-        let dest = paths.home.join(&snapshot.manifest_key);
-        if !dest.exists() {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(
-                &dest,
-                crate::download_local_object_from_remote(paths, remote, &snapshot.manifest_key)?,
-            )?;
-        }
+    let keys = export
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot.manifest_json.trim().is_empty())
+        .map(|snapshot| snapshot.manifest_key.clone())
+        .collect::<Vec<_>>();
+    materialize_keys(paths, remote, keys)
+}
+
+fn materialize_clone_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<()> {
+    materialize_keys(paths, remote, local_object_keys(paths, export)?)
+}
+
+fn materialize_keys(paths: &Paths, remote: &RemoteStore, keys: Vec<String>) -> Result<()> {
+    if matches!(remote, RemoteStore::S3(_)) {
+        return materialize_keys_parallel(paths, remote, keys);
+    }
+    for key in keys {
+        materialize_one_key(paths, remote, &key)?;
     }
     Ok(())
+}
+
+fn materialize_one_key(paths: &Paths, remote: &RemoteStore, key: &str) -> Result<()> {
+    let dest = paths.home.join(key);
+    if dest.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = crate::download_local_object_from_remote(paths, remote, key)
+        .with_context(|| format!("download clone object {key}"))?;
+    fs::write(&dest, bytes).with_context(|| format!("write clone object {key}"))?;
+    Ok(())
+}
+
+fn materialize_keys_parallel(paths: &Paths, remote: &RemoteStore, keys: Vec<String>) -> Result<()> {
+    let keys = keys
+        .into_iter()
+        .filter(|key| !paths.home.join(key).exists())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let workers = clone_parallel_downloads().min(keys.len());
+    let paths = Arc::new(paths.clone());
+    let remote = Arc::new(remote.clone());
+    let keys = Arc::new(Mutex::new(keys.into_iter()));
+    let (err_tx, err_rx) = mpsc::channel::<anyhow::Error>();
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let paths = Arc::clone(&paths);
+        let remote = Arc::clone(&remote);
+        let keys = Arc::clone(&keys);
+        let err_tx = err_tx.clone();
+        handles.push(thread::spawn(move || {
+            loop {
+                let key = {
+                    let mut keys = match keys.lock() {
+                        Ok(keys) => keys,
+                        Err(err) => {
+                            let _ =
+                                err_tx.send(anyhow::anyhow!("clone work queue poisoned: {err}"));
+                            return;
+                        }
+                    };
+                    keys.next()
+                };
+                let Some(key) = key else {
+                    return;
+                };
+                if let Err(err) = materialize_one_key(&paths, &remote, &key) {
+                    let _ = err_tx.send(err);
+                    return;
+                }
+            }
+        }));
+    }
+    drop(err_tx);
+    let mut first_error = err_rx.into_iter().next();
+    for handle in handles {
+        if let Err(err) = handle.join() {
+            first_error
+                .get_or_insert_with(|| anyhow::anyhow!("clone download worker panicked: {err:?}"));
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn clone_parallel_downloads() -> usize {
+    env::var("MAJUTSU_CLONE_PARALLEL_DOWNLOADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32)
 }

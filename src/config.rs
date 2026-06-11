@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use crate::watch_runtime::{default_watch_backend, normalize_watch_backend};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Paths {
     pub(crate) home: PathBuf,
     pub(crate) db: PathBuf,

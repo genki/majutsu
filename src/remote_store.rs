@@ -51,11 +51,13 @@ fn default_part_size_for_endpoint(endpoint: &str) -> usize {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum RemoteStore {
     File(FileRemote),
     S3(S3Remote),
 }
 
+#[derive(Clone)]
 pub(crate) struct FileRemote {
     pub(crate) root: PathBuf,
 }
@@ -66,6 +68,7 @@ fn file_remote_fsync_enabled() -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Clone)]
 pub(crate) struct S3Remote {
     pub(crate) bucket: String,
     pub(crate) prefix: String,
