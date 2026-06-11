@@ -128,7 +128,11 @@ fn sync_configured_remote(
     let current = current_snapshot(conn)?;
     let export = export_metadata(conn, config)?;
     let sync_cache = read_remote_sync_cache(paths, remote)?;
-    let state_fingerprint = remote_sync_state_fingerprint(config, &export)?;
+    let remote_export = metadata_export_for_remote(remote, export);
+    let state_fingerprint = format!(
+        "remote-metadata-v2:{}",
+        remote_sync_state_fingerprint(config, &remote_export)?
+    );
     let upload_stats = upload_queue_stats(paths)?;
     if upload_stats.total == 0
         && sync_cache.state_fingerprint.as_deref() == Some(state_fingerprint.as_str())
@@ -344,25 +348,21 @@ fn enqueue_and_drain_sync(
     remote: &RemoteStore,
 ) -> Result<()> {
     let export = export_metadata(conn, config)?;
-    let export = if remote_prefers_canonical_only(remote) {
-        remote_metadata_export(export)
-    } else {
-        export
-    };
+    let remote_export = metadata_export_for_remote(remote, export);
     let sync_cache = read_remote_sync_cache(paths, remote)?;
-    let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &export)?;
-    let state_fingerprint = remote_sync_state_fingerprint(config, &export)?;
-    enqueue_inline_upload(
-        paths,
-        "metadata/export.json",
-        serde_json::to_vec_pretty(&export)?,
-    )?;
+    let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &remote_export)?;
+    let state_fingerprint = format!(
+        "remote-metadata-v2:{}",
+        remote_sync_state_fingerprint(config, &remote_export)?
+    );
+    let remote_metadata_json = metadata_export_json_for_remote(remote, &remote_export)?;
+    enqueue_inline_upload(paths, "metadata/export.json", remote_metadata_json.clone())?;
     let host_metadata = host_metadata_key(&config.host.id);
-    enqueue_inline_upload(paths, &host_metadata, serde_json::to_vec_pretty(&export)?)?;
-    for snapshot in &export.snapshots {
+    enqueue_inline_upload(paths, &host_metadata, remote_metadata_json.clone())?;
+    for snapshot in &remote_export.snapshots {
         enqueue_snapshot_uploads_if_needed(paths, remote, &sync_cache, &config.host.id, snapshot)?;
     }
-    for operation in &export.operations {
+    for operation in &remote_export.operations {
         enqueue_operation_uploads_if_needed(
             paths,
             remote,
@@ -375,13 +375,13 @@ fn enqueue_and_drain_sync(
         enqueue_inline_upload(
             paths,
             &host_oplog_key(&config.host.id),
-            majutsu_core::encode_operation_log(&export.operations)?,
+            majutsu_core::encode_operation_log(&remote_export.operations)?,
         )?;
     }
     enqueue_inline_upload(
         paths,
         &host_oplog_canonical_key(&config.host.id),
-        encode_canonical_remote_oplog(paths, &export.operations)?,
+        encode_canonical_remote_oplog(paths, &remote_export.operations)?,
     )?;
     enqueue_cached_inline_upload(
         paths,
@@ -397,7 +397,7 @@ fn enqueue_and_drain_sync(
         "host.toml",
         toml::to_string_pretty(&config.host)?.into_bytes(),
     )?;
-    if let Some(current) = export.refs.get("current") {
+    if let Some(current) = remote_export.refs.get("current") {
         enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
         enqueue_inline_upload(
             paths,
@@ -410,14 +410,14 @@ fn enqueue_and_drain_sync(
             current.as_bytes().to_vec(),
         )?;
     }
-    if let Some(last_synced) = export.refs.get("last-synced") {
+    if let Some(last_synced) = remote_export.refs.get("last-synced") {
         enqueue_inline_upload(
             paths,
             &host_last_synced_ref_key(&config.host.id),
             last_synced.as_bytes().to_vec(),
         )?;
     }
-    let host_index = update_remote_host_index(remote, config, &export, &host_metadata)?;
+    let host_index = update_remote_host_index(remote, config, &remote_export, &host_metadata)?;
     enqueue_inline_upload(
         paths,
         REMOTE_HOST_INDEX_KEY,
@@ -426,7 +426,7 @@ fn enqueue_and_drain_sync(
     enqueue_inline_upload(
         paths,
         &remote_gc_mark_key(&config.host.id),
-        serde_json::to_vec_pretty(&build_gc_mark_export(config, &export))?,
+        serde_json::to_vec_pretty(&build_gc_mark_export(config, &remote_export))?,
     )?;
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
@@ -438,15 +438,15 @@ fn enqueue_and_drain_sync(
             fs::read(&recipients)?,
         )?;
     }
-    if !export.chunks.is_empty() {
+    if !remote_export.chunks.is_empty() {
         enqueue_inline_upload(
             paths,
             REMOTE_CHUNK_INDEX_SHARD_KEY,
-            encode_canonical_remote_export(paths, &build_chunk_index_shard(&export))?,
+            encode_canonical_remote_export(paths, &build_chunk_index_shard(&remote_export))?,
         )?;
     }
 
-    for key in local_object_keys(&export) {
+    for key in local_object_keys(&remote_export) {
         let local = paths.home.join(&key);
         if local.exists() {
             let canonical_only =
@@ -476,19 +476,24 @@ fn enqueue_and_drain_sync(
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
     let (pruned_remote_exports, pruned_remote_objects) = if sync_remote_prune_enabled() {
         (
-            prune_remote_host_exports(remote, &config.host.id, &export)?,
+            prune_remote_host_exports(remote, &config.host.id, &remote_export)?,
             prune_remote_packed_blob_objects(
                 remote,
                 &config.host.id,
-                &export,
+                &remote_export,
                 config.large.max_parallel_uploads,
             )?,
         )
     } else {
         (0, 0)
     };
-    let pruned_local_objects = prune_local_packed_blob_objects(paths, &export)?;
-    persist_export_remote_refs(conn, &remote.describe(), &config.host.id, &export.refs)?;
+    let pruned_local_objects = prune_local_packed_blob_objects(paths, &remote_export)?;
+    persist_export_remote_refs(
+        conn,
+        &remote.describe(),
+        &config.host.id,
+        &remote_export.refs,
+    )?;
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
     println!("pruned_remote_objects {}", pruned_remote_objects);
@@ -510,7 +515,7 @@ fn s3_prefers_canonical_remote_only(key: &str) -> bool {
 }
 
 fn content_object_fingerprint(key: &str) -> String {
-    format!("content:{key}")
+    format!("content-v2:{key}")
 }
 
 fn sync_remote_prune_enabled() -> bool {
@@ -519,7 +524,17 @@ fn sync_remote_prune_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn remote_metadata_export(mut export: MetadataExport) -> MetadataExport {
+fn metadata_export_for_remote(remote: &RemoteStore, export: MetadataExport) -> MetadataExport {
+    if remote_prefers_canonical_only(remote) {
+        return compact_remote_metadata_export(export);
+    }
+    export
+}
+
+fn compact_remote_metadata_export(mut export: MetadataExport) -> MetadataExport {
+    for snapshot in &mut export.snapshots {
+        snapshot.manifest_json.clear();
+    }
     let skipped_parents = export
         .operations
         .iter()
@@ -571,10 +586,14 @@ fn enqueue_snapshot_uploads_if_needed(
 ) -> Result<()> {
     let canonical_key = host_snapshot_canonical_key(host_id, &snapshot.id);
     let fingerprint = payload_fingerprint(&serde_json::to_vec(snapshot)?);
-    let canonical_bytes = encode_canonical_remote_export(paths, snapshot)?;
+    let canonical_bytes = encode_snapshot_export_for_remote(paths, remote, snapshot)?;
     if matches!(remote, RemoteStore::File(_)) {
         let legacy_key = host_snapshot_key(host_id, &snapshot.id);
-        enqueue_inline_upload(paths, &legacy_key, serde_json::to_vec_pretty(snapshot)?)?;
+        enqueue_inline_upload(
+            paths,
+            &legacy_key,
+            snapshot_export_json_for_remote(remote, snapshot)?,
+        )?;
         enqueue_inline_upload(paths, &canonical_key, canonical_bytes)?;
         return Ok(());
     }
@@ -838,6 +857,71 @@ fn print_sync_status(status: &SyncStatusSnapshot) {
         "upload_queue_backpressure {}",
         status.upload_queue_backpressure
     );
+}
+
+fn metadata_export_json_for_remote(
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<Vec<u8>> {
+    if remote_prefers_canonical_only(remote) {
+        let mut value = serde_json::to_value(export)?;
+        compact_manifest_json_fields(&mut value);
+        return serde_json::to_vec_pretty(&value).map_err(Into::into);
+    }
+    serde_json::to_vec_pretty(export).map_err(Into::into)
+}
+
+fn snapshot_export_json_for_remote<T: Serialize>(
+    remote: &RemoteStore,
+    snapshot: &T,
+) -> Result<Vec<u8>> {
+    if remote_prefers_canonical_only(remote) {
+        let mut value = serde_json::to_value(snapshot)?;
+        compact_manifest_json_fields(&mut value);
+        return serde_json::to_vec_pretty(&value).map_err(Into::into);
+    }
+    serde_json::to_vec_pretty(snapshot).map_err(Into::into)
+}
+
+fn encode_snapshot_export_for_remote<T: Serialize>(
+    paths: &Paths,
+    remote: &RemoteStore,
+    snapshot: &T,
+) -> Result<Vec<u8>> {
+    if remote_prefers_canonical_only(remote) {
+        let mut value = serde_json::to_value(snapshot)?;
+        compact_manifest_json_fields(&mut value);
+        return encode_canonical_remote_export(paths, &value);
+    }
+    encode_canonical_remote_export(paths, snapshot)
+}
+
+fn compact_manifest_json_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("manifest_json") {
+                object.insert(
+                    "manifest_json".into(),
+                    serde_json::Value::String(String::new()),
+                );
+                object.insert(
+                    "manifest_json_omitted".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            if let Some(serde_json::Value::Array(snapshots)) = object.get_mut("snapshots") {
+                for snapshot in snapshots {
+                    compact_manifest_json_fields(snapshot);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                compact_manifest_json_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Result<Vec<u8>> {

@@ -126,3 +126,9 @@ mj op diff <op-id> --root moon
 
 `mj op log` は操作単位の履歴、`mj op diff` はその操作の before / after snapshot から
 導出した file-level diff を表示する。
+
+
+## remote metadata storage efficiency
+
+S3 互換 remote では、index file から埋め込み snapshot manifest を省略した compact
+metadata export を使う。詳細は `docs/REMOTE_METADATA_STORAGE.md` を参照する。

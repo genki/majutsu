@@ -99,6 +99,15 @@ pub struct SnapshotExport {
 }
 
 pub fn snapshot_export_matches(actual: &SnapshotExport, expected: &SnapshotExport) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let mut actual = actual.clone();
+    let mut expected = expected.clone();
+    if actual.manifest_json.trim().is_empty() || expected.manifest_json.trim().is_empty() {
+        actual.manifest_json.clear();
+        expected.manifest_json.clear();
+    }
     actual == expected
 }
 
@@ -1226,6 +1235,10 @@ mod tests {
         assert_eq!(value["manifest_key"], "objects/snapshots/snap-1.json");
         assert_eq!(value["manifest_json"], "{}");
         assert!(snapshot_export_matches(&export, &export));
+
+        let mut compact = export.clone();
+        compact.manifest_json.clear();
+        assert!(snapshot_export_matches(&compact, &export));
     }
 
     #[test]

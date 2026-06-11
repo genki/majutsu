@@ -24,13 +24,21 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let export_bytes = remote.get(&metadata.key)?;
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     export.config.remote = Some(remote_config);
+    let compact_snapshot_metadata = export
+        .snapshots
+        .iter()
+        .any(|snapshot| snapshot.manifest_json.trim().is_empty());
     validate_config(&export.config)?;
     crate::validate_clone_host_summary(&metadata.host, metadata.host_index, &export)?;
-    crate::validate_clone_metadata(&export)?;
+    if !compact_snapshot_metadata {
+        crate::validate_clone_metadata(&export)?;
+    }
     crate::validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
     crate::validate_clone_remote_gc_mark(&remote, metadata.host.as_ref(), &export)?;
     crate::validate_clone_remote_lifecycle_artifacts(&remote)?;
-    ensure_clone_objects_available(&remote, &export)?;
+    if !compact_snapshot_metadata {
+        ensure_clone_objects_available(&remote, &export)?;
+    }
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
     let clone_result = (|| -> Result<()> {
@@ -50,6 +58,11 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             let key = env::var("MAJUTSU_MASTER_KEY")
                 .context("encrypted clone requires MAJUTSU_MASTER_KEY=<64-hex-key>")?;
             crate::write_master_key(&staging_paths, &key)?;
+        }
+        if compact_snapshot_metadata {
+            hydrate_compact_snapshot_manifests(&staging_paths, &remote, &mut export)?;
+            crate::validate_clone_metadata(&export)?;
+            ensure_clone_objects_available(&remote, &export)?;
         }
         crate::validate_clone_remote_oplog(
             &staging_paths,
@@ -163,6 +176,34 @@ fn clone_staging_home(home: &Path) -> PathBuf {
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| "majutsu".into());
     parent.join(format!(".{name}.clone-{}", Uuid::new_v4()))
+}
+
+fn hydrate_compact_snapshot_manifests(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &mut MetadataExport,
+) -> Result<()> {
+    for snapshot in &mut export.snapshots {
+        if !snapshot.manifest_json.trim().is_empty() {
+            continue;
+        }
+        let dest = paths.home.join(&snapshot.manifest_key);
+        if !dest.exists() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(
+                &dest,
+                crate::download_local_object_from_remote(paths, remote, &snapshot.manifest_key)?,
+            )?;
+        }
+        let bytes = crate::read_object(paths, &snapshot.manifest_key)
+            .with_context(|| format!("decode snapshot manifest {}", snapshot.manifest_key))?;
+        let manifest: majutsu_core::SnapshotManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse snapshot manifest {}", snapshot.manifest_key))?;
+        snapshot.manifest_json = serde_json::to_string(&manifest)?;
+    }
+    Ok(())
 }
 
 fn ensure_clone_objects_available(remote: &RemoteStore, export: &MetadataExport) -> Result<()> {

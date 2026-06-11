@@ -842,3 +842,9 @@ mj remote fsck --deep
 ```
 
 `mj sync` は小さな loose blob が多い場合に自動 pack してから upload し、pack 済みになった旧 loose blob object は他 host の GC mark を確認してから remote から削除する。S3 互換 remote の list は pagination に対応し、`remote fsck` は通常 quick mode、`--deep` 指定時のみ payload 検証を行う。調整項目は `docs/MOON_ROOT_STORAGE_OPTIMIZATION.md` を参照する。
+
+
+## remote metadata storage efficiency
+
+S3 互換 remote では、index file から埋め込み snapshot manifest を省略した compact
+metadata export を使う。詳細は `docs/REMOTE_METADATA_STORAGE.md` を参照する。
