@@ -1,5 +1,5 @@
 use anyhow::Result;
-use majutsu_core::{LargeManifest, LiveMetadataReferences, SnapshotManifest};
+use majutsu_core::{LargeManifest, LiveMetadataReferences};
 use majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use rusqlite::{Connection, params};
 use std::collections::BTreeSet;
@@ -114,10 +114,22 @@ fn protected_ref_snapshots(
 
 fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<PrunedMetadata> {
     let mut live = LiveMetadataReferences::default();
-    let mut stmt = conn.prepare("select manifest_json from snapshots")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut stmt = conn.prepare("select id, manifest_key, manifest_json from snapshots")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
     for row in rows {
-        let manifest: SnapshotManifest = serde_json::from_str(&row?)?;
+        let (id, manifest_key, manifest_json) = row?;
+        let manifest = crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &id,
+            &manifest_key,
+            &manifest_json,
+        )?;
         for manifest_key in live.add_snapshot_manifest(&manifest) {
             let large_manifest: LargeManifest =
                 serde_json::from_slice(&read_object(paths, &manifest_key)?)?;
@@ -162,8 +174,8 @@ pub(crate) fn gc_cmd(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
     let config = read_config(paths)?;
-    let export = export_metadata(&conn, &config)?;
-    let referenced = local_object_keys(&export)
+    let export = export_metadata(paths, &conn, &config)?;
+    let referenced = local_object_keys(paths, &export)?
         .into_iter()
         .collect::<BTreeSet<_>>();
     let mut removed = 0usize;
@@ -173,13 +185,56 @@ pub(crate) fn gc_cmd(paths: &Paths) -> Result<()> {
             removed += 1;
         }
     }
+    let (compacted_manifests, compacted_manifest_objects) =
+        compact_snapshot_manifest_metadata(paths, &conn)?;
     record_op(
         &conn,
         "gc",
         current_snapshot(&conn)?.as_deref(),
         current_snapshot(&conn)?.as_deref(),
-        Some(&format!("removed {removed} unreferenced objects")),
+        Some(&format!(
+            "removed {removed} unreferenced objects; compacted {compacted_manifests} manifests and {compacted_manifest_objects} manifest objects"
+        )),
     )?;
     println!("removed_unreferenced_objects {removed}");
+    println!("compacted_snapshot_manifests {compacted_manifests}");
+    println!("compacted_snapshot_manifest_objects {compacted_manifest_objects}");
     Ok(())
+}
+
+fn compact_snapshot_manifest_metadata(paths: &Paths, conn: &Connection) -> Result<(usize, usize)> {
+    let mut stmt =
+        conn.prepare("select id, manifest_key, manifest_json from snapshots order by created_at")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut compacted_metadata = 0usize;
+    let mut compacted_objects = 0usize;
+    for row in rows {
+        let (id, manifest_key, manifest_json) = row?;
+        let manifest = crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &id,
+            &manifest_key,
+            &manifest_json,
+        )?;
+        fs::write(
+            paths.home.join(&manifest_key),
+            crate::encode_compact_snapshot_manifest_for_local(paths, &manifest)?,
+        )?;
+        compacted_objects += 1;
+        if manifest_json.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "update snapshots set manifest_json='' where id=?1",
+            params![id],
+        )?;
+        compacted_metadata += 1;
+    }
+    Ok((compacted_metadata, compacted_objects))
 }

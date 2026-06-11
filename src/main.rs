@@ -148,7 +148,9 @@ use key_runtime::key_cmd;
 use large_runtime::large_cmd;
 use lifecycle_runtime::lifecycle_cmd;
 use mount_runtime::{hydrate_cmd, mount_cmd, unmount_cmd};
-use object_paths::{large_chunk_base, remote_live_object_keys, s3_remote_live_object_keys};
+use object_paths::{
+    large_chunk_base, remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
+};
 use operation_log::{
     query_operations, record_op, record_op_with_details, record_op_with_id, rewrite_local_oplog,
 };
@@ -288,7 +290,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let parent = current_snapshot(&conn)?;
     let parent_manifest = parent
         .as_deref()
-        .map(|id| load_snapshot_by_id(&conn, id))
+        .map(|id| load_snapshot_by_id(paths, &conn, id))
         .transpose()?;
     let op_id = new_id("op");
     let snapshot_id = new_id("snap");
@@ -474,7 +476,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
     let manifest_oid = blake3_hex(&manifest_json);
-    let manifest_key = store_bytes(paths, &paths.objects, &manifest_oid, &manifest_json)?;
+    let manifest_key = store_encoded_object_bytes(
+        paths,
+        &paths.objects,
+        &manifest_oid,
+        &encode_compact_snapshot_manifest_for_local(paths, &manifest)?,
+    )?;
     let tx = conn.transaction()?;
     for blob in &pending_blob_inserts {
         tx.execute(
@@ -491,7 +498,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             op_id,
             manifest.timestamp.to_rfc3339(),
             manifest_key,
-            String::from_utf8(manifest_json)?
+            ""
         ],
     )?;
     tx.execute(
@@ -637,8 +644,7 @@ pub(crate) fn validate_clone_remote_snapshot_objects(
     export: &MetadataExport,
 ) -> Result<()> {
     for snapshot in &export.snapshots {
-        let metadata_manifest: SnapshotManifest = serde_json::from_str(&snapshot.manifest_json)
-            .with_context(|| format!("parse snapshot manifest metadata {}", snapshot.id))?;
+        let metadata_manifest = raw_snapshot_manifest_from_export(paths, snapshot)?;
         for variant in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
             let remote_manifest: SnapshotManifest =
                 serde_json::from_slice(&decode_object(paths, &variant.bytes)?).with_context(
@@ -679,6 +685,17 @@ pub(crate) fn validate_clone_remote_snapshot_objects(
         }
     }
     Ok(())
+}
+
+fn raw_snapshot_manifest_from_export(
+    paths: &Paths,
+    snapshot: &SnapshotExport,
+) -> Result<SnapshotManifest> {
+    if !snapshot.manifest_json.trim().is_empty() {
+        return Ok(serde_json::from_str(&snapshot.manifest_json)?);
+    }
+    let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
+    Ok(serde_json::from_slice(&decode_object(paths, &bytes)?)?)
 }
 
 pub(crate) fn validate_clone_remote_large_objects(
@@ -1165,6 +1182,7 @@ pub(crate) fn validate_clone_remote_refs(
 }
 
 pub(crate) fn validate_clone_remote_gc_mark(
+    paths: &Paths,
     remote: &RemoteStore,
     host: Option<&RemoteHostSummary>,
     export: &MetadataExport,
@@ -1179,9 +1197,9 @@ pub(crate) fn validate_clone_remote_gc_mark(
     let mark: GcMarkExport = serde_json::from_slice(&remote.get(&key)?)
         .with_context(|| format!("parse remote gc mark {key}"))?;
     let expected = if matches!(remote, RemoteStore::S3(_)) {
-        s3_remote_live_object_keys(export)
+        s3_remote_live_object_keys_for_local(paths, export)?
     } else {
-        remote_live_object_keys(export)
+        remote_live_object_keys_for_local(paths, export)?
     }
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -1336,9 +1354,7 @@ pub(crate) fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
         issues.push(format_history_graph_issue(issue));
     }
     validate_clone_metadata_references(export, &mut issues);
-    for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
-        issues.push(format_large_pin_issue(issue));
-    }
+    validate_clone_large_pin_metadata_into(export, &mut issues);
     if issues.is_empty() {
         return Ok(());
     }
@@ -1354,6 +1370,21 @@ pub(crate) fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
         String::new()
     };
     bail!("remote metadata is inconsistent and cannot be cloned: {sample}{suffix}")
+}
+
+pub(crate) fn validate_clone_large_pin_metadata(export: &MetadataExport) -> Result<()> {
+    let mut issues = Vec::new();
+    validate_clone_large_pin_metadata_into(export, &mut issues);
+    if issues.is_empty() {
+        return Ok(());
+    }
+    bail!("{}", issues.remove(0))
+}
+
+fn validate_clone_large_pin_metadata_into(export: &MetadataExport, issues: &mut Vec<String>) {
+    for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
+        issues.push(format_large_pin_issue(issue));
+    }
 }
 
 fn validate_clone_metadata_references(export: &MetadataExport, issues: &mut Vec<String>) {
@@ -1492,17 +1523,16 @@ pub(crate) fn download_local_object_from_remote(
     let bytes = remote
         .get(&alias)
         .with_context(|| format!("download {key} via canonical alias {alias}"))?;
-    canonical_remote_object_to_local_bytes(paths, remote, key, &bytes)
+    canonical_remote_object_to_local_bytes(paths, key, &bytes)
 }
 
 fn canonical_remote_object_to_local_bytes(
     paths: &Paths,
-    remote: &RemoteStore,
     key: &str,
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
     if key.starts_with("objects/blobs/") {
-        if let Some(bytes) = compact_snapshot_manifest_to_local_bytes(paths, remote, bytes)? {
+        if let Some(bytes) = compact_snapshot_manifest_to_local_bytes(paths, bytes)? {
             return Ok(bytes);
         }
     }
@@ -1531,6 +1561,23 @@ pub(crate) fn encode_compact_snapshot_manifest_for_remote(
     paths: &Paths,
     manifest: &SnapshotManifest,
 ) -> Result<Vec<u8>> {
+    let value = compact_snapshot_manifest_value(manifest)?;
+    let cbor = serde_cbor::to_vec(&value)?;
+    let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
+    encode_object(paths, &compressed)
+}
+
+pub(crate) fn encode_compact_snapshot_manifest_for_local(
+    paths: &Paths,
+    manifest: &SnapshotManifest,
+) -> Result<Vec<u8>> {
+    encode_object(
+        paths,
+        &serde_json::to_vec_pretty(&compact_snapshot_manifest_value(manifest)?)?,
+    )
+}
+
+fn compact_snapshot_manifest_value(manifest: &SnapshotManifest) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(manifest)?;
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -1539,51 +1586,22 @@ pub(crate) fn encode_compact_snapshot_manifest_for_remote(
         );
         object.insert("roots_omitted".into(), serde_json::Value::Bool(true));
     }
-    let cbor = serde_cbor::to_vec(&value)?;
-    let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
-    encode_object(paths, &compressed)
+    Ok(value)
 }
 
 fn compact_snapshot_manifest_to_local_bytes(
     paths: &Paths,
-    remote: &RemoteStore,
     bytes: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    let Ok(mut manifest) = decode_canonical_remote_export::<SnapshotManifest>(paths, bytes) else {
+    let Ok(manifest) = decode_canonical_remote_export::<SnapshotManifest>(paths, bytes) else {
         return Ok(None);
     };
     if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
         return Ok(None);
     }
-    for (root_id, root_tree) in manifest.root_trees.clone() {
-        let tree_bytes = read_or_cache_remote_local_object(paths, remote, &root_tree.tree_key)
-            .with_context(|| format!("download root tree {}", root_tree.tree_key))?;
-        let tree: TreeManifest = serde_json::from_slice(&decode_object(paths, &tree_bytes)?)
-            .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
-        let entries = tree.entries.into_values().collect::<Vec<_>>();
-        manifest.roots.insert(root_id, entries);
-    }
-    Ok(Some(encode_object(
-        paths,
-        &serde_json::to_vec_pretty(&manifest)?,
+    Ok(Some(encode_compact_snapshot_manifest_for_local(
+        paths, &manifest,
     )?))
-}
-
-fn read_or_cache_remote_local_object(
-    paths: &Paths,
-    remote: &RemoteStore,
-    key: &str,
-) -> Result<Vec<u8>> {
-    let local = paths.home.join(key);
-    if local.exists() {
-        return fs::read(&local).with_context(|| format!("read cached remote object {key}"));
-    }
-    let bytes = download_local_object_from_remote(paths, remote, key)?;
-    if let Some(parent) = local.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&local, &bytes).with_context(|| format!("cache remote object {key}"))?;
-    Ok(bytes)
 }
 
 pub(crate) fn remote_object_available(remote: &RemoteStore, key: &str) -> Result<bool> {
@@ -1643,22 +1661,18 @@ pub(crate) fn remote_local_object_variants(
                 .with_context(|| format!("download {key} via canonical alias {alias}"))?;
             variants.push(RemoteObjectVariant {
                 remote_key: alias,
-                bytes: canonical_remote_object_to_local_bytes(paths, remote, key, &bytes)?,
+                bytes: canonical_remote_object_to_local_bytes(paths, key, &bytes)?,
             });
         }
     }
     Ok(variants)
 }
 
-fn build_restore_plan(
-    _paths: &Paths,
-    conn: &Connection,
-    args: &RestoreArgs,
-) -> Result<RestorePlan> {
+fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> Result<RestorePlan> {
     if let Some(path) = &args.path {
         validate_relative_filter_path(path, "restore --path")?;
     }
-    let snapshot = load_snapshot(conn, args)?;
+    let snapshot = load_snapshot(paths, conn, args)?;
     let root_paths = roots(conn)?
         .into_iter()
         .map(|root| (root.id, root.path))
@@ -2447,7 +2461,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn export_metadata(conn: &Connection, config: &Config) -> Result<MetadataExport> {
+pub(crate) fn export_metadata(
+    _paths: &Paths,
+    conn: &Connection,
+    config: &Config,
+) -> Result<MetadataExport> {
     let roots = roots(conn)?;
     let config_roots = roots.iter().map(ConfigRoot::from).collect();
     let mut snapshots = Vec::new();
@@ -2537,7 +2555,7 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
                 snapshot.op_id,
                 snapshot.created_at,
                 snapshot.manifest_key,
-                snapshot.manifest_json
+                ""
             ],
         )?;
     }
@@ -2778,6 +2796,15 @@ fn is_file_changed_error(err: &anyhow::Error) -> bool {
 }
 
 pub(crate) fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -> Result<String> {
+    store_encoded_object_bytes(paths, base, oid, &encode_object(paths, bytes)?)
+}
+
+pub(crate) fn store_encoded_object_bytes(
+    paths: &Paths,
+    base: &Path,
+    oid: &str,
+    bytes: &[u8],
+) -> Result<String> {
     let storage_id = object_storage_id(paths, oid)?;
     let (a, b) = storage_id.split_at(2);
     let dir = base.join(a);
@@ -2786,7 +2813,7 @@ pub(crate) fn store_bytes(paths: &Paths, base: &Path, oid: &str, bytes: &[u8]) -
     if !path.exists() {
         let tmp = path.with_extension("tmp");
         let mut f = File::create(&tmp)?;
-        f.write_all(&encode_object(paths, bytes)?)?;
+        f.write_all(bytes)?;
         if fsync_objects_enabled() {
             f.sync_all()?;
         }
@@ -2855,7 +2882,34 @@ pub(crate) fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
 
 pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
     let bytes = fs::read(paths.home.join(key))?;
-    decode_object(paths, &bytes)
+    let decoded = decode_object(paths, &bytes)?;
+    if key.starts_with("objects/blobs/") {
+        return hydrate_compact_snapshot_manifest_payload(paths, key, decoded);
+    }
+    Ok(decoded)
+}
+
+pub(crate) fn hydrate_compact_snapshot_manifest_payload(
+    paths: &Paths,
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let Ok(mut manifest) = serde_json::from_slice::<SnapshotManifest>(&bytes) else {
+        return Ok(bytes);
+    };
+    if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
+        return Ok(bytes);
+    }
+    for (root_id, root_tree) in manifest.root_trees.clone() {
+        let tree_bytes = read_object(paths, &root_tree.tree_key)
+            .with_context(|| format!("hydrate compact snapshot manifest {key} root {root_id}"))?;
+        let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
+            .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
+        manifest
+            .roots
+            .insert(root_id, tree.entries.into_values().collect());
+    }
+    Ok(serde_json::to_vec_pretty(&manifest)?)
 }
 
 pub(crate) fn read_blob_payload(

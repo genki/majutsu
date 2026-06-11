@@ -88,6 +88,59 @@ fn first_blob_object_key(state: &std::path::Path) -> String {
         .unwrap()
 }
 
+fn local_snapshot_manifest(state: &std::path::Path, order: &str) -> serde_json::Value {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let (manifest_key, manifest_json): (String, String) = conn
+        .query_row(
+            &format!("select manifest_key, manifest_json from snapshots order by created_at {order} limit 1"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    if !manifest_json.trim().is_empty() {
+        return serde_json::from_str(&manifest_json).unwrap();
+    }
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join(manifest_key)).unwrap()).unwrap();
+    if manifest["roots"]
+        .as_object()
+        .is_some_and(|roots| roots.is_empty())
+    {
+        let mut roots = serde_json::Map::new();
+        for (root_id, root_tree) in manifest["root_trees"].as_object().unwrap() {
+            let tree_key = root_tree["tree_key"].as_str().unwrap();
+            let tree: serde_json::Value =
+                serde_json::from_slice(&fs::read(state.join(tree_key)).unwrap()).unwrap();
+            roots.insert(
+                root_id.clone(),
+                serde_json::Value::Array(
+                    tree["entries"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .cloned()
+                        .collect(),
+                ),
+            );
+        }
+        manifest["roots"] = serde_json::Value::Object(roots);
+    }
+    manifest
+}
+
+fn remote_snapshot_manifest(
+    remote: &std::path::Path,
+    snapshot: &serde_json::Value,
+) -> serde_json::Value {
+    if let Some(manifest_json) = snapshot["manifest_json"].as_str()
+        && !manifest_json.trim().is_empty()
+    {
+        return serde_json::from_str(manifest_json).unwrap();
+    }
+    let manifest_key = snapshot["manifest_key"].as_str().unwrap();
+    serde_json::from_slice(&fs::read(remote.join(manifest_key)).unwrap()).unwrap()
+}
+
 fn canonical_loose_blob_key(object_key: &str) -> String {
     let rest = object_key
         .strip_prefix("objects/blobs/")
@@ -541,10 +594,8 @@ fn multi_root_sync_clone_restore_preserves_host_snapshot() {
         serde_json::from_slice(&fs::read(host_metadata_export_path(&remote)).unwrap()).unwrap();
     assert_eq!(export["roots"].as_array().unwrap().len(), 2);
     assert_eq!(export["snapshots"].as_array().unwrap().len(), 2);
-    let first_manifest: serde_json::Value =
-        serde_json::from_str(export["snapshots"][0]["manifest_json"].as_str().unwrap()).unwrap();
-    let second_manifest: serde_json::Value =
-        serde_json::from_str(export["snapshots"][1]["manifest_json"].as_str().unwrap()).unwrap();
+    let first_manifest = remote_snapshot_manifest(&remote, &export["snapshots"][0]);
+    let second_manifest = remote_snapshot_manifest(&remote, &export["snapshots"][1]);
     assert!(first_manifest["root_trees"].get("docs").is_some());
     assert!(first_manifest["root_trees"].get("projects").is_some());
     assert_eq!(
@@ -4575,10 +4626,8 @@ fn unchanged_root_reuses_previous_tree_object() {
         serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
     let snapshots = export["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 2);
-    let first_manifest: serde_json::Value =
-        serde_json::from_str(snapshots[0]["manifest_json"].as_str().unwrap()).unwrap();
-    let second_manifest: serde_json::Value =
-        serde_json::from_str(snapshots[1]["manifest_json"].as_str().unwrap()).unwrap();
+    let first_manifest = remote_snapshot_manifest(&remote, &snapshots[0]);
+    let second_manifest = remote_snapshot_manifest(&remote, &snapshots[1]);
     assert_eq!(
         first_manifest["root_trees"]["sample"]["tree_id"],
         second_manifest["root_trees"]["sample"]["tree_id"]
@@ -5360,15 +5409,7 @@ fn restore_preserves_file_mode_and_mtime() {
             .as_secs(),
         1_700_000_000
     );
-    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
-    let manifest_json: String = conn
-        .query_row(
-            "select manifest_json from snapshots order by created_at desc limit 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+    let manifest = local_snapshot_manifest(&state, "desc");
     let record = manifest["roots"]["sample"]
         .as_array()
         .unwrap()
@@ -8221,13 +8262,7 @@ fn fsck_detects_corrupt_local_tree_manifest_object() {
         c
     });
 
-    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
-    let manifest_json: String = conn
-        .query_row("select manifest_json from snapshots limit 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+    let manifest = local_snapshot_manifest(&state, "asc");
     let tree_key = manifest["root_trees"]["sample"]["tree_key"]
         .as_str()
         .unwrap();

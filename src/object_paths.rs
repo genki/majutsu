@@ -1,4 +1,5 @@
 use anyhow::Result;
+#[cfg(test)]
 use majutsu_core::SnapshotManifest;
 use std::path::PathBuf;
 use walkdir::WalkDir;
@@ -6,8 +7,123 @@ use walkdir::WalkDir;
 use crate::config::{MetadataExport, Paths};
 use crate::util::path_to_slash;
 use majutsu_store::{canonical_remote_alias, canonical_remote_aliases};
+use std::fs;
 
-pub(crate) fn local_object_keys(export: &MetadataExport) -> Vec<String> {
+pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for snapshot in &export.snapshots {
+        keys.push(snapshot.manifest_key.clone());
+        if let Ok(manifest) = snapshot_manifest_for_object_keys(paths, snapshot) {
+            for root_tree in manifest.root_trees.values() {
+                keys.push(root_tree.tree_key.clone());
+            }
+        }
+    }
+    for blob in &export.blobs {
+        if blob.pack_id.is_none() {
+            keys.push(blob.object_key.clone());
+        }
+    }
+    for pack in &export.packs {
+        keys.push(pack.pack_key.clone());
+        keys.push(pack.index_key.clone());
+    }
+    for large in &export.large_objects {
+        keys.push(large.manifest_key.clone());
+    }
+    for chunk in &export.chunks {
+        keys.push(chunk.object_key.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn snapshot_manifest_for_object_keys(
+    paths: &Paths,
+    snapshot: &majutsu_core::SnapshotExport,
+) -> Result<majutsu_core::SnapshotManifest> {
+    if !snapshot.manifest_json.trim().is_empty() {
+        return Ok(serde_json::from_str(&snapshot.manifest_json)?);
+    }
+    let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
+    Ok(serde_json::from_slice(&crate::decode_object(
+        paths, &bytes,
+    )?)?)
+}
+
+pub(crate) fn prefer_canonical_remote_only(key: &str) -> bool {
+    key.starts_with("objects/large/chunks/fixed/")
+        || key.starts_with("objects/large/chunks/fastcdc/")
+}
+
+pub(crate) fn prefer_s3_canonical_remote_only(key: &str) -> bool {
+    prefer_canonical_remote_only(key)
+        || key.starts_with("objects/trees/")
+        || key.starts_with("objects/blobs/")
+        || key.starts_with("objects/packs/")
+        || key.starts_with("objects/indexes/pack/")
+        || key.starts_with("objects/large/manifests/")
+}
+
+#[cfg(test)]
+pub(crate) fn remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
+    remote_live_object_keys_with_canonical_policy(export, prefer_canonical_remote_only)
+}
+
+#[cfg(test)]
+pub(crate) fn s3_remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
+    remote_live_object_keys_with_canonical_policy(export, prefer_s3_canonical_remote_only)
+}
+
+pub(crate) fn remote_live_object_keys_for_local(
+    paths: &Paths,
+    export: &MetadataExport,
+) -> Result<Vec<String>> {
+    remote_live_object_keys_from_local_keys(
+        local_object_keys(paths, export)?,
+        prefer_canonical_remote_only,
+    )
+}
+
+pub(crate) fn s3_remote_live_object_keys_for_local(
+    paths: &Paths,
+    export: &MetadataExport,
+) -> Result<Vec<String>> {
+    remote_live_object_keys_from_local_keys(
+        local_object_keys(paths, export)?,
+        prefer_s3_canonical_remote_only,
+    )
+}
+
+#[cfg(test)]
+fn remote_live_object_keys_with_canonical_policy(
+    export: &MetadataExport,
+    canonical_only: fn(&str) -> bool,
+) -> Vec<String> {
+    let local_keys = local_object_keys_from_metadata(export);
+    remote_live_object_keys_from_local_keys(local_keys, canonical_only)
+        .expect("metadata-only remote live object key calculation cannot fail")
+}
+
+fn remote_live_object_keys_from_local_keys(
+    local_keys: Vec<String>,
+    canonical_only: fn(&str) -> bool,
+) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for key in &local_keys {
+        if !canonical_only(key) {
+            keys.push(key.clone());
+        }
+        keys.extend(canonical_remote_aliases(key));
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+#[cfg(test)]
+pub(crate) fn local_object_keys_from_metadata(export: &MetadataExport) -> Vec<String> {
     let mut keys = Vec::new();
     for snapshot in &export.snapshots {
         keys.push(snapshot.manifest_key.clone());
@@ -31,45 +147,6 @@ pub(crate) fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     }
     for chunk in &export.chunks {
         keys.push(chunk.object_key.clone());
-    }
-    keys.sort();
-    keys.dedup();
-    keys
-}
-
-pub(crate) fn prefer_canonical_remote_only(key: &str) -> bool {
-    key.starts_with("objects/large/chunks/fixed/")
-        || key.starts_with("objects/large/chunks/fastcdc/")
-}
-
-pub(crate) fn prefer_s3_canonical_remote_only(key: &str) -> bool {
-    prefer_canonical_remote_only(key)
-        || key.starts_with("objects/trees/")
-        || key.starts_with("objects/blobs/")
-        || key.starts_with("objects/packs/")
-        || key.starts_with("objects/indexes/pack/")
-        || key.starts_with("objects/large/manifests/")
-}
-
-pub(crate) fn remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
-    remote_live_object_keys_with_canonical_policy(export, prefer_canonical_remote_only)
-}
-
-pub(crate) fn s3_remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
-    remote_live_object_keys_with_canonical_policy(export, prefer_s3_canonical_remote_only)
-}
-
-fn remote_live_object_keys_with_canonical_policy(
-    export: &MetadataExport,
-    canonical_only: fn(&str) -> bool,
-) -> Vec<String> {
-    let local_keys = local_object_keys(export);
-    let mut keys = Vec::new();
-    for key in &local_keys {
-        if !canonical_only(key) {
-            keys.push(key.clone());
-        }
-        keys.extend(canonical_remote_aliases(key));
     }
     keys.sort();
     keys.dedup();

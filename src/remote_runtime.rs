@@ -128,11 +128,11 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
 fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     let config = read_config(paths)?;
     let conn = open_db(paths)?;
-    let export = export_metadata(&conn, &config)?;
+    let export = export_metadata(paths, &conn, &config)?;
     if !remote.exists(REMOTE_HOST_INDEX_KEY)? && !remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
         bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
     }
-    let keys = local_object_keys(&export);
+    let keys = local_object_keys(paths, &export)?;
     let mut missing = 0usize;
     let start = std::time::Instant::now();
     for (idx, key) in keys.iter().enumerate() {

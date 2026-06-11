@@ -1,9 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use majutsu_core::{FileRecord, RootSnapshot, SnapshotManifest};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
+use std::fs;
 
 use crate::cli::RestoreArgs;
+use crate::config::Paths;
 use crate::util::parse_time;
 
 pub(crate) fn current_snapshot(conn: &Connection) -> Result<Option<String>> {
@@ -14,7 +16,11 @@ pub(crate) fn current_snapshot(conn: &Connection) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
-pub(crate) fn load_snapshot(conn: &Connection, args: &RestoreArgs) -> Result<SnapshotManifest> {
+pub(crate) fn load_snapshot(
+    paths: &Paths,
+    conn: &Connection,
+    args: &RestoreArgs,
+) -> Result<SnapshotManifest> {
     let id = if let Some(id) = &args.snapshot {
         id.clone()
     } else if let Some(at) = &args.at {
@@ -22,12 +28,7 @@ pub(crate) fn load_snapshot(conn: &Connection, args: &RestoreArgs) -> Result<Sna
     } else {
         current_snapshot(conn)?.ok_or_else(|| anyhow!("no current snapshot"))?
     };
-    let json: String = conn.query_row(
-        "select manifest_json from snapshots where id=?1",
-        params![id],
-        |row| row.get(0),
-    )?;
-    Ok(serde_json::from_str(&json)?)
+    load_snapshot_by_id(paths, conn, &id)
 }
 
 pub(crate) fn snapshot_id_at(conn: &Connection, at: &str) -> Result<String> {
@@ -40,21 +41,66 @@ pub(crate) fn snapshot_id_at(conn: &Connection, at: &str) -> Result<String> {
     .ok_or_else(|| anyhow!("no snapshot at or before {at}"))
 }
 
-pub(crate) fn load_snapshot_by_id(conn: &Connection, id: &str) -> Result<SnapshotManifest> {
-    let json: String = conn.query_row(
-        "select manifest_json from snapshots where id=?1",
+pub(crate) fn load_snapshot_by_id(
+    paths: &Paths,
+    conn: &Connection,
+    id: &str,
+) -> Result<SnapshotManifest> {
+    let (manifest_key, manifest_json): (String, String) = conn.query_row(
+        "select manifest_key, manifest_json from snapshots where id=?1",
         params![id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(serde_json::from_str(&json)?)
+    snapshot_manifest_from_parts(paths, id, &manifest_key, &manifest_json)
+}
+
+pub(crate) fn snapshot_manifest_from_parts(
+    paths: &Paths,
+    id: &str,
+    manifest_key: &str,
+    manifest_json: &str,
+) -> Result<SnapshotManifest> {
+    if !manifest_json.trim().is_empty() {
+        return serde_json::from_str(manifest_json)
+            .with_context(|| format!("parse snapshot manifest metadata {id}"));
+    }
+    let bytes = match crate::read_object(paths, manifest_key) {
+        Ok(bytes) => bytes,
+        Err(local_err) => hydrate_snapshot_manifest_from_remote(paths, manifest_key)
+            .and_then(|_| crate::read_object(paths, manifest_key))
+            .with_context(|| {
+                format!("read snapshot manifest object {id} {manifest_key}: {local_err}")
+            })?,
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
+}
+
+fn hydrate_snapshot_manifest_from_remote(paths: &Paths, manifest_key: &str) -> Result<()> {
+    let config = crate::config::read_config(paths)?;
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(());
+    };
+    let remote = crate::remote_store::open_remote(remote_config)?;
+    if !crate::remote_object_available(&remote, manifest_key)? {
+        return Ok(());
+    }
+    let bytes = crate::download_local_object_from_remote(paths, &remote, manifest_key)?;
+    let dest = paths.home.join(manifest_key);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(dest, bytes)?;
+    Ok(())
 }
 
 pub(crate) fn snapshot_contains_root(
+    paths: &Paths,
     conn: &Connection,
     snapshot_id: &str,
     root: &str,
 ) -> Result<bool> {
-    Ok(load_snapshot_by_id(conn, snapshot_id)?
+    Ok(load_snapshot_by_id(paths, conn, snapshot_id)?
         .roots
         .contains_key(root))
 }

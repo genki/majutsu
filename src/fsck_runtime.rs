@@ -39,7 +39,9 @@ use std::path::Path;
 use crate::config::{
     Config, HostConfig, METADATA_EXPORT_VERSION, Paths, RootConfig, read_config, validate_config,
 };
-use crate::object_paths::{local_object_keys, remote_live_object_keys, s3_remote_live_object_keys};
+use crate::object_paths::{
+    local_object_keys, remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
+};
 use crate::operation_log::{local_oplog_path, query_operations, record_op};
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::RemoteStore;
@@ -57,8 +59,8 @@ pub(crate) fn fsck(paths: &Paths) -> Result<()> {
     let conn = open_db(paths)?;
     let mut missing = 0usize;
     let config = read_config(paths)?;
-    let export = export_metadata(&conn, &config)?;
-    for key in local_object_keys(&export) {
+    let export = export_metadata(paths, &conn, &config)?;
+    for key in local_object_keys(paths, &export)? {
         let full = paths.home.join(&key);
         if !full.exists() {
             missing += 1;
@@ -417,7 +419,12 @@ fn validate_local_metadata_references(
 ) -> Result<()> {
     let mut live = LiveMetadataReferences::default();
     for snapshot in &export.snapshots {
-        let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
+        let manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &snapshot.id,
+            &snapshot.manifest_key,
+            &snapshot.manifest_json,
+        ) {
             Ok(manifest) => manifest,
             Err(_) => continue,
         };
@@ -461,15 +468,19 @@ fn validate_local_snapshot_objects(
     missing: &mut usize,
 ) -> Result<()> {
     for snapshot in &export.snapshots {
-        let metadata_manifest: SnapshotManifest =
-            match serde_json::from_str(&snapshot.manifest_json) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    *missing += 1;
-                    eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
-                    continue;
-                }
-            };
+        let metadata_manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &snapshot.id,
+            &snapshot.manifest_key,
+            &snapshot.manifest_json,
+        ) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
+                continue;
+            }
+        };
         match read_object(paths, &snapshot.manifest_key).and_then(|bytes| {
             serde_json::from_slice::<SnapshotManifest>(&bytes).map_err(Into::into)
         }) {
@@ -939,9 +950,13 @@ fn expected_gc_mark_object_keys(
 ) -> Result<BTreeSet<String>> {
     let export = export_with_hydrated_remote_snapshot_manifests(paths, remote, export)?;
     if matches!(remote, RemoteStore::S3(_)) {
-        return Ok(s3_remote_live_object_keys(&export).into_iter().collect());
+        return Ok(s3_remote_live_object_keys_for_local(paths, &export)?
+            .into_iter()
+            .collect());
     }
-    Ok(remote_live_object_keys(&export).into_iter().collect())
+    Ok(remote_live_object_keys_for_local(paths, &export)?
+        .into_iter()
+        .collect())
 }
 
 fn export_with_hydrated_remote_snapshot_manifests(
@@ -1255,7 +1270,12 @@ pub(crate) fn validate_remote_metadata_references(
 ) -> Result<()> {
     let mut live = LiveMetadataReferences::default();
     for snapshot in &export.snapshots {
-        let manifest: SnapshotManifest = match serde_json::from_str(&snapshot.manifest_json) {
+        let manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &snapshot.id,
+            &snapshot.manifest_key,
+            &snapshot.manifest_json,
+        ) {
             Ok(manifest) => manifest,
             Err(_) => continue,
         };
@@ -1301,25 +1321,32 @@ pub(crate) fn validate_remote_snapshot_objects(
     missing: &mut usize,
 ) -> Result<()> {
     for snapshot in &export.snapshots {
-        let metadata_manifest: SnapshotManifest =
-            match serde_json::from_str(&snapshot.manifest_json) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    *missing += 1;
-                    eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
-                    continue;
-                }
-            };
+        let metadata_manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &snapshot.id,
+            &snapshot.manifest_key,
+            &snapshot.manifest_json,
+        ) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid snapshot manifest metadata {}: {err}", snapshot.id);
+                continue;
+            }
+        };
         for bytes in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
+            let payload = crate::hydrate_compact_snapshot_manifest_payload(
+                paths,
+                &snapshot.manifest_key,
+                decode_object(paths, &bytes.bytes)?,
+            )?;
             let remote_manifest: SnapshotManifest =
-                serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
-                    || {
-                        format!(
-                            "parse snapshot manifest {} from {}",
-                            snapshot.manifest_key, bytes.remote_key
-                        )
-                    },
-                )?;
+                serde_json::from_slice(&payload).with_context(|| {
+                    format!(
+                        "parse snapshot manifest {} from {}",
+                        snapshot.manifest_key, bytes.remote_key
+                    )
+                })?;
             if !snapshot_manifest_matches(&remote_manifest, &metadata_manifest) {
                 *missing += 1;
                 eprintln!(
@@ -1718,7 +1745,7 @@ fn remote_fsck_export(
         }
     }
     validate_remote_chunk_index(paths, remote, &export, missing)?;
-    for key in local_object_keys(&export) {
+    for key in local_object_keys(paths, &export)? {
         let legacy_exists = remote.exists(&key)?;
         let aliases = canonical_remote_aliases(&key);
         let alias_exists = aliases

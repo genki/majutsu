@@ -120,6 +120,7 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
             let mut job = read_restore_job(paths, &job_id)?;
             ensure_restore_job_resumable(&job)?;
             ensure_restore_job_has_no_missing_objects(&job)?;
+            hydrate_restore_job_snapshot_manifest(paths, &job)?;
             hydrate_restore_job_objects(paths, &mut job)?;
             ensure_restore_job_not_blocked(&job)?;
             let args = RestoreArgs {
@@ -149,6 +150,33 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
             println!("restored to {}", restore_target_label(&plan));
         }
     }
+    Ok(())
+}
+
+fn hydrate_restore_job_snapshot_manifest(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
+    let conn = crate::open_db(paths)?;
+    let manifest_key: String = conn.query_row(
+        "select manifest_key from snapshots where id=?1",
+        params![job.snapshot_id],
+        |row| row.get(0),
+    )?;
+    let dest = paths.home.join(&manifest_key);
+    if dest.exists() {
+        return Ok(());
+    }
+    let config = read_config(paths)?;
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(());
+    };
+    let remote = open_remote(remote_config)?;
+    if !remote_object_available(&remote, &manifest_key)? {
+        return Ok(());
+    }
+    let bytes = download_local_object_from_remote(paths, &remote, &manifest_key)?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&dest, bytes).with_context(|| format!("hydrate snapshot manifest {manifest_key}"))?;
     Ok(())
 }
 

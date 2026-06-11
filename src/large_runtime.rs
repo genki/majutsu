@@ -8,7 +8,7 @@ use crate::cli::LargeCommand;
 use crate::config::Paths;
 use crate::fsck_runtime::fsck;
 use crate::operation_log::record_op;
-use crate::snapshot_state::{current_snapshot, load_snapshot_by_id};
+use crate::snapshot_state::{current_snapshot, load_snapshot_by_id, snapshot_manifest_from_parts};
 use crate::util::{parse_db_time, parse_duration_ago, parse_time};
 use crate::{ensure_ready, open_db};
 
@@ -53,7 +53,7 @@ pub(crate) fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
         LargeCommand::Pin(args) => {
             let snapshot =
                 current_snapshot(&conn)?.ok_or_else(|| anyhow!("no current snapshot"))?;
-            let manifests = large_pin_snapshots(&conn, args.since.as_deref(), &snapshot)?;
+            let manifests = large_pin_snapshots(paths, &conn, args.since.as_deref(), &snapshot)?;
             let mut pinned = 0usize;
             let mut seen = BTreeSet::new();
             for manifest in manifests {
@@ -114,24 +114,36 @@ pub(crate) fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
 }
 
 fn large_pin_snapshots(
+    paths: &Paths,
     conn: &Connection,
     since: Option<&str>,
     current_snapshot_id: &str,
 ) -> Result<Vec<SnapshotManifest>> {
     let Some(since) = since else {
-        return Ok(vec![load_snapshot_by_id(conn, current_snapshot_id)?]);
+        return Ok(vec![load_snapshot_by_id(paths, conn, current_snapshot_id)?]);
     };
     let cutoff = parse_pin_since(since)?;
-    let mut stmt =
-        conn.prepare("select manifest_json, created_at from snapshots order by created_at")?;
+    let mut stmt = conn.prepare(
+        "select id, manifest_key, manifest_json, created_at from snapshots order by created_at",
+    )?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })?;
     let mut manifests = Vec::new();
     for row in rows {
-        let (json, created_at) = row?;
+        let (id, manifest_key, manifest_json, created_at) = row?;
         if parse_db_time(&created_at)? >= cutoff {
-            manifests.push(serde_json::from_str(&json)?);
+            manifests.push(snapshot_manifest_from_parts(
+                paths,
+                &id,
+                &manifest_key,
+                &manifest_json,
+            )?);
         }
     }
     Ok(manifests)

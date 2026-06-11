@@ -28,18 +28,16 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         .snapshots
         .iter()
         .any(|snapshot| snapshot.manifest_json.trim().is_empty());
+    let staging_home = clone_staging_home(&paths.home);
+    let staging_paths = resolve_paths(Some(staging_home.clone()))?;
     validate_config(&export.config)?;
     crate::validate_clone_host_summary(&metadata.host, metadata.host_index, &export)?;
+    crate::validate_clone_large_pin_metadata(&export)?;
     if !compact_snapshot_metadata {
         crate::validate_clone_metadata(&export)?;
     }
     crate::validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
     crate::validate_clone_remote_lifecycle_artifacts(&remote)?;
-    if !compact_snapshot_metadata {
-        ensure_clone_objects_available(&remote, &export)?;
-    }
-    let staging_home = clone_staging_home(&paths.home);
-    let staging_paths = resolve_paths(Some(staging_home.clone()))?;
     let clone_result = (|| -> Result<()> {
         crate::create_layout(&staging_paths)?;
         write_config(&staging_paths, &export.config)?;
@@ -59,11 +57,14 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             crate::write_master_key(&staging_paths, &key)?;
         }
         if compact_snapshot_metadata {
-            hydrate_compact_snapshot_manifests(&staging_paths, &remote, &mut export)?;
-            crate::validate_clone_metadata(&export)?;
-            ensure_clone_objects_available(&remote, &export)?;
+            download_compact_snapshot_manifests(&staging_paths, &remote, &export)?;
         }
-        crate::validate_clone_remote_gc_mark(&remote, metadata.host.as_ref(), &export)?;
+        crate::validate_clone_remote_gc_mark(
+            &staging_paths,
+            &remote,
+            metadata.host.as_ref(),
+            &export,
+        )?;
         crate::validate_clone_remote_oplog(
             &staging_paths,
             &remote,
@@ -77,12 +78,14 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &export.snapshots,
             &export.operations,
         )?;
-        crate::validate_clone_remote_snapshot_objects(&staging_paths, &remote, &export)?;
-        crate::validate_clone_remote_blob_objects(&staging_paths, &remote, &export)?;
-        crate::validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
-        crate::validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
-        crate::validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
-        for key in local_object_keys(&export) {
+        if !matches!(remote, RemoteStore::S3(_)) {
+            crate::validate_clone_remote_snapshot_objects(&staging_paths, &remote, &export)?;
+            crate::validate_clone_remote_blob_objects(&staging_paths, &remote, &export)?;
+            crate::validate_clone_remote_chunk_index(&staging_paths, &remote, &export)?;
+            crate::validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
+            crate::validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
+        }
+        for key in local_object_keys(&staging_paths, &export)? {
             let dest = staging_paths.home.join(&key);
             if dest.exists() {
                 continue;
@@ -181,12 +184,12 @@ fn clone_staging_home(home: &Path) -> PathBuf {
     parent.join(format!(".{name}.clone-{}", Uuid::new_v4()))
 }
 
-fn hydrate_compact_snapshot_manifests(
+fn download_compact_snapshot_manifests(
     paths: &Paths,
     remote: &RemoteStore,
-    export: &mut MetadataExport,
+    export: &MetadataExport,
 ) -> Result<()> {
-    for snapshot in &mut export.snapshots {
+    for snapshot in &export.snapshots {
         if !snapshot.manifest_json.trim().is_empty() {
             continue;
         }
@@ -200,38 +203,6 @@ fn hydrate_compact_snapshot_manifests(
                 crate::download_local_object_from_remote(paths, remote, &snapshot.manifest_key)?,
             )?;
         }
-        let bytes = crate::read_object(paths, &snapshot.manifest_key)
-            .with_context(|| format!("decode snapshot manifest {}", snapshot.manifest_key))?;
-        let manifest: majutsu_core::SnapshotManifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse snapshot manifest {}", snapshot.manifest_key))?;
-        snapshot.manifest_json = serde_json::to_string(&manifest)?;
     }
     Ok(())
-}
-
-fn ensure_clone_objects_available(remote: &RemoteStore, export: &MetadataExport) -> Result<()> {
-    let mut missing = Vec::new();
-    for key in local_object_keys(export) {
-        if !crate::remote_object_available(remote, &key)? {
-            missing.push(key);
-        }
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-    let sample = missing
-        .iter()
-        .take(5)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let suffix = if missing.len() > 5 {
-        format!(", ... {} more", missing.len() - 5)
-    } else {
-        String::new()
-    };
-    bail!(
-        "remote is missing {} object(s) required for clone: {sample}{suffix}",
-        missing.len()
-    )
 }

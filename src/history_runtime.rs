@@ -1765,13 +1765,13 @@ pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
     if args.operations {
-        print_op_log(&conn, &args)
+        print_op_log(paths, &conn, &args)
     } else {
-        print_change_log(&conn, &args)
+        print_change_log(paths, &conn, &args)
     }
 }
 
-fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
+fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {
     let operations = recent_operations(conn)?;
     let mut printed = 0usize;
     let mut output = String::new();
@@ -1781,7 +1781,7 @@ fn print_change_log(conn: &Connection, args: &LogArgs) -> Result<()> {
         if printed >= args.limit {
             break;
         }
-        let changes = operation_file_changes(conn, &op, args.root.as_deref())?;
+        let changes = operation_file_changes(paths, conn, &op, args.root.as_deref())?;
         if changes.is_empty() {
             continue;
         }
@@ -1858,6 +1858,7 @@ struct FileChange {
 }
 
 fn operation_file_changes(
+    paths: &Paths,
     conn: &Connection,
     op: &OperationExport,
     root: Option<&str>,
@@ -1865,11 +1866,11 @@ fn operation_file_changes(
     let Some(after_id) = op.after_snapshot.as_deref() else {
         return Ok(Vec::new());
     };
-    let after = load_snapshot_by_id(conn, after_id)?;
+    let after = load_snapshot_by_id(paths, conn, after_id)?;
     let before = op
         .before_snapshot
         .as_deref()
-        .map(|id| load_snapshot_by_id(conn, id))
+        .map(|id| load_snapshot_by_id(paths, conn, id))
         .transpose()?;
     snapshot_file_changes(before.as_ref(), &after, root)
 }
@@ -1934,7 +1935,7 @@ fn color_change_status(ui: &StatusUi, status: &str) -> String {
     ui.severity(status, severity)
 }
 
-fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
+fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {
     let rows = recent_operations(conn)?;
     let mut printed = 0usize;
     let mut output = String::new();
@@ -1952,11 +1953,11 @@ fn print_op_log(conn: &Connection, args: &LogArgs) -> Result<()> {
             let matches_root = message.as_deref() == Some(root)
                 || before
                     .as_deref()
-                    .and_then(|snapshot| snapshot_contains_root(conn, snapshot, root).ok())
+                    .and_then(|snapshot| snapshot_contains_root(paths, conn, snapshot, root).ok())
                     .unwrap_or(false)
                 || after
                     .as_deref()
-                    .and_then(|snapshot| snapshot_contains_root(conn, snapshot, root).ok())
+                    .and_then(|snapshot| snapshot_contains_root(paths, conn, snapshot, root).ok())
                     .unwrap_or(false);
             if !matches_root {
                 continue;
@@ -1984,7 +1985,7 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
     match command {
-        OpCommand::Log(args) => print_op_log(&conn, &args),
+        OpCommand::Log(args) => print_op_log(paths, &conn, &args),
         OpCommand::Show(args) => {
             let op = query_operation(&conn, &args.op_id)?;
             println!("id {}", op.id);
@@ -2006,13 +2007,13 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
             );
             if args.files {
                 println!("files");
-                print_op_diff(&conn, &op, args.root.as_deref())?;
+                print_op_diff(paths, &conn, &op, args.root.as_deref())?;
             }
             Ok(())
         }
         OpCommand::Diff(args) => {
             let op = query_operation(&conn, &args.op_id)?;
-            print_op_diff(&conn, &op, args.root.as_deref())?;
+            print_op_diff(paths, &conn, &op, args.root.as_deref())?;
             Ok(())
         }
         OpCommand::Restore { op_id } => {
@@ -2041,15 +2042,20 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
     }
 }
 
-fn print_op_diff(conn: &Connection, op: &OperationExport, root: Option<&str>) -> Result<()> {
+fn print_op_diff(
+    paths: &Paths,
+    conn: &Connection,
+    op: &OperationExport,
+    root: Option<&str>,
+) -> Result<()> {
     let Some(after_id) = op.after_snapshot.as_deref() else {
         bail!("operation has no after snapshot to diff: {}", op.id);
     };
-    let after = load_snapshot_by_id(conn, after_id)?;
+    let after = load_snapshot_by_id(paths, conn, after_id)?;
     let before = op
         .before_snapshot
         .as_deref()
-        .map(|id| load_snapshot_by_id(conn, id))
+        .map(|id| load_snapshot_by_id(paths, conn, id))
         .transpose()?;
     print_snapshot_diff(before.as_ref(), &after, root)
 }
@@ -2065,14 +2071,14 @@ pub(crate) fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
         .clone()
         .or_else(|| current_snapshot(&conn).ok().flatten())
         .ok_or_else(|| anyhow!("no target snapshot"))?;
-    let to = load_snapshot_by_id(&conn, &to_id)?;
+    let to = load_snapshot_by_id(paths, &conn, &to_id)?;
     let from_id = if let Some(at) = &args.at {
         Some(snapshot_id_at(&conn, at)?)
     } else {
         args.from.or_else(|| to.parent.clone())
     };
     let from = if let Some(from_id) = from_id {
-        Some(load_snapshot_by_id(&conn, &from_id)?)
+        Some(load_snapshot_by_id(paths, &conn, &from_id)?)
     } else {
         None
     };

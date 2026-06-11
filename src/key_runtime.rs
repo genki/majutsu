@@ -7,7 +7,7 @@ use crate::cli::KeyCommand;
 use crate::config::{Paths, encryption_enabled, read_config};
 use crate::object_paths::large_chunk_base_for_key;
 use crate::operation_log::record_op;
-use crate::snapshot_state::current_snapshot;
+use crate::snapshot_state::{current_snapshot, snapshot_manifest_from_parts};
 use crate::util::blake3_hex;
 use crate::{
     build_tree_manifest, create_layout, open_db, query_blobs, query_chunks, query_large_objects,
@@ -80,13 +80,19 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
         large_manifests.insert(large.oid.clone(), manifest);
     }
     let mut snapshots = Vec::new();
-    let mut stmt = conn.prepare("select id, manifest_json from snapshots order by created_at")?;
+    let mut stmt =
+        conn.prepare("select id, manifest_key, manifest_json from snapshots order by created_at")?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     for row in rows {
-        let (id, json) = row?;
-        snapshots.push((id, serde_json::from_str::<SnapshotManifest>(&json)?));
+        let (id, manifest_key, manifest_json) = row?;
+        let manifest = snapshot_manifest_from_parts(paths, &id, &manifest_key, &manifest_json)?;
+        snapshots.push((id, manifest));
     }
 
     write_master_key(paths, &new_key)?;
@@ -160,10 +166,15 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
         }
         let manifest_json = serde_json::to_vec_pretty(&manifest)?;
         let manifest_oid = blake3_hex(&manifest_json);
-        let manifest_key = store_bytes(paths, &paths.objects, &manifest_oid, &manifest_json)?;
+        let manifest_key = crate::store_encoded_object_bytes(
+            paths,
+            &paths.objects,
+            &manifest_oid,
+            &crate::encode_compact_snapshot_manifest_for_local(paths, &manifest)?,
+        )?;
         conn.execute(
             "update snapshots set manifest_key=?2, manifest_json=?3 where id=?1",
-            params![snapshot_id, manifest_key, String::from_utf8(manifest_json)?],
+            params![snapshot_id, manifest_key, ""],
         )?;
         snapshots_rewritten += 1;
         objects += 1;

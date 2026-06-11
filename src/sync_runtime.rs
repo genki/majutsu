@@ -28,7 +28,7 @@ use crate::db_refs::{
 };
 use crate::object_paths::{
     canonical_alias_for_legacy_key, local_object_keys, prefer_s3_canonical_remote_only,
-    remote_live_object_keys, s3_remote_live_object_keys,
+    remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
 };
 use crate::operation_log::{record_op_with_details, update_operation_result};
 use crate::pack_runtime::pack_cmd;
@@ -131,7 +131,7 @@ fn sync_configured_remote(
     let _lock = acquire_process_lock(&paths.sync_lock, "sync")?;
     auto_pack_before_sync(paths, conn)?;
     let current = current_snapshot(conn)?;
-    let export = export_metadata(conn, config)?;
+    let export = export_metadata(paths, conn, config)?;
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     let remote_export = metadata_export_for_remote(remote, export);
     let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
@@ -350,8 +350,8 @@ fn enqueue_and_drain_sync(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
-    let content_export = export_metadata(conn, config)?;
-    let remote_export = metadata_export_for_remote(remote, export_metadata(conn, config)?);
+    let content_export = export_metadata(paths, conn, config)?;
+    let remote_export = metadata_export_for_remote(remote, export_metadata(paths, conn, config)?);
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &remote_export)?;
     let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
@@ -426,7 +426,12 @@ fn enqueue_and_drain_sync(
     enqueue_inline_upload(
         paths,
         &remote_gc_mark_key(&config.host.id),
-        serde_json::to_vec_pretty(&build_gc_mark_export(config, remote, &content_export))?,
+        serde_json::to_vec_pretty(&build_gc_mark_export(
+            paths,
+            config,
+            remote,
+            &content_export,
+        )?)?,
     )?;
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
@@ -456,7 +461,7 @@ fn enqueue_and_drain_sync(
     } else {
         None
     };
-    for key in local_object_keys(&content_export) {
+    for key in local_object_keys(paths, &content_export)? {
         let local = paths.home.join(&key);
         if local.exists() {
             let canonical_only =
@@ -824,8 +829,8 @@ fn sync_status_snapshot(
     if let Some(value) = remote_last_synced.as_deref() {
         set_remote_ref_value(conn, &remote.describe(), &canonical_last_synced, value)?;
     }
-    let export = export_metadata(conn, &read_config(paths)?)?;
-    let local_keys = local_object_keys(&export);
+    let export = export_metadata(paths, conn, &read_config(paths)?)?;
+    let local_keys = local_object_keys(paths, &export)?;
     let mut missing_remote = 0usize;
     for key in &local_keys {
         if !remote_object_available(remote, key)? {
@@ -972,21 +977,22 @@ fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
 }
 
 fn build_gc_mark_export(
+    paths: &Paths,
     config: &Config,
     remote: &RemoteStore,
     export: &MetadataExport,
-) -> GcMarkExport {
+) -> Result<GcMarkExport> {
     let object_keys = if remote_prefers_canonical_only(remote) {
-        s3_remote_live_object_keys(export)
+        s3_remote_live_object_keys_for_local(paths, export)?
     } else {
-        remote_live_object_keys(export)
+        remote_live_object_keys_for_local(paths, export)?
     };
-    GcMarkExport::new(
+    Ok(GcMarkExport::new(
         config.host.id.clone(),
         Utc::now(),
         export.refs.get("current").cloned(),
         object_keys,
-    )
+    ))
 }
 
 fn encode_canonical_local_object(

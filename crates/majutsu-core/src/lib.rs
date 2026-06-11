@@ -801,6 +801,25 @@ pub struct LargeChunk {
 }
 
 pub fn snapshot_manifest_matches(actual: &SnapshotManifest, expected: &SnapshotManifest) -> bool {
+    if actual.roots.is_empty() || expected.roots.is_empty() {
+        let mut actual = match serde_json::to_value(actual) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let mut expected = match serde_json::to_value(expected) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        if let Some(object) = actual.as_object_mut() {
+            object.remove("roots");
+            object.remove("roots_omitted");
+        }
+        if let Some(object) = expected.as_object_mut() {
+            object.remove("roots");
+            object.remove("roots_omitted");
+        }
+        return actual == expected;
+    }
     serde_json::to_value(actual).ok() == serde_json::to_value(expected).ok()
 }
 

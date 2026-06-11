@@ -31,7 +31,7 @@ pub(crate) fn branch_cmd(paths: &Paths, command: BranchCommand) -> Result<()> {
         BranchCommand::Current => show_current_branch(&conn),
         BranchCommand::Create(args) => create_branch(paths, &conn, args),
         BranchCommand::Switch(args) => switch_branch(paths, &conn, args),
-        BranchCommand::SetHead(args) => set_branch_head(&conn, args),
+        BranchCommand::SetHead(args) => set_branch_head(paths, &conn, args),
         BranchCommand::Delete(args) => delete_branch(&conn, args),
         BranchCommand::Rename(args) => rename_branch(&conn, args),
     }
@@ -100,7 +100,7 @@ fn show_current_branch(conn: &Connection) -> Result<()> {
 
 fn create_branch(paths: &Paths, conn: &Connection, args: BranchCreateArgs) -> Result<()> {
     validate_branch_name(&args.name)?;
-    let snapshot_id = resolve_snapshot(conn, args.snapshot.as_deref(), args.at.as_deref())?;
+    let snapshot_id = resolve_snapshot(paths, conn, args.snapshot.as_deref(), args.at.as_deref())?;
     let exists = branch_head(conn, &args.name)?.is_some();
     if exists && !args.force {
         bail!(
@@ -108,7 +108,7 @@ fn create_branch(paths: &Paths, conn: &Connection, args: BranchCreateArgs) -> Re
             args.name
         );
     }
-    load_snapshot_by_id(conn, &snapshot_id)?;
+    load_snapshot_by_id(paths, conn, &snapshot_id)?;
     let before = current_snapshot(conn)?;
     set_ref_value(conn, &branch_ref_name(&args.name), &snapshot_id)?;
     let mut after = before.clone();
@@ -153,13 +153,13 @@ fn switch_branch(paths: &Paths, conn: &Connection, args: BranchSwitchArgs) -> Re
     )
 }
 
-fn set_branch_head(conn: &Connection, args: BranchSetHeadArgs) -> Result<()> {
+fn set_branch_head(paths: &Paths, conn: &Connection, args: BranchSetHeadArgs) -> Result<()> {
     validate_branch_name(&args.name)?;
     let Some(old_head) = branch_head(conn, &args.name)? else {
         bail!("unknown branch: {}", args.name);
     };
-    let snapshot_id = resolve_snapshot(conn, args.snapshot.as_deref(), args.at.as_deref())?;
-    load_snapshot_by_id(conn, &snapshot_id)?;
+    let snapshot_id = resolve_snapshot(paths, conn, args.snapshot.as_deref(), args.at.as_deref())?;
+    load_snapshot_by_id(paths, conn, &snapshot_id)?;
     set_ref_value(conn, &branch_ref_name(&args.name), &snapshot_id)?;
     if active_branch(conn)?.as_deref() == Some(args.name.as_str()) {
         set_ref_value(conn, "current", &snapshot_id)?;
@@ -274,7 +274,7 @@ fn switch_to_branch(
     let Some(snapshot_id) = branch_head(conn, name)? else {
         bail!("unknown branch: {name}");
     };
-    load_snapshot_by_id(conn, &snapshot_id)?;
+    load_snapshot_by_id(paths, conn, &snapshot_id)?;
     let before = current_snapshot(conn)?;
     if options.restore {
         apply_branch_restore(paths, &snapshot_id, options.to, options.force).map_err(|err| {
@@ -320,11 +320,16 @@ fn apply_branch_restore(
     )
 }
 
-fn resolve_snapshot(conn: &Connection, snapshot: Option<&str>, at: Option<&str>) -> Result<String> {
+fn resolve_snapshot(
+    paths: &Paths,
+    conn: &Connection,
+    snapshot: Option<&str>,
+    at: Option<&str>,
+) -> Result<String> {
     match (snapshot, at) {
         (Some(_), Some(_)) => bail!("use either --snapshot or --at, not both"),
         (Some(snapshot), None) => {
-            load_snapshot_by_id(conn, snapshot)?;
+            load_snapshot_by_id(paths, conn, snapshot)?;
             Ok(snapshot.to_string())
         }
         (None, Some(at)) => snapshot_id_at(conn, at),
