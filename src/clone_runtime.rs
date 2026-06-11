@@ -30,13 +30,20 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     trace.mark("open remote");
     let loaded = clone_loaded_metadata(&remote, args.host.as_deref())?;
     trace.mark("select metadata");
-    let export_bytes = match loaded.export {
-        Some(export) => serde_json::to_vec(&export)?,
-        None => clone_metadata_bytes(&remote, &loaded.selection.key)?,
+    let mut export = match loaded.export {
+        Some(export) => {
+            trace.mark("download metadata");
+            trace.mark("parse metadata");
+            export
+        }
+        None => {
+            let export_bytes = clone_metadata_bytes(&remote, &loaded.selection.key)?;
+            trace.mark("download metadata");
+            let export = serde_json::from_slice(&export_bytes)?;
+            trace.mark("parse metadata");
+            export
+        }
     };
-    trace.mark("download metadata");
-    let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
-    trace.mark("parse metadata");
     export.config.remote = Some(remote_config);
     let compact_snapshot_metadata = export.snapshots.iter().any(snapshot_metadata_is_compact);
     let staging_home = clone_staging_home(&paths.home);
