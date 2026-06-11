@@ -43,8 +43,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-#[cfg(test)]
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -1566,6 +1565,130 @@ pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Resu
     fs::write(&tmp, bytes)?;
     fs::rename(&tmp, &dest)?;
     Ok(true)
+}
+
+pub(crate) fn hydrate_local_objects_from_remote(paths: &Paths, keys: Vec<String>) -> Result<usize> {
+    let mut keys = keys
+        .into_iter()
+        .filter(|key| !paths.home.join(key).exists())
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let Ok(config) = read_config(paths) else {
+        return Ok(0);
+    };
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(0);
+    };
+    let remote = open_remote(remote_config)?;
+    if !matches!(remote, RemoteStore::S3(_)) {
+        let mut hydrated = 0usize;
+        for key in keys {
+            if hydrate_one_local_object_from_remote(paths, &remote, &key)? {
+                hydrated += 1;
+            }
+        }
+        return Ok(hydrated);
+    }
+    hydrate_local_objects_from_remote_parallel(paths, remote, keys)
+}
+
+fn hydrate_local_objects_from_remote_parallel(
+    paths: &Paths,
+    remote: RemoteStore,
+    keys: Vec<String>,
+) -> Result<usize> {
+    let workers = restore_prefetch_parallelism().min(keys.len());
+    let paths = Arc::new(paths.clone());
+    let remote = Arc::new(remote);
+    let keys = Arc::new(Mutex::new(keys.into_iter()));
+    let (result_tx, result_rx) = mpsc::channel::<Result<usize>>();
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let paths = Arc::clone(&paths);
+        let remote = Arc::clone(&remote);
+        let keys = Arc::clone(&keys);
+        let result_tx = result_tx.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut hydrated = 0usize;
+            loop {
+                let key = {
+                    let mut keys = match keys.lock() {
+                        Ok(keys) => keys,
+                        Err(err) => {
+                            let _ = result_tx
+                                .send(Err(anyhow!("restore prefetch queue poisoned: {err}")));
+                            return;
+                        }
+                    };
+                    keys.next()
+                };
+                let Some(key) = key else {
+                    break;
+                };
+                match hydrate_one_local_object_from_remote(&paths, &remote, &key) {
+                    Ok(true) => hydrated += 1,
+                    Ok(false) => {}
+                    Err(err) => {
+                        let _ = result_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+            let _ = result_tx.send(Ok(hydrated));
+        }));
+    }
+    drop(result_tx);
+    let mut hydrated = 0usize;
+    let mut first_error = None;
+    for result in result_rx {
+        match result {
+            Ok(count) => hydrated += count,
+            Err(err) => {
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    for handle in handles {
+        if let Err(err) = handle.join() {
+            first_error.get_or_insert_with(|| anyhow!("restore prefetch worker panicked: {err:?}"));
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(hydrated)
+}
+
+fn hydrate_one_local_object_from_remote(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+) -> Result<bool> {
+    let dest = paths.home.join(key);
+    if dest.exists() {
+        return Ok(false);
+    }
+    let bytes = download_local_object_from_remote(paths, remote, key)
+        .with_context(|| format!("prefetch restore object {key}"))?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &dest)?;
+    Ok(true)
+}
+
+fn restore_prefetch_parallelism() -> usize {
+    env::var("MAJUTSU_RESTORE_PREFETCH_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32)
 }
 
 fn canonical_remote_object_to_local_bytes(

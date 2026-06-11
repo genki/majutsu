@@ -26,8 +26,9 @@ use crate::restore_apply::{
 };
 use crate::{
     build_restore_job, decode_object, download_local_object_from_remote,
-    hydrate_restore_job_objects, query_blobs, read_blob_payload, read_large_chunk, read_object,
-    remote_object_available, request_archive_restore_for_job, write_large_chunks_atomic,
+    hydrate_local_objects_from_remote, hydrate_restore_job_objects, query_blobs, read_blob_payload,
+    read_large_chunk, read_object, remote_object_available, request_archive_restore_for_job,
+    write_large_chunks_atomic,
 };
 
 #[derive(Debug)]
@@ -607,6 +608,11 @@ pub(crate) fn apply_restore_plan(
             bail!("restore would delete extra files; rerun with --force to delete them");
         }
     }
+    let required_objects = required_object_keys_for_plan(paths, &conn, plan)?
+        .into_iter()
+        .filter(|key| restore_apply_prefetches_object(key))
+        .collect();
+    hydrate_local_objects_from_remote(paths, required_objects)?;
     for delete in &plan.deletes {
         let dest = restore_delete_destination(plan, delete)?;
         if fs::symlink_metadata(&dest).is_ok() {
@@ -651,6 +657,10 @@ pub(crate) fn apply_restore_plan(
         apply_file_metadata(&dest, record)?;
     }
     Ok(())
+}
+
+fn restore_apply_prefetches_object(key: &str) -> bool {
+    !key.starts_with("objects/packs/") && !key.starts_with("objects/indexes/pack/")
 }
 
 pub(crate) fn restore_conflicts(
