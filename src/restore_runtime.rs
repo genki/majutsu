@@ -565,7 +565,9 @@ pub(crate) fn read_large_manifest_for_restore(
     paths: &Paths,
     manifest_key: &str,
 ) -> Result<LargeManifest> {
-    match read_object(paths, manifest_key) {
+    match fs::read(paths.home.join(manifest_key))
+        .and_then(|bytes| decode_object(paths, &bytes).map_err(std::io::Error::other))
+    {
         Ok(bytes) => return serde_json::from_slice(&bytes).map_err(Into::into),
         Err(local_err) => {
             let config = read_config(paths).with_context(|| {

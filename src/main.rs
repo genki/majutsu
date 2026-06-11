@@ -1145,9 +1145,11 @@ pub(crate) fn validate_clone_remote_refs(
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    for key in remote.list(&format!("hosts/{}/refs/", host.id))? {
-        if !expected_ref_keys.contains(&key) {
-            bail!("remote has unexpected host ref {key}");
+    if !matches!(remote, RemoteStore::S3(_)) {
+        for key in remote.list(&format!("hosts/{}/refs/", host.id))? {
+            if !expected_ref_keys.contains(&key) {
+                bail!("remote has unexpected host ref {key}");
+            }
         }
     }
     if let Some(current) = export.refs.get("current") {
@@ -1159,13 +1161,15 @@ pub(crate) fn validate_clone_remote_refs(
             ),
             None => bail!("remote is missing canonical host current ref {key}"),
         }
-        let legacy_key = host_legacy_current_key(&host.id);
-        if let Some(legacy_current) = remote_ref(remote, &legacy_key)?
-            && legacy_current != *current
-        {
-            bail!(
-                "remote ref {legacy_key} points to {legacy_current}, expected metadata current {current}"
-            );
+        if !matches!(remote, RemoteStore::S3(_)) {
+            let legacy_key = host_legacy_current_key(&host.id);
+            if let Some(legacy_current) = remote_ref(remote, &legacy_key)?
+                && legacy_current != *current
+            {
+                bail!(
+                    "remote ref {legacy_key} points to {legacy_current}, expected metadata current {current}"
+                );
+            }
         }
     }
     if let Some(last_synced) = export.refs.get("last-synced") {
@@ -1538,6 +1542,31 @@ pub(crate) fn download_local_object_from_remote(
         .get(&alias)
         .with_context(|| format!("download {key} via canonical alias {alias}"))?;
     canonical_remote_object_to_local_bytes(paths, key, &bytes)
+}
+
+pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Result<bool> {
+    let dest = paths.home.join(key);
+    if dest.exists() {
+        return Ok(true);
+    }
+    let Ok(config) = read_config(paths) else {
+        return Ok(false);
+    };
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(false);
+    };
+    let remote = open_remote(remote_config)?;
+    let bytes = match download_local_object_from_remote(paths, &remote, key) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &dest)?;
+    Ok(true)
 }
 
 fn canonical_remote_object_to_local_bytes(
@@ -2552,15 +2581,16 @@ pub(crate) fn export_metadata(
     })
 }
 
-fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
+fn import_metadata(conn: &mut Connection, export: &MetadataExport) -> Result<()> {
+    let tx = conn.transaction()?;
     for root in &export.roots {
-        conn.execute(
+        tx.execute(
             "insert or replace into roots(id, data_json) values (?1, ?2)",
             params![root.id, serde_json::to_string(root)?],
         )?;
     }
     for snapshot in &export.snapshots {
-        conn.execute(
+        tx.execute(
             "insert or replace into snapshots(id, parent_id, op_id, created_at, manifest_key, manifest_json)
              values (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -2574,7 +2604,7 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
         )?;
     }
     for op in &export.operations {
-        conn.execute(
+        tx.execute(
             "insert or replace into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
              values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
@@ -2593,42 +2623,43 @@ fn import_metadata(conn: &Connection, export: &MetadataExport) -> Result<()> {
         )?;
     }
     for (name, value) in &export.refs {
-        conn.execute(
+        tx.execute(
             "insert or replace into refs(name, value) values (?1, ?2)",
             params![name, value],
         )?;
     }
     for blob in &export.blobs {
-        conn.execute(
+        tx.execute(
             "insert or replace into blobs(oid, size, object_key, pack_id, pack_offset, pack_len) values (?1, ?2, ?3, ?4, ?5, ?6)",
             params![blob.oid, blob.size, blob.object_key, blob.pack_id, blob.pack_offset, blob.pack_len],
         )?;
     }
     for pack in &export.packs {
-        conn.execute(
+        tx.execute(
             "insert or replace into packs(pack_id, pack_key, index_key, object_count, size) values (?1, ?2, ?3, ?4, ?5)",
             params![pack.pack_id, pack.pack_key, pack.index_key, pack.object_count, pack.size],
         )?;
     }
     for large in &export.large_objects {
-        conn.execute(
+        tx.execute(
             "insert or replace into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
             params![large.oid, large.size, large.chunk_count, large.manifest_key],
         )?;
     }
     for chunk in &export.chunks {
-        conn.execute(
+        tx.execute(
             "insert or replace into chunks(oid, size, object_key) values (?1, ?2, ?3)",
             params![chunk.oid, chunk.size, chunk.object_key],
         )?;
     }
     for pin in &export.large_pins {
-        conn.execute(
+        tx.execute(
             "insert or replace into large_pins(oid, pinned_at, reason) values (?1, ?2, ?3)",
             params![pin.oid, pin.pinned_at, pin.reason],
         )?;
     }
-    rewrite_local_oplog(conn)?;
+    rewrite_local_oplog(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2895,6 +2926,11 @@ pub(crate) fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
+    let path = paths.home.join(key);
+    if !path.exists() {
+        hydrate_local_object_from_remote(paths, key)
+            .with_context(|| format!("hydrate missing local object {key}"))?;
+    }
     let bytes = fs::read(paths.home.join(key))?;
     let decoded = decode_object(paths, &bytes)?;
     if key.starts_with("objects/blobs/") {
@@ -2958,6 +2994,10 @@ pub(crate) fn read_blob_payload(
             .ok_or_else(|| anyhow!("missing pack len for {oid}"))? as usize;
         if !paths.home.join(&pack.pack_key).exists() && paths.home.join(fallback_key).exists() {
             return read_object(paths, fallback_key);
+        }
+        if !paths.home.join(&pack.pack_key).exists() {
+            hydrate_local_object_from_remote(paths, &pack.pack_key)
+                .with_context(|| format!("hydrate missing pack object {}", pack.pack_key))?;
         }
         let bytes = fs::read(paths.home.join(pack.pack_key))?;
         let slice = bytes

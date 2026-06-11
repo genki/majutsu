@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::cli::CloneArgs;
@@ -17,14 +18,19 @@ use crate::remote_runtime::{read_remote_host_index, remote_host_index_with_legac
 use crate::remote_store::{RemoteStore, open_remote};
 
 pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
+    let trace = CloneTrace::new();
     if paths.home.exists() && paths.home.read_dir()?.next().is_some() {
         bail!("target majutsu home is not empty: {}", paths.home.display());
     }
     let remote_config = RemoteConfig::from_url(args.remote);
     let remote = open_remote(&remote_config)?;
+    trace.mark("open remote");
     let metadata = clone_metadata_selection(&remote, args.host.as_deref())?;
+    trace.mark("select metadata");
     let export_bytes = remote.get(&metadata.key)?;
+    trace.mark("download metadata");
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
+    trace.mark("parse metadata");
     export.config.remote = Some(remote_config);
     let compact_snapshot_metadata = export.snapshots.iter().any(snapshot_metadata_is_compact);
     let staging_home = clone_staging_home(&paths.home);
@@ -36,7 +42,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         crate::validate_clone_metadata(&export)?;
     }
     crate::validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
-    crate::validate_clone_remote_lifecycle_artifacts(&remote)?;
+    trace.mark("validate bootstrap metadata");
     let clone_result = (|| -> Result<()> {
         crate::create_layout(&staging_paths)?;
         write_config(&staging_paths, &export.config)?;
@@ -58,19 +64,21 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         if compact_snapshot_metadata {
             download_compact_snapshot_manifests(&staging_paths, &remote, &export)?;
         }
-        crate::validate_clone_remote_gc_mark(
-            &staging_paths,
-            &remote,
-            metadata.host.as_ref(),
-            &export,
-        )?;
-        crate::validate_clone_remote_oplog(
-            &staging_paths,
-            &remote,
-            metadata.host.as_ref(),
-            &export.operations,
-        )?;
+        trace.mark("write bootstrap files");
         if !matches!(remote, RemoteStore::S3(_)) {
+            crate::validate_clone_remote_lifecycle_artifacts(&remote)?;
+            crate::validate_clone_remote_gc_mark(
+                &staging_paths,
+                &remote,
+                metadata.host.as_ref(),
+                &export,
+            )?;
+            crate::validate_clone_remote_oplog(
+                &staging_paths,
+                &remote,
+                metadata.host.as_ref(),
+                &export.operations,
+            )?;
             crate::validate_clone_remote_timeline_exports(
                 &staging_paths,
                 &remote,
@@ -84,15 +92,20 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             crate::validate_clone_remote_pack_objects(&staging_paths, &remote, &export)?;
             crate::validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
         }
-        materialize_clone_objects(&staging_paths, &remote, &export)?;
-        let conn = crate::open_db(&staging_paths)?;
-        crate::import_metadata(&conn, &export)?;
+        trace.mark("validate remote objects");
+        if clone_should_materialize_objects(&remote) {
+            materialize_clone_objects(&staging_paths, &remote, &export)?;
+        }
+        trace.mark("materialize objects");
+        let mut conn = crate::open_db(&staging_paths)?;
+        crate::import_metadata(&mut conn, &export)?;
         persist_export_remote_refs(
             &conn,
             &remote.describe(),
             &export.config.host.id,
             &export.refs,
         )?;
+        trace.mark("import metadata");
         Ok(())
     })();
     if let Err(err) = clone_result {
@@ -112,7 +125,33 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    trace.mark("finish");
     Ok(())
+}
+
+struct CloneTrace {
+    enabled: bool,
+    start: Instant,
+}
+
+impl CloneTrace {
+    fn new() -> Self {
+        Self {
+            enabled: env::var("MAJUTSU_TRACE_CLONE")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
+            start: Instant::now(),
+        }
+    }
+
+    fn mark(&self, label: &str) {
+        if self.enabled {
+            eprintln!(
+                "clone_trace elapsed_ms={} stage={label}",
+                self.start.elapsed().as_millis()
+            );
+        }
+    }
 }
 
 fn snapshot_metadata_is_compact(snapshot: &majutsu_core::SnapshotExport) -> bool {
@@ -288,4 +327,13 @@ fn clone_parallel_downloads() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(32)
+}
+
+fn clone_should_materialize_objects(remote: &RemoteStore) -> bool {
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return true;
+    }
+    env::var("MAJUTSU_CLONE_FULL_MATERIALIZE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }

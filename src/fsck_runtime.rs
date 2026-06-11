@@ -616,7 +616,11 @@ fn validate_local_pack_objects(
                 );
             }
         }
-        match fs::read(paths.home.join(&pack.pack_key)) {
+        let pack_path = paths.home.join(&pack.pack_key);
+        if !pack_path.exists() {
+            let _ = crate::hydrate_local_object_from_remote(paths, &pack.pack_key);
+        }
+        match fs::read(&pack_path) {
             Ok(bytes) => {
                 for issue in pack_object_issues(pack, bytes.len() as u64, &expected_blob_metadata) {
                     *missing += 1;
