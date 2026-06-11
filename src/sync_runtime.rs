@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use majutsu_core::{LargeManifest, OperationLogEntry as OperationExport, TreeManifest};
+use majutsu_core::{
+    LargeManifest, OperationLogEntry as OperationExport, SnapshotManifest, TreeManifest,
+};
 use majutsu_pack::PackIndex;
 use majutsu_store::{
     REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY, RemoteChunkIndexEntry as ChunkIndexEntry,
@@ -444,6 +446,11 @@ fn enqueue_and_drain_sync(
         )?;
     }
 
+    let snapshot_manifest_keys = content_export
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.manifest_key.as_str())
+        .collect::<BTreeSet<_>>();
     let existing_canonical_aliases = if remote_prefers_canonical_only(remote) {
         Some(list_remote_canonical_content_aliases(remote)?)
     } else {
@@ -472,7 +479,7 @@ fn enqueue_and_drain_sync(
                     enqueue_inline_upload(
                         paths,
                         &alias,
-                        encode_canonical_local_object(paths, &key)?,
+                        encode_canonical_local_object(paths, &key, &snapshot_manifest_keys)?,
                     )?;
                 } else {
                     enqueue_file_upload(paths, &alias, &local)?;
@@ -982,8 +989,17 @@ fn build_gc_mark_export(
     )
 }
 
-fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
+fn encode_canonical_local_object(
+    paths: &Paths,
+    key: &str,
+    snapshot_manifest_keys: &BTreeSet<&str>,
+) -> Result<Vec<u8>> {
     let bytes = read_object(paths, key)?;
+    if snapshot_manifest_keys.contains(key) {
+        let manifest: SnapshotManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode snapshot manifest {key}"))?;
+        return crate::encode_compact_snapshot_manifest_for_remote(paths, &manifest);
+    }
     if key.starts_with("objects/trees/") {
         let manifest: TreeManifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode tree manifest {key}"))?;
@@ -1002,7 +1018,8 @@ fn encode_canonical_local_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
 }
 
 fn canonical_alias_uses_structured_encoding(key: &str) -> bool {
-    key.starts_with("objects/trees/")
+    key.starts_with("objects/blobs/")
+        || key.starts_with("objects/trees/")
         || key.starts_with("objects/indexes/pack/")
         || key.starts_with("objects/large/manifests/")
 }

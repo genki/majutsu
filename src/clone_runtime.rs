@@ -84,6 +84,9 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         crate::validate_clone_remote_large_objects(&staging_paths, &remote, &export)?;
         for key in local_object_keys(&export) {
             let dest = staging_paths.home.join(&key);
+            if dest.exists() {
+                continue;
+            }
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }

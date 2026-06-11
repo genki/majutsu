@@ -1492,14 +1492,20 @@ pub(crate) fn download_local_object_from_remote(
     let bytes = remote
         .get(&alias)
         .with_context(|| format!("download {key} via canonical alias {alias}"))?;
-    canonical_remote_object_to_local_bytes(paths, key, &bytes)
+    canonical_remote_object_to_local_bytes(paths, remote, key, &bytes)
 }
 
 fn canonical_remote_object_to_local_bytes(
     paths: &Paths,
+    remote: &RemoteStore,
     key: &str,
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
+    if key.starts_with("objects/blobs/") {
+        if let Some(bytes) = compact_snapshot_manifest_to_local_bytes(paths, remote, bytes)? {
+            return Ok(bytes);
+        }
+    }
     if key.starts_with("objects/trees/") {
         let manifest: TreeManifest = decode_canonical_remote_export(paths, bytes)?;
         return Ok(encode_object(
@@ -1519,6 +1525,65 @@ fn canonical_remote_object_to_local_bytes(
         )?);
     }
     Ok(bytes.to_vec())
+}
+
+pub(crate) fn encode_compact_snapshot_manifest_for_remote(
+    paths: &Paths,
+    manifest: &SnapshotManifest,
+) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(manifest)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "roots".into(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+        object.insert("roots_omitted".into(), serde_json::Value::Bool(true));
+    }
+    let cbor = serde_cbor::to_vec(&value)?;
+    let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
+    encode_object(paths, &compressed)
+}
+
+fn compact_snapshot_manifest_to_local_bytes(
+    paths: &Paths,
+    remote: &RemoteStore,
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let Ok(mut manifest) = decode_canonical_remote_export::<SnapshotManifest>(paths, bytes) else {
+        return Ok(None);
+    };
+    if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
+        return Ok(None);
+    }
+    for (root_id, root_tree) in manifest.root_trees.clone() {
+        let tree_bytes = read_or_cache_remote_local_object(paths, remote, &root_tree.tree_key)
+            .with_context(|| format!("download root tree {}", root_tree.tree_key))?;
+        let tree: TreeManifest = serde_json::from_slice(&decode_object(paths, &tree_bytes)?)
+            .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
+        let entries = tree.entries.into_values().collect::<Vec<_>>();
+        manifest.roots.insert(root_id, entries);
+    }
+    Ok(Some(encode_object(
+        paths,
+        &serde_json::to_vec_pretty(&manifest)?,
+    )?))
+}
+
+fn read_or_cache_remote_local_object(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+) -> Result<Vec<u8>> {
+    let local = paths.home.join(key);
+    if local.exists() {
+        return fs::read(&local).with_context(|| format!("read cached remote object {key}"));
+    }
+    let bytes = download_local_object_from_remote(paths, remote, key)?;
+    if let Some(parent) = local.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&local, &bytes).with_context(|| format!("cache remote object {key}"))?;
+    Ok(bytes)
 }
 
 pub(crate) fn remote_object_available(remote: &RemoteStore, key: &str) -> Result<bool> {
@@ -1578,7 +1643,7 @@ pub(crate) fn remote_local_object_variants(
                 .with_context(|| format!("download {key} via canonical alias {alias}"))?;
             variants.push(RemoteObjectVariant {
                 remote_key: alias,
-                bytes: canonical_remote_object_to_local_bytes(paths, key, &bytes)?,
+                bytes: canonical_remote_object_to_local_bytes(paths, remote, key, &bytes)?,
             });
         }
     }
