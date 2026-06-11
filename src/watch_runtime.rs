@@ -635,16 +635,16 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(Ok(test_event("a.txt"))).unwrap();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(15));
+            thread::sleep(Duration::from_millis(20));
             tx.send(Ok(test_event("b.txt"))).unwrap();
-            thread::sleep(Duration::from_millis(80));
+            thread::sleep(Duration::from_millis(120));
         });
 
         let outcome = drain_watch_event_buffer(
             &paths,
             &rx,
             WatchEventBufferConfig {
-                quiet: Duration::from_millis(30),
+                quiet: Duration::from_millis(80),
                 settle: Duration::ZERO,
                 max_latency: Duration::from_millis(500),
                 max_events: 100,
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(outcome.reason, "quiet");
         assert_eq!(outcome.events, 3);
         assert!(
-            outcome.elapsed_ms >= 40,
+            outcome.elapsed_ms >= 90,
             "quiet window should slide after later events: {outcome:?}"
         );
     }

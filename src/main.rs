@@ -559,12 +559,11 @@ fn record_snapshot_failure(
 }
 
 pub(crate) fn remote_ref(remote: &RemoteStore, key: &str) -> Result<Option<String>> {
-    if remote.exists(key)? {
-        return Ok(Some(
-            String::from_utf8(remote.get(key)?)?.trim().to_string(),
-        ));
-    }
-    Ok(None)
+    remote
+        .get_optional(key)?
+        .map(|bytes| String::from_utf8(bytes).map(|value| value.trim().to_string()))
+        .transpose()
+        .map_err(Into::into)
 }
 
 pub(crate) fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(

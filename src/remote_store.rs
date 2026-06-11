@@ -201,6 +201,24 @@ impl RemoteStore {
         }
     }
 
+    pub(crate) fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        match self {
+            RemoteStore::File(remote) => match fs::read(remote.root.join(key)) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(err) => Err(err.into()),
+            },
+            RemoteStore::S3(remote) => remote.get_optional(key),
+        }
+    }
+
     pub(crate) fn delete(&self, key: &str) -> Result<()> {
         match self {
             RemoteStore::File(remote) => {
@@ -616,6 +634,10 @@ impl S3Remote {
         self.get_with_range(key, None)
     }
 
+    fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.get_with_range_optional(key, None)
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         let remote_key = self.remote_key(key);
         let response = if self.uses_sigv2() {
@@ -654,6 +676,11 @@ impl S3Remote {
     }
 
     fn get_with_range(&self, key: &str, range: Option<String>) -> Result<Vec<u8>> {
+        self.get_with_range_optional(key, range)?
+            .ok_or_else(|| anyhow!("s3 get failed for {key}: HTTP 404"))
+    }
+
+    fn get_with_range_optional(&self, key: &str, range: Option<String>) -> Result<Option<Vec<u8>>> {
         let remote_key = self.remote_key(key);
         let response = if self.uses_sigv2() {
             let date = http_date();
@@ -688,9 +715,12 @@ impl S3Remote {
             request.send()?
         };
         if !response.status().is_success() {
+            if response.status().as_u16() == 404 {
+                return Ok(None);
+            }
             bail!("s3 get failed for {key}: HTTP {}", response.status());
         }
-        Ok(response.bytes()?.to_vec())
+        Ok(Some(response.bytes()?.to_vec()))
     }
 
     fn exists(&self, key: &str) -> Result<bool> {

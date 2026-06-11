@@ -159,9 +159,8 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
 }
 
 pub(crate) fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
-    if remote.exists(REMOTE_HOST_INDEX_KEY)? {
-        let mut index: RemoteHostIndex =
-            serde_json::from_slice(&remote.get(REMOTE_HOST_INDEX_KEY)?)?;
+    if let Some(bytes) = remote.get_optional(REMOTE_HOST_INDEX_KEY)? {
+        let mut index: RemoteHostIndex = serde_json::from_slice(&bytes)?;
         index.sort_hosts();
         return Ok(index);
     }
@@ -170,9 +169,10 @@ pub(crate) fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostI
 
 pub(crate) fn remote_host_index_with_legacy(remote: &RemoteStore) -> Result<RemoteHostIndex> {
     let mut index = read_remote_host_index(remote)?;
-    if index.hosts.is_empty() && remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-        let export: MetadataExport =
-            serde_json::from_slice(&remote.get(LEGACY_METADATA_EXPORT_KEY)?)?;
+    if index.hosts.is_empty()
+        && let Some(bytes) = remote.get_optional(LEGACY_METADATA_EXPORT_KEY)?
+    {
+        let export: MetadataExport = serde_json::from_slice(&bytes)?;
         index.hosts.push(RemoteHostSummary {
             id: export.config.host.id.clone(),
             name: export.config.host.name.clone(),
