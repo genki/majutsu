@@ -45,7 +45,7 @@ use crate::{
     remote_ref,
 };
 
-const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v5";
+const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v6";
 
 pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     ensure_ready(paths)?;
@@ -360,6 +360,13 @@ fn enqueue_and_drain_sync(
     enqueue_inline_upload(paths, "metadata/export.json", remote_metadata_json.clone())?;
     let host_metadata = host_metadata_key(&config.host.id);
     enqueue_inline_upload(paths, &host_metadata, remote_metadata_json.clone())?;
+    enqueue_compressed_metadata_uploads_if_supported(
+        paths,
+        remote,
+        "metadata/export.json",
+        &host_metadata,
+        &remote_metadata_json,
+    )?;
     for snapshot in &remote_export.snapshots {
         enqueue_snapshot_uploads_if_needed(paths, remote, &sync_cache, &config.host.id, snapshot)?;
     }
@@ -619,6 +626,30 @@ fn compact_snapshot_manifest_value(value: &mut serde_json::Value) {
         );
         object.insert("roots_omitted".into(), serde_json::Value::Bool(true));
     }
+}
+
+fn enqueue_compressed_metadata_uploads_if_supported(
+    paths: &Paths,
+    remote: &RemoteStore,
+    legacy_key: &str,
+    host_key: &str,
+    metadata_json: &[u8],
+) -> Result<()> {
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return Ok(());
+    }
+    let compressed = zstd::stream::encode_all(metadata_json, 3)?;
+    enqueue_inline_upload(
+        paths,
+        &compressed_metadata_key(legacy_key),
+        compressed.clone(),
+    )?;
+    enqueue_inline_upload(paths, &compressed_metadata_key(host_key), compressed)?;
+    Ok(())
+}
+
+fn compressed_metadata_key(key: &str) -> String {
+    format!("{key}.zst")
 }
 
 fn enqueue_cached_inline_upload(

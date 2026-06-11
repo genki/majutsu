@@ -1137,6 +1137,9 @@ pub(crate) fn validate_clone_remote_refs(
     let Some(host) = host else {
         return Ok(());
     };
+    if matches!(remote, RemoteStore::S3(_)) && !clone_validates_s3_remote_refs() {
+        return Ok(());
+    }
     let expected_ref_keys = [
         host_current_ref_key(&host.id),
         host_last_synced_ref_key(&host.id),
@@ -1181,6 +1184,12 @@ pub(crate) fn validate_clone_remote_refs(
         }
     }
     Ok(())
+}
+
+fn clone_validates_s3_remote_refs() -> bool {
+    env::var("MAJUTSU_CLONE_VALIDATE_REMOTE_REFS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn validate_clone_remote_gc_mark(

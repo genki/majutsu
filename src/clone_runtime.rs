@@ -27,7 +27,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     trace.mark("open remote");
     let metadata = clone_metadata_selection(&remote, args.host.as_deref())?;
     trace.mark("select metadata");
-    let export_bytes = remote.get(&metadata.key)?;
+    let export_bytes = clone_metadata_bytes(&remote, &metadata.key)?;
     trace.mark("download metadata");
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     trace.mark("parse metadata");
@@ -50,11 +50,8 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &staging_paths.host,
             toml::to_string_pretty(&export.config.host)?,
         )?;
-        if remote.exists("keys/recipients.toml")? {
-            fs::write(
-                staging_paths.home.join("keys/recipients.toml"),
-                remote.get("keys/recipients.toml")?,
-            )?;
+        if let Some(recipients) = remote.get_optional("keys/recipients.toml")? {
+            fs::write(staging_paths.home.join("keys/recipients.toml"), recipients)?;
         }
         if export.config.security.encryption != "none" {
             let key = env::var("MAJUTSU_MASTER_KEY")
@@ -161,6 +158,26 @@ fn snapshot_metadata_is_compact(snapshot: &majutsu_core::SnapshotExport) -> bool
     serde_json::from_str::<majutsu_core::SnapshotManifest>(&snapshot.manifest_json)
         .map(|manifest| manifest.roots.is_empty() && !manifest.root_trees.is_empty())
         .unwrap_or(false)
+}
+
+fn clone_metadata_bytes(remote: &RemoteStore, key: &str) -> Result<Vec<u8>> {
+    if matches!(remote, RemoteStore::S3(_)) {
+        let compressed_key = compressed_metadata_key(key);
+        if let Some(bytes) = remote
+            .get_optional(&compressed_key)
+            .with_context(|| format!("read compressed metadata {compressed_key}"))?
+        {
+            return zstd::stream::decode_all(bytes.as_slice())
+                .with_context(|| format!("decode compressed metadata {compressed_key}"));
+        }
+    }
+    remote
+        .get(key)
+        .with_context(|| format!("read metadata {key}"))
+}
+
+fn compressed_metadata_key(key: &str) -> String {
+    format!("{key}.zst")
 }
 
 struct CloneMetadataSelection {
