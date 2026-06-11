@@ -86,7 +86,7 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
                 Some(after),
                 Some(&format!("to {}", restore_target_label(&plan))),
             )?;
-            print_restore_plan(paths, &conn, &plan)?;
+            print_restore_plan_with_stats_mode(paths, &conn, &plan, RestoreStatsMode::LocalOnly)?;
             println!("restored to {}", restore_target_label(&plan));
         }
         RestoreCommand::Prepare(args) => {
@@ -329,6 +329,21 @@ pub(crate) fn print_restore_plan(
     conn: &Connection,
     plan: &RestorePlan,
 ) -> Result<()> {
+    print_restore_plan_with_stats_mode(paths, conn, plan, RestoreStatsMode::Full)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RestoreStatsMode {
+    Full,
+    LocalOnly,
+}
+
+fn print_restore_plan_with_stats_mode(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+    stats_mode: RestoreStatsMode,
+) -> Result<()> {
     let large = plan
         .files
         .iter()
@@ -353,7 +368,7 @@ pub(crate) fn print_restore_plan(
     println!("modify_files {}", changes.modify_files);
     println!("keep_files {}", changes.keep_files);
     println!("delete_files {}", changes.delete_files);
-    let stats = restore_object_stats(paths, conn, plan)?;
+    let stats = restore_object_stats_with_mode(paths, conn, plan, stats_mode)?;
     println!("large_files {large}");
     println!("required_objects {}", stats.required_objects);
     println!("required_chunks {}", stats.required_chunks);
@@ -369,6 +384,9 @@ pub(crate) fn print_restore_plan(
         "archive_or_missing_objects {}",
         stats.archive_or_missing_objects
     );
+    if matches!(stats_mode, RestoreStatsMode::LocalOnly) {
+        println!("remote_stats skipped");
+    }
     Ok(())
 }
 
@@ -394,13 +412,43 @@ pub(crate) fn restore_object_stats(
     conn: &Connection,
     plan: &RestorePlan,
 ) -> Result<RestoreObjectStats> {
+    restore_object_stats_with_mode(paths, conn, plan, RestoreStatsMode::Full)
+}
+
+fn restore_object_stats_with_mode(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+    stats_mode: RestoreStatsMode,
+) -> Result<RestoreObjectStats> {
     let required_objects = required_object_keys_for_plan(paths, conn, plan)?;
-    let required_chunks = required_chunk_count_for_plan(paths, plan)?;
     let required_chunk_keys = required_large_chunk_keys_for_plan(paths, plan)?;
+    let required_chunks = required_chunk_keys.len();
     let local_objects = required_objects
         .iter()
         .filter(|key| paths.home.join(key).exists())
         .count();
+    if matches!(stats_mode, RestoreStatsMode::LocalOnly) {
+        let local_chunks = required_chunk_keys
+            .iter()
+            .filter(|key| paths.home.join(key).exists())
+            .count();
+        let missing_objects = required_objects.len().saturating_sub(local_objects);
+        let missing_chunks = required_chunk_keys.len().saturating_sub(local_chunks);
+        return Ok(RestoreObjectStats {
+            required_objects: required_objects.len(),
+            required_chunks,
+            local_chunks,
+            remote_chunks: 0,
+            archived_chunks: 0,
+            missing_chunks,
+            local_objects,
+            remote_objects: 0,
+            archived_objects: 0,
+            missing_objects,
+            archive_or_missing_objects: missing_objects,
+        });
+    }
     let remote = read_config(paths)
         .ok()
         .and_then(|config| config.remote.and_then(|remote| open_remote(&remote).ok()));
@@ -473,24 +521,6 @@ pub(crate) fn restore_object_stats(
         missing_objects,
         archive_or_missing_objects,
     })
-}
-
-pub(crate) fn required_chunk_count_for_plan(paths: &Paths, plan: &RestorePlan) -> Result<usize> {
-    let mut chunks = 0usize;
-    for record in &plan.files {
-        if let Some((_, manifest_key, chunk_count)) = payload_large_ref(&record.payload) {
-            let manifest = read_large_manifest_for_restore(paths, manifest_key)
-                .with_context(|| format!("read large manifest {manifest_key}"))?;
-            if manifest.chunks.len() != chunk_count {
-                bail!(
-                    "large manifest chunk count mismatch for {manifest_key}: payload={chunk_count} manifest={}",
-                    manifest.chunks.len()
-                );
-            }
-            chunks += manifest.chunks.len();
-        }
-    }
-    Ok(chunks)
 }
 
 fn required_large_chunk_keys_for_plan(paths: &Paths, plan: &RestorePlan) -> Result<Vec<String>> {
@@ -597,6 +627,11 @@ pub(crate) fn apply_restore_plan(
     check_conflicts: bool,
 ) -> Result<()> {
     let conn = crate::open_db(paths)?;
+    let required_objects = required_object_keys_for_plan(paths, &conn, plan)?
+        .into_iter()
+        .filter(|key| restore_apply_prefetches_object(key))
+        .collect();
+    hydrate_local_objects_from_remote(paths, required_objects)?;
     if check_conflicts && !force {
         let conflicts = restore_conflicts(paths, &conn, plan)?;
         if !conflicts.is_empty() {
@@ -608,11 +643,6 @@ pub(crate) fn apply_restore_plan(
             bail!("restore would delete extra files; rerun with --force to delete them");
         }
     }
-    let required_objects = required_object_keys_for_plan(paths, &conn, plan)?
-        .into_iter()
-        .filter(|key| restore_apply_prefetches_object(key))
-        .collect();
-    hydrate_local_objects_from_remote(paths, required_objects)?;
     for delete in &plan.deletes {
         let dest = restore_delete_destination(plan, delete)?;
         if fs::symlink_metadata(&dest).is_ok() {
