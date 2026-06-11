@@ -7,11 +7,13 @@ use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
 };
 use std::collections::BTreeMap;
+use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use rusqlite::{Connection, params};
 
@@ -76,8 +78,11 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
             }
         }
         RestoreCommand::Apply(args) => {
+            let trace = RestoreTrace::new();
             let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            trace.mark("build plan");
             apply_restore_plan(paths, &plan, args.force, args.check_conflicts)?;
+            trace.mark("apply plan");
             let after = plan.snapshot.snapshot_id.as_str();
             record_op(
                 &conn,
@@ -86,8 +91,11 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
                 Some(after),
                 Some(&format!("to {}", restore_target_label(&plan))),
             )?;
+            trace.mark("record operation");
             print_restore_plan_with_stats_mode(paths, &conn, &plan, RestoreStatsMode::LocalOnly)?;
+            trace.mark("print plan");
             println!("restored to {}", restore_target_label(&plan));
+            trace.mark("finish");
         }
         RestoreCommand::Prepare(args) => {
             let plan = crate::build_restore_plan(paths, &conn, &args)?;
@@ -152,6 +160,31 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
         }
     }
     Ok(())
+}
+
+struct RestoreTrace {
+    enabled: bool,
+    start: Instant,
+}
+
+impl RestoreTrace {
+    fn new() -> Self {
+        Self {
+            enabled: env::var("MAJUTSU_TRACE_RESTORE")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
+            start: Instant::now(),
+        }
+    }
+
+    fn mark(&self, label: &str) {
+        if self.enabled {
+            eprintln!(
+                "restore_trace elapsed_ms={} stage={label}",
+                self.start.elapsed().as_millis()
+            );
+        }
+    }
 }
 
 fn hydrate_restore_job_snapshot_manifest(paths: &Paths, job: &RestoreQueueItem) -> Result<()> {
@@ -626,12 +659,14 @@ pub(crate) fn apply_restore_plan(
     force: bool,
     check_conflicts: bool,
 ) -> Result<()> {
+    let trace = RestoreTrace::new();
     let conn = crate::open_db(paths)?;
     let required_objects = required_object_keys_for_plan(paths, &conn, plan)?
         .into_iter()
         .filter(|key| restore_apply_prefetches_object(key))
         .collect();
     hydrate_local_objects_from_remote(paths, required_objects)?;
+    trace.mark("prefetch objects");
     if check_conflicts && !force {
         let conflicts = restore_conflicts(paths, &conn, plan)?;
         if !conflicts.is_empty() {
@@ -643,6 +678,7 @@ pub(crate) fn apply_restore_plan(
             bail!("restore would delete extra files; rerun with --force to delete them");
         }
     }
+    trace.mark("check conflicts");
     for delete in &plan.deletes {
         let dest = restore_delete_destination(plan, delete)?;
         if fs::symlink_metadata(&dest).is_ok() {
@@ -650,6 +686,7 @@ pub(crate) fn apply_restore_plan(
             remove_empty_restore_parents(plan, delete, &dest)?;
         }
     }
+    trace.mark("delete files");
     let mut directory_metadata = Vec::new();
     for record in &plan.files {
         let dest = restore_destination(plan, record)?;
@@ -683,9 +720,11 @@ pub(crate) fn apply_restore_plan(
             }
         }
     }
+    trace.mark("restore files");
     for (dest, record) in directory_metadata {
         apply_file_metadata(&dest, record)?;
     }
+    trace.mark("directory metadata");
     Ok(())
 }
 

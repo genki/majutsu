@@ -1843,14 +1843,18 @@ pub(crate) fn remote_local_object_variants(
 }
 
 fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> Result<RestorePlan> {
+    let trace_start = std::time::Instant::now();
     if let Some(path) = &args.path {
         validate_relative_filter_path(path, "restore --path")?;
     }
+    restore_trace_mark(trace_start, "build_plan validate args");
     let snapshot = load_snapshot(paths, conn, args)?;
+    restore_trace_mark(trace_start, "build_plan load snapshot");
     let root_paths = roots(conn)?
         .into_iter()
         .map(|root| (root.id, root.path))
         .collect::<BTreeMap<_, _>>();
+    restore_trace_mark(trace_start, "build_plan load roots");
     let mut files = Vec::new();
     let mut plan_roots = Vec::new();
     for (root_id, records) in &snapshot.roots {
@@ -1941,7 +1945,9 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
             });
         }
     }
+    restore_trace_mark(trace_start, "build_plan filter files");
     let deletes = build_restore_deletes(args, &root_paths, &plan_roots, &files)?;
+    restore_trace_mark(trace_start, "build_plan deletes");
     Ok(RestorePlan {
         snapshot,
         to: args.to.clone(),
@@ -1949,6 +1955,15 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
         files,
         deletes,
     })
+}
+
+fn restore_trace_mark(start: std::time::Instant, label: &str) {
+    if restore_trace_enabled() {
+        eprintln!(
+            "restore_trace elapsed_ms={} stage={label}",
+            start.elapsed().as_millis()
+        );
+    }
 }
 
 fn build_restore_deletes(
@@ -3072,7 +3087,7 @@ fn write_large_chunks_atomic_pipelined(
     let chunks = Arc::new(chunks);
     let next = Arc::new(Mutex::new(0usize));
     let (result_tx, result_rx) =
-        mpsc::sync_channel::<Result<(usize, Vec<u8>)>>(parallelism.saturating_mul(2).max(1));
+        mpsc::sync_channel::<Result<(usize, Vec<u8>, u128)>>(parallelism.saturating_mul(2).max(1));
     let mut handles = Vec::new();
     for _ in 0..parallelism {
         let paths = Arc::clone(&paths);
@@ -3096,9 +3111,13 @@ fn write_large_chunks_atomic_pipelined(
                     *next += 1;
                     chunk
                 };
+                let read_started = std::time::Instant::now();
                 match read_large_chunk_payload(&paths, &chunk.object_key, &chunk.compression) {
                     Ok(bytes) => {
-                        if result_tx.send(Ok((chunk.index, bytes))).is_err() {
+                        if result_tx
+                            .send(Ok((chunk.index, bytes, read_started.elapsed().as_millis())))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -3112,14 +3131,20 @@ fn write_large_chunks_atomic_pipelined(
     }
     drop(result_tx);
 
+    let trace_enabled = restore_trace_enabled();
     let write_result = write_atomic_with(dest, |file| {
         let mut pending = BTreeMap::<usize, Vec<u8>>::new();
         let mut next_write = 0usize;
+        let mut read_ms = 0u128;
+        let mut write_ms = 0u128;
         for result in result_rx {
-            let (index, bytes) = result?;
+            let (index, bytes, chunk_read_ms) = result?;
+            read_ms += chunk_read_ms;
             pending.insert(index, bytes);
             while let Some(bytes) = pending.remove(&next_write) {
+                let write_started = std::time::Instant::now();
                 file.write_all(&bytes)?;
+                write_ms += write_started.elapsed().as_millis();
                 next_write += 1;
             }
         }
@@ -3128,6 +3153,15 @@ fn write_large_chunks_atomic_pipelined(
                 "large restore wrote {} of {} chunk(s)",
                 next_write,
                 chunks.len()
+            );
+        }
+        if trace_enabled {
+            eprintln!(
+                "restore_trace large_chunks={} parallelism={} read_decode_ms_sum={} write_ms_sum={}",
+                chunks.len(),
+                parallelism,
+                read_ms,
+                write_ms
             );
         }
         Ok(())
@@ -3152,6 +3186,12 @@ fn restore_chunk_pipeline_parallelism() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2)
+}
+
+fn restore_trace_enabled() -> bool {
+    env::var("MAJUTSU_TRACE_RESTORE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {

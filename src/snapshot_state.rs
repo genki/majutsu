@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use majutsu_core::{FileRecord, RootSnapshot, SnapshotManifest};
+use majutsu_core::{FileRecord, RootSnapshot, SnapshotManifest, TreeManifest};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::fs;
@@ -28,6 +28,9 @@ pub(crate) fn load_snapshot(
     } else {
         current_snapshot(conn)?.ok_or_else(|| anyhow!("no current snapshot"))?
     };
+    if args.root.is_some() {
+        return load_snapshot_by_id_for_root(paths, conn, &id, args.root.as_deref());
+    }
     load_snapshot_by_id(paths, conn, &id)
 }
 
@@ -74,6 +77,74 @@ pub(crate) fn snapshot_manifest_from_parts(
     };
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
+}
+
+fn load_snapshot_by_id_for_root(
+    paths: &Paths,
+    conn: &Connection,
+    id: &str,
+    root: Option<&str>,
+) -> Result<SnapshotManifest> {
+    let (manifest_key, manifest_json): (String, String) = conn.query_row(
+        "select manifest_key, manifest_json from snapshots where id=?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    snapshot_manifest_from_parts_for_root(paths, id, &manifest_key, &manifest_json, root)
+}
+
+fn snapshot_manifest_from_parts_for_root(
+    paths: &Paths,
+    id: &str,
+    manifest_key: &str,
+    manifest_json: &str,
+    root: Option<&str>,
+) -> Result<SnapshotManifest> {
+    if !manifest_json.trim().is_empty() {
+        return serde_json::from_str(manifest_json)
+            .with_context(|| format!("parse snapshot manifest metadata {id}"));
+    }
+    let bytes = read_snapshot_manifest_object_raw(paths, id, manifest_key)?;
+    let mut manifest: SnapshotManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))?;
+    if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
+        return Ok(manifest);
+    }
+    let Some(root) = root else {
+        return Ok(manifest);
+    };
+    if let Some(root_tree) = manifest.root_trees.get(root) {
+        let tree_bytes = crate::read_object(paths, &root_tree.tree_key).with_context(|| {
+            format!("hydrate compact snapshot manifest {manifest_key} root {root}")
+        })?;
+        let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
+            .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
+        manifest
+            .roots
+            .insert(root.to_string(), tree.entries.into_values().collect());
+    }
+    Ok(manifest)
+}
+
+fn read_snapshot_manifest_object_raw(
+    paths: &Paths,
+    id: &str,
+    manifest_key: &str,
+) -> Result<Vec<u8>> {
+    let local = paths.home.join(manifest_key);
+    let bytes = match fs::read(&local) {
+        Ok(bytes) => bytes,
+        Err(local_err) => {
+            hydrate_snapshot_manifest_from_remote(paths, manifest_key).with_context(|| {
+                format!("read snapshot manifest object {id} {manifest_key}: {local_err}")
+            })?;
+            fs::read(&local).with_context(|| {
+                format!("read hydrated snapshot manifest object {id} {manifest_key}")
+            })?
+        }
+    };
+    crate::decode_object(paths, &bytes)
+        .with_context(|| format!("decode snapshot manifest object {id} {manifest_key}"))
 }
 
 fn hydrate_snapshot_manifest_from_remote(paths: &Paths, manifest_key: &str) -> Result<()> {
