@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use majutsu_store::{LEGACY_METADATA_EXPORT_KEY, RemoteHostSummary, select_remote_host};
+use majutsu_store::{
+    LEGACY_METADATA_EXPORT_KEY, RemoteHostIndex, RemoteHostSummary, select_remote_host,
+};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,9 +28,12 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let remote_config = RemoteConfig::from_url(args.remote);
     let remote = open_remote(&remote_config)?;
     trace.mark("open remote");
-    let metadata = clone_metadata_selection(&remote, args.host.as_deref())?;
+    let loaded = clone_loaded_metadata(&remote, args.host.as_deref())?;
     trace.mark("select metadata");
-    let export_bytes = clone_metadata_bytes(&remote, &metadata.key)?;
+    let export_bytes = match loaded.export {
+        Some(export) => serde_json::to_vec(&export)?,
+        None => clone_metadata_bytes(&remote, &loaded.selection.key)?,
+    };
     trace.mark("download metadata");
     let mut export: MetadataExport = serde_json::from_slice(&export_bytes)?;
     trace.mark("parse metadata");
@@ -36,12 +42,16 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
     validate_config(&export.config)?;
-    crate::validate_clone_host_summary(&metadata.host, metadata.host_index, &export)?;
+    crate::validate_clone_host_summary(
+        &loaded.selection.host,
+        loaded.selection.host_index,
+        &export,
+    )?;
     crate::validate_clone_large_pin_metadata(&export)?;
     if !compact_snapshot_metadata {
         crate::validate_clone_metadata(&export)?;
     }
-    crate::validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
+    crate::validate_clone_remote_refs(&remote, loaded.selection.host.as_ref(), &export)?;
     trace.mark("validate bootstrap metadata");
     let clone_result = (|| -> Result<()> {
         crate::create_layout(&staging_paths)?;
@@ -67,19 +77,19 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             crate::validate_clone_remote_gc_mark(
                 &staging_paths,
                 &remote,
-                metadata.host.as_ref(),
+                loaded.selection.host.as_ref(),
                 &export,
             )?;
             crate::validate_clone_remote_oplog(
                 &staging_paths,
                 &remote,
-                metadata.host.as_ref(),
+                loaded.selection.host.as_ref(),
                 &export.operations,
             )?;
             crate::validate_clone_remote_timeline_exports(
                 &staging_paths,
                 &remote,
-                metadata.host.as_ref(),
+                loaded.selection.host.as_ref(),
                 &export.snapshots,
                 &export.operations,
             )?;
@@ -180,10 +190,80 @@ fn compressed_metadata_key(key: &str) -> String {
     format!("{key}.zst")
 }
 
+struct CloneLoadedMetadata {
+    selection: CloneMetadataSelection,
+    export: Option<MetadataExport>,
+}
+
 struct CloneMetadataSelection {
     key: String,
     host: Option<RemoteHostSummary>,
     host_index: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CloneBootstrapExport {
+    version: u32,
+    host_index: RemoteHostIndex,
+    metadata: MetadataExport,
+}
+
+const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
+const CLONE_BOOTSTRAP_VERSION: u32 = 1;
+
+fn clone_loaded_metadata(remote: &RemoteStore, host: Option<&str>) -> Result<CloneLoadedMetadata> {
+    if let Some(loaded) = clone_loaded_metadata_from_bootstrap(remote, host)? {
+        return Ok(loaded);
+    }
+    Ok(CloneLoadedMetadata {
+        selection: clone_metadata_selection(remote, host)?,
+        export: None,
+    })
+}
+
+fn clone_loaded_metadata_from_bootstrap(
+    remote: &RemoteStore,
+    host: Option<&str>,
+) -> Result<Option<CloneLoadedMetadata>> {
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return Ok(None);
+    }
+    let Some(bytes) = remote
+        .get_optional(CLONE_BOOTSTRAP_KEY)
+        .with_context(|| format!("read clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?
+    else {
+        return Ok(None);
+    };
+    let decoded = zstd::stream::decode_all(bytes.as_slice())
+        .with_context(|| format!("decode clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?;
+    let bootstrap: CloneBootstrapExport = serde_json::from_slice(&decoded)
+        .with_context(|| format!("parse clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?;
+    if bootstrap.version != CLONE_BOOTSTRAP_VERSION {
+        return Ok(None);
+    }
+    let mut index = bootstrap.host_index;
+    index.sort_hosts();
+    let selected = match host {
+        Some(host_id) => select_remote_host(index.hosts, host_id).ok(),
+        None => match index.hosts.as_slice() {
+            [host] => Some(host.clone()),
+            _ => None,
+        },
+    };
+    let Some(host) = selected else {
+        return Ok(None);
+    };
+    if host.id != bootstrap.metadata.config.host.id {
+        return Ok(None);
+    }
+    Ok(Some(CloneLoadedMetadata {
+        selection: CloneMetadataSelection {
+            key: host.metadata_key.clone(),
+            host: Some(host),
+            host_index: true,
+        },
+        export: Some(bootstrap.metadata),
+    }))
 }
 
 fn clone_metadata_selection(
