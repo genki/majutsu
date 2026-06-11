@@ -2556,12 +2556,20 @@ fn compress_large_chunk(
 }
 
 fn read_large_chunk(paths: &Paths, chunk: &LargeChunk) -> Result<Vec<u8>> {
-    let bytes = read_object(paths, &chunk.object_key)?;
-    decode_large_chunk_stored_bytes(chunk, &bytes)
+    read_large_chunk_payload(paths, &chunk.object_key, &chunk.compression)
 }
 
 pub(crate) fn decode_large_chunk_stored_bytes(chunk: &LargeChunk, bytes: &[u8]) -> Result<Vec<u8>> {
-    match chunk.compression.as_str() {
+    decode_large_chunk_payload(&chunk.compression, bytes)
+}
+
+fn read_large_chunk_payload(paths: &Paths, object_key: &str, compression: &str) -> Result<Vec<u8>> {
+    let bytes = read_object(paths, object_key)?;
+    decode_large_chunk_payload(compression, &bytes)
+}
+
+fn decode_large_chunk_payload(compression: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    match compression {
         "none" => Ok(bytes.to_vec()),
         "zstd" => Ok(zstd::stream::decode_all(bytes)?),
         other => bail!("unsupported large chunk compression: {other}"),
@@ -3025,12 +3033,125 @@ fn object_keys_are_hmac(paths: &Paths) -> Result<bool> {
 }
 
 fn write_large_chunks_atomic(paths: &Paths, dest: &Path, manifest: &LargeManifest) -> Result<()> {
+    let parallelism = restore_chunk_pipeline_parallelism().min(manifest.chunks.len());
+    if parallelism > 1 {
+        return write_large_chunks_atomic_pipelined(paths, dest, manifest, parallelism);
+    }
     write_atomic_with(dest, |file| {
         for chunk in &manifest.chunks {
             file.write_all(&read_large_chunk(paths, chunk)?)?;
         }
         Ok(())
     })
+}
+
+#[derive(Debug, Clone)]
+struct RestoreChunkRead {
+    index: usize,
+    object_key: String,
+    compression: String,
+}
+
+fn write_large_chunks_atomic_pipelined(
+    paths: &Paths,
+    dest: &Path,
+    manifest: &LargeManifest,
+    parallelism: usize,
+) -> Result<()> {
+    let chunks = manifest
+        .chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| RestoreChunkRead {
+            index,
+            object_key: chunk.object_key.clone(),
+            compression: chunk.compression.clone(),
+        })
+        .collect::<Vec<_>>();
+    let paths = Arc::new(paths.clone());
+    let chunks = Arc::new(chunks);
+    let next = Arc::new(Mutex::new(0usize));
+    let (result_tx, result_rx) =
+        mpsc::sync_channel::<Result<(usize, Vec<u8>)>>(parallelism.saturating_mul(2).max(1));
+    let mut handles = Vec::new();
+    for _ in 0..parallelism {
+        let paths = Arc::clone(&paths);
+        let chunks = Arc::clone(&chunks);
+        let next = Arc::clone(&next);
+        let result_tx = result_tx.clone();
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let chunk = {
+                    let mut next = match next.lock() {
+                        Ok(next) => next,
+                        Err(err) => {
+                            let _ = result_tx
+                                .send(Err(anyhow!("large restore chunk queue poisoned: {err}")));
+                            return;
+                        }
+                    };
+                    let Some(chunk) = chunks.get(*next).cloned() else {
+                        break;
+                    };
+                    *next += 1;
+                    chunk
+                };
+                match read_large_chunk_payload(&paths, &chunk.object_key, &chunk.compression) {
+                    Ok(bytes) => {
+                        if result_tx.send(Ok((chunk.index, bytes))).is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = result_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+    drop(result_tx);
+
+    let write_result = write_atomic_with(dest, |file| {
+        let mut pending = BTreeMap::<usize, Vec<u8>>::new();
+        let mut next_write = 0usize;
+        for result in result_rx {
+            let (index, bytes) = result?;
+            pending.insert(index, bytes);
+            while let Some(bytes) = pending.remove(&next_write) {
+                file.write_all(&bytes)?;
+                next_write += 1;
+            }
+        }
+        if next_write != chunks.len() {
+            bail!(
+                "large restore wrote {} of {} chunk(s)",
+                next_write,
+                chunks.len()
+            );
+        }
+        Ok(())
+    });
+
+    let mut first_error = write_result.err();
+    for handle in handles {
+        if let Err(err) = handle.join() {
+            first_error
+                .get_or_insert_with(|| anyhow!("large restore chunk worker panicked: {err:?}"));
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn restore_chunk_pipeline_parallelism() -> usize {
+    env::var("MAJUTSU_RESTORE_CHUNK_PIPELINE_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
 }
 
 pub(crate) fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
