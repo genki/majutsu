@@ -148,7 +148,7 @@ use key_runtime::key_cmd;
 use large_runtime::large_cmd;
 use lifecycle_runtime::lifecycle_cmd;
 use mount_runtime::{hydrate_cmd, mount_cmd, unmount_cmd};
-use object_paths::{large_chunk_base, remote_live_object_keys};
+use object_paths::{large_chunk_base, remote_live_object_keys, s3_remote_live_object_keys};
 use operation_log::{
     query_operations, record_op, record_op_with_details, record_op_with_id, rewrite_local_oplog,
 };
@@ -1178,9 +1178,13 @@ pub(crate) fn validate_clone_remote_gc_mark(
     }
     let mark: GcMarkExport = serde_json::from_slice(&remote.get(&key)?)
         .with_context(|| format!("parse remote gc mark {key}"))?;
-    let expected = remote_live_object_keys(export)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let expected = if matches!(remote, RemoteStore::S3(_)) {
+        s3_remote_live_object_keys(export)
+    } else {
+        remote_live_object_keys(export)
+    }
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     if let Some(issue) = mark
         .validation_issues(&host.id, export.refs.get("current"), &expected)
         .into_iter()

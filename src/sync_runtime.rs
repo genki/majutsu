@@ -25,7 +25,8 @@ use crate::db_refs::{
     persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use crate::object_paths::{
-    local_object_keys, prefer_canonical_remote_only, remote_live_object_keys,
+    canonical_alias_for_legacy_key, local_object_keys, prefer_s3_canonical_remote_only,
+    remote_live_object_keys, s3_remote_live_object_keys,
 };
 use crate::operation_log::{record_op_with_details, update_operation_result};
 use crate::pack_runtime::pack_cmd;
@@ -41,6 +42,8 @@ use crate::{
     encode_object, ensure_ready, export_metadata, open_db, read_object, remote_object_available,
     remote_ref,
 };
+
+const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v5";
 
 pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     ensure_ready(paths)?;
@@ -129,13 +132,11 @@ fn sync_configured_remote(
     let export = export_metadata(conn, config)?;
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     let remote_export = metadata_export_for_remote(remote, export);
-    let state_fingerprint = format!(
-        "remote-metadata-v2:{}",
-        remote_sync_state_fingerprint(config, &remote_export)?
-    );
+    let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
     let upload_stats = upload_queue_stats(paths)?;
     if upload_stats.total == 0
         && sync_cache.state_fingerprint.as_deref() == Some(state_fingerprint.as_str())
+        && !sync_remote_prune_enabled()
     {
         println!("synced 0 objects to {}", remote.describe());
         println!("pruned_remote_exports 0");
@@ -347,14 +348,11 @@ fn enqueue_and_drain_sync(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
-    let export = export_metadata(conn, config)?;
-    let remote_export = metadata_export_for_remote(remote, export);
+    let content_export = export_metadata(conn, config)?;
+    let remote_export = metadata_export_for_remote(remote, export_metadata(conn, config)?);
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &remote_export)?;
-    let state_fingerprint = format!(
-        "remote-metadata-v2:{}",
-        remote_sync_state_fingerprint(config, &remote_export)?
-    );
+    let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
     let remote_metadata_json = metadata_export_json_for_remote(remote, &remote_export)?;
     enqueue_inline_upload(paths, "metadata/export.json", remote_metadata_json.clone())?;
     let host_metadata = host_metadata_key(&config.host.id);
@@ -426,7 +424,7 @@ fn enqueue_and_drain_sync(
     enqueue_inline_upload(
         paths,
         &remote_gc_mark_key(&config.host.id),
-        serde_json::to_vec_pretty(&build_gc_mark_export(config, &remote_export))?,
+        serde_json::to_vec_pretty(&build_gc_mark_export(config, remote, &content_export))?,
     )?;
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
@@ -446,7 +444,12 @@ fn enqueue_and_drain_sync(
         )?;
     }
 
-    for key in local_object_keys(&remote_export) {
+    let existing_canonical_aliases = if remote_prefers_canonical_only(remote) {
+        Some(list_remote_canonical_content_aliases(remote)?)
+    } else {
+        None
+    };
+    for key in local_object_keys(&content_export) {
         let local = paths.home.join(&key);
         if local.exists() {
             let canonical_only =
@@ -457,7 +460,12 @@ fn enqueue_and_drain_sync(
             for alias in canonical_remote_aliases(&key) {
                 let fingerprint = content_object_fingerprint(&alias);
                 sync_fingerprints.insert(alias.clone(), fingerprint.clone());
-                if cache_matches(&sync_cache, &alias, &fingerprint) {
+                let alias_exists = existing_canonical_aliases
+                    .as_ref()
+                    .is_some_and(|keys| keys.contains(&alias));
+                if cache_matches(&sync_cache, &alias, &fingerprint)
+                    && (existing_canonical_aliases.is_none() || alias_exists)
+                {
                     continue;
                 }
                 if canonical_alias_uses_structured_encoding(&key) {
@@ -475,15 +483,16 @@ fn enqueue_and_drain_sync(
     let uploaded = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
     let (pruned_remote_exports, pruned_remote_objects) = if sync_remote_prune_enabled() {
-        (
-            prune_remote_host_exports(remote, &config.host.id, &remote_export)?,
+        let pruned_remote_exports =
+            prune_remote_host_exports(remote, &config.host.id, &remote_export)?;
+        let pruned_remote_objects =
             prune_remote_packed_blob_objects(
                 remote,
                 &config.host.id,
                 &remote_export,
                 config.large.max_parallel_uploads,
-            )?,
-        )
+            )? + prune_remote_legacy_canonical_objects(remote, config.large.max_parallel_uploads)?;
+        (pruned_remote_exports, pruned_remote_objects)
     } else {
         (0, 0)
     };
@@ -506,12 +515,7 @@ fn remote_prefers_canonical_only(remote: &RemoteStore) -> bool {
 }
 
 fn s3_prefers_canonical_remote_only(key: &str) -> bool {
-    prefer_canonical_remote_only(key)
-        || key.starts_with("objects/trees/")
-        || key.starts_with("objects/blobs/")
-        || key.starts_with("objects/packs/")
-        || key.starts_with("objects/indexes/pack/")
-        || key.starts_with("objects/large/manifests/")
+    prefer_s3_canonical_remote_only(key)
 }
 
 fn content_object_fingerprint(key: &str) -> String {
@@ -752,6 +756,14 @@ fn remote_sync_state_fingerprint(config: &Config, export: &MetadataExport) -> Re
     Ok(payload_fingerprint(&serde_json::to_vec(&value)?))
 }
 
+fn remote_sync_state_cache_key(config: &Config, export: &MetadataExport) -> Result<String> {
+    Ok(format!(
+        "{}:{}",
+        REMOTE_SYNC_STATE_VERSION,
+        remote_sync_state_fingerprint(config, export)?
+    ))
+}
+
 fn cache_matches(cache: &RemoteSyncCache, key: &str, fingerprint: &str) -> bool {
     cache
         .entries
@@ -952,12 +964,21 @@ fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
     ChunkIndexShard::new(Utc::now(), chunks)
 }
 
-fn build_gc_mark_export(config: &Config, export: &MetadataExport) -> GcMarkExport {
+fn build_gc_mark_export(
+    config: &Config,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> GcMarkExport {
+    let object_keys = if remote_prefers_canonical_only(remote) {
+        s3_remote_live_object_keys(export)
+    } else {
+        remote_live_object_keys(export)
+    };
     GcMarkExport::new(
         config.host.id.clone(),
         Utc::now(),
         export.refs.get("current").cloned(),
-        remote_live_object_keys(export),
+        object_keys,
     )
 }
 
@@ -1089,6 +1110,62 @@ fn prune_remote_packed_blob_objects(
         .collect::<Vec<_>>();
     delete_remote_keys(remote, &delete_keys, max_parallel_deletes)?;
     Ok(delete_keys.len())
+}
+
+fn prune_remote_legacy_canonical_objects(
+    remote: &RemoteStore,
+    max_parallel_deletes: usize,
+) -> Result<usize> {
+    if !remote_prefers_canonical_only(remote) {
+        return Ok(0);
+    }
+    if env::var("MAJUTSU_SYNC_REMOTE_LEGACY_OBJECT_PRUNE").as_deref() == Ok("0") {
+        return Ok(0);
+    }
+    let protected = remote_gc_mark_live_keys(remote)?;
+    let canonical_keys = list_remote_canonical_content_aliases(remote)?;
+    let mut candidates = BTreeSet::new();
+    for prefix in [
+        "objects/blobs/",
+        "objects/trees/",
+        "objects/packs/",
+        "objects/indexes/pack/",
+        "objects/large/manifests/",
+        "objects/large/chunks/fixed/",
+        "objects/large/chunks/fastcdc/",
+    ] {
+        for key in remote.list(prefix)? {
+            if protected.contains(&key) {
+                continue;
+            }
+            let Some(alias) = canonical_alias_for_legacy_key(&key) else {
+                continue;
+            };
+            if canonical_keys.contains(&alias) {
+                candidates.insert(key);
+            }
+        }
+    }
+    let delete_keys = candidates.into_iter().collect::<Vec<_>>();
+    delete_remote_keys(remote, &delete_keys, max_parallel_deletes)?;
+    Ok(delete_keys.len())
+}
+
+fn list_remote_canonical_content_aliases(remote: &RemoteStore) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for prefix in [
+        "blobs/loose/",
+        "trees/",
+        "packs/small/",
+        "packs/normal/",
+        "indexes/pack-index/",
+        "large/manifests/",
+        "large/chunks/fixed-8m/",
+        "large/chunks/fastcdc/",
+    ] {
+        keys.extend(remote.list(prefix)?);
+    }
+    Ok(keys)
 }
 
 fn prune_local_packed_blob_objects(paths: &Paths, export: &MetadataExport) -> Result<usize> {

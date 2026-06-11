@@ -39,7 +39,7 @@ use std::path::Path;
 use crate::config::{
     Config, HostConfig, METADATA_EXPORT_VERSION, Paths, RootConfig, read_config, validate_config,
 };
-use crate::object_paths::{local_object_keys, remote_live_object_keys};
+use crate::object_paths::{local_object_keys, remote_live_object_keys, s3_remote_live_object_keys};
 use crate::operation_log::{local_oplog_path, query_operations, record_op};
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::RemoteStore;
@@ -904,6 +904,7 @@ fn validate_local_oplog(conn: &Connection, missing: &mut usize) -> Result<()> {
 }
 
 pub(crate) fn validate_remote_gc_records(
+    paths: &Paths,
     remote: &RemoteStore,
     host_id: &str,
     export: &crate::MetadataExport,
@@ -922,7 +923,7 @@ pub(crate) fn validate_remote_gc_records(
                 return validate_remote_gc_tombstones(remote, host_id, missing);
             }
         };
-        let expected = expected_gc_mark_object_keys(export);
+        let expected = expected_gc_mark_object_keys(paths, remote, export)?;
         for issue in mark.validation_issues(host_id, export.refs.get("current"), &expected) {
             *missing += 1;
             eprintln!("{}", issue.message(&mark_key, host_id));
@@ -931,8 +932,40 @@ pub(crate) fn validate_remote_gc_records(
     validate_remote_gc_tombstones(remote, host_id, missing)
 }
 
-fn expected_gc_mark_object_keys(export: &crate::MetadataExport) -> BTreeSet<String> {
-    remote_live_object_keys(export).into_iter().collect()
+fn expected_gc_mark_object_keys(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &crate::MetadataExport,
+) -> Result<BTreeSet<String>> {
+    let export = export_with_hydrated_remote_snapshot_manifests(paths, remote, export)?;
+    if matches!(remote, RemoteStore::S3(_)) {
+        return Ok(s3_remote_live_object_keys(&export).into_iter().collect());
+    }
+    Ok(remote_live_object_keys(&export).into_iter().collect())
+}
+
+fn export_with_hydrated_remote_snapshot_manifests(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &crate::MetadataExport,
+) -> Result<crate::MetadataExport> {
+    let mut export: crate::MetadataExport = serde_json::from_value(serde_json::to_value(export)?)?;
+    for snapshot in &mut export.snapshots {
+        if !snapshot.manifest_json.trim().is_empty() {
+            continue;
+        }
+        let bytes = crate::download_local_object_from_remote(paths, remote, &snapshot.manifest_key)
+            .with_context(|| {
+                format!(
+                    "download remote snapshot manifest {}",
+                    snapshot.manifest_key
+                )
+            })?;
+        let manifest: SnapshotManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse remote snapshot manifest {}", snapshot.manifest_key))?;
+        snapshot.manifest_json = serde_json::to_string(&manifest)?;
+    }
+    Ok(export)
 }
 
 fn validate_remote_gc_tombstones(
@@ -1613,7 +1646,7 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                     eprintln!("missing canonical host operation export {key}");
                 }
             }
-            validate_remote_gc_records(remote, &host.id, &export, &mut missing)?;
+            validate_remote_gc_records(paths, remote, &host.id, &export, &mut missing)?;
         }
         validate_remote_host_prefix_hosts(remote, &indexed_host_ids, &mut missing)?;
         validate_remote_gc_prefix_hosts(remote, &indexed_host_ids, &mut missing)?;

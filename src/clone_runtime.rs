@@ -34,7 +34,6 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         crate::validate_clone_metadata(&export)?;
     }
     crate::validate_clone_remote_refs(&remote, metadata.host.as_ref(), &export)?;
-    crate::validate_clone_remote_gc_mark(&remote, metadata.host.as_ref(), &export)?;
     crate::validate_clone_remote_lifecycle_artifacts(&remote)?;
     if !compact_snapshot_metadata {
         ensure_clone_objects_available(&remote, &export)?;
@@ -64,6 +63,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             crate::validate_clone_metadata(&export)?;
             ensure_clone_objects_available(&remote, &export)?;
         }
+        crate::validate_clone_remote_gc_mark(&remote, metadata.host.as_ref(), &export)?;
         crate::validate_clone_remote_oplog(
             &staging_paths,
             &remote,

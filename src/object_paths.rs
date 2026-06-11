@@ -5,7 +5,7 @@ use walkdir::WalkDir;
 
 use crate::config::{MetadataExport, Paths};
 use crate::util::path_to_slash;
-use majutsu_store::canonical_remote_aliases;
+use majutsu_store::{canonical_remote_alias, canonical_remote_aliases};
 
 pub(crate) fn local_object_keys(export: &MetadataExport) -> Vec<String> {
     let mut keys = Vec::new();
@@ -42,11 +42,31 @@ pub(crate) fn prefer_canonical_remote_only(key: &str) -> bool {
         || key.starts_with("objects/large/chunks/fastcdc/")
 }
 
+pub(crate) fn prefer_s3_canonical_remote_only(key: &str) -> bool {
+    prefer_canonical_remote_only(key)
+        || key.starts_with("objects/trees/")
+        || key.starts_with("objects/blobs/")
+        || key.starts_with("objects/packs/")
+        || key.starts_with("objects/indexes/pack/")
+        || key.starts_with("objects/large/manifests/")
+}
+
 pub(crate) fn remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
+    remote_live_object_keys_with_canonical_policy(export, prefer_canonical_remote_only)
+}
+
+pub(crate) fn s3_remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
+    remote_live_object_keys_with_canonical_policy(export, prefer_s3_canonical_remote_only)
+}
+
+fn remote_live_object_keys_with_canonical_policy(
+    export: &MetadataExport,
+    canonical_only: fn(&str) -> bool,
+) -> Vec<String> {
     let local_keys = local_object_keys(export);
     let mut keys = Vec::new();
     for key in &local_keys {
-        if !prefer_canonical_remote_only(key) {
+        if !canonical_only(key) {
             keys.push(key.clone());
         }
         keys.extend(canonical_remote_aliases(key));
@@ -54,6 +74,10 @@ pub(crate) fn remote_live_object_keys(export: &MetadataExport) -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+pub(crate) fn canonical_alias_for_legacy_key(key: &str) -> Option<String> {
+    canonical_remote_alias(key).filter(|alias| alias != key)
 }
 
 pub(crate) fn large_chunk_base(paths: &Paths, chunking: &str) -> PathBuf {
@@ -84,4 +108,77 @@ pub(crate) fn all_local_object_keys(paths: &Paths) -> Result<Vec<String>> {
         }
     }
     Ok(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        Config, HostConfig, LargeCompressionConfig, LargeConfig, MetadataExport, PackConfig,
+        RestoreConfig, SecurityConfig, TieringConfig, WatchConfig, default_chunk_size,
+        default_large_binary_min_size, default_large_chunking, default_large_max_parallel_uploads,
+        default_large_min_size,
+    };
+    use chrono::Utc;
+    use majutsu_store::BlobExport;
+    use std::collections::BTreeMap;
+
+    fn empty_export() -> MetadataExport {
+        MetadataExport {
+            version: 1,
+            exported_at: Utc::now(),
+            config: Config {
+                host: HostConfig {
+                    id: "host".into(),
+                    name: "host".into(),
+                },
+                remote: None,
+                roots: Vec::new(),
+                large: LargeConfig {
+                    enabled: true,
+                    min_size: default_large_min_size(),
+                    binary_min_size: default_large_binary_min_size(),
+                    default_chunking: default_large_chunking(),
+                    chunk_size: default_chunk_size(),
+                    max_parallel_uploads: default_large_max_parallel_uploads(),
+                    multipart: true,
+                    always: Vec::new(),
+                    never: Vec::new(),
+                    compression: LargeCompressionConfig::default(),
+                },
+                pack: PackConfig::default(),
+                watch: WatchConfig::default(),
+                security: SecurityConfig::default(),
+                tiering: TieringConfig::default(),
+                restore: RestoreConfig::default(),
+            },
+            roots: Vec::new(),
+            snapshots: Vec::new(),
+            operations: Vec::new(),
+            refs: BTreeMap::new(),
+            blobs: Vec::new(),
+            large_objects: Vec::new(),
+            chunks: Vec::new(),
+            packs: Vec::new(),
+            large_pins: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn s3_live_keys_omit_legacy_blob_when_canonical_alias_exists() {
+        let mut export = empty_export();
+        export.blobs.push(BlobExport::new(
+            "abcdef".into(),
+            3,
+            "objects/blobs/ab/cdef".into(),
+        ));
+
+        let legacy = remote_live_object_keys(&export);
+        assert!(legacy.contains(&"objects/blobs/ab/cdef".to_string()));
+        assert!(legacy.contains(&"blobs/loose/ab/cdef.blob.enc".to_string()));
+
+        let s3 = s3_remote_live_object_keys(&export);
+        assert!(!s3.contains(&"objects/blobs/ab/cdef".to_string()));
+        assert!(s3.contains(&"blobs/loose/ab/cdef.blob.enc".to_string()));
+    }
 }
