@@ -193,7 +193,8 @@ mod tests {
     use crate::config::{
         Config, HostConfig, LargeCompressionConfig, LargeConfig, MetadataExport, PackConfig,
         RestoreConfig, SecurityConfig, TieringConfig, WatchConfig, default_chunk_size,
-        default_large_binary_min_size, default_large_chunking, default_large_max_parallel_uploads,
+        default_large_binary_min_size, default_large_chunked_chunk_size,
+        default_large_chunked_min_size, default_large_chunking, default_large_max_parallel_uploads,
         default_large_min_size,
     };
     use chrono::Utc;
@@ -215,6 +216,8 @@ mod tests {
                     enabled: true,
                     min_size: default_large_min_size(),
                     binary_min_size: default_large_binary_min_size(),
+                    chunked_min_size: default_large_chunked_min_size(),
+                    chunked_chunk_size: default_large_chunked_chunk_size(),
                     default_chunking: default_large_chunking(),
                     chunk_size: default_chunk_size(),
                     max_parallel_uploads: default_large_max_parallel_uploads(),

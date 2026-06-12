@@ -135,9 +135,10 @@ use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
     MetadataExport, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig, SecurityConfig,
     TieringConfig, WatchConfig, default_chunk_size, default_large_binary_min_size,
-    default_large_chunking, default_large_max_parallel_uploads, default_large_min_size,
-    default_security_hash, default_security_key_id, encryption_enabled, encryption_mode,
-    read_config, resolve_paths, validate_restore_archive_config, write_config,
+    default_large_chunked_chunk_size, default_large_chunked_min_size, default_large_chunking,
+    default_large_max_parallel_uploads, default_large_min_size, default_security_hash,
+    default_security_key_id, encryption_enabled, encryption_mode, read_config, resolve_paths,
+    validate_restore_archive_config, write_config,
 };
 use daemon_runtime::{apply_env_files, daemon_cmd};
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
@@ -237,6 +238,8 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                 enabled: true,
                 min_size: default_large_min_size(),
                 binary_min_size: default_large_binary_min_size(),
+                chunked_min_size: default_large_chunked_min_size(),
+                chunked_chunk_size: default_large_chunked_chunk_size(),
                 default_chunking: default_large_chunking(),
                 chunk_size: default_chunk_size(),
                 max_parallel_uploads: default_large_max_parallel_uploads(),
@@ -592,13 +595,26 @@ fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
         "event-journal-replay",
         "pending filesystem events after last snapshot-finish",
     )?;
-    snapshot(
+    match snapshot(
         paths,
         SnapshotArgs {
             message: Some("watch journal replay snapshot".into()),
         },
-    )?;
+    ) {
+        Ok(()) => {}
+        Err(err) if snapshot_lock_error(&err) => {
+            record_event(paths, "watch-snapshot-deferred", &format!("{err:#}"))?;
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
+    }
     Ok(true)
+}
+
+fn snapshot_lock_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("snapshot already running with pid")
+        || format!("{err:#}").contains("snapshot already running with pid")
 }
 
 pub(crate) fn validate_clone_remote_blob_objects(
@@ -2345,9 +2361,11 @@ fn scan_root(
                 storage_tier_hint: "hot-manifest-cold-chunks".into(),
                 hydrate_policy: "on-demand".into(),
             }
-        } else if large_config.enabled && meta.len() >= large_config.binary_min_size {
+        } else if large_config.enabled && meta.len() >= large_config.chunked_min_size {
+            let mut chunked_config = large_config.clone();
+            chunked_config.chunk_size = large_config.chunked_chunk_size;
             let (oid, manifest_key, chunk_count) =
-                store_large_file(paths, entry.path(), &rel, &large_config, binary)?;
+                store_large_file(paths, entry.path(), &rel, &chunked_config, binary)?;
             Payload::ChunkedBlob {
                 oid,
                 manifest_key,
@@ -2458,6 +2476,13 @@ fn store_large_file_buffered(
     let bytes = stable_read(path, "strict")?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes);
+    let oid = hasher.finalize().to_hex().to_string();
+    let conn = open_db(paths)?;
+    if let Some((manifest_key, chunk_count)) =
+        existing_large_object_manifest(paths, &conn, &oid, config)?
+    {
+        return Ok((oid, manifest_key, chunk_count));
+    }
     let mut chunks = Vec::new();
     let ranges =
         majutsu_large::chunk_ranges_for_bytes(&config.default_chunking, config.chunk_size, &bytes);
@@ -2465,12 +2490,7 @@ fn store_large_file_buffered(
         let chunk = &bytes[start..end];
         let chunk_oid = blake3_hex(chunk);
         let stored = compress_large_chunk(config, rel, chunk)?;
-        let object_key = store_bytes(
-            paths,
-            &large_chunk_base(paths, &config.default_chunking),
-            &chunk_oid,
-            &stored.bytes,
-        )?;
+        let object_key = store_large_chunk_bytes(paths, &conn, config, &chunk_oid, &stored.bytes)?;
         chunks.push(LargeChunk {
             index,
             offset: start as u64,
@@ -2480,13 +2500,11 @@ fn store_large_file_buffered(
             oid: chunk_oid.clone(),
             object_key: object_key.clone(),
         });
-        let conn = open_db(paths)?;
         conn.execute(
-            "insert or ignore into chunks(oid, size, object_key) values (?1, ?2, ?3)",
+            "insert or replace into chunks(oid, size, object_key) values (?1, ?2, ?3)",
             params![chunk_oid, chunk.len() as u64, object_key],
         )?;
     }
-    let oid = hasher.finalize().to_hex().to_string();
     let manifest = LargeManifest {
         version: 1,
         oid: oid.clone(),
@@ -2500,9 +2518,8 @@ fn store_large_file_buffered(
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
     let manifest_oid = blake3_hex(&manifest_json);
     let manifest_key = store_bytes(paths, &paths.large_manifests, &manifest_oid, &manifest_json)?;
-    let conn = open_db(paths)?;
     conn.execute(
-        "insert or ignore into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
+        "insert or replace into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
         params![oid, bytes.len() as u64, manifest.chunks.len(), manifest_key],
     )?;
     Ok((oid, manifest_key, manifest.chunks.len()))
@@ -2538,6 +2555,7 @@ fn store_large_file_fixed_streaming_once(
 ) -> Result<(String, String, usize)> {
     let before = fs::metadata(path)?;
     let mut file = File::open(path)?;
+    let conn = open_db(paths)?;
     let mut hasher = blake3::Hasher::new();
     let mut chunks = Vec::new();
     let mut buffer = vec![0u8; config.chunk_size.max(1)];
@@ -2552,12 +2570,7 @@ fn store_large_file_fixed_streaming_once(
         hasher.update(chunk);
         let chunk_oid = blake3_hex(chunk);
         let stored = compress_large_chunk(config, rel, chunk)?;
-        let object_key = store_bytes(
-            paths,
-            &large_chunk_base(paths, &config.default_chunking),
-            &chunk_oid,
-            &stored.bytes,
-        )?;
+        let object_key = store_large_chunk_bytes(paths, &conn, config, &chunk_oid, &stored.bytes)?;
         chunks.push(LargeChunk {
             index,
             offset,
@@ -2575,6 +2588,11 @@ fn store_large_file_fixed_streaming_once(
         bail!("file changed while reading: {}", path.display());
     }
     let oid = hasher.finalize().to_hex().to_string();
+    if let Some((manifest_key, chunk_count)) =
+        existing_large_object_manifest(paths, &conn, &oid, config)?
+    {
+        return Ok((oid, manifest_key, chunk_count));
+    }
     let manifest = LargeManifest {
         version: 1,
         oid: oid.clone(),
@@ -2588,18 +2606,78 @@ fn store_large_file_fixed_streaming_once(
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
     let manifest_oid = blake3_hex(&manifest_json);
     let manifest_key = store_bytes(paths, &paths.large_manifests, &manifest_oid, &manifest_json)?;
-    let conn = open_db(paths)?;
     for chunk in &manifest.chunks {
         conn.execute(
-            "insert or ignore into chunks(oid, size, object_key) values (?1, ?2, ?3)",
+            "insert or replace into chunks(oid, size, object_key) values (?1, ?2, ?3)",
             params![chunk.oid, chunk.len, chunk.object_key],
         )?;
     }
     conn.execute(
-        "insert or ignore into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
+        "insert or replace into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
         params![oid, manifest.size, manifest.chunks.len(), manifest_key],
     )?;
     Ok((oid, manifest_key, manifest.chunks.len()))
+}
+
+fn store_large_chunk_bytes(
+    paths: &Paths,
+    conn: &Connection,
+    config: &LargeConfig,
+    chunk_oid: &str,
+    bytes: &[u8],
+) -> Result<String> {
+    if let Some(object_key) = existing_chunk_object_key(paths, conn, chunk_oid)? {
+        return Ok(object_key);
+    }
+    store_bytes(
+        paths,
+        &large_chunk_base(paths, &config.default_chunking),
+        chunk_oid,
+        bytes,
+    )
+}
+
+fn existing_chunk_object_key(
+    paths: &Paths,
+    conn: &Connection,
+    oid: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("select object_key from chunks where oid=?1")?;
+    let mut rows = stmt.query(params![oid])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let object_key: String = row.get(0)?;
+    if paths.home.join(&object_key).exists() {
+        Ok(Some(object_key))
+    } else {
+        Ok(None)
+    }
+}
+
+fn existing_large_object_manifest(
+    paths: &Paths,
+    conn: &Connection,
+    oid: &str,
+    config: &LargeConfig,
+) -> Result<Option<(String, usize)>> {
+    let mut stmt =
+        conn.prepare("select manifest_key, chunk_count from large_objects where oid=?1")?;
+    let mut rows = stmt.query(params![oid])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let manifest_key: String = row.get(0)?;
+    let chunk_count: usize = row.get(1)?;
+    if !paths.home.join(&manifest_key).exists() {
+        return Ok(None);
+    }
+    let manifest: LargeManifest = serde_json::from_slice(&read_object(paths, &manifest_key)?)?;
+    if manifest.chunking == config.default_chunking && manifest.chunk_size == config.chunk_size {
+        Ok(Some((manifest_key, chunk_count)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn compress_large_chunk(
@@ -2761,6 +2839,8 @@ pub(crate) fn export_metadata(
                 enabled: config.large.enabled,
                 min_size: config.large.min_size,
                 binary_min_size: config.large.binary_min_size,
+                chunked_min_size: config.large.chunked_min_size,
+                chunked_chunk_size: config.large.chunked_chunk_size,
                 default_chunking: config.large.default_chunking.clone(),
                 chunk_size: config.large.chunk_size,
                 max_parallel_uploads: config.large.max_parallel_uploads,
@@ -3824,6 +3904,8 @@ tier = "Bulk"
                 application_plugin: None,
                 large_min_size: None,
                 large_binary_min_size: None,
+                large_chunked_min_size: None,
+                large_chunked_chunk_size: None,
                 large_chunk_size: None,
                 large_chunking: None,
                 large_always: Vec::new(),

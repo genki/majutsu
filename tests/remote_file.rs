@@ -270,6 +270,7 @@ fn file_remote_clone_restores_normal_and_large_files() {
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("binary_min_size = 16777216", "binary_min_size = 131072")
+        .replace("chunked_min_size = 1048576", "chunked_min_size = 131072")
         .replace("chunk_size = 8388608", "chunk_size = 65536");
     fs::write(&config_path, config).unwrap();
     run({
@@ -6420,6 +6421,7 @@ fn snapshot_manifest_uses_spec_payload_variants() {
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("binary_min_size = 16777216", "binary_min_size = 131072")
+        .replace("chunked_min_size = 1048576", "chunked_min_size = 131072")
         .replace("chunk_size = 8388608", "chunk_size = 65536");
     fs::write(&config_path, config).unwrap();
     run({
@@ -11821,6 +11823,95 @@ fn root_large_policy_override_can_route_small_files_to_large_pipeline() {
     });
     assert!(stat.contains("large_objects 1"));
     assert!(stat.contains("chunks 5"));
+}
+
+#[test]
+fn default_chunked_min_size_routes_medium_text_to_chunked_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    let mut medium = Vec::with_capacity(1024 * 1024 + 128);
+    for i in 0..1024 * 1024 + 128 {
+        medium.push(b'a' + (i % 26) as u8);
+    }
+    fs::write(source.join("medium.log"), &medium).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let tree_path = find_file_ending(&state.join("objects/trees"), "");
+    let tree: serde_json::Value = serde_json::from_slice(&fs::read(tree_path).unwrap()).unwrap();
+    assert_eq!(
+        tree["entries"]["medium.log"]["payload"]["type"],
+        "chunked-blob"
+    );
+    assert_eq!(
+        tree["entries"]["medium.log"]["payload"]["chunk_count"],
+        serde_json::Value::from(17)
+    );
+}
+
+#[test]
+fn encrypted_chunked_blob_reuses_stable_payload_refs_across_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    let mut medium = Vec::with_capacity(1024 * 1024 + 128);
+    for i in 0..1024 * 1024 + 128 {
+        medium.push(((i * 31 + 17) % 251) as u8);
+    }
+    fs::write(source.join("medium.bin"), &medium).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init").arg("--encrypt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let diff = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("diff");
+        c
+    });
+    assert!(diff.trim().is_empty(), "{diff}");
 }
 
 #[test]

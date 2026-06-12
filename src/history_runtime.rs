@@ -164,6 +164,16 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
                 "binary-min-size",
                 &format_bytes(config.large.binary_min_size),
             ],
+            [
+                "large",
+                "chunked-min-size",
+                &format_bytes(config.large.chunked_min_size),
+            ],
+            [
+                "large",
+                "chunked-chunk-size",
+                &format_bytes(config.large.chunked_chunk_size as u64),
+            ],
             ["large", "chunking", config.large.default_chunking.as_str()],
             [
                 "large",

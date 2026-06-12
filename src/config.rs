@@ -246,7 +246,7 @@ pub(crate) struct MountViewMetadata {
     pub(crate) hydrated_large_files: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct LargeConfig {
     pub(crate) enabled: bool,
     #[serde(
@@ -259,6 +259,16 @@ pub(crate) struct LargeConfig {
         deserialize_with = "deserialize_u64_bytes"
     )]
     pub(crate) binary_min_size: u64,
+    #[serde(
+        default = "default_large_chunked_min_size",
+        deserialize_with = "deserialize_u64_bytes"
+    )]
+    pub(crate) chunked_min_size: u64,
+    #[serde(
+        default = "default_large_chunked_chunk_size",
+        deserialize_with = "deserialize_usize_bytes"
+    )]
+    pub(crate) chunked_chunk_size: usize,
     #[serde(default = "default_large_chunking")]
     pub(crate) default_chunking: String,
     #[serde(
@@ -446,6 +456,10 @@ pub(crate) struct RootLargeConfig {
     pub(crate) min_size: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_option_u64_bytes")]
     pub(crate) binary_min_size: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_option_u64_bytes")]
+    pub(crate) chunked_min_size: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_option_usize_bytes")]
+    pub(crate) chunked_chunk_size: Option<usize>,
     #[serde(default)]
     pub(crate) default_chunking: Option<String>,
     #[serde(
@@ -580,6 +594,12 @@ fn validate_large_config(large: &LargeConfig) -> Result<()> {
     validate_large_chunking(&large.default_chunking)?;
     if large.chunk_size == 0 {
         bail!("large chunk_size must be greater than zero");
+    }
+    if large.chunked_min_size == 0 {
+        bail!("large chunked_min_size must be greater than zero");
+    }
+    if large.chunked_chunk_size == 0 {
+        bail!("large chunked_chunk_size must be greater than zero");
     }
     if large.max_parallel_uploads == 0 {
         bail!("large max_parallel_uploads must be greater than zero");
@@ -748,6 +768,14 @@ pub(crate) fn default_large_max_parallel_uploads() -> usize {
 
 pub(crate) fn default_large_binary_min_size() -> u64 {
     majutsu_large::default_large_binary_min_size()
+}
+
+pub(crate) fn default_large_chunked_min_size() -> u64 {
+    majutsu_large::default_chunked_min_size()
+}
+
+pub(crate) fn default_large_chunked_chunk_size() -> usize {
+    majutsu_large::default_chunked_chunk_size()
 }
 
 pub(crate) fn default_chunk_size() -> usize {

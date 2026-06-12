@@ -100,6 +100,7 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
             return wait_for_sync_catchup(
                 paths,
                 &conn,
+                &config,
                 &remote,
                 &target_current,
                 args.timeout_secs,
@@ -112,7 +113,14 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     sync_configured_remote(paths, &conn, &config, &remote)?;
     if args.wait {
         let target_current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
-        wait_for_sync_catchup(paths, &conn, &remote, &target_current, args.timeout_secs)?;
+        wait_for_sync_catchup(
+            paths,
+            &conn,
+            &config,
+            &remote,
+            &target_current,
+            args.timeout_secs,
+        )?;
     }
     Ok(())
 }
@@ -322,6 +330,7 @@ fn print_sync_wait_status(status: &SyncWaitStatus) {
 fn wait_for_sync_catchup(
     paths: &Paths,
     conn: &Connection,
+    config: &Config,
     remote: &RemoteStore,
     target_current: &str,
     timeout_secs: u64,
@@ -344,6 +353,14 @@ fn wait_for_sync_catchup(
             println!("wait_target_current {}", target_current);
             println!("status_mode quick");
             return Ok(());
+        }
+        if status.sync_lock_pid.is_none()
+            && status.queued_uploads == 0
+            && status.local_current != status.remote_current
+        {
+            println!("wait_resync {}", status.local_current);
+            sync_configured_remote(paths, conn, config, remote)?;
+            continue;
         }
         if Instant::now() >= deadline {
             print_sync_wait_status(&status);

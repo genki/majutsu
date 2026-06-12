@@ -166,6 +166,8 @@ pub fn effective_large_config(config: &Config, root: &RootConfig) -> LargeConfig
         enabled: config.large.enabled,
         min_size: config.large.min_size,
         binary_min_size: config.large.binary_min_size,
+        chunked_min_size: config.large.chunked_min_size,
+        chunked_chunk_size: config.large.chunked_chunk_size,
         default_chunking: config.large.default_chunking.clone(),
         chunk_size: config.large.chunk_size,
         max_parallel_uploads: config.large.max_parallel_uploads,
@@ -180,6 +182,12 @@ pub fn effective_large_config(config: &Config, root: &RootConfig) -> LargeConfig
         }
         if let Some(binary_min_size) = root_large.binary_min_size {
             large.binary_min_size = binary_min_size;
+        }
+        if let Some(chunked_min_size) = root_large.chunked_min_size {
+            large.chunked_min_size = chunked_min_size;
+        }
+        if let Some(chunked_chunk_size) = root_large.chunked_chunk_size {
+            large.chunked_chunk_size = chunked_chunk_size;
         }
         if let Some(default_chunking) = &root_large.default_chunking {
             large.default_chunking = default_chunking.clone();
@@ -246,6 +254,8 @@ fn path_pattern_match(pattern: &str, rel: &str) -> bool {
 pub fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {
     if args.large_min_size.is_none()
         && args.large_binary_min_size.is_none()
+        && args.large_chunked_min_size.is_none()
+        && args.large_chunked_chunk_size.is_none()
         && args.large_chunk_size.is_none()
         && args.large_chunking.is_none()
         && args.large_always.is_empty()
@@ -256,6 +266,8 @@ pub fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {
     Some(RootLargeConfig {
         min_size: args.large_min_size,
         binary_min_size: args.large_binary_min_size,
+        chunked_min_size: args.large_chunked_min_size,
+        chunked_chunk_size: args.large_chunked_chunk_size,
         default_chunking: args.large_chunking.clone(),
         chunk_size: args.large_chunk_size,
         always: args.large_always.clone(),
@@ -272,6 +284,8 @@ pub fn apply_root_large_set(root: &mut RootConfig, args: &RootSetArgs) -> Result
     }
     let wants_large = args.large_min_size.is_some()
         || args.large_binary_min_size.is_some()
+        || args.large_chunked_min_size.is_some()
+        || args.large_chunked_chunk_size.is_some()
         || args.large_chunk_size.is_some()
         || args.large_chunking.is_some()
         || !args.large_always.is_empty()
@@ -284,6 +298,8 @@ pub fn apply_root_large_set(root: &mut RootConfig, args: &RootSetArgs) -> Result
     let large = root.large.get_or_insert_with(|| RootLargeConfig {
         min_size: None,
         binary_min_size: None,
+        chunked_min_size: None,
+        chunked_chunk_size: None,
         default_chunking: None,
         chunk_size: None,
         always: Vec::new(),
@@ -294,6 +310,12 @@ pub fn apply_root_large_set(root: &mut RootConfig, args: &RootSetArgs) -> Result
     }
     if let Some(binary_min_size) = args.large_binary_min_size {
         large.binary_min_size = Some(binary_min_size);
+    }
+    if let Some(chunked_min_size) = args.large_chunked_min_size {
+        large.chunked_min_size = Some(chunked_min_size);
+    }
+    if let Some(chunked_chunk_size) = args.large_chunked_chunk_size {
+        large.chunked_chunk_size = Some(chunked_chunk_size);
     }
     if let Some(chunk_size) = args.large_chunk_size {
         large.chunk_size = Some(chunk_size);

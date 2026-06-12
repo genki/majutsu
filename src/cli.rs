@@ -375,6 +375,18 @@ pub(crate) struct RootAddArgs {
         help = "Minimum binary-file size treated as a large object"
     )]
     pub(crate) large_binary_min_size: Option<u64>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        help = "Minimum non-large file size stored as chunked blobs"
+    )]
+    pub(crate) large_chunked_min_size: Option<u64>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        help = "Chunk size for non-large files stored as chunked blobs"
+    )]
+    pub(crate) large_chunked_chunk_size: Option<usize>,
     #[arg(long, value_name = "BYTES", help = "Large object chunk size")]
     pub(crate) large_chunk_size: Option<usize>,
     #[arg(
@@ -448,6 +460,10 @@ pub(crate) struct RootSetArgs {
     pub(crate) large_min_size: Option<u64>,
     #[arg(long)]
     pub(crate) large_binary_min_size: Option<u64>,
+    #[arg(long)]
+    pub(crate) large_chunked_min_size: Option<u64>,
+    #[arg(long)]
+    pub(crate) large_chunked_chunk_size: Option<usize>,
     #[arg(long)]
     pub(crate) large_chunk_size: Option<usize>,
     #[arg(long)]

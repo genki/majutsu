@@ -297,6 +297,14 @@ pub fn default_large_binary_min_size() -> u64 {
     DEFAULT_LARGE_BINARY_MIN_SIZE
 }
 
+pub fn default_chunked_min_size() -> u64 {
+    1024 * 1024
+}
+
+pub fn default_chunked_chunk_size() -> usize {
+    64 * 1024
+}
+
 pub fn default_chunk_size() -> usize {
     DEFAULT_CHUNK_SIZE
 }
@@ -442,6 +450,8 @@ mod tests {
     fn defaults_match_large_pipeline_spec() {
         assert_eq!(default_large_min_size(), 64 * 1024 * 1024);
         assert_eq!(default_large_binary_min_size(), 16 * 1024 * 1024);
+        assert_eq!(default_chunked_min_size(), 1024 * 1024);
+        assert_eq!(default_chunked_chunk_size(), 64 * 1024);
         assert_eq!(default_chunk_size(), 8 * 1024 * 1024);
         assert_eq!(default_chunking(), "fixed");
         assert_eq!(default_max_parallel_uploads(), 8);
