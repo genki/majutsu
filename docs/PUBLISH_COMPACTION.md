@@ -36,5 +36,16 @@ MAJUTSU_SYNC_LEGACY_CURRENT_REFS=1 mj sync
 
 ## GC mark
 
-GC mark は remote prune の安全性に関わるため、この段階では毎 sync publish を維持する。
-低頻度化・差分化は別の設計課題として扱う。
+S3/GCS 互換 backend では compact head を通常復旧の正とするため、GC mark は初回だけ seed し、
+通常の小変更 sync では毎回 publish しない。GC mark は remote prune の保護集合として使うため、
+remote prune を実行する同期では最新状態を強制 publish してから prune する。
+
+GC mark を互換確認などで毎回更新したい場合は次を使う。
+
+```sh
+MAJUTSU_SYNC_GC_MARK_EVERY_TIME=1 mj sync
+```
+
+file remote は従来通り、GC mark を毎 sync publish し、fsck でも current snapshot と live object
+集合の一致を厳密に検証する。S3/GCS 互換 backend では compact head が存在する場合、古い GC mark
+は remote prune 用の補助情報として扱い、version、host id、重複 key などの構造破損だけを検出する。

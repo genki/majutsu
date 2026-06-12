@@ -366,19 +366,23 @@ fn validate_quick_host_metadata(
             }
         }
     }
-    validate_quick_gc_records(remote, &host.id, current, missing)
+    validate_quick_gc_records(remote, &host.id, current, head.as_ref(), missing)
 }
 
 fn validate_quick_gc_records(
     remote: &RemoteStore,
     host_id: &str,
     current: Option<&String>,
+    head: Option<&RemoteHeadExport>,
     missing: &mut usize,
 ) -> Result<()> {
+    let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
     let mark_key = remote_gc_mark_key(host_id);
     let Some(bytes) = remote.get_optional(&mark_key)? else {
-        *missing += 1;
-        eprintln!("missing remote gc mark {mark_key}");
+        if !compact_head_authoritative {
+            *missing += 1;
+            eprintln!("missing remote gc mark {mark_key}");
+        }
         return Ok(());
     };
     let mark: GcMarkExport = match serde_json::from_slice(&bytes) {
@@ -400,7 +404,7 @@ fn validate_quick_gc_records(
             mark.host_id, host_id
         );
     }
-    if mark.current_snapshot.as_ref() != current {
+    if mark.current_snapshot.as_ref() != current && !compact_head_authoritative {
         *missing += 1;
         eprintln!("remote gc mark current snapshot does not match metadata {mark_key}");
     }

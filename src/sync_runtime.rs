@@ -661,16 +661,7 @@ fn enqueue_and_drain_sync(
         }
     }
     trace.mark("content queue");
-    enqueue_inline_upload(
-        paths,
-        &remote_gc_mark_key(&config.host.id),
-        serde_json::to_vec_pretty(&build_gc_mark_export(
-            paths,
-            config,
-            remote,
-            &content_export,
-        )?)?,
-    )?;
+    enqueue_gc_mark_if_needed(paths, remote, config, &content_export)?;
     trace.mark("gc mark");
     let upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     trace.mark("drain queue");
@@ -810,6 +801,13 @@ fn sync_remote_prune_enabled() -> bool {
     std::env::var("MAJUTSU_SYNC_REMOTE_PRUNE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn sync_gc_mark_every_time() -> bool {
+    sync_remote_prune_enabled()
+        || std::env::var("MAJUTSU_SYNC_GC_MARK_EVERY_TIME")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
 }
 
 fn metadata_export_for_remote(
@@ -1451,6 +1449,26 @@ fn build_gc_mark_export(
         export.refs.get("current").cloned(),
         object_keys,
     ))
+}
+
+fn enqueue_gc_mark_if_needed(
+    paths: &Paths,
+    remote: &RemoteStore,
+    config: &Config,
+    export: &MetadataExport,
+) -> Result<()> {
+    let key = remote_gc_mark_key(&config.host.id);
+    let should_publish = !remote_prefers_canonical_only(remote)
+        || sync_gc_mark_every_time()
+        || !remote.exists(&key)?;
+    if !should_publish {
+        return Ok(());
+    }
+    enqueue_inline_upload(
+        paths,
+        &key,
+        serde_json::to_vec_pretty(&build_gc_mark_export(paths, config, remote, export)?)?,
+    )
 }
 
 fn encode_canonical_local_object(

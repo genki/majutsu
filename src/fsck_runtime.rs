@@ -953,9 +953,13 @@ pub(crate) fn validate_remote_gc_records(
     missing: &mut usize,
 ) -> Result<()> {
     let mark_key = remote_gc_mark_key(host_id);
+    let compact_head_authoritative =
+        matches!(remote, RemoteStore::S3(_)) && read_remote_head(paths, remote, host_id)?.is_some();
     if !remote.exists(&mark_key)? {
-        *missing += 1;
-        eprintln!("missing remote gc mark {mark_key}");
+        if !compact_head_authoritative {
+            *missing += 1;
+            eprintln!("missing remote gc mark {mark_key}");
+        }
     } else {
         let mark: GcMarkExport = match serde_json::from_slice(&remote.get(&mark_key)?) {
             Ok(mark) => mark,
@@ -965,13 +969,40 @@ pub(crate) fn validate_remote_gc_records(
                 return validate_remote_gc_tombstones(remote, host_id, missing);
             }
         };
-        let expected = expected_gc_mark_object_keys(paths, remote, export)?;
-        for issue in mark.validation_issues(host_id, export.refs.get("current"), &expected) {
-            *missing += 1;
-            eprintln!("{}", issue.message(&mark_key, host_id));
+        if compact_head_authoritative {
+            validate_compact_remote_gc_mark(&mark_key, host_id, &mark, missing);
+        } else {
+            let expected = expected_gc_mark_object_keys(paths, remote, export)?;
+            for issue in mark.validation_issues(host_id, export.refs.get("current"), &expected) {
+                *missing += 1;
+                eprintln!("{}", issue.message(&mark_key, host_id));
+            }
         }
     }
     validate_remote_gc_tombstones(remote, host_id, missing)
+}
+
+fn validate_compact_remote_gc_mark(
+    mark_key: &str,
+    host_id: &str,
+    mark: &GcMarkExport,
+    missing: &mut usize,
+) {
+    if mark.version != 1 {
+        *missing += 1;
+        eprintln!("unsupported remote gc mark version {mark_key}");
+    }
+    if mark.host_id != host_id {
+        *missing += 1;
+        eprintln!(
+            "remote gc mark host id {} does not match {}",
+            mark.host_id, host_id
+        );
+    }
+    if mark.has_duplicate_object_keys() {
+        *missing += 1;
+        eprintln!("remote gc mark contains duplicate object keys {mark_key}");
+    }
 }
 
 fn expected_gc_mark_object_keys(
