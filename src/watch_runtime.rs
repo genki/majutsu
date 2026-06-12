@@ -263,15 +263,23 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
 
     let message = args.message.unwrap_or_else(|| "watch snapshot".into());
     let exe = std::env::current_exe()?;
-    let status = std::process::Command::new(&exe)
+    let output = std::process::Command::new(&exe)
         .arg("--home")
         .arg(&paths.home)
         .arg("snapshot")
         .arg("--message")
         .arg(&message)
-        .status()?;
-    if !status.success() {
-        bail!("watch snapshot child process failed with status {status}");
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("snapshot already running with pid") {
+            record_event(paths, "watch-snapshot-deferred", stderr.trim())?;
+            return Ok(());
+        }
+        bail!(
+            "watch snapshot child process failed with status {}",
+            output.status
+        );
     }
     record_event(paths, "watch-snapshot-child", &message)?;
 

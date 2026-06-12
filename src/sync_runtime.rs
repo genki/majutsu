@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
@@ -352,6 +352,13 @@ fn enqueue_and_drain_sync(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
+    let local_prune_min_age_secs = env::var("MAJUTSU_SYNC_LOCAL_PRUNE_MIN_AGE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60);
+    let local_prune_cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(local_prune_min_age_secs))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let content_export = export_metadata(paths, conn, config)?;
     let remote_export =
         metadata_export_for_remote(paths, remote, export_metadata(paths, conn, config)?)?;
@@ -519,7 +526,8 @@ fn enqueue_and_drain_sync(
     } else {
         (0, 0)
     };
-    let pruned_local_objects = prune_local_packed_blob_objects(paths, &remote_export)?;
+    let pruned_local_objects =
+        prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff)?;
     persist_export_remote_refs(
         conn,
         &remote.describe(),
@@ -1302,7 +1310,11 @@ fn list_remote_canonical_content_aliases(remote: &RemoteStore) -> Result<BTreeSe
     Ok(keys)
 }
 
-fn prune_local_packed_blob_objects(paths: &Paths, export: &MetadataExport) -> Result<usize> {
+fn prune_local_packed_blob_objects(
+    paths: &Paths,
+    export: &MetadataExport,
+    cutoff: SystemTime,
+) -> Result<usize> {
     if env::var("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE").as_deref() == Ok("0") {
         return Ok(0);
     }
@@ -1328,6 +1340,13 @@ fn prune_local_packed_blob_objects(paths: &Paths, export: &MetadataExport) -> Re
         }
         let key = crate::util::path_to_slash(entry.path().strip_prefix(&paths.home)?);
         if referenced_blob_dir_keys.contains(key.as_str()) {
+            continue;
+        }
+        if entry
+            .metadata()?
+            .modified()
+            .is_ok_and(|modified| modified > cutoff)
+        {
             continue;
         }
         fs::remove_file(entry.path()).with_context(|| format!("remove {key}"))?;

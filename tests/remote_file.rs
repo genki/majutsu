@@ -7961,7 +7961,8 @@ fn sync_prunes_local_loose_blobs_after_auto_pack() {
         c.arg("--home")
             .arg(&state)
             .arg("sync")
-            .env("MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS", "1");
+            .env("MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS", "1")
+            .env("MAJUTSU_SYNC_LOCAL_PRUNE_MIN_AGE_SECS", "0");
         c
     });
     assert!(sync.contains("auto_pack unpacked_small_blobs "));
