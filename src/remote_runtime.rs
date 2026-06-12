@@ -15,7 +15,36 @@ use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
 use crate::util::parse_db_time;
-use crate::{ensure_ready, export_metadata, open_db, remote_object_available, remote_ref};
+use crate::{
+    decode_object, ensure_ready, export_metadata, open_db, remote_object_available, remote_ref,
+};
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoteHeadExport {
+    version: u32,
+    host_id: String,
+    host_name: String,
+    current_snapshot: Option<String>,
+    last_synced: Option<String>,
+    metadata_key: String,
+}
+
+fn remote_head_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/head.cbor.zst.enc")
+}
+
+fn read_remote_head(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<Option<RemoteHeadExport>> {
+    let Some(bytes) = remote.get_optional(&remote_head_key(host_id))? else {
+        return Ok(None);
+    };
+    let decoded = decode_object(paths, &bytes)?;
+    let decompressed = zstd::stream::decode_all(decoded.as_slice())?;
+    Ok(Some(serde_cbor::from_slice(&decompressed)?))
+}
 
 pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     ensure_ready(paths)?;
@@ -136,7 +165,7 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     Ok(())
 }
 
-fn remote_fsck_quick(_paths: &Paths, remote: &RemoteStore) -> Result<()> {
+fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     let start = std::time::Instant::now();
     let mut missing = 0usize;
     let mut checked_metadata = 0usize;
@@ -183,7 +212,7 @@ fn remote_fsck_quick(_paths: &Paths, remote: &RemoteStore) -> Result<()> {
                 continue;
             }
         };
-        validate_quick_host_metadata(remote, host, &export, &mut missing)?;
+        validate_quick_host_metadata(paths, remote, host, &export, &mut missing)?;
     }
     if missing > 0 {
         bail!("remote fsck quick found {missing} issue(s)");
@@ -210,6 +239,7 @@ fn decode_remote_metadata_bytes(key: &str, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn validate_quick_host_metadata(
+    paths: &Paths,
     remote: &RemoteStore,
     host: &RemoteHostSummary,
     export: &MetadataExport,
@@ -237,6 +267,44 @@ fn validate_quick_host_metadata(
             host.id
         );
     }
+    let head = read_remote_head(paths, remote, &host.id)?;
+    if let Some(head) = head.as_ref() {
+        if head.version != 1 {
+            *missing += 1;
+            eprintln!(
+                "unsupported remote head version {}",
+                remote_head_key(&host.id)
+            );
+        }
+        if head.host_id != host.id {
+            *missing += 1;
+            eprintln!(
+                "remote head host id {} does not match {}",
+                head.host_id, host.id
+            );
+        }
+        if head.host_name != export.config.host.name {
+            *missing += 1;
+            eprintln!(
+                "remote head host name does not match metadata for {}",
+                host.id
+            );
+        }
+        if head.metadata_key != host.metadata_key {
+            *missing += 1;
+            eprintln!(
+                "remote head metadata key does not match host index for {}",
+                host.id
+            );
+        }
+        if head.current_snapshot.as_ref() != current {
+            *missing += 1;
+            eprintln!(
+                "remote head current snapshot does not match metadata for {}",
+                host.id
+            );
+        }
+    }
     if let Some(current) = current {
         let key = host_current_ref_key(&host.id);
         match remote_ref(remote, &key)? {
@@ -246,8 +314,10 @@ fn validate_quick_host_metadata(
                 eprintln!("{key} points to {value}, expected {current}");
             }
             None => {
-                *missing += 1;
-                eprintln!("missing remote ref {key}");
+                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                    *missing += 1;
+                    eprintln!("missing remote ref {key}");
+                }
             }
         }
     }
@@ -269,6 +339,15 @@ fn validate_quick_host_metadata(
             }
         }
         let key = host_last_synced_ref_key(&host.id);
+        if let Some(head) = head.as_ref() {
+            if head.last_synced.as_ref() != Some(last_synced) {
+                *missing += 1;
+                eprintln!(
+                    "remote head last-synced does not match metadata for {}",
+                    host.id
+                );
+            }
+        }
         match remote_ref(remote, &key)? {
             Some(value) if value == *last_synced => {}
             Some(value) => {
@@ -276,8 +355,10 @@ fn validate_quick_host_metadata(
                 eprintln!("{key} points to {value}, expected {last_synced}");
             }
             None => {
-                *missing += 1;
-                eprintln!("missing remote ref {key}");
+                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                    *missing += 1;
+                    eprintln!("missing remote ref {key}");
+                }
             }
         }
     }

@@ -323,7 +323,10 @@ fn upload_publish_priority(key: &str) -> u8 {
     if key == "hosts/current" || key.starts_with("refs/") || key.contains("/refs/") {
         return 3;
     }
-    if key.ends_with("/current") || key.contains("/refs/current") {
+    if key.ends_with("/current")
+        || key.contains("/refs/current")
+        || key.ends_with("/head.cbor.zst.enc")
+    {
         return 3;
     }
     if key.starts_with("metadata/")
@@ -400,6 +403,10 @@ mod tests {
         assert!(
             upload_publish_priority("hosts/example/metadata/export.json")
                 < upload_publish_priority("hosts/example/refs/current")
+        );
+        assert!(
+            upload_publish_priority("hosts/example/metadata/export.json")
+                < upload_publish_priority("hosts/example/head.cbor.zst.enc")
         );
     }
 }

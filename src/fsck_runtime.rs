@@ -54,6 +54,33 @@ use crate::{
     read_large_chunk, read_object, remote_local_object_variants, remote_ref,
 };
 
+#[derive(Debug, serde::Deserialize)]
+struct RemoteHeadExport {
+    version: u32,
+    host_id: String,
+    host_name: String,
+    current_snapshot: Option<String>,
+    last_synced: Option<String>,
+    metadata_key: String,
+}
+
+fn remote_head_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/head.cbor.zst.enc")
+}
+
+fn read_remote_head(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<Option<RemoteHeadExport>> {
+    let Some(bytes) = remote.get_optional(&remote_head_key(host_id))? else {
+        return Ok(None);
+    };
+    let decoded = decode_object(paths, &bytes)?;
+    let decompressed = zstd::stream::decode_all(decoded.as_slice())?;
+    Ok(Some(serde_cbor::from_slice(&decompressed)?))
+}
+
 pub(crate) fn fsck(paths: &Paths) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = open_db(paths)?;
@@ -1610,6 +1637,44 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                     host.id
                 );
             }
+            let head = read_remote_head(paths, remote, &host.id)?;
+            if let Some(head) = head.as_ref() {
+                if head.version != 1 {
+                    missing += 1;
+                    eprintln!(
+                        "unsupported remote head version {}",
+                        remote_head_key(&host.id)
+                    );
+                }
+                if head.host_id != host.id {
+                    missing += 1;
+                    eprintln!(
+                        "remote head host id {} does not match {}",
+                        head.host_id, host.id
+                    );
+                }
+                if head.host_name != export.config.host.name {
+                    missing += 1;
+                    eprintln!(
+                        "remote head host name does not match metadata for {}",
+                        host.id
+                    );
+                }
+                if head.metadata_key != host.metadata_key {
+                    missing += 1;
+                    eprintln!(
+                        "remote head metadata key does not match host index for {}",
+                        host.id
+                    );
+                }
+                if head.current_snapshot.as_ref() != current {
+                    missing += 1;
+                    eprintln!(
+                        "remote head current snapshot does not match metadata for {}",
+                        host.id
+                    );
+                }
+            }
             let current_ref_key = host_current_ref_key(&host.id);
             if let Some(current) = current {
                 match remote_ref(remote, &current_ref_key)? {
@@ -1621,8 +1686,10 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                         );
                     }
                     None => {
-                        missing += 1;
-                        eprintln!("missing remote ref {current_ref_key}");
+                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                            missing += 1;
+                            eprintln!("missing remote ref {current_ref_key}");
+                        }
                     }
                 }
                 let legacy_current_key = host_legacy_current_key(&host.id);
@@ -1653,6 +1720,15 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                     }
                 }
                 let last_synced_ref_key = host_last_synced_ref_key(&host.id);
+                if let Some(head) = head.as_ref() {
+                    if head.last_synced.as_ref() != Some(last_synced) {
+                        missing += 1;
+                        eprintln!(
+                            "remote head last-synced does not match metadata for {}",
+                            host.id
+                        );
+                    }
+                }
                 match remote_ref(remote, &last_synced_ref_key)? {
                     Some(remote_last_synced) if remote_last_synced == *last_synced => {}
                     Some(remote_last_synced) => {
@@ -1662,8 +1738,10 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                         );
                     }
                     None => {
-                        missing += 1;
-                        eprintln!("missing remote ref {last_synced_ref_key}");
+                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                            missing += 1;
+                            eprintln!("missing remote ref {last_synced_ref_key}");
+                        }
                     }
                 }
             }

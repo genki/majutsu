@@ -132,3 +132,9 @@ mj op diff <op-id> --root moon
 
 S3 互換 remote では、index file から埋め込み snapshot manifest を省略した compact
 metadata export を使う。詳細は `docs/REMOTE_METADATA_STORAGE.md` を参照する。
+
+## publish compaction
+
+S3/GCS 互換 remote では、最新 head 情報を `hosts/<host-id>/head.cbor.zst.enc`
+へ集約し、小変更時の canonical ref publish 数を削減する。詳細は
+`docs/PUBLISH_COMPACTION.md` を参照する。

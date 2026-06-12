@@ -42,13 +42,78 @@ use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
 use crate::util::{blake3_hex, new_id, parse_db_time};
 use crate::{
-    encode_object, ensure_ready, export_metadata, open_db, read_object, remote_object_available,
-    remote_ref,
+    decode_object, encode_object, ensure_ready, export_metadata, open_db, read_object,
+    remote_object_available, remote_ref,
 };
 
 const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v7";
 const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
 const CLONE_BOOTSTRAP_VERSION: u32 = 2;
+const REMOTE_HEAD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteHeadExport {
+    version: u32,
+    host_id: String,
+    host_name: String,
+    current_snapshot: Option<String>,
+    last_synced: Option<String>,
+    metadata_key: String,
+    host_index_key: String,
+    gc_mark_key: String,
+    latest_snapshot_key: Option<String>,
+    latest_operation_key: Option<String>,
+    updated_at: String,
+}
+
+fn remote_head_key(host_id: &str) -> String {
+    format!("hosts/{host_id}/head.cbor.zst.enc")
+}
+
+fn build_remote_head_export(
+    config: &Config,
+    export: &MetadataExport,
+    metadata_key: &str,
+) -> RemoteHeadExport {
+    let current_snapshot = export.refs.get("current").cloned();
+    let latest_snapshot_key = current_snapshot
+        .as_ref()
+        .map(|snapshot_id| host_snapshot_canonical_key(&config.host.id, snapshot_id));
+    let latest_operation_key = export
+        .operations
+        .last()
+        .map(|operation| host_operation_canonical_key(&config.host.id, &operation.id));
+    RemoteHeadExport {
+        version: REMOTE_HEAD_VERSION,
+        host_id: config.host.id.clone(),
+        host_name: config.host.name.clone(),
+        current_snapshot,
+        last_synced: export.refs.get("last-synced").cloned(),
+        metadata_key: metadata_key.to_string(),
+        host_index_key: REMOTE_HOST_INDEX_KEY.to_string(),
+        gc_mark_key: remote_gc_mark_key(&config.host.id),
+        latest_snapshot_key,
+        latest_operation_key,
+        updated_at: Utc::now().to_rfc3339(),
+    }
+}
+
+fn decode_remote_head(paths: &Paths, bytes: &[u8]) -> Result<RemoteHeadExport> {
+    let decoded = decode_object(paths, bytes)?;
+    let decompressed = zstd::stream::decode_all(decoded.as_slice())?;
+    Ok(serde_cbor::from_slice(&decompressed)?)
+}
+
+fn read_remote_head(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<Option<RemoteHeadExport>> {
+    let Some(bytes) = remote.get_optional(&remote_head_key(host_id))? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_remote_head(paths, &bytes)?))
+}
 
 struct SyncTrace {
     enabled: bool,
@@ -269,13 +334,20 @@ fn sync_wait_status(
 ) -> Result<SyncWaitStatus> {
     let local_current = current_snapshot(conn)?.unwrap_or_else(|| "(none)".into());
     let config = read_config(paths)?;
-    let canonical_current = host_current_ref_key(&config.host.id);
-    let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
-    let mut remote_current = remote_ref(remote, &canonical_current)?;
-    if remote_current.is_none() {
-        remote_current = remote_ref(remote, "hosts/current")?;
-    }
-    let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
+    let (remote_current, remote_last_synced) =
+        match read_remote_head(paths, remote, &config.host.id)? {
+            Some(head) => (head.current_snapshot, head.last_synced),
+            None => {
+                let canonical_current = host_current_ref_key(&config.host.id);
+                let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
+                let mut remote_current = remote_ref(remote, &canonical_current)?;
+                if remote_current.is_none() {
+                    remote_current = remote_ref(remote, "hosts/current")?;
+                }
+                let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
+                (remote_current, remote_last_synced)
+            }
+        };
     let upload_stats = upload_queue_stats(paths)?;
     let sync_lock_pid = process_lock_owner(&paths.sync_lock).ok().flatten();
     Ok(SyncWaitStatus {
@@ -472,27 +544,29 @@ fn enqueue_and_drain_sync(
         "host.toml",
         toml::to_string_pretty(&config.host)?.into_bytes(),
     )?;
-    if let Some(current) = remote_export.refs.get("current") {
-        if should_upload_legacy_current_refs(remote) {
-            enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
+    if should_upload_remote_ref_objects(remote) {
+        if let Some(current) = remote_export.refs.get("current") {
+            if should_upload_legacy_current_refs(remote) {
+                enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
+                enqueue_inline_upload(
+                    paths,
+                    &host_legacy_current_key(&config.host.id),
+                    current.as_bytes().to_vec(),
+                )?;
+            }
             enqueue_inline_upload(
                 paths,
-                &host_legacy_current_key(&config.host.id),
+                &host_current_ref_key(&config.host.id),
                 current.as_bytes().to_vec(),
             )?;
         }
-        enqueue_inline_upload(
-            paths,
-            &host_current_ref_key(&config.host.id),
-            current.as_bytes().to_vec(),
-        )?;
-    }
-    if let Some(last_synced) = remote_export.refs.get("last-synced") {
-        enqueue_inline_upload(
-            paths,
-            &host_last_synced_ref_key(&config.host.id),
-            last_synced.as_bytes().to_vec(),
-        )?;
+        if let Some(last_synced) = remote_export.refs.get("last-synced") {
+            enqueue_inline_upload(
+                paths,
+                &host_last_synced_ref_key(&config.host.id),
+                last_synced.as_bytes().to_vec(),
+            )?;
+        }
     }
     let host_index = update_remote_host_index(remote, config, &remote_export, &host_metadata)?;
     trace.mark("host index");
@@ -501,6 +575,7 @@ fn enqueue_and_drain_sync(
         REMOTE_HOST_INDEX_KEY,
         serde_json::to_vec_pretty(&host_index)?,
     )?;
+    enqueue_remote_head_if_supported(paths, remote, config, &remote_export, &host_metadata)?;
     enqueue_clone_bootstrap_if_supported(paths, remote, host_index)?;
     trace.mark("clone bootstrap");
     let recipients = paths.home.join("keys/recipients.toml");
@@ -867,10 +942,32 @@ fn should_upload_legacy_current_refs(remote: &RemoteStore) -> bool {
     !matches!(remote, RemoteStore::S3(_))
 }
 
+fn should_upload_remote_ref_objects(remote: &RemoteStore) -> bool {
+    if env::var("MAJUTSU_SYNC_REMOTE_REF_OBJECTS").as_deref() == Ok("1") {
+        return true;
+    }
+    !matches!(remote, RemoteStore::S3(_))
+}
+
 #[derive(Debug, Serialize)]
 struct CloneBootstrapExport {
     version: u32,
     host_index: RemoteHostIndex,
+}
+
+fn enqueue_remote_head_if_supported(
+    paths: &Paths,
+    remote: &RemoteStore,
+    config: &Config,
+    export: &MetadataExport,
+    metadata_key: &str,
+) -> Result<()> {
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return Ok(());
+    }
+    let key = remote_head_key(&config.host.id);
+    let head = build_remote_head_export(config, export, metadata_key);
+    enqueue_inline_upload(paths, &key, encode_canonical_remote_export(paths, &head)?)
 }
 
 fn enqueue_clone_bootstrap_if_supported(
@@ -1164,11 +1261,18 @@ fn sync_status_snapshot(
     let config = read_config(paths)?;
     let canonical_current = host_current_ref_key(&config.host.id);
     let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
-    let mut remote_current = remote_ref(remote, &canonical_current)?;
-    if remote_current.is_none() {
-        remote_current = remote_ref(remote, "hosts/current")?;
-    }
-    let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
+    let (remote_current, remote_last_synced) =
+        match read_remote_head(paths, remote, &config.host.id)? {
+            Some(head) => (head.current_snapshot, head.last_synced),
+            None => {
+                let mut remote_current = remote_ref(remote, &canonical_current)?;
+                if remote_current.is_none() {
+                    remote_current = remote_ref(remote, "hosts/current")?;
+                }
+                let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
+                (remote_current, remote_last_synced)
+            }
+        };
     if let Some(value) = remote_current.as_deref() {
         set_remote_ref_value(conn, &remote.describe(), &canonical_current, value)?;
     }
