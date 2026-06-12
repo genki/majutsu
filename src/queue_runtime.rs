@@ -30,6 +30,23 @@ impl UploadQueueStats {
 }
 
 pub(crate) fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) -> Result<()> {
+    enqueue_inline_upload_with_overwrite(paths, key, bytes, false)
+}
+
+pub(crate) fn enqueue_inline_upload_overwrite(
+    paths: &Paths,
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    enqueue_inline_upload_with_overwrite(paths, key, bytes, true)
+}
+
+fn enqueue_inline_upload_with_overwrite(
+    paths: &Paths,
+    key: &str,
+    bytes: Vec<u8>,
+    overwrite: bool,
+) -> Result<()> {
     let id = expected_upload_queue_item_id(key);
     let payload_path = upload_payload_path(paths, &id);
     if let Some(parent) = payload_path.parent() {
@@ -45,11 +62,25 @@ pub(crate) fn enqueue_inline_upload(paths: &Paths, key: &str, bytes: Vec<u8>) ->
             key.to_string(),
             path_to_slash(&payload_path),
             Utc::now(),
-        ),
+        )
+        .with_overwrite(overwrite),
     )
 }
 
 pub(crate) fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Result<()> {
+    enqueue_file_upload_with_overwrite(paths, key, source, false)
+}
+
+pub(crate) fn enqueue_file_upload_overwrite(paths: &Paths, key: &str, source: &Path) -> Result<()> {
+    enqueue_file_upload_with_overwrite(paths, key, source, true)
+}
+
+fn enqueue_file_upload_with_overwrite(
+    paths: &Paths,
+    key: &str,
+    source: &Path,
+    overwrite: bool,
+) -> Result<()> {
     remove_upload_payload(paths, &expected_upload_queue_item_id(key))?;
     write_upload_item(
         paths,
@@ -58,7 +89,8 @@ pub(crate) fn enqueue_file_upload(paths: &Paths, key: &str, source: &Path) -> Re
             key.to_string(),
             path_to_slash(source),
             Utc::now(),
-        ),
+        )
+        .with_overwrite(overwrite),
     )
 }
 
@@ -200,19 +232,25 @@ fn upload_queue_item(
     path: &Path,
     item: UploadQueueItem,
 ) -> Result<UploadQueueItemResult> {
-    if queued_upload_can_be_skipped(paths, remote, &item) {
+    if !item.overwrite && queued_upload_can_be_skipped(paths, remote, &item) {
         fs::remove_file(path)?;
         return Ok(UploadQueueItemResult::Skipped);
     }
     let upload_result = if let Some(bytes) = item.inline.clone() {
-        if is_content_addressed_remote_key(&item.key) && remote.capabilities().conditional_put {
+        if !item.overwrite
+            && is_content_addressed_remote_key(&item.key)
+            && remote.capabilities().conditional_put
+        {
             remote.put_if_absent(&item.key, &bytes).map(|_| ())
         } else {
             remote.put(&item.key, &bytes)
         }
     } else if let Some(source) = &item.source {
         let source = Path::new(source);
-        if is_content_addressed_remote_key(&item.key) && remote.capabilities().conditional_put {
+        if !item.overwrite
+            && is_content_addressed_remote_key(&item.key)
+            && remote.capabilities().conditional_put
+        {
             remote.put_file_if_absent(&item.key, source).map(|_| ())
         } else {
             remote.put_file(&item.key, source)

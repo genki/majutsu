@@ -34,15 +34,16 @@ use crate::operation_log::{record_op_with_details, update_operation_result};
 use crate::pack_runtime::pack_cmd;
 use crate::process_runtime::{acquire_process_lock, process_lock_owner};
 use crate::queue_runtime::{
-    drain_upload_queue, enqueue_file_upload, enqueue_inline_upload, upload_queue_stats,
+    drain_upload_queue, enqueue_file_upload, enqueue_file_upload_overwrite, enqueue_inline_upload,
+    enqueue_inline_upload_overwrite, upload_queue_stats,
 };
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
 use crate::util::{blake3_hex, new_id, parse_db_time};
 use crate::{
-    encode_object, ensure_ready, export_metadata, open_db, read_object, remote_object_available,
-    remote_ref,
+    decode_object, encode_object, ensure_ready, export_metadata, open_db, read_object,
+    remote_object_available, remote_ref,
 };
 
 const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v7";
@@ -136,16 +137,18 @@ fn sync_configured_remote(
     let export = export_metadata(paths, conn, config)?;
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     let remote_export = metadata_export_for_remote(paths, remote, export)?;
-    let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
+    let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
     let upload_stats = upload_queue_stats(paths)?;
     if upload_stats.total == 0
         && sync_cache.state_fingerprint.as_deref() == Some(state_fingerprint.as_str())
         && !sync_remote_prune_enabled()
     {
+        let pruned_local_objects =
+            prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff_time())?;
         println!("synced 0 objects to {}", remote.describe());
         println!("pruned_remote_exports 0");
         println!("pruned_remote_objects 0");
-        println!("pruned_local_objects 0");
+        println!("pruned_local_objects {}", pruned_local_objects);
         return Ok(());
     }
     let previous_last_synced = ref_value(conn, "last-synced")?;
@@ -352,19 +355,13 @@ fn enqueue_and_drain_sync(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
-    let local_prune_min_age_secs = env::var("MAJUTSU_SYNC_LOCAL_PRUNE_MIN_AGE_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(60);
-    let local_prune_cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(local_prune_min_age_secs))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let local_prune_cutoff = local_prune_cutoff_time();
     let content_export = export_metadata(paths, conn, config)?;
     let remote_export =
         metadata_export_for_remote(paths, remote, export_metadata(paths, conn, config)?)?;
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &remote_export)?;
-    let state_fingerprint = remote_sync_state_cache_key(config, &remote_export)?;
+    let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
     let remote_metadata_json = metadata_export_json_for_remote(remote, &remote_export)?;
     enqueue_inline_upload(paths, "metadata/export.json", remote_metadata_json.clone())?;
     let host_metadata = host_metadata_key(&config.host.id);
@@ -475,10 +472,24 @@ fn enqueue_and_drain_sync(
             let canonical_only =
                 remote_prefers_canonical_only(remote) && s3_prefers_canonical_remote_only(&key);
             if !canonical_only {
-                enqueue_file_upload_if_needed(paths, remote, &key, &local)?;
+                let force = snapshot_manifest_keys.contains(key.as_str());
+                enqueue_file_upload_if_needed(paths, remote, &key, &local, force)?;
             }
             for alias in canonical_remote_aliases(&key) {
-                let fingerprint = content_object_fingerprint(&alias);
+                let structured_bytes = if canonical_alias_uses_structured_encoding(&key) {
+                    Some(encode_canonical_local_object(
+                        paths,
+                        &key,
+                        &snapshot_manifest_keys,
+                    )?)
+                } else {
+                    None
+                };
+                let fingerprint = if let Some(bytes) = &structured_bytes {
+                    payload_fingerprint(&decode_object(paths, bytes)?)
+                } else {
+                    content_object_fingerprint(&alias)
+                };
                 sync_fingerprints.insert(alias.clone(), fingerprint.clone());
                 let alias_exists = existing_canonical_aliases
                     .as_ref()
@@ -488,12 +499,8 @@ fn enqueue_and_drain_sync(
                 {
                     continue;
                 }
-                if canonical_alias_uses_structured_encoding(&key) {
-                    enqueue_inline_upload(
-                        paths,
-                        &alias,
-                        encode_canonical_local_object(paths, &key, &snapshot_manifest_keys)?,
-                    )?;
+                if let Some(bytes) = structured_bytes {
+                    enqueue_inline_upload_overwrite(paths, &alias, bytes)?;
                 } else {
                     enqueue_file_upload(paths, &alias, &local)?;
                 }
@@ -763,11 +770,16 @@ fn enqueue_file_upload_if_needed(
     remote: &RemoteStore,
     key: &str,
     source: &std::path::Path,
+    force: bool,
 ) -> Result<()> {
-    if remote_key_can_be_skipped(remote, key) {
+    if !force && remote_key_can_be_skipped(remote, key) {
         return Ok(());
     }
-    enqueue_file_upload(paths, key, source)
+    if force {
+        enqueue_file_upload_overwrite(paths, key, source)
+    } else {
+        enqueue_file_upload(paths, key, source)
+    }
 }
 
 fn remote_key_can_be_skipped(remote: &RemoteStore, key: &str) -> bool {
@@ -860,7 +872,11 @@ fn build_remote_sync_fingerprints(
     Ok(entries)
 }
 
-fn remote_sync_state_fingerprint(config: &Config, export: &MetadataExport) -> Result<String> {
+fn remote_sync_state_fingerprint(
+    paths: &Paths,
+    config: &Config,
+    export: &MetadataExport,
+) -> Result<String> {
     let mut export_value = serde_json::to_value(export)?;
     if let Some(object) = export_value.as_object_mut() {
         object.remove("exported_at");
@@ -872,18 +888,33 @@ fn remote_sync_state_fingerprint(config: &Config, export: &MetadataExport) -> Re
             refs.remove("last-synced");
         }
     }
+    let mut snapshot_manifest_fingerprints = BTreeMap::new();
+    for snapshot in &export.snapshots {
+        let path = paths.home.join(&snapshot.manifest_key);
+        if path.exists() {
+            snapshot_manifest_fingerprints.insert(
+                snapshot.manifest_key.clone(),
+                payload_fingerprint(&fs::read(path)?),
+            );
+        }
+    }
     let value = serde_json::json!({
         "config": config,
         "export": export_value,
+        "snapshot_manifest_fingerprints": snapshot_manifest_fingerprints,
     });
     Ok(payload_fingerprint(&serde_json::to_vec(&value)?))
 }
 
-fn remote_sync_state_cache_key(config: &Config, export: &MetadataExport) -> Result<String> {
+fn remote_sync_state_cache_key(
+    paths: &Paths,
+    config: &Config,
+    export: &MetadataExport,
+) -> Result<String> {
     Ok(format!(
         "{}:{}",
         REMOTE_SYNC_STATE_VERSION,
-        remote_sync_state_fingerprint(config, export)?
+        remote_sync_state_fingerprint(paths, config, export)?
     ))
 }
 
@@ -1353,6 +1384,16 @@ fn prune_local_packed_blob_objects(
         removed += 1;
     }
     Ok(removed)
+}
+
+fn local_prune_cutoff_time() -> SystemTime {
+    let local_prune_min_age_secs = env::var("MAJUTSU_SYNC_LOCAL_PRUNE_MIN_AGE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60);
+    SystemTime::now()
+        .checked_sub(Duration::from_secs(local_prune_min_age_secs))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn delete_remote_keys(

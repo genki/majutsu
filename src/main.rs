@@ -380,7 +380,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             return Err(err);
         }
         let scan_root_config = snapshot_scan_root(paths, &root)?;
-        let scan_result = scan_root(paths, &config, &scan_root_config);
+        let scan_result = scan_root(paths, &conn, &config, &scan_root_config);
         let post_result = run_post_snapshot_hook(paths, &root);
         let scanned = match scan_result {
             Ok(scanned) => scanned,
@@ -2239,10 +2239,16 @@ struct BlobInsert {
     object_key: String,
 }
 
-fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<ScannedRoot> {
+fn scan_root(
+    paths: &Paths,
+    conn: &Connection,
+    config: &Config,
+    root: &RootConfig,
+) -> Result<ScannedRoot> {
     let ignore = build_ignore(root)?;
     let mut records = Vec::new();
     let mut blobs = Vec::new();
+    let packed_blob_keys = packed_blob_object_keys(conn)?;
     let walker = WalkDir::new(&root.path)
         .follow_links(root.follow_symlinks)
         .sort_by_file_name();
@@ -2347,7 +2353,11 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Scanne
         } else {
             let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
             let oid = blake3_hex(&bytes);
-            let object_key = store_bytes(paths, &paths.objects, &oid, &bytes)?;
+            let object_key = if let Some(object_key) = packed_blob_keys.get(oid.as_str()) {
+                object_key.clone()
+            } else {
+                store_bytes(paths, &paths.objects, &oid, &bytes)?
+            };
             blobs.push(BlobInsert {
                 oid: oid.clone(),
                 size: bytes.len() as u64,
@@ -2373,6 +2383,19 @@ fn scan_root(paths: &Paths, config: &Config, root: &RootConfig) -> Result<Scanne
         });
     }
     Ok(ScannedRoot { records, blobs })
+}
+
+fn packed_blob_object_keys(conn: &Connection) -> Result<BTreeMap<String, String>> {
+    let mut stmt = conn.prepare("select oid, object_key from blobs where pack_id is not null")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut keys = BTreeMap::new();
+    for row in rows {
+        let (oid, object_key) = row?;
+        keys.insert(oid, object_key);
+    }
+    Ok(keys)
 }
 
 fn is_permission_denied_error(err: &anyhow::Error) -> bool {
@@ -3371,6 +3394,8 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{RootAddArgs, RootCommand};
+    use crate::root_runtime::root_cmd;
 
     fn test_s3_remote() -> S3Remote {
         S3Remote {
@@ -3759,6 +3784,84 @@ tier = "Bulk"
         };
 
         assert_eq!(fs.read_file(&record, 6, 6).unwrap(), b"packed".to_vec());
+    }
+
+    #[test]
+    fn snapshot_reuses_packed_blob_without_recreating_loose_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        init(
+            &paths,
+            InitArgs {
+                remote: None,
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let payload = vec![b'x'; (majutsu_pack::SMALL_BLOB_MAX_SIZE as usize) + 1024];
+        fs::write(root.join("payload.bin"), &payload).unwrap();
+        root_cmd(
+            &paths,
+            RootCommand::Add(RootAddArgs {
+                id: "sample".into(),
+                path: root.clone(),
+                name: None,
+                exclude: Vec::new(),
+                presets: Vec::new(),
+                include: Vec::new(),
+                follow_symlinks: false,
+                require_mount: false,
+                snapshot_mode: "default".into(),
+                pre_snapshot: None,
+                post_snapshot: None,
+                snapshot_source: None,
+                application_plugin: None,
+                large_min_size: None,
+                large_binary_min_size: None,
+                large_chunk_size: None,
+                large_chunking: None,
+                large_always: Vec::new(),
+                large_never: Vec::new(),
+            }),
+        )
+        .unwrap();
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("initial".into()),
+            },
+        )
+        .unwrap();
+        let oid = blake3_hex(&payload);
+        let conn = open_db(&paths).unwrap();
+        let object_key: String = conn
+            .query_row(
+                "select object_key from blobs where oid=?1",
+                params![oid.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(paths.home.join(&object_key).exists());
+        drop(conn);
+
+        pack_cmd(&paths, PackArgs { compact: false }).unwrap();
+        fs::remove_file(paths.home.join(&object_key)).unwrap();
+        assert!(!paths.home.join(&object_key).exists());
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("after-pack".into()),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !paths.home.join(&object_key).exists(),
+            "snapshot should keep using the packed blob instead of recreating a loose object"
+        );
     }
 
     #[cfg(target_os = "linux")]

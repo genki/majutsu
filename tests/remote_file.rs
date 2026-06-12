@@ -14181,6 +14181,90 @@ fn repeated_sync_skips_existing_snapshot_and_operation_exports() {
     );
 }
 
+#[test]
+fn sync_reuploads_compacted_snapshot_manifest_payloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("dir")).unwrap();
+    for i in 0..200 {
+        fs::write(
+            source.join("dir").join(format!("file-{i}.txt")),
+            b"payload\n",
+        )
+        .unwrap();
+    }
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("large manifest");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let manifest_key: String = conn
+        .query_row("select manifest_key from snapshots limit 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let full_manifest = serde_json::to_vec_pretty(&local_snapshot_manifest(&state, "asc")).unwrap();
+    fs::write(state.join(&manifest_key), &full_manifest).unwrap();
+    fs::write(remote.join(&manifest_key), &full_manifest).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let full_remote_len = fs::metadata(remote.join(&manifest_key)).unwrap().len();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let compact_remote_len = fs::metadata(remote.join(&manifest_key)).unwrap().len();
+    assert!(
+        compact_remote_len < full_remote_len / 2,
+        "remote snapshot manifest should be overwritten with compact payload: full={full_remote_len} compact={compact_remote_len}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_start_accepts_watch_timing_overrides() {

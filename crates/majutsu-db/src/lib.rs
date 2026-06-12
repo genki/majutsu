@@ -82,6 +82,8 @@ pub struct UploadQueueItem {
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +110,7 @@ impl UploadQueueItem {
             created_at,
             attempts: 0,
             retry_after: None,
+            overwrite: false,
         }
     }
 
@@ -120,7 +123,13 @@ impl UploadQueueItem {
             created_at,
             attempts: 0,
             retry_after: None,
+            overwrite: false,
         }
+    }
+
+    pub fn with_overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
+        self
     }
 
     pub fn preserve_retry_state(self, existing: &Self) -> Self {
@@ -155,6 +164,10 @@ impl UploadQueueItem {
         }
         issues
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn expected_upload_queue_item_id(key: &str) -> String {
