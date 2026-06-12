@@ -179,6 +179,13 @@ fn snapshot_metadata_is_compact(snapshot: &majutsu_core::SnapshotExport) -> bool
 
 fn clone_metadata_bytes(remote: &RemoteStore, key: &str) -> Result<Vec<u8>> {
     if matches!(remote, RemoteStore::S3(_)) {
+        if key.ends_with(".zst") {
+            let bytes = remote
+                .get(key)
+                .with_context(|| format!("read compressed metadata {key}"))?;
+            return zstd::stream::decode_all(bytes.as_slice())
+                .with_context(|| format!("decode compressed metadata {key}"));
+        }
         let compressed_key = compressed_metadata_key(key);
         if let Some(bytes) = remote
             .get_optional(&compressed_key)

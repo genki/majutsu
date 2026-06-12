@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use majutsu_store::{
     LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteGcMark as GcMarkExport,
@@ -147,7 +147,9 @@ fn remote_fsck_quick(_paths: &Paths, remote: &RemoteStore) -> Result<()> {
     for host in &index.hosts {
         checked_metadata += 1;
         let expected_metadata_key = host_metadata_key(&host.id);
+        let expected_compressed_metadata_key = compressed_metadata_key(&expected_metadata_key);
         if host.metadata_key != expected_metadata_key
+            && host.metadata_key != expected_compressed_metadata_key
             && host.metadata_key != LEGACY_METADATA_EXPORT_KEY
         {
             missing += 1;
@@ -161,7 +163,15 @@ fn remote_fsck_quick(_paths: &Paths, remote: &RemoteStore) -> Result<()> {
             eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
             continue;
         };
-        let export: MetadataExport = match serde_json::from_slice(&bytes) {
+        let metadata_bytes = match decode_remote_metadata_bytes(&host.metadata_key, &bytes) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                missing += 1;
+                eprintln!("invalid host metadata {}: {err}", host.metadata_key);
+                continue;
+            }
+        };
+        let export: MetadataExport = match serde_json::from_slice(&metadata_bytes) {
             Ok(export) => export,
             Err(err) => {
                 missing += 1;
@@ -181,6 +191,18 @@ fn remote_fsck_quick(_paths: &Paths, remote: &RemoteStore) -> Result<()> {
     println!("hint use `mj remote fsck --objects` to verify every referenced object");
     println!("hint use `mj remote fsck --deep` for payload decode/hash verification");
     Ok(())
+}
+
+fn compressed_metadata_key(key: &str) -> String {
+    format!("{key}.zst")
+}
+
+fn decode_remote_metadata_bytes(key: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    if key.ends_with(".zst") {
+        return zstd::stream::decode_all(bytes)
+            .with_context(|| format!("decode compressed metadata {key}"));
+    }
+    Ok(bytes.to_vec())
 }
 
 fn validate_quick_host_metadata(

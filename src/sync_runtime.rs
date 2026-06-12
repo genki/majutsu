@@ -42,13 +42,38 @@ use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
 use crate::util::{blake3_hex, new_id, parse_db_time};
 use crate::{
-    decode_object, encode_object, ensure_ready, export_metadata, open_db, read_object,
-    remote_object_available, remote_ref,
+    encode_object, ensure_ready, export_metadata, open_db, read_object, remote_object_available,
+    remote_ref,
 };
 
 const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v7";
 const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
 const CLONE_BOOTSTRAP_VERSION: u32 = 1;
+
+struct SyncTrace {
+    enabled: bool,
+    start: Instant,
+}
+
+impl SyncTrace {
+    fn new() -> Self {
+        Self {
+            enabled: env::var("MAJUTSU_TRACE_SYNC")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
+            start: Instant::now(),
+        }
+    }
+
+    fn mark(&self, label: &str) {
+        if self.enabled {
+            eprintln!(
+                "sync_trace elapsed_ms={} stage={label}",
+                self.start.elapsed().as_millis()
+            );
+        }
+    }
+}
 
 pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     ensure_ready(paths)?;
@@ -131,20 +156,29 @@ fn sync_configured_remote(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
+    let trace = SyncTrace::new();
     let _lock = acquire_process_lock(&paths.sync_lock, "sync")?;
+    trace.mark("lock");
     auto_pack_before_sync(paths, conn)?;
+    trace.mark("auto pack");
     let current = current_snapshot(conn)?;
     let export = export_metadata(paths, conn, config)?;
+    trace.mark("export metadata");
     let sync_cache = read_remote_sync_cache(paths, remote)?;
+    trace.mark("read sync cache");
     let remote_export = metadata_export_for_remote(paths, remote, export)?;
+    trace.mark("prepare remote metadata");
     let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
+    trace.mark("state fingerprint");
     let upload_stats = upload_queue_stats(paths)?;
+    trace.mark("upload queue stats");
     if upload_stats.total == 0
         && sync_cache.state_fingerprint.as_deref() == Some(state_fingerprint.as_str())
         && !sync_remote_prune_enabled()
     {
         let pruned_local_objects =
             prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff_time())?;
+        trace.mark("local prune");
         println!("synced 0 objects to {}", remote.describe());
         println!("pruned_remote_exports 0");
         println!("pruned_remote_objects 0");
@@ -154,6 +188,7 @@ fn sync_configured_remote(
     let previous_last_synced = ref_value(conn, "last-synced")?;
     let synced_at = Utc::now().to_rfc3339();
     set_ref_value(conn, "last-synced", &synced_at)?;
+    trace.mark("record last synced");
     let sync_op = new_id("op");
     record_op_with_details(
         conn,
@@ -166,7 +201,8 @@ fn sync_configured_remote(
         None,
         Some("queued"),
     )?;
-    let result = enqueue_and_drain_sync(paths, conn, config, remote);
+    trace.mark("record sync op");
+    let result = enqueue_and_drain_sync(paths, conn, config, remote, &trace);
     match result {
         Ok(()) => {
             update_operation_result(conn, &sync_op, "done", None, Some("synced"))?;
@@ -354,23 +390,29 @@ fn enqueue_and_drain_sync(
     conn: &Connection,
     config: &Config,
     remote: &RemoteStore,
+    trace: &SyncTrace,
 ) -> Result<()> {
     let local_prune_cutoff = local_prune_cutoff_time();
     let content_export = export_metadata(paths, conn, config)?;
+    trace.mark("content export");
     let remote_export =
         metadata_export_for_remote(paths, remote, export_metadata(paths, conn, config)?)?;
+    trace.mark("remote export");
     let sync_cache = read_remote_sync_cache(paths, remote)?;
+    trace.mark("read sync cache 2");
     let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &remote_export)?;
+    trace.mark("metadata fingerprints");
     let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
+    trace.mark("state fingerprint 2");
     let remote_metadata_json = metadata_export_json_for_remote(remote, &remote_export)?;
-    enqueue_inline_upload(paths, "metadata/export.json", remote_metadata_json.clone())?;
-    let host_metadata = host_metadata_key(&config.host.id);
-    enqueue_inline_upload(paths, &host_metadata, remote_metadata_json.clone())?;
-    enqueue_compressed_metadata_uploads_if_supported(
+    trace.mark("metadata json");
+    let legacy_metadata = "metadata/export.json";
+    let host_metadata_plain = host_metadata_key(&config.host.id);
+    let host_metadata = enqueue_metadata_uploads(
         paths,
         remote,
-        "metadata/export.json",
-        &host_metadata,
+        legacy_metadata,
+        &host_metadata_plain,
         &remote_metadata_json,
     )?;
     for snapshot in &remote_export.snapshots {
@@ -432,12 +474,14 @@ fn enqueue_and_drain_sync(
         )?;
     }
     let host_index = update_remote_host_index(remote, config, &remote_export, &host_metadata)?;
+    trace.mark("host index");
     enqueue_inline_upload(
         paths,
         REMOTE_HOST_INDEX_KEY,
         serde_json::to_vec_pretty(&host_index)?,
     )?;
     enqueue_clone_bootstrap_if_supported(paths, remote, host_index, &remote_export)?;
+    trace.mark("clone bootstrap");
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
         enqueue_cached_inline_upload(
@@ -455,18 +499,31 @@ fn enqueue_and_drain_sync(
             encode_canonical_remote_export(paths, &build_chunk_index_shard(&remote_export))?,
         )?;
     }
+    trace.mark("metadata queue");
 
-    let snapshot_manifest_keys = content_export
+    let content_keys = sync_content_local_object_keys(paths, remote, &content_export, &sync_cache)?;
+    let snapshot_manifest_keys = content_keys
+        .iter()
+        .filter(|key| {
+            content_export
+                .snapshots
+                .iter()
+                .any(|snapshot| snapshot.manifest_key == **key)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let all_snapshot_manifest_keys = content_export
         .snapshots
         .iter()
         .map(|snapshot| snapshot.manifest_key.as_str())
         .collect::<BTreeSet<_>>();
-    let existing_canonical_aliases = if remote_prefers_canonical_only(remote) {
-        Some(list_remote_canonical_content_aliases(remote)?)
-    } else {
-        None
-    };
-    for key in local_object_keys(paths, &content_export)? {
+    let existing_canonical_aliases =
+        if remote_prefers_canonical_only(remote) && sync_verify_cached_remote_aliases() {
+            Some(list_remote_canonical_content_aliases(remote)?)
+        } else {
+            None
+        };
+    for key in content_keys {
         let local = paths.home.join(&key);
         if local.exists() {
             let canonical_only =
@@ -476,17 +533,10 @@ fn enqueue_and_drain_sync(
                 enqueue_file_upload_if_needed(paths, remote, &key, &local, force)?;
             }
             for alias in canonical_remote_aliases(&key) {
-                let structured_bytes = if canonical_alias_uses_structured_encoding(&key) {
-                    Some(encode_canonical_local_object(
-                        paths,
-                        &key,
-                        &snapshot_manifest_keys,
-                    )?)
-                } else {
-                    None
-                };
-                let fingerprint = if let Some(bytes) = &structured_bytes {
-                    payload_fingerprint(&decode_object(paths, bytes)?)
+                let snapshot_manifest = snapshot_manifest_keys.contains(&key);
+                let mut structured_bytes = None;
+                let fingerprint = if snapshot_manifest {
+                    payload_fingerprint(&fs::read(&local)?)
                 } else {
                     content_object_fingerprint(&alias)
                 };
@@ -499,6 +549,13 @@ fn enqueue_and_drain_sync(
                 {
                     continue;
                 }
+                if structured_bytes.is_none() && canonical_alias_uses_structured_encoding(&key) {
+                    structured_bytes = Some(encode_canonical_local_object(
+                        paths,
+                        &key,
+                        &all_snapshot_manifest_keys,
+                    )?);
+                }
                 if let Some(bytes) = structured_bytes {
                     enqueue_inline_upload_overwrite(paths, &alias, bytes)?;
                 } else {
@@ -507,6 +564,7 @@ fn enqueue_and_drain_sync(
             }
         }
     }
+    trace.mark("content queue");
     enqueue_inline_upload(
         paths,
         &remote_gc_mark_key(&config.host.id),
@@ -517,8 +575,11 @@ fn enqueue_and_drain_sync(
             &content_export,
         )?)?,
     )?;
+    trace.mark("gc mark");
     let uploaded = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    trace.mark("drain queue");
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
+    trace.mark("write sync cache");
     let (pruned_remote_exports, pruned_remote_objects) = if sync_remote_prune_enabled() {
         let pruned_remote_exports =
             prune_remote_host_exports(remote, &config.host.id, &remote_export)?;
@@ -535,12 +596,14 @@ fn enqueue_and_drain_sync(
     };
     let pruned_local_objects =
         prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff)?;
+    trace.mark("local prune");
     persist_export_remote_refs(
         conn,
         &remote.describe(),
         &config.host.id,
         &remote_export.refs,
     )?;
+    trace.mark("persist remote refs");
     println!("synced {} objects to {}", uploaded, remote.describe());
     println!("pruned_remote_exports {}", pruned_remote_exports);
     println!("pruned_remote_objects {}", pruned_remote_objects);
@@ -558,6 +621,71 @@ fn s3_prefers_canonical_remote_only(key: &str) -> bool {
 
 fn content_object_fingerprint(key: &str) -> String {
     format!("content-v2:{key}")
+}
+
+fn sync_content_local_object_keys(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+    cache: &RemoteSyncCache,
+) -> Result<Vec<String>> {
+    if !remote_prefers_canonical_only(remote)
+        || cache.entries.is_empty()
+        || sync_verify_cached_remote_aliases()
+    {
+        return local_object_keys(paths, export);
+    }
+    let mut keys = Vec::new();
+    if let Some(current) = export.refs.get("current")
+        && let Some(snapshot) = export
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == *current)
+    {
+        keys.push(snapshot.manifest_key.clone());
+        if let Ok(manifest) = current_snapshot_manifest_for_object_keys(paths, snapshot) {
+            for root_tree in manifest.root_trees.values() {
+                keys.push(root_tree.tree_key.clone());
+            }
+        }
+    }
+    for blob in &export.blobs {
+        if blob.pack_id.is_none() {
+            keys.push(blob.object_key.clone());
+        }
+    }
+    for pack in &export.packs {
+        keys.push(pack.pack_key.clone());
+        keys.push(pack.index_key.clone());
+    }
+    for large in &export.large_objects {
+        keys.push(large.manifest_key.clone());
+    }
+    for chunk in &export.chunks {
+        keys.push(chunk.object_key.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn current_snapshot_manifest_for_object_keys(
+    paths: &Paths,
+    snapshot: &majutsu_core::SnapshotExport,
+) -> Result<SnapshotManifest> {
+    if !snapshot.manifest_json.trim().is_empty() {
+        return Ok(serde_json::from_str(&snapshot.manifest_json)?);
+    }
+    let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
+    Ok(serde_json::from_slice(&crate::decode_object(
+        paths, &bytes,
+    )?)?)
+}
+
+fn sync_verify_cached_remote_aliases() -> bool {
+    env::var("MAJUTSU_SYNC_VERIFY_CACHED_REMOTE_ALIASES")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn sync_remote_prune_enabled() -> bool {
@@ -646,15 +774,17 @@ fn compact_snapshot_manifest_value(value: &mut serde_json::Value) {
     }
 }
 
-fn enqueue_compressed_metadata_uploads_if_supported(
+fn enqueue_metadata_uploads(
     paths: &Paths,
     remote: &RemoteStore,
     legacy_key: &str,
     host_key: &str,
     metadata_json: &[u8],
-) -> Result<()> {
+) -> Result<String> {
     if !matches!(remote, RemoteStore::S3(_)) {
-        return Ok(());
+        enqueue_inline_upload(paths, legacy_key, metadata_json.to_vec())?;
+        enqueue_inline_upload(paths, host_key, metadata_json.to_vec())?;
+        return Ok(host_key.to_string());
     }
     let compressed = zstd::stream::encode_all(metadata_json, 3)?;
     enqueue_inline_upload(
@@ -663,7 +793,7 @@ fn enqueue_compressed_metadata_uploads_if_supported(
         compressed.clone(),
     )?;
     enqueue_inline_upload(paths, &compressed_metadata_key(host_key), compressed)?;
-    Ok(())
+    Ok(compressed_metadata_key(host_key))
 }
 
 fn compressed_metadata_key(key: &str) -> String {

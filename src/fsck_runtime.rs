@@ -1564,7 +1564,10 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
         for host in &index.hosts {
             verified_hosts += 1;
             let expected_metadata_key = host_metadata_key(&host.id);
-            if host.metadata_key != expected_metadata_key {
+            let expected_compressed_metadata_key = compressed_metadata_key(&expected_metadata_key);
+            if host.metadata_key != expected_metadata_key
+                && host.metadata_key != expected_compressed_metadata_key
+            {
                 missing += 1;
                 eprintln!(
                     "host index metadata_key {} does not match canonical key {}",
@@ -1709,7 +1712,8 @@ fn remote_fsck_export(
     host_id: Option<&str>,
     missing: &mut usize,
 ) -> Result<crate::MetadataExport> {
-    let export: crate::MetadataExport = serde_json::from_slice(&remote.get(metadata_key)?)
+    let metadata_bytes = remote_metadata_bytes(remote, metadata_key)?;
+    let export: crate::MetadataExport = serde_json::from_slice(&metadata_bytes)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
     if export.version != METADATA_EXPORT_VERSION {
         *missing += 1;
@@ -1824,6 +1828,19 @@ fn remote_fsck_export(
         }
     }
     Ok(export)
+}
+
+fn compressed_metadata_key(key: &str) -> String {
+    format!("{key}.zst")
+}
+
+fn remote_metadata_bytes(remote: &RemoteStore, metadata_key: &str) -> Result<Vec<u8>> {
+    let bytes = remote.get(metadata_key)?;
+    if metadata_key.ends_with(".zst") {
+        return zstd::stream::decode_all(bytes.as_slice())
+            .with_context(|| format!("decode compressed metadata {metadata_key}"));
+    }
+    Ok(bytes)
 }
 
 fn validate_remote_gc_prefix_hosts(
