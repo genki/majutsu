@@ -32,6 +32,9 @@ cleanup() {
     echo "MinIO E2E が失敗しました。Podman logs を表示します。" >&2
     podman_cmd logs "$minio_name" >&2 2>/dev/null || true
   fi
+  if [[ -n "$work" && -d "$work/home" && -x "${mj_bin:-}" ]]; then
+    "$mj_bin" --home "$work/home" daemon stop >/dev/null 2>&1 || true
+  fi
   if [[ -n "$work" && -d "$work" ]]; then
     rm -rf "$work"
   fi

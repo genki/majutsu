@@ -473,12 +473,14 @@ fn enqueue_and_drain_sync(
         toml::to_string_pretty(&config.host)?.into_bytes(),
     )?;
     if let Some(current) = remote_export.refs.get("current") {
-        enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
-        enqueue_inline_upload(
-            paths,
-            &host_legacy_current_key(&config.host.id),
-            current.as_bytes().to_vec(),
-        )?;
+        if should_upload_legacy_current_refs(remote) {
+            enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
+            enqueue_inline_upload(
+                paths,
+                &host_legacy_current_key(&config.host.id),
+                current.as_bytes().to_vec(),
+            )?;
+        }
         enqueue_inline_upload(
             paths,
             &host_current_ref_key(&config.host.id),
@@ -858,6 +860,13 @@ fn should_upload_full_remote_oplog(remote: &RemoteStore) -> bool {
     !matches!(remote, RemoteStore::S3(_))
 }
 
+fn should_upload_legacy_current_refs(remote: &RemoteStore) -> bool {
+    if env::var("MAJUTSU_SYNC_LEGACY_CURRENT_REFS").as_deref() == Ok("1") {
+        return true;
+    }
+    !matches!(remote, RemoteStore::S3(_))
+}
+
 #[derive(Debug, Serialize)]
 struct CloneBootstrapExport {
     version: u32,
@@ -876,9 +885,19 @@ fn enqueue_clone_bootstrap_if_supported(
         version: CLONE_BOOTSTRAP_VERSION,
         host_index,
     };
+    if !should_upload_s3_clone_bootstrap(remote)? {
+        return Ok(());
+    }
     let json = serde_json::to_vec(&bootstrap)?;
     let compressed = zstd::stream::encode_all(json.as_slice(), 3)?;
     enqueue_inline_upload(paths, CLONE_BOOTSTRAP_KEY, compressed)
+}
+
+fn should_upload_s3_clone_bootstrap(remote: &RemoteStore) -> Result<bool> {
+    if env::var("MAJUTSU_SYNC_S3_BOOTSTRAP_EVERY_TIME").as_deref() == Ok("1") {
+        return Ok(true);
+    }
+    Ok(!remote.exists(CLONE_BOOTSTRAP_KEY)?)
 }
 
 fn enqueue_cached_inline_upload(

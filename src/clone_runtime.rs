@@ -28,9 +28,9 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let remote_config = RemoteConfig::from_url(args.remote);
     let remote = open_remote(&remote_config)?;
     trace.mark("open remote");
-    let loaded = clone_loaded_metadata(&remote, args.host.as_deref())?;
+    let mut loaded = clone_loaded_metadata(&remote, args.host.as_deref())?;
     trace.mark("select metadata");
-    let mut export = match loaded.export {
+    let mut export = match loaded.export.take() {
         Some(export) => {
             trace.mark("download metadata");
             trace.mark("parse metadata");
@@ -45,6 +45,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         }
     };
     export.config.remote = Some(remote_config);
+    refresh_s3_bootstrap_host_summary(&remote, &mut loaded, &export);
     let compact_snapshot_metadata = export.snapshots.iter().any(snapshot_metadata_is_compact);
     let staging_home = clone_staging_home(&paths.home);
     let staging_paths = resolve_paths(Some(staging_home.clone()))?;
@@ -213,6 +214,31 @@ struct CloneMetadataSelection {
     key: String,
     host: Option<RemoteHostSummary>,
     host_index: bool,
+}
+
+fn refresh_s3_bootstrap_host_summary(
+    remote: &RemoteStore,
+    loaded: &mut CloneLoadedMetadata,
+    export: &MetadataExport,
+) {
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return;
+    }
+    let Some(host) = loaded.selection.host.as_mut() else {
+        return;
+    };
+    if host.id != export.config.host.id {
+        return;
+    }
+    host.name = export.config.host.name.clone();
+    host.current_snapshot = export.refs.get("current").cloned();
+    if let Some(last_synced) = export
+        .refs
+        .get("last-synced")
+        .and_then(|value| crate::util::parse_db_time(value).ok())
+    {
+        host.last_synced_at = last_synced;
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
