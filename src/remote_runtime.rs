@@ -1,8 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use majutsu_store::{
-    LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteHostIndex, RemoteHostSummary,
-    select_remote_host,
+    LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteGcMark as GcMarkExport,
+    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostSummary,
+    host_current_ref_key, host_last_synced_ref_key, host_metadata_key, remote_gc_mark_key,
+    remote_gc_tombstone_prefix, select_remote_host,
 };
 
 use crate::cli::RemoteCommand;
@@ -12,7 +14,8 @@ use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
-use crate::{ensure_ready, export_metadata, open_db, remote_object_available};
+use crate::util::parse_db_time;
+use crate::{ensure_ready, export_metadata, open_db, remote_object_available, remote_ref};
 
 pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     ensure_ready(paths)?;
@@ -46,9 +49,11 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 println!("range_get {}", first.len());
             }
         }
-        RemoteCommand::Fsck { deep } => {
+        RemoteCommand::Fsck { objects, deep } => {
             if deep {
                 remote_fsck(paths, &remote)?;
+            } else if objects {
+                remote_fsck_objects(paths, &remote)?;
             } else {
                 remote_fsck_quick(paths, &remote)?;
             }
@@ -61,8 +66,10 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 current.as_deref(),
                 Some(if deep {
                     "checked remote state deeply"
-                } else {
+                } else if objects {
                     "checked remote object existence"
+                } else {
+                    "checked remote metadata health"
                 }),
             )?;
         }
@@ -125,7 +132,192 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     Ok(())
 }
 
-fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
+fn remote_fsck_quick(_paths: &Paths, remote: &RemoteStore) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut missing = 0usize;
+    let mut checked_metadata = 0usize;
+    let index = remote_host_index_with_legacy(remote)?;
+    if index.hosts.is_empty() {
+        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    }
+    for issue in index.duplicate_issues() {
+        missing += 1;
+        eprintln!("remote host index issue: {issue:?}");
+    }
+    for host in &index.hosts {
+        checked_metadata += 1;
+        let expected_metadata_key = host_metadata_key(&host.id);
+        if host.metadata_key != expected_metadata_key
+            && host.metadata_key != LEGACY_METADATA_EXPORT_KEY
+        {
+            missing += 1;
+            eprintln!(
+                "host index metadata_key {} does not match canonical key {}",
+                host.metadata_key, expected_metadata_key
+            );
+        }
+        let Some(bytes) = remote.get_optional(&host.metadata_key)? else {
+            missing += 1;
+            eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
+            continue;
+        };
+        let export: MetadataExport = match serde_json::from_slice(&bytes) {
+            Ok(export) => export,
+            Err(err) => {
+                missing += 1;
+                eprintln!("invalid host metadata {}: {err}", host.metadata_key);
+                continue;
+            }
+        };
+        validate_quick_host_metadata(remote, host, &export, &mut missing)?;
+    }
+    if missing > 0 {
+        bail!("remote fsck quick found {missing} issue(s)");
+    }
+    println!("remote fsck quick ok");
+    println!("mode metadata");
+    println!("checked_metadata {checked_metadata}");
+    println!("elapsed_secs {}", start.elapsed().as_secs());
+    println!("hint use `mj remote fsck --objects` to verify every referenced object");
+    println!("hint use `mj remote fsck --deep` for payload decode/hash verification");
+    Ok(())
+}
+
+fn validate_quick_host_metadata(
+    remote: &RemoteStore,
+    host: &RemoteHostSummary,
+    export: &MetadataExport,
+    missing: &mut usize,
+) -> Result<()> {
+    if export.config.host.id != host.id {
+        *missing += 1;
+        eprintln!(
+            "host index id {} does not match metadata host id {}",
+            host.id, export.config.host.id
+        );
+    }
+    if export.config.host.name != host.name {
+        *missing += 1;
+        eprintln!(
+            "host index name {} does not match metadata host name {}",
+            host.name, export.config.host.name
+        );
+    }
+    let current = export.refs.get("current");
+    if host.current_snapshot.as_ref() != current {
+        *missing += 1;
+        eprintln!(
+            "host index current snapshot does not match metadata for {}",
+            host.id
+        );
+    }
+    if let Some(current) = current {
+        let key = host_current_ref_key(&host.id);
+        match remote_ref(remote, &key)? {
+            Some(value) if value == *current => {}
+            Some(value) => {
+                *missing += 1;
+                eprintln!("{key} points to {value}, expected {current}");
+            }
+            None => {
+                *missing += 1;
+                eprintln!("missing remote ref {key}");
+            }
+        }
+    }
+    if let Some(last_synced) = export.refs.get("last-synced") {
+        match parse_db_time(last_synced) {
+            Ok(value) if host.last_synced_at == value => {}
+            Ok(value) => {
+                *missing += 1;
+                eprintln!(
+                    "host index last_synced_at {} does not match metadata last-synced {} for {}",
+                    host.last_synced_at.to_rfc3339(),
+                    value.to_rfc3339(),
+                    host.id
+                );
+            }
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid metadata last-synced for {}: {err}", host.id);
+            }
+        }
+        let key = host_last_synced_ref_key(&host.id);
+        match remote_ref(remote, &key)? {
+            Some(value) if value == *last_synced => {}
+            Some(value) => {
+                *missing += 1;
+                eprintln!("{key} points to {value}, expected {last_synced}");
+            }
+            None => {
+                *missing += 1;
+                eprintln!("missing remote ref {key}");
+            }
+        }
+    }
+    validate_quick_gc_records(remote, &host.id, current, missing)
+}
+
+fn validate_quick_gc_records(
+    remote: &RemoteStore,
+    host_id: &str,
+    current: Option<&String>,
+    missing: &mut usize,
+) -> Result<()> {
+    let mark_key = remote_gc_mark_key(host_id);
+    let Some(bytes) = remote.get_optional(&mark_key)? else {
+        *missing += 1;
+        eprintln!("missing remote gc mark {mark_key}");
+        return Ok(());
+    };
+    let mark: GcMarkExport = match serde_json::from_slice(&bytes) {
+        Ok(mark) => mark,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("invalid remote gc mark {mark_key}: {err}");
+            return Ok(());
+        }
+    };
+    if mark.version != 1 {
+        *missing += 1;
+        eprintln!("unsupported remote gc mark version {mark_key}");
+    }
+    if mark.host_id != host_id {
+        *missing += 1;
+        eprintln!(
+            "remote gc mark host id {} does not match {}",
+            mark.host_id, host_id
+        );
+    }
+    if mark.current_snapshot.as_ref() != current {
+        *missing += 1;
+        eprintln!("remote gc mark current snapshot does not match metadata {mark_key}");
+    }
+    if mark.has_duplicate_object_keys() {
+        *missing += 1;
+        eprintln!("remote gc mark contains duplicate object keys {mark_key}");
+    }
+    for key in remote.list(&remote_gc_tombstone_prefix(host_id))? {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let tombstone: GcTombstoneExport = match serde_json::from_slice(&remote.get(&key)?) {
+            Ok(tombstone) => tombstone,
+            Err(err) => {
+                *missing += 1;
+                eprintln!("invalid remote gc tombstone {key}: {err}");
+                continue;
+            }
+        };
+        for issue in tombstone.validation_issues(host_id) {
+            *missing += 1;
+            eprintln!("remote gc tombstone issue {key}: {issue:?}");
+        }
+    }
+    Ok(())
+}
+
+fn remote_fsck_objects(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     let config = read_config(paths)?;
     let conn = open_db(paths)?;
     let export = export_metadata(paths, &conn, &config)?;
@@ -149,11 +341,13 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
         }
     }
     if missing > 0 {
-        bail!("remote fsck quick found {missing} missing object(s)");
+        bail!("remote fsck objects found {missing} missing object(s)");
     }
-    println!("remote fsck quick ok");
+    println!("remote fsck objects ok");
+    println!("mode objects");
     println!("checked_objects {}", keys.len());
     println!("elapsed_secs {}", start.elapsed().as_secs());
+    println!("hint use `mj remote fsck` for quick metadata health verification");
     println!("hint use `mj remote fsck --deep` for payload decode/hash verification");
     Ok(())
 }

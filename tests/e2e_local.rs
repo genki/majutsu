@@ -35,6 +35,15 @@ fn assert_success(output: Output, context: &str) {
     }
 }
 
+fn assert_failure(output: Output, context: &str) {
+    assert!(
+        !output.status.success(),
+        "{context} は失敗する想定でした\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn assert_file(path: &Path, expected: &[u8]) {
     let actual =
         fs::read(path).unwrap_or_else(|err| panic!("{} を読めません: {err}", path.display()));
@@ -487,10 +496,43 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
     );
     assert_success(run_mj(&home, ["snapshot", "--message", "fsck"]), "snapshot");
     assert_success(run_mj(&home, ["sync"]), "sync");
-    assert_success(run_mj(&home, ["remote", "fsck"]), "remote fsck quick");
+    let quick = run_mj(&home, ["remote", "fsck"]);
+    assert_success(quick, "remote fsck quick");
+    assert_success(
+        run_mj(&home, ["remote", "fsck", "--objects"]),
+        "remote fsck objects",
+    );
     assert_success(
         run_mj(&home, ["remote", "fsck", "--deep"]),
         "remote fsck deep",
+    );
+
+    let mut removed = 0usize;
+    for dirname in ["objects", "blobs", "packs"] {
+        let path = remote.join(dirname);
+        if !path.exists() {
+            continue;
+        }
+        let files = walkdir::WalkDir::new(path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.path().to_path_buf())
+            .collect::<Vec<_>>();
+        for file in files {
+            fs::remove_file(file).unwrap();
+            removed += 1;
+        }
+    }
+    assert!(removed > 0, "remote content object");
+
+    assert_success(
+        run_mj(&home, ["remote", "fsck"]),
+        "remote fsck quick after content loss",
+    );
+    assert_failure(
+        run_mj(&home, ["remote", "fsck", "--objects"]),
+        "remote fsck objects after content loss",
     );
 }
 

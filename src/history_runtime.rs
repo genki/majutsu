@@ -85,9 +85,9 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
             state_bytes: storage.state_bytes,
             object_bytes: storage.objects_bytes,
             queue_bytes: storage.queue_bytes,
-            blob_bytes: db_stats.blob_bytes as u64,
-            pack_bytes: db_stats.pack_bytes as u64,
-            chunk_bytes: db_stats.chunk_bytes as u64,
+            blob_bytes: storage.loose_blob_bytes,
+            pack_bytes: storage.pack_bytes,
+            chunk_bytes: storage.large_bytes,
         },
     );
     writeln!(output).expect("write status output");
@@ -226,7 +226,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     }
     writeln!(output).expect("write status output");
 
-    writeln!(output, "{}", ui.heading("Metadata")).expect("write status output");
+    writeln!(output, "{}", ui.heading("Logical Metadata")).expect("write status output");
     print_table(
         &mut output,
         width,
@@ -236,7 +236,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
             ["operations", &db_stats.operations.to_string(), "-"],
             ["refs", &db_stats.refs.to_string(), "-"],
             [
-                "blobs",
+                "logical blobs",
                 &db_stats.blobs.to_string(),
                 &format_bytes(db_stats.blob_bytes as u64),
             ],
@@ -261,7 +261,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     );
     writeln!(output).expect("write status output");
 
-    writeln!(output, "{}", ui.heading("Storage")).expect("write status output");
+    writeln!(output, "{}", ui.heading("Local Storage")).expect("write status output");
     print_table(
         &mut output,
         width,
@@ -276,6 +276,26 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
                 "objects",
                 &storage.objects_files.to_string(),
                 &format_bytes(storage.objects_bytes),
+            ],
+            [
+                "loose blobs",
+                &storage.loose_blob_files.to_string(),
+                &format_bytes(storage.loose_blob_bytes),
+            ],
+            [
+                "packs",
+                &storage.pack_files.to_string(),
+                &format_bytes(storage.pack_bytes),
+            ],
+            [
+                "large/chunks",
+                &storage.large_files.to_string(),
+                &format_bytes(storage.large_bytes),
+            ],
+            [
+                "trees",
+                &storage.tree_files.to_string(),
+                &format_bytes(storage.tree_bytes),
             ],
             [
                 "logs",
@@ -1504,6 +1524,14 @@ struct StorageStats {
     state_bytes: u64,
     objects_files: u64,
     objects_bytes: u64,
+    loose_blob_files: u64,
+    loose_blob_bytes: u64,
+    pack_files: u64,
+    pack_bytes: u64,
+    large_files: u64,
+    large_bytes: u64,
+    tree_files: u64,
+    tree_bytes: u64,
     logs_files: u64,
     logs_bytes: u64,
     queue_files: u64,
@@ -1513,6 +1541,10 @@ struct StorageStats {
 fn read_storage_stats(paths: &Paths) -> Result<StorageStats> {
     let state = dir_stats(&paths.home)?;
     let objects = dir_stats(&paths.home.join("objects"))?;
+    let loose_blobs = dir_stats(&paths.home.join("objects/blobs"))?;
+    let packs = dir_stats(&paths.home.join("objects/packs"))?;
+    let large = dir_stats(&paths.home.join("objects/large"))?;
+    let trees = dir_stats(&paths.home.join("objects/trees"))?;
     let logs = dir_stats(&paths.logs)?;
     let queue = dir_stats(&paths.home.join("queue"))?;
     Ok(StorageStats {
@@ -1520,6 +1552,14 @@ fn read_storage_stats(paths: &Paths) -> Result<StorageStats> {
         state_bytes: state.bytes,
         objects_files: objects.files,
         objects_bytes: objects.bytes,
+        loose_blob_files: loose_blobs.files,
+        loose_blob_bytes: loose_blobs.bytes,
+        pack_files: packs.files,
+        pack_bytes: packs.bytes,
+        large_files: large.files,
+        large_bytes: large.bytes,
+        tree_files: trees.files,
+        tree_bytes: trees.bytes,
         logs_files: logs.files,
         logs_bytes: logs.bytes,
         queue_files: queue.files,

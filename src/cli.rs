@@ -629,7 +629,12 @@ pub(crate) enum RemoteCommand {
     Fsck {
         #[arg(
             long,
-            help = "Run full payload verification. Default remote fsck is quick metadata/existence verification."
+            help = "Check every referenced remote object without payload decoding. Default remote fsck checks only critical metadata."
+        )]
+        objects: bool,
+        #[arg(
+            long,
+            help = "Run full payload verification. Default remote fsck checks only critical metadata."
         )]
         deep: bool,
     },
