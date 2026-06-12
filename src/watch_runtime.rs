@@ -150,13 +150,28 @@ fn watch_notify_loop<W: Watcher>(
     mut watcher: W,
     rx: mpsc::Receiver<notify::Result<notify::Event>>,
 ) -> Result<()> {
+    let mut watched_roots = Vec::new();
     for root in &active_roots {
-        watcher.watch(&root.path, RecursiveMode::Recursive)?;
-        record_event(
-            paths,
-            "watch-root",
-            &format!("{} {}", root.id, root.path.display()),
-        )?;
+        match watcher.watch(&root.path, RecursiveMode::Recursive) {
+            Ok(()) => {
+                record_event(
+                    paths,
+                    "watch-root",
+                    &format!("{} {}", root.id, root.path.display()),
+                )?;
+                watched_roots.push(root.clone());
+            }
+            Err(err) => {
+                record_event(
+                    paths,
+                    "watch-root-error",
+                    &format!("{} {}: {err}", root.id, root.path.display()),
+                )?;
+            }
+        }
+    }
+    if watched_roots.is_empty() {
+        bail!("no active roots could be watched");
     }
     if replay_pending_journal_events(paths)? && args.once {
         record_event(
@@ -167,9 +182,9 @@ fn watch_notify_loop<W: Watcher>(
         return Ok(());
     }
     loop {
-        let event = match recv_watch_event(&rx, args.periodic_rescan_secs)? {
-            Some(event) => event,
-            None => {
+        let event = match recv_watch_event(&rx, args.periodic_rescan_secs) {
+            Ok(Some(event)) => event,
+            Ok(None) => {
                 record_event(
                     paths,
                     "periodic-rescan",
@@ -186,11 +201,18 @@ fn watch_notify_loop<W: Watcher>(
                 }
                 continue;
             }
+            Err(err) => {
+                if is_watch_channel_disconnected(&err) {
+                    return Err(err);
+                }
+                record_watch_error(paths, backend_label, &err)?;
+                continue;
+            }
         };
         if !snapshot_relevant_event(&event) {
             continue;
         }
-        record_notify_event(paths, backend_label, &active_roots, &event)?;
+        record_notify_event(paths, backend_label, &watched_roots, &event)?;
         if args.mode == "strict" {
             snapshot_and_maybe_sync(
                 paths,
@@ -209,7 +231,7 @@ fn watch_notify_loop<W: Watcher>(
             max_latency: Duration::from_millis(args.buffer_max_ms.max(1)),
             max_events: args.buffer_max_events.max(1),
         };
-        let outcome = drain_watch_event_buffer(paths, &rx, buffer, backend_label, &active_roots)?;
+        let outcome = drain_watch_event_buffer(paths, &rx, buffer, backend_label, &watched_roots)?;
         record_event(
             paths,
             "watch-buffer-flush",
@@ -509,7 +531,10 @@ fn drain_watch_event_buffer(
                 events += 1;
                 last_event = Instant::now();
             }
-            Ok(Err(err)) => return Err(err.into()),
+            Ok(Err(err)) => {
+                record_watch_error(paths, backend_label, &err)?;
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let reason = if started.elapsed() >= config.max_latency {
                     "max-latency"
@@ -567,7 +592,10 @@ fn settle_before_flush(
                     record_notify_event(paths, backend_label, active_roots, &next)?;
                     events += 1;
                 }
-                Ok(Err(err)) => return Err(err.into()),
+                Ok(Err(err)) => {
+                    record_watch_error(paths, backend_label, &err)?;
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
             }
@@ -586,6 +614,24 @@ fn buffer_outcome(
         events,
         elapsed_ms: started.elapsed().as_millis(),
     }
+}
+
+fn record_watch_error(
+    paths: &Paths,
+    backend_label: &str,
+    err: &dyn std::fmt::Display,
+) -> Result<()> {
+    record_event(
+        paths,
+        "watch-error",
+        &format!("backend={backend_label}: {err}"),
+    )
+}
+
+fn is_watch_channel_disconnected(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("watch channel disconnected")
+        || message.contains("receiving on a closed channel")
 }
 
 #[cfg(test)]

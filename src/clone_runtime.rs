@@ -219,11 +219,12 @@ struct CloneMetadataSelection {
 struct CloneBootstrapExport {
     version: u32,
     host_index: RemoteHostIndex,
-    metadata: MetadataExport,
+    #[serde(default)]
+    metadata: Option<MetadataExport>,
 }
 
 const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
-const CLONE_BOOTSTRAP_VERSION: u32 = 1;
+const CLONE_BOOTSTRAP_VERSION: u32 = 2;
 
 fn clone_loaded_metadata(remote: &RemoteStore, host: Option<&str>) -> Result<CloneLoadedMetadata> {
     if let Some(loaded) = clone_loaded_metadata_from_bootstrap(remote, host)? {
@@ -252,7 +253,7 @@ fn clone_loaded_metadata_from_bootstrap(
         .with_context(|| format!("decode clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?;
     let bootstrap: CloneBootstrapExport = serde_json::from_slice(&decoded)
         .with_context(|| format!("parse clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?;
-    if bootstrap.version != CLONE_BOOTSTRAP_VERSION {
+    if bootstrap.version != 1 && bootstrap.version != CLONE_BOOTSTRAP_VERSION {
         return Ok(None);
     }
     let mut index = bootstrap.host_index;
@@ -267,8 +268,18 @@ fn clone_loaded_metadata_from_bootstrap(
     let Some(host) = selected else {
         return Ok(None);
     };
-    if host.id != bootstrap.metadata.config.host.id {
-        return Ok(None);
+    if let Some(metadata) = bootstrap.metadata {
+        if host.id != metadata.config.host.id {
+            return Ok(None);
+        }
+        return Ok(Some(CloneLoadedMetadata {
+            selection: CloneMetadataSelection {
+                key: host.metadata_key.clone(),
+                host: Some(host),
+                host_index: true,
+            },
+            export: Some(metadata),
+        }));
     }
     Ok(Some(CloneLoadedMetadata {
         selection: CloneMetadataSelection {
@@ -276,7 +287,7 @@ fn clone_loaded_metadata_from_bootstrap(
             host: Some(host),
             host_index: true,
         },
-        export: Some(bootstrap.metadata),
+        export: None,
     }))
 }
 

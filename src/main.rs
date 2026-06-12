@@ -1091,7 +1091,10 @@ pub(crate) fn validate_clone_host_summary(
     };
     if host_index {
         let expected_metadata_key = host_metadata_key(&host.id);
-        if host.metadata_key != expected_metadata_key {
+        let expected_compressed_metadata_key = format!("{expected_metadata_key}.zst");
+        if host.metadata_key != expected_metadata_key
+            && host.metadata_key != expected_compressed_metadata_key
+        {
             bail!(
                 "remote host index metadata_key {} does not match canonical key {}",
                 host.metadata_key,

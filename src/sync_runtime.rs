@@ -48,7 +48,7 @@ use crate::{
 
 const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v7";
 const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
-const CLONE_BOOTSTRAP_VERSION: u32 = 1;
+const CLONE_BOOTSTRAP_VERSION: u32 = 2;
 
 struct SyncTrace {
     enabled: bool,
@@ -480,7 +480,7 @@ fn enqueue_and_drain_sync(
         REMOTE_HOST_INDEX_KEY,
         serde_json::to_vec_pretty(&host_index)?,
     )?;
-    enqueue_clone_bootstrap_if_supported(paths, remote, host_index, &remote_export)?;
+    enqueue_clone_bootstrap_if_supported(paths, remote, host_index)?;
     trace.mark("clone bootstrap");
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
@@ -807,17 +807,15 @@ fn compressed_metadata_key(key: &str) -> String {
 }
 
 #[derive(Debug, Serialize)]
-struct CloneBootstrapExport<'a> {
+struct CloneBootstrapExport {
     version: u32,
     host_index: RemoteHostIndex,
-    metadata: &'a MetadataExport,
 }
 
 fn enqueue_clone_bootstrap_if_supported(
     paths: &Paths,
     remote: &RemoteStore,
     host_index: RemoteHostIndex,
-    metadata: &MetadataExport,
 ) -> Result<()> {
     if !matches!(remote, RemoteStore::S3(_)) {
         return Ok(());
@@ -825,7 +823,6 @@ fn enqueue_clone_bootstrap_if_supported(
     let bootstrap = CloneBootstrapExport {
         version: CLONE_BOOTSTRAP_VERSION,
         host_index,
-        metadata,
     };
     let json = serde_json::to_vec(&bootstrap)?;
     let compressed = zstd::stream::encode_all(json.as_slice(), 3)?;
