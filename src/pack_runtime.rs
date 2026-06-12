@@ -4,7 +4,8 @@ use majutsu_pack::{PackEntry, PackIndex, PackTier};
 use majutsu_store::BlobExport;
 use rusqlite::{Connection, params};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 
 use crate::cli::PackArgs;
 use crate::config::{PackConfig, Paths, read_config};
@@ -65,39 +66,29 @@ where
 {
     let target_size = target_size.max(1);
     let mut indexes = Vec::new();
-    let mut pack_id = new_id("pack");
     let prefixes = majutsu_pack::date_prefixes(tier, Utc::now());
-    let mut pack_key = majutsu_pack::pack_key(&prefixes.pack_prefix, &pack_id);
-    let mut index_key = majutsu_pack::index_key(&prefixes.index_prefix, &pack_id);
-    let mut pack_bytes = Vec::new();
-    let mut entries = Vec::new();
+    let mut pack = open_pack(paths, &prefixes.pack_prefix, &prefixes.index_prefix)?;
     for blob in blobs {
         let payload = payload_for(blob)?;
         let stored = encode_object(paths, &payload)?;
         let record_len = 8 + stored.len() as u64;
-        if !entries.is_empty() && pack_bytes.len() as u64 + record_len > target_size {
-            indexes.push(finish_pack(
-                paths, pack_id, pack_key, index_key, pack_bytes, entries,
-            )?);
-            pack_id = new_id("pack");
-            pack_key = majutsu_pack::pack_key(&prefixes.pack_prefix, &pack_id);
-            index_key = majutsu_pack::index_key(&prefixes.index_prefix, &pack_id);
-            pack_bytes = Vec::new();
-            entries = Vec::new();
+        if !pack.entries.is_empty() && pack.size + record_len > target_size {
+            indexes.push(finish_pack(paths, pack)?);
+            pack = open_pack(paths, &prefixes.pack_prefix, &prefixes.index_prefix)?;
         }
-        let offset = pack_bytes.len() as u64;
-        pack_bytes.extend_from_slice(&(stored.len() as u64).to_le_bytes());
-        pack_bytes.extend_from_slice(&stored);
-        entries.push(PackEntry {
+        let offset = pack.size;
+        pack.writer
+            .write_all(&(stored.len() as u64).to_le_bytes())?;
+        pack.writer.write_all(&stored)?;
+        pack.size += record_len;
+        pack.entries.push(PackEntry {
             oid: blob.oid.clone(),
             offset,
             len: 8 + stored.len() as u64,
         });
     }
-    if !entries.is_empty() {
-        indexes.push(finish_pack(
-            paths, pack_id, pack_key, index_key, pack_bytes, entries,
-        )?);
+    if !pack.entries.is_empty() {
+        indexes.push(finish_pack(paths, pack)?);
     }
     Ok(indexes)
 }
@@ -139,36 +130,73 @@ struct WrittenPack {
     size: u64,
 }
 
-fn finish_pack(
-    paths: &Paths,
+struct OpenPack {
     pack_id: String,
     pack_key: String,
     index_key: String,
-    pack_bytes: Vec<u8>,
     entries: Vec<PackEntry>,
-) -> Result<WrittenPack> {
+    writer: BufWriter<File>,
+    size: u64,
+}
+
+fn open_pack(paths: &Paths, pack_prefix: &str, index_prefix: &str) -> Result<OpenPack> {
+    let pack_id = new_id("pack");
+    let pack_key = majutsu_pack::pack_key(pack_prefix, &pack_id);
+    let index_key = majutsu_pack::index_key(index_prefix, &pack_id);
     let pack_path = paths.home.join(&pack_key);
     if let Some(parent) = pack_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&pack_path, &pack_bytes)?;
+    let file = File::create(&pack_path)?;
+    advise_sequential(&file);
+    Ok(OpenPack {
+        pack_id,
+        pack_key,
+        index_key,
+        entries: Vec::new(),
+        writer: BufWriter::with_capacity(1024 * 1024, file),
+        size: 0,
+    })
+}
+
+fn finish_pack(paths: &Paths, mut pack: OpenPack) -> Result<WrittenPack> {
+    pack.writer.flush()?;
+    advise_dontneed(pack.writer.get_ref());
     let index = PackIndex {
         version: 1,
-        pack_id: pack_id.clone(),
-        pack_key: pack_key.clone(),
-        entries,
+        pack_id: pack.pack_id.clone(),
+        pack_key: pack.pack_key.clone(),
+        entries: pack.entries,
     };
-    let index_path = paths.home.join(&index_key);
+    let index_path = paths.home.join(&pack.index_key);
     if let Some(parent) = index_path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
     Ok(WrittenPack {
         index,
-        index_key,
-        size: pack_bytes.len() as u64,
+        index_key: pack.index_key,
+        size: pack.size,
     })
 }
+
+#[cfg(unix)]
+fn advise_sequential(file: &File) {
+    use std::os::fd::AsRawFd;
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File) {}
+
+#[cfg(unix)]
+fn advise_dontneed(file: &File) {
+    use std::os::fd::AsRawFd;
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+}
+
+#[cfg(not(unix))]
+fn advise_dontneed(_file: &File) {}
 
 fn persist_written_packs(conn: &mut Connection, packs: &[WrittenPack]) -> Result<()> {
     let tx = conn.transaction()?;

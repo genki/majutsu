@@ -204,22 +204,25 @@ fn upload_queue_item(
         fs::remove_file(path)?;
         return Ok(UploadQueueItemResult::Skipped);
     }
-    let bytes = if let Some(bytes) = item.inline.clone() {
-        bytes
+    let upload_result = if let Some(bytes) = item.inline.clone() {
+        if is_content_addressed_remote_key(&item.key) && remote.capabilities().conditional_put {
+            remote.put_if_absent(&item.key, &bytes).map(|_| ())
+        } else {
+            remote.put(&item.key, &bytes)
+        }
     } else if let Some(source) = &item.source {
-        fs::read(source).with_context(|| format!("read queued upload source {source}"))?
+        let source = Path::new(source);
+        if is_content_addressed_remote_key(&item.key) && remote.capabilities().conditional_put {
+            remote.put_file_if_absent(&item.key, source).map(|_| ())
+        } else {
+            remote.put_file(&item.key, source)
+        }
     } else {
         bail!(
             "queued upload has neither inline payload nor source: {}",
             item.key
         );
     };
-    let upload_result =
-        if is_content_addressed_remote_key(&item.key) && remote.capabilities().conditional_put {
-            remote.put_if_absent(&item.key, &bytes).map(|_| ())
-        } else {
-            remote.put(&item.key, &bytes)
-        };
     match upload_result {
         Ok(()) => {
             remove_upload_payload(paths, &item.id)?;

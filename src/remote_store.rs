@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use majutsu_store::{RemoteCapabilities, archive_restore_status, s3_archive_restore_request_xml};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Body, Client};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -167,6 +167,20 @@ impl RemoteStore {
         }
     }
 
+    pub(crate) fn put_file(&self, key: &str, source: &Path) -> Result<()> {
+        match self {
+            RemoteStore::File(remote) => {
+                let path = remote.root.join(key);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(source, path)?;
+                Ok(())
+            }
+            RemoteStore::S3(remote) => remote.put_file(key, source),
+        }
+    }
+
     pub(crate) fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         match self {
             RemoteStore::File(remote) => {
@@ -191,6 +205,34 @@ impl RemoteStore {
                 }
             }
             RemoteStore::S3(remote) => remote.put_if_absent(key, bytes),
+        }
+    }
+
+    pub(crate) fn put_file_if_absent(&self, key: &str, source: &Path) -> Result<bool> {
+        match self {
+            RemoteStore::File(remote) => {
+                let path = remote.root.join(key);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(mut out) => {
+                        let mut input = File::open(source)?;
+                        std::io::copy(&mut input, &mut out)?;
+                        if file_remote_fsync_enabled() {
+                            out.sync_all()?;
+                        }
+                        Ok(true)
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                    Err(err) => Err(err.into()),
+                }
+            }
+            RemoteStore::S3(remote) => remote.put_file_if_absent(key, source),
         }
     }
 
@@ -300,6 +342,71 @@ impl S3Remote {
         self.put_object(key, bytes, true)
     }
 
+    fn put_file(&self, key: &str, source: &Path) -> Result<()> {
+        self.put_file_object(key, source, false).map(|_| ())
+    }
+
+    fn put_file_if_absent(&self, key: &str, source: &Path) -> Result<bool> {
+        if self.uses_sigv2() {
+            bail!("conditional put requires S3 Signature V4");
+        }
+        self.put_file_object(key, source, true)
+    }
+
+    fn put_file_object(&self, key: &str, source: &Path, if_absent: bool) -> Result<bool> {
+        let len = fs::metadata(source)?.len();
+        if self.should_use_multipart(len as usize) {
+            if if_absent && self.exists(key)? {
+                return Ok(false);
+            }
+            self.put_multipart_file(key, source, len)?;
+            return Ok(true);
+        }
+        let remote_key = self.remote_key(key);
+        let url = self.object_url(&remote_key);
+        let response = if self.uses_sigv2() {
+            let date = http_date();
+            let path = format!("/{}/{}", self.bucket, remote_key);
+            let auth = self.auth_v2("PUT", "", "application/octet-stream", &date, &path)?;
+            let file = File::open(source)?;
+            self.client
+                .put(url)
+                .header(DATE, date)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(AUTHORIZATION, auth)
+                .body(Body::sized(file, len))
+                .send()?
+        } else {
+            let payload_hash = sha256_file(source)?;
+            let mut extra_headers = self.put_object_headers(key)?;
+            if if_absent {
+                extra_headers.push(("if-none-match".to_string(), "*".to_string()));
+            }
+            let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &extra_headers)?;
+            let mut request = self
+                .client
+                .put(url)
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(AUTHORIZATION, auth.authorization)
+                .header(CONTENT_TYPE, "application/octet-stream");
+            for (name, value) in extra_headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let file = File::open(source)?;
+            request.body(Body::sized(file, len)).send()?
+        };
+        advise_path_dontneed(source);
+        if if_absent && matches!(response.status().as_u16(), 409 | 412) {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            bail!("s3 put failed for {key}: HTTP {}", response.status());
+        }
+        Ok(true)
+    }
+
     fn put_object(&self, key: &str, bytes: &[u8], if_absent: bool) -> Result<bool> {
         if self.should_use_multipart(bytes.len()) {
             if if_absent && self.exists(key)? {
@@ -362,6 +469,22 @@ impl S3Remote {
             let _ = self.abort_multipart(&remote_key, &upload_id);
         }
         result.with_context(|| format!("multipart upload failed for {key}"))
+    }
+
+    fn put_multipart_file(&self, key: &str, source: &Path, len: u64) -> Result<()> {
+        let remote_key = self.remote_key(key);
+        let upload_id = self.initiate_multipart(key, &remote_key)?;
+        let result = (|| {
+            let mut parts =
+                self.upload_multipart_file_parts(key, &remote_key, &upload_id, source, len)?;
+            parts.sort_by_key(|part| part.part_number);
+            self.complete_multipart(&remote_key, &upload_id, &parts)
+        })();
+        if result.is_err() {
+            let _ = self.abort_multipart(&remote_key, &upload_id);
+        }
+        advise_path_dontneed(source);
+        result.with_context(|| format!("multipart file upload failed for {key}"))
     }
 
     fn put_lifecycle_configuration(&self, policy_xml: &str) -> Result<()> {
@@ -454,6 +577,76 @@ impl S3Remote {
         Ok(parts)
     }
 
+    fn upload_multipart_file_parts(
+        &self,
+        key: &str,
+        remote_key: &str,
+        upload_id: &str,
+        source: &Path,
+        len: u64,
+    ) -> Result<Vec<CompletedPart>> {
+        let part_size = self.multipart_part_size_for_len(len as usize);
+        let parallelism = self.multipart_file_parallelism_for_key(key);
+        let mut file = File::open(source)?;
+        advise_sequential(&file);
+        let mut parts = Vec::new();
+        let mut batch = Vec::<(usize, Vec<u8>)>::new();
+        let mut part_number = 1usize;
+        loop {
+            let mut chunk = vec![0; part_size];
+            let mut read = 0usize;
+            while read < part_size {
+                let n = file.read(&mut chunk[read..])?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+            if read == 0 {
+                break;
+            }
+            chunk.truncate(read);
+            batch.push((part_number, chunk));
+            part_number += 1;
+            if batch.len() >= parallelism {
+                parts.extend(self.upload_multipart_owned_batch(remote_key, upload_id, &mut batch)?);
+            }
+        }
+        if !batch.is_empty() {
+            parts.extend(self.upload_multipart_owned_batch(remote_key, upload_id, &mut batch)?);
+        }
+        Ok(parts)
+    }
+
+    fn upload_multipart_owned_batch(
+        &self,
+        remote_key: &str,
+        upload_id: &str,
+        batch: &mut Vec<(usize, Vec<u8>)>,
+    ) -> Result<Vec<CompletedPart>> {
+        let current = std::mem::take(batch);
+        std::thread::scope(|scope| {
+            let handles = current
+                .into_iter()
+                .map(|(part_number, chunk)| {
+                    scope.spawn(move || {
+                        let etag =
+                            self.upload_part_owned(remote_key, upload_id, part_number, chunk)?;
+                        Ok(CompletedPart { part_number, etag })
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow!("multipart file upload worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
     fn multipart_part_size_for_len(&self, len: usize) -> usize {
         adaptive_multipart_part_size(len, &self.endpoint)
     }
@@ -468,6 +661,14 @@ impl S3Remote {
                 .min(self.max_parallel_uploads.max(1));
         }
         self.max_parallel_uploads.max(1)
+    }
+
+    fn multipart_file_parallelism_for_key(&self, key: &str) -> usize {
+        env::var("MAJUTSU_S3_FILE_MAX_PARALLEL_UPLOADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| self.multipart_parallelism_for_key(key).min(2))
     }
 
     pub(crate) fn multipart_initiate_headers(&self, key: &str) -> Result<Vec<(String, String)>> {
@@ -522,6 +723,43 @@ impl S3Remote {
             .header("x-amz-content-sha256", payload_hash)
             .header(AUTHORIZATION, auth.authorization)
             .body(bytes.to_vec())
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "s3 upload part {part_number} failed: HTTP {} {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            );
+        }
+        response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow!("s3 upload part {part_number} response had no ETag"))
+    }
+
+    fn upload_part_owned(
+        &self,
+        remote_key: &str,
+        upload_id: &str,
+        part_number: usize,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
+        let query = canonical_query(&[
+            ("partNumber", part_number.to_string()),
+            ("uploadId", upload_id.to_string()),
+        ]);
+        let payload_hash = sha256_hex(&bytes);
+        let auth = self.auth_v4("PUT", remote_key, &query, &payload_hash, &[])?;
+        let response = self
+            .client
+            .put(self.object_url_query(remote_key, &query))
+            .header(HOST, self.host_header()?)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(AUTHORIZATION, auth.authorization)
+            .body(bytes)
             .send()?;
         if !response.status().is_success() {
             bail!(
@@ -1018,6 +1256,46 @@ fn http_date() -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    advise_sequential(&file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    advise_dontneed(&file);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn advise_sequential(file: &File) {
+    use std::os::fd::AsRawFd;
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File) {}
+
+#[cfg(unix)]
+fn advise_dontneed(file: &File) {
+    use std::os::fd::AsRawFd;
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+}
+
+#[cfg(not(unix))]
+fn advise_dontneed(_file: &File) {}
+
+fn advise_path_dontneed(path: &Path) {
+    if let Ok(file) = File::open(path) {
+        advise_dontneed(&file);
+    }
 }
 
 fn hmac_sha256(key: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
