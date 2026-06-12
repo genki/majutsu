@@ -164,8 +164,8 @@ pub(crate) fn drain_upload_queue(
     paths: &Paths,
     remote: &RemoteStore,
     max_parallel_uploads: usize,
-) -> Result<usize> {
-    let mut uploaded = 0usize;
+) -> Result<UploadDrainStats> {
+    let mut stats = UploadDrainStats::default();
     let mut items = upload_queue_items(paths)?;
     items.sort_by(|a, b| {
         upload_publish_priority(&a.1.key)
@@ -180,15 +180,18 @@ pub(crate) fn drain_upload_queue(
         .unwrap_or_else(Instant::now);
     for batch in items.chunks(parallelism) {
         if progress_enabled
-            && (uploaded == 0
-                || uploaded % 25 == 0
+            && (stats.uploaded == 0
+                || stats.uploaded % 25 == 0
                 || last_progress.elapsed() >= StdDuration::from_secs(5))
         {
             let key = batch
                 .first()
                 .map(|(_, item)| item.key.as_str())
                 .unwrap_or("(none)");
-            eprintln!("sync upload progress {uploaded}/{total} key={key}");
+            eprintln!(
+                "sync upload progress {}/{} key={key}",
+                stats.uploaded, total
+            );
             last_progress = Instant::now();
         }
 
@@ -210,19 +213,31 @@ pub(crate) fn drain_upload_queue(
         })?;
         for result in results {
             match result {
-                UploadQueueItemResult::Uploaded => uploaded += 1,
-                UploadQueueItemResult::Skipped => {}
+                UploadQueueItemResult::Uploaded { bytes } => {
+                    stats.uploaded += 1;
+                    stats.uploaded_bytes += bytes;
+                }
+                UploadQueueItemResult::Skipped => {
+                    stats.skipped += 1;
+                }
             }
         }
     }
     if progress_enabled {
-        eprintln!("sync upload progress {}/{} done", uploaded, total);
+        eprintln!("sync upload progress {}/{} done", stats.uploaded, total);
     }
-    Ok(uploaded)
+    Ok(stats)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadDrainStats {
+    pub(crate) uploaded: usize,
+    pub(crate) uploaded_bytes: u64,
+    pub(crate) skipped: usize,
 }
 
 enum UploadQueueItemResult {
-    Uploaded,
+    Uploaded { bytes: u64 },
     Skipped,
 }
 
@@ -236,6 +251,7 @@ fn upload_queue_item(
         fs::remove_file(path)?;
         return Ok(UploadQueueItemResult::Skipped);
     }
+    let upload_bytes = upload_item_payload_size(&item).unwrap_or(0);
     let upload_result = if let Some(bytes) = item.inline.clone() {
         if !item.overwrite
             && is_content_addressed_remote_key(&item.key)
@@ -265,7 +281,9 @@ fn upload_queue_item(
         Ok(()) => {
             remove_upload_payload(paths, &item.id)?;
             fs::remove_file(path)?;
-            Ok(UploadQueueItemResult::Uploaded)
+            Ok(UploadQueueItemResult::Uploaded {
+                bytes: upload_bytes,
+            })
         }
         Err(err) => {
             let mut item = item;
@@ -275,6 +293,16 @@ fn upload_queue_item(
             Err(err).with_context(|| format!("upload failed for {}", item.key))
         }
     }
+}
+
+fn upload_item_payload_size(item: &UploadQueueItem) -> Result<u64> {
+    if let Some(bytes) = &item.inline {
+        return Ok(bytes.len() as u64);
+    }
+    if let Some(source) = &item.source {
+        return Ok(fs::metadata(source)?.len());
+    }
+    Ok(0)
 }
 
 fn upload_queue_parallelism(remote: &RemoteStore, max_parallel_uploads: usize) -> usize {

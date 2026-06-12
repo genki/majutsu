@@ -576,7 +576,7 @@ fn enqueue_and_drain_sync(
         )?)?,
     )?;
     trace.mark("gc mark");
-    let uploaded = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    let upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     trace.mark("drain queue");
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
     trace.mark("write sync cache");
@@ -604,7 +604,13 @@ fn enqueue_and_drain_sync(
         &remote_export.refs,
     )?;
     trace.mark("persist remote refs");
-    println!("synced {} objects to {}", uploaded, remote.describe());
+    println!(
+        "synced {} objects to {}",
+        upload_drain.uploaded,
+        remote.describe()
+    );
+    println!("synced_bytes {}", upload_drain.uploaded_bytes);
+    println!("skipped_uploads {}", upload_drain.skipped);
     println!("pruned_remote_exports {}", pruned_remote_exports);
     println!("pruned_remote_objects {}", pruned_remote_objects);
     println!("pruned_local_objects {}", pruned_local_objects);
