@@ -434,16 +434,6 @@ fn enqueue_and_drain_sync(
         serde_json::to_vec_pretty(&host_index)?,
     )?;
     enqueue_clone_bootstrap_if_supported(paths, remote, host_index, &remote_export)?;
-    enqueue_inline_upload(
-        paths,
-        &remote_gc_mark_key(&config.host.id),
-        serde_json::to_vec_pretty(&build_gc_mark_export(
-            paths,
-            config,
-            remote,
-            &content_export,
-        )?)?,
-    )?;
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
         enqueue_cached_inline_upload(
@@ -503,6 +493,16 @@ fn enqueue_and_drain_sync(
             }
         }
     }
+    enqueue_inline_upload(
+        paths,
+        &remote_gc_mark_key(&config.host.id),
+        serde_json::to_vec_pretty(&build_gc_mark_export(
+            paths,
+            config,
+            remote,
+            &content_export,
+        )?)?,
+    )?;
     let uploaded = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
     let (pruned_remote_exports, pruned_remote_objects) = if sync_remote_prune_enabled() {
@@ -1306,27 +1306,32 @@ fn prune_local_packed_blob_objects(paths: &Paths, export: &MetadataExport) -> Re
     if env::var("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE").as_deref() == Ok("0") {
         return Ok(0);
     }
-    let local_pack_keys = export
-        .packs
-        .iter()
-        .filter(|pack| {
-            paths.home.join(&pack.pack_key).exists() && paths.home.join(&pack.index_key).exists()
-        })
-        .map(|pack| pack.pack_id.as_str())
+    let all_local_packs_present = export.packs.iter().all(|pack| {
+        paths.home.join(&pack.pack_key).exists() && paths.home.join(&pack.index_key).exists()
+    });
+    if !all_local_packs_present {
+        return Ok(0);
+    }
+    let referenced_blob_dir_keys = local_object_keys(paths, export)?
+        .into_iter()
+        .filter(|key| key.starts_with("objects/blobs/"))
         .collect::<BTreeSet<_>>();
     let mut removed = 0usize;
-    for blob in &export.blobs {
-        let Some(pack_id) = blob.pack_id.as_deref() else {
-            continue;
-        };
-        if !local_pack_keys.contains(pack_id) {
+    let blob_root = paths.home.join("objects/blobs");
+    if !blob_root.exists() {
+        return Ok(0);
+    }
+    for entry in walkdir::WalkDir::new(&blob_root).sort_by_file_name() {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
             continue;
         }
-        let local = paths.home.join(&blob.object_key);
-        if local.exists() {
-            fs::remove_file(&local).with_context(|| format!("remove {}", blob.object_key))?;
-            removed += 1;
+        let key = crate::util::path_to_slash(entry.path().strip_prefix(&paths.home)?);
+        if referenced_blob_dir_keys.contains(key.as_str()) {
+            continue;
         }
+        fs::remove_file(entry.path()).with_context(|| format!("remove {key}"))?;
+        removed += 1;
     }
     Ok(removed)
 }
