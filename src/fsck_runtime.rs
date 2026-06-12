@@ -1680,10 +1680,12 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                 match remote_ref(remote, &current_ref_key)? {
                     Some(remote_current) if remote_current == *current => {}
                     Some(remote_current) => {
-                        missing += 1;
-                        eprintln!(
-                            "{current_ref_key} points to {remote_current}, expected {current}"
-                        );
+                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                            missing += 1;
+                            eprintln!(
+                                "{current_ref_key} points to {remote_current}, expected {current}"
+                            );
+                        }
                     }
                     None => {
                         if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
@@ -1732,10 +1734,12 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                 match remote_ref(remote, &last_synced_ref_key)? {
                     Some(remote_last_synced) if remote_last_synced == *last_synced => {}
                     Some(remote_last_synced) => {
-                        missing += 1;
-                        eprintln!(
-                            "{last_synced_ref_key} points to {remote_last_synced}, expected {last_synced}"
-                        );
+                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                            missing += 1;
+                            eprintln!(
+                                "{last_synced_ref_key} points to {remote_last_synced}, expected {last_synced}"
+                            );
+                        }
                     }
                     None => {
                         if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {

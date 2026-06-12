@@ -310,8 +310,10 @@ fn validate_quick_host_metadata(
         match remote_ref(remote, &key)? {
             Some(value) if value == *current => {}
             Some(value) => {
-                *missing += 1;
-                eprintln!("{key} points to {value}, expected {current}");
+                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                    *missing += 1;
+                    eprintln!("{key} points to {value}, expected {current}");
+                }
             }
             None => {
                 if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
@@ -351,8 +353,10 @@ fn validate_quick_host_metadata(
         match remote_ref(remote, &key)? {
             Some(value) if value == *last_synced => {}
             Some(value) => {
-                *missing += 1;
-                eprintln!("{key} points to {value}, expected {last_synced}");
+                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                    *missing += 1;
+                    eprintln!("{key} points to {value}, expected {last_synced}");
+                }
             }
             None => {
                 if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
