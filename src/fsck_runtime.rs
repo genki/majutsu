@@ -1037,8 +1037,10 @@ pub(crate) fn validate_remote_oplog(
 ) -> Result<()> {
     let canonical_key = host_oplog_canonical_key(host_id);
     if !remote.exists(&canonical_key)? {
-        *missing += 1;
-        eprintln!("missing canonical host operation log {canonical_key}");
+        if !matches!(remote, RemoteStore::S3(_)) {
+            *missing += 1;
+            eprintln!("missing canonical host operation log {canonical_key}");
+        }
     } else {
         let operations = decode_canonical_remote_oplog(paths, &remote.get(&canonical_key)?)
             .map_err(|err| anyhow::anyhow!("parse remote operation log {canonical_key}: {err}"))?;
@@ -2095,7 +2097,11 @@ fn validate_remote_timeline_prefixes(
                 host_operation_canonical_key(host_id, &operation.id),
             ]
         })
-        .chain([host_oplog_key(host_id), host_oplog_canonical_key(host_id)])
+        .chain(if matches!(remote, RemoteStore::S3(_)) {
+            Vec::new()
+        } else {
+            vec![host_oplog_key(host_id), host_oplog_canonical_key(host_id)]
+        })
         .collect::<BTreeSet<_>>();
     for key in remote.list(&host_ops_prefix(host_id))? {
         if !expected_operation_keys.contains(&key) {

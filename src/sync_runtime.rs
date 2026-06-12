@@ -451,11 +451,13 @@ fn enqueue_and_drain_sync(
             majutsu_core::encode_operation_log(&remote_export.operations)?,
         )?;
     }
-    enqueue_inline_upload(
-        paths,
-        &host_oplog_canonical_key(&config.host.id),
-        encode_canonical_remote_oplog(paths, &remote_export.operations)?,
-    )?;
+    if should_upload_full_remote_oplog(remote) {
+        enqueue_inline_upload(
+            paths,
+            &host_oplog_canonical_key(&config.host.id),
+            encode_canonical_remote_oplog(paths, &remote_export.operations)?,
+        )?;
+    }
     enqueue_cached_inline_upload(
         paths,
         &sync_cache,
@@ -669,6 +671,15 @@ fn sync_content_local_object_keys(
         if let Ok(manifest) = current_snapshot_manifest_for_object_keys(paths, snapshot) {
             for root_tree in manifest.root_trees.values() {
                 keys.push(root_tree.tree_key.clone());
+                if let Ok(tree) = tree_manifest_for_object_keys(paths, &root_tree.tree_key) {
+                    for record in tree.entries.values() {
+                        if let Some((_, manifest_key, _)) =
+                            majutsu_core::payload_large_ref(&record.payload)
+                        {
+                            keys.push(manifest_key.to_string());
+                        }
+                    }
+                }
             }
         }
     }
@@ -700,6 +711,13 @@ fn current_snapshot_manifest_for_object_keys(
         return Ok(serde_json::from_str(&snapshot.manifest_json)?);
     }
     let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
+    Ok(serde_json::from_slice(&crate::decode_object(
+        paths, &bytes,
+    )?)?)
+}
+
+fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeManifest> {
+    let bytes = fs::read(paths.home.join(tree_key))?;
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
     )?)?)
@@ -810,17 +828,34 @@ fn enqueue_metadata_uploads(
         return Ok(host_key.to_string());
     }
     let compressed = zstd::stream::encode_all(metadata_json, 3)?;
-    enqueue_inline_upload(
-        paths,
-        &compressed_metadata_key(legacy_key),
-        compressed.clone(),
-    )?;
+    let legacy_compressed_key = compressed_metadata_key(legacy_key);
+    if should_seed_s3_legacy_metadata(remote, legacy_key, &legacy_compressed_key)? {
+        enqueue_inline_upload(paths, &legacy_compressed_key, compressed.clone())?;
+    }
     enqueue_inline_upload(paths, &compressed_metadata_key(host_key), compressed)?;
     Ok(compressed_metadata_key(host_key))
 }
 
 fn compressed_metadata_key(key: &str) -> String {
     format!("{key}.zst")
+}
+
+fn should_seed_s3_legacy_metadata(
+    remote: &RemoteStore,
+    legacy_key: &str,
+    compressed_key: &str,
+) -> Result<bool> {
+    if env::var("MAJUTSU_SYNC_S3_LEGACY_METADATA_EVERY_TIME").as_deref() == Ok("1") {
+        return Ok(true);
+    }
+    Ok(!remote.exists(legacy_key)? && !remote.exists(compressed_key)?)
+}
+
+fn should_upload_full_remote_oplog(remote: &RemoteStore) -> bool {
+    if env::var("MAJUTSU_SYNC_FULL_REMOTE_OPLOG").as_deref() == Ok("1") {
+        return true;
+    }
+    !matches!(remote, RemoteStore::S3(_))
 }
 
 #[derive(Debug, Serialize)]
@@ -1379,8 +1414,10 @@ fn prune_remote_host_exports(
             ]
         })
         .collect::<BTreeSet<_>>();
-    live_ops.insert(host_oplog_key(host_id));
-    live_ops.insert(host_oplog_canonical_key(host_id));
+    if should_upload_full_remote_oplog(remote) {
+        live_ops.insert(host_oplog_key(host_id));
+        live_ops.insert(host_oplog_canonical_key(host_id));
+    }
     let mut removed = 0usize;
     for key in remote.list(&host_snapshots_prefix(host_id))? {
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc"))

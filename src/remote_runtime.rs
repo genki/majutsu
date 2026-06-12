@@ -109,7 +109,11 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         } => {
             let index = remote_host_index_with_legacy(&remote)?;
             let host = select_remote_host(index.hosts, &id)?;
-            let export: MetadataExport = serde_json::from_slice(&remote.get(&host.metadata_key)?)?;
+            let metadata_bytes = remote.get(&host.metadata_key)?;
+            let export: MetadataExport = serde_json::from_slice(&decode_remote_metadata_bytes(
+                &host.metadata_key,
+                &metadata_bytes,
+            )?)?;
             println!("id {}", host.id);
             println!("name {}", host.name);
             println!("last_synced_at {}", host.last_synced_at.to_rfc3339());

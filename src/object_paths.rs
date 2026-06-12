@@ -1,6 +1,5 @@
 use anyhow::Result;
-#[cfg(test)]
-use majutsu_core::SnapshotManifest;
+use majutsu_core::{TreeManifest, payload_large_ref};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -16,6 +15,13 @@ pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Resul
         if let Ok(manifest) = snapshot_manifest_for_object_keys(paths, snapshot) {
             for root_tree in manifest.root_trees.values() {
                 keys.push(root_tree.tree_key.clone());
+                if let Ok(tree) = tree_manifest_for_object_keys(paths, &root_tree.tree_key) {
+                    for record in tree.entries.values() {
+                        if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
+                            keys.push(manifest_key.to_string());
+                        }
+                    }
+                }
             }
         }
     }
@@ -47,6 +53,13 @@ fn snapshot_manifest_for_object_keys(
         return Ok(serde_json::from_str(&snapshot.manifest_json)?);
     }
     let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
+    Ok(serde_json::from_slice(&crate::decode_object(
+        paths, &bytes,
+    )?)?)
+}
+
+fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeManifest> {
+    let bytes = fs::read(paths.home.join(tree_key))?;
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
     )?)?)
@@ -127,7 +140,9 @@ pub(crate) fn local_object_keys_from_metadata(export: &MetadataExport) -> Vec<St
     let mut keys = Vec::new();
     for snapshot in &export.snapshots {
         keys.push(snapshot.manifest_key.clone());
-        if let Ok(manifest) = serde_json::from_str::<SnapshotManifest>(&snapshot.manifest_json) {
+        if let Ok(manifest) =
+            serde_json::from_str::<majutsu_core::SnapshotManifest>(&snapshot.manifest_json)
+        {
             for root_tree in manifest.root_trees.values() {
                 keys.push(root_tree.tree_key.clone());
             }
