@@ -1576,7 +1576,27 @@ pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Resu
     Ok(true)
 }
 
-pub(crate) fn hydrate_local_objects_from_remote(paths: &Paths, keys: Vec<String>) -> Result<usize> {
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct HydrateStats {
+    pub(crate) hydrated: usize,
+    pub(crate) downloaded_bytes: u64,
+    pub(crate) download_ms_sum: u128,
+    pub(crate) write_ms_sum: u128,
+}
+
+impl HydrateStats {
+    pub(crate) fn add(&mut self, other: HydrateStats) {
+        self.hydrated += other.hydrated;
+        self.downloaded_bytes += other.downloaded_bytes;
+        self.download_ms_sum += other.download_ms_sum;
+        self.write_ms_sum += other.write_ms_sum;
+    }
+}
+
+pub(crate) fn hydrate_local_objects_from_remote(
+    paths: &Paths,
+    keys: Vec<String>,
+) -> Result<HydrateStats> {
     let mut keys = keys
         .into_iter()
         .filter(|key| !paths.home.join(key).exists())
@@ -1584,23 +1604,21 @@ pub(crate) fn hydrate_local_objects_from_remote(paths: &Paths, keys: Vec<String>
     keys.sort();
     keys.dedup();
     if keys.is_empty() {
-        return Ok(0);
+        return Ok(HydrateStats::default());
     }
     let Ok(config) = read_config(paths) else {
-        return Ok(0);
+        return Ok(HydrateStats::default());
     };
     let Some(remote_config) = config.remote.as_ref() else {
-        return Ok(0);
+        return Ok(HydrateStats::default());
     };
     let remote = open_remote(remote_config)?;
     if !matches!(remote, RemoteStore::S3(_)) {
-        let mut hydrated = 0usize;
+        let mut stats = HydrateStats::default();
         for key in keys {
-            if hydrate_one_local_object_from_remote(paths, &remote, &key)? {
-                hydrated += 1;
-            }
+            stats.add(hydrate_one_local_object_from_remote(paths, &remote, &key)?);
         }
-        return Ok(hydrated);
+        return Ok(stats);
     }
     hydrate_local_objects_from_remote_parallel(paths, remote, keys)
 }
@@ -1609,12 +1627,12 @@ fn hydrate_local_objects_from_remote_parallel(
     paths: &Paths,
     remote: RemoteStore,
     keys: Vec<String>,
-) -> Result<usize> {
+) -> Result<HydrateStats> {
     let workers = restore_prefetch_parallelism().min(keys.len());
     let paths = Arc::new(paths.clone());
     let remote = Arc::new(remote);
     let keys = Arc::new(Mutex::new(keys.into_iter()));
-    let (result_tx, result_rx) = mpsc::channel::<Result<usize>>();
+    let (result_tx, result_rx) = mpsc::channel::<Result<HydrateStats>>();
     let mut handles = Vec::new();
     for _ in 0..workers {
         let paths = Arc::clone(&paths);
@@ -1622,7 +1640,7 @@ fn hydrate_local_objects_from_remote_parallel(
         let keys = Arc::clone(&keys);
         let result_tx = result_tx.clone();
         handles.push(std::thread::spawn(move || {
-            let mut hydrated = 0usize;
+            let mut stats = HydrateStats::default();
             loop {
                 let key = {
                     let mut keys = match keys.lock() {
@@ -1639,23 +1657,22 @@ fn hydrate_local_objects_from_remote_parallel(
                     break;
                 };
                 match hydrate_one_local_object_from_remote(&paths, &remote, &key) {
-                    Ok(true) => hydrated += 1,
-                    Ok(false) => {}
+                    Ok(item) => stats.add(item),
                     Err(err) => {
                         let _ = result_tx.send(Err(err));
                         return;
                     }
                 }
             }
-            let _ = result_tx.send(Ok(hydrated));
+            let _ = result_tx.send(Ok(stats));
         }));
     }
     drop(result_tx);
-    let mut hydrated = 0usize;
+    let mut stats = HydrateStats::default();
     let mut first_error = None;
     for result in result_rx {
         match result {
-            Ok(count) => hydrated += count,
+            Ok(item) => stats.add(item),
             Err(err) => {
                 first_error.get_or_insert(err);
             }
@@ -1669,27 +1686,36 @@ fn hydrate_local_objects_from_remote_parallel(
     if let Some(err) = first_error {
         return Err(err);
     }
-    Ok(hydrated)
+    Ok(stats)
 }
 
 fn hydrate_one_local_object_from_remote(
     paths: &Paths,
     remote: &RemoteStore,
     key: &str,
-) -> Result<bool> {
+) -> Result<HydrateStats> {
     let dest = paths.home.join(key);
     if dest.exists() {
-        return Ok(false);
+        return Ok(HydrateStats::default());
     }
+    let download_started = std::time::Instant::now();
     let bytes = download_local_object_from_remote(paths, remote, key)
         .with_context(|| format!("prefetch restore object {key}"))?;
+    let download_ms = download_started.elapsed().as_millis();
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = dest.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let write_started = std::time::Instant::now();
     fs::write(&tmp, bytes)?;
     fs::rename(&tmp, &dest)?;
-    Ok(true)
+    let write_ms = write_started.elapsed().as_millis();
+    Ok(HydrateStats {
+        hydrated: 1,
+        downloaded_bytes: fs::metadata(&dest)?.len(),
+        download_ms_sum: download_ms,
+        write_ms_sum: write_ms,
+    })
 }
 
 fn restore_prefetch_parallelism() -> usize {
@@ -1788,7 +1814,7 @@ pub(crate) fn remote_object_available(remote: &RemoteStore, key: &str) -> Result
     remote.exists(&alias)
 }
 
-fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<String> {
+pub(crate) fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<String> {
     if remote.exists(key)? {
         return Ok(key.to_string());
     }
@@ -2189,7 +2215,7 @@ fn hydrate_packed_blobs_from_remote(
     Ok(true)
 }
 
-fn pack_entry_payload<'a>(oid: &str, entry: &'a [u8]) -> Result<&'a [u8]> {
+pub(crate) fn pack_entry_payload<'a>(oid: &str, entry: &'a [u8]) -> Result<&'a [u8]> {
     if entry.len() < 8 {
         bail!("pack entry too short for {oid}");
     }

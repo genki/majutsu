@@ -6,13 +6,14 @@ use majutsu_pack::PackExport;
 use majutsu_restore::{
     RestoreChangeStats, RestorePathState, RestoreQueueItem, count_restore_changes,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use rusqlite::{Connection, params};
@@ -26,11 +27,13 @@ use crate::restore_apply::{
     apply_file_metadata, prepare_directory_restore_destination, prepare_file_restore_destination,
     restore_special_file, restore_special_matches, restore_symlink,
 };
+use crate::util::blake3_hex;
+use crate::{HydrateStats, pack_entry_payload};
 use crate::{
     build_restore_job, decode_object, download_local_object_from_remote,
     hydrate_local_objects_from_remote, hydrate_restore_job_objects, query_blobs, read_blob_payload,
-    read_large_chunk, read_object, remote_object_available, request_archive_restore_for_job,
-    write_large_chunks_atomic,
+    read_large_chunk, read_object, remote_available_key, remote_object_available,
+    request_archive_restore_for_job, write_large_chunks_atomic,
 };
 
 #[derive(Debug)]
@@ -182,6 +185,19 @@ impl RestoreTrace {
             eprintln!(
                 "restore_trace elapsed_ms={} stage={label}",
                 self.start.elapsed().as_millis()
+            );
+        }
+    }
+
+    fn mark_stats(&self, label: &str, stats: HydrateStats) {
+        if self.enabled {
+            eprintln!(
+                "restore_trace elapsed_ms={} stage={label} hydrated={} downloaded_bytes={} download_ms_sum={} write_ms_sum={}",
+                self.start.elapsed().as_millis(),
+                stats.hydrated,
+                stats.downloaded_bytes,
+                stats.download_ms_sum,
+                stats.write_ms_sum
             );
         }
     }
@@ -661,12 +677,14 @@ pub(crate) fn apply_restore_plan(
 ) -> Result<()> {
     let trace = RestoreTrace::new();
     let conn = crate::open_db(paths)?;
+    let packed_stats = prefetch_packed_blob_ranges_for_plan(paths, &conn, plan)?;
+    trace.mark_stats("prefetch packed blob ranges", packed_stats);
     let required_objects = required_object_keys_for_plan(paths, &conn, plan)?
         .into_iter()
         .filter(|key| restore_apply_prefetches_object(key))
         .collect();
-    hydrate_local_objects_from_remote(paths, required_objects)?;
-    trace.mark("prefetch objects");
+    let object_stats = hydrate_local_objects_from_remote(paths, required_objects)?;
+    trace.mark_stats("prefetch objects", object_stats);
     if check_conflicts && !force {
         let conflicts = restore_conflicts(paths, &conn, plan)?;
         if !conflicts.is_empty() {
@@ -730,6 +748,217 @@ pub(crate) fn apply_restore_plan(
 
 fn restore_apply_prefetches_object(key: &str) -> bool {
     !key.starts_with("objects/packs/") && !key.starts_with("objects/indexes/pack/")
+}
+
+#[derive(Debug, Clone)]
+struct PackedBlobRangePrefetch {
+    oid: String,
+    object_key: String,
+    pack_key: String,
+    remote_pack_key: String,
+    offset: u64,
+    len: u64,
+    size: u64,
+}
+
+fn prefetch_packed_blob_ranges_for_plan(
+    paths: &Paths,
+    conn: &Connection,
+    plan: &RestorePlan,
+) -> Result<HydrateStats> {
+    let blobs = query_blobs(conn)?;
+    let blobs_by_oid = blobs
+        .iter()
+        .map(|blob| (blob.oid.as_str(), blob))
+        .collect::<HashMap<_, _>>();
+    let mut pack_cache = HashMap::<String, PackExport>::new();
+    let mut tasks = Vec::new();
+    for record in &plan.files {
+        let Some((oid, _)) = payload_blob_ref(&record.payload) else {
+            continue;
+        };
+        let blob = blobs_by_oid
+            .get(oid)
+            .copied()
+            .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
+        let Some(pack_id) = blob.pack_id.as_deref() else {
+            continue;
+        };
+        if paths.home.join(&blob.object_key).exists() {
+            continue;
+        }
+        let pack = if let Some(pack) = pack_cache.get(pack_id) {
+            pack.clone()
+        } else {
+            let pack: PackExport = conn.query_row(
+                "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",
+                params![pack_id],
+                |row| {
+                    Ok(PackExport {
+                        pack_id: row.get(0)?,
+                        pack_key: row.get(1)?,
+                        index_key: row.get(2)?,
+                        object_count: row.get(3)?,
+                        size: row.get(4)?,
+                    })
+                },
+            )?;
+            pack_cache.insert(pack_id.to_string(), pack.clone());
+            pack
+        };
+        if paths.home.join(&pack.pack_key).exists() {
+            continue;
+        }
+        let offset = blob
+            .pack_offset
+            .ok_or_else(|| anyhow!("missing pack offset for {}", blob.oid))?;
+        let len = blob
+            .pack_len
+            .ok_or_else(|| anyhow!("missing pack len for {}", blob.oid))?;
+        tasks.push(PackedBlobRangePrefetch {
+            oid: blob.oid.clone(),
+            object_key: blob.object_key.clone(),
+            pack_key: pack.pack_key,
+            remote_pack_key: String::new(),
+            offset,
+            len,
+            size: blob.size,
+        });
+    }
+    tasks.sort_by(|left, right| left.object_key.cmp(&right.object_key));
+    tasks.dedup_by(|left, right| left.object_key == right.object_key);
+    if tasks.is_empty() {
+        return Ok(HydrateStats::default());
+    }
+    let Ok(config) = read_config(paths) else {
+        return Ok(HydrateStats::default());
+    };
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(HydrateStats::default());
+    };
+    let remote = open_remote(remote_config)?;
+    let mut remote_pack_keys = HashMap::<String, String>::new();
+    for task in &mut tasks {
+        let remote_pack_key = if let Some(key) = remote_pack_keys.get(&task.pack_key) {
+            key.clone()
+        } else {
+            let key = remote_available_key(&remote, &task.pack_key)?;
+            remote_pack_keys.insert(task.pack_key.clone(), key.clone());
+            key
+        };
+        task.remote_pack_key = remote_pack_key;
+    }
+    prefetch_packed_blob_ranges_parallel(paths, remote, tasks)
+}
+
+fn prefetch_packed_blob_ranges_parallel(
+    paths: &Paths,
+    remote: crate::remote_store::RemoteStore,
+    tasks: Vec<PackedBlobRangePrefetch>,
+) -> Result<HydrateStats> {
+    let workers = restore_packed_range_parallelism().min(tasks.len());
+    let paths = Arc::new(paths.clone());
+    let remote = Arc::new(remote);
+    let tasks = Arc::new(Mutex::new(tasks.into_iter()));
+    let (result_tx, result_rx) = mpsc::channel::<Result<HydrateStats>>();
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let paths = Arc::clone(&paths);
+        let remote = Arc::clone(&remote);
+        let tasks = Arc::clone(&tasks);
+        let result_tx = result_tx.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut stats = HydrateStats::default();
+            loop {
+                let task = {
+                    let mut tasks = match tasks.lock() {
+                        Ok(tasks) => tasks,
+                        Err(err) => {
+                            let _ = result_tx
+                                .send(Err(anyhow!("restore packed range queue poisoned: {err}")));
+                            return;
+                        }
+                    };
+                    tasks.next()
+                };
+                let Some(task) = task else {
+                    break;
+                };
+                match prefetch_one_packed_blob_range(&paths, &remote, &task) {
+                    Ok(item) => stats.add(item),
+                    Err(err) => {
+                        let _ = result_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+            let _ = result_tx.send(Ok(stats));
+        }));
+    }
+    drop(result_tx);
+    let mut stats = HydrateStats::default();
+    let mut first_error = None;
+    for result in result_rx {
+        match result {
+            Ok(item) => stats.add(item),
+            Err(err) => {
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    for handle in handles {
+        if let Err(err) = handle.join() {
+            first_error
+                .get_or_insert_with(|| anyhow!("restore packed range worker panicked: {err:?}"));
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(stats)
+}
+
+fn prefetch_one_packed_blob_range(
+    paths: &Paths,
+    remote: &crate::remote_store::RemoteStore,
+    task: &PackedBlobRangePrefetch,
+) -> Result<HydrateStats> {
+    let dest = paths.home.join(&task.object_key);
+    if dest.exists() {
+        return Ok(HydrateStats::default());
+    }
+    let download_started = Instant::now();
+    let entry = remote
+        .get_range(&task.remote_pack_key, task.offset, task.len)
+        .with_context(|| format!("download packed blob {} from {}", task.oid, task.pack_key))?;
+    let encoded = pack_entry_payload(&task.oid, &entry)?;
+    let decoded = decode_object(paths, encoded)
+        .with_context(|| format!("decode packed blob {}", task.oid))?;
+    if decoded.len() as u64 != task.size || blake3_hex(&decoded) != task.oid {
+        bail!("packed blob range hash mismatch {}", task.oid);
+    }
+    let download_ms = download_started.elapsed().as_millis();
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let write_started = Instant::now();
+    fs::write(&tmp, encoded)?;
+    fs::rename(&tmp, &dest)?;
+    Ok(HydrateStats {
+        hydrated: 1,
+        downloaded_bytes: task.len,
+        download_ms_sum: download_ms,
+        write_ms_sum: write_started.elapsed().as_millis(),
+    })
+}
+
+fn restore_packed_range_parallelism() -> usize {
+    env::var("MAJUTSU_RESTORE_PACKED_RANGE_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
 }
 
 pub(crate) fn restore_conflicts(
