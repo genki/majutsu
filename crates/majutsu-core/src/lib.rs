@@ -430,6 +430,7 @@ pub enum OperationKind {
     #[serde(alias = "Prune")]
     Prune,
     Gc,
+    CachePrune,
     LifecycleApply,
     #[serde(alias = "KeyRotation")]
     KeyRotation,
@@ -556,6 +557,7 @@ pub fn valid_operation_kind_label(kind: &str) -> bool {
             | "pack-compact"
             | "prune"
             | "gc"
+            | "cache-prune"
             | "lifecycle-apply"
             | "fsck"
     )

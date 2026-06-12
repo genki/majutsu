@@ -362,6 +362,86 @@ fn prune_dry_run_and_gc_preserve_current_restore() {
     assert_file(&restore.join("docs/note.txt"), b"v2\n");
 }
 
+#[test]
+fn cache_prune_evicts_synced_payload_cache_and_restore_hydrates() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let remote = temp.path().join("remote");
+    let root = temp.path().join("data");
+    let restore = temp.path().join("restore");
+
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.txt"), b"cache prune note\n").unwrap();
+    fs::write(root.join("payload.bin"), vec![b'x'; 2 * 1024 * 1024]).unwrap();
+
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "init",
+                "--remote",
+                &format!("file://{}", remote.display()),
+                "--host-name",
+                "cache-prune-e2e-host",
+            ],
+        ),
+        "init",
+    );
+    assert_success(
+        run_mj(&home, ["root", "add", "data", root.to_str().unwrap()]),
+        "root add data",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "cache prune source"]),
+        "snapshot",
+    );
+    let sync = run_mj(&home, ["sync"]);
+    if !sync.status.success() {
+        panic!(
+            "sync が失敗しました\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            sync.status.code(),
+            String::from_utf8_lossy(&sync.stdout),
+            String::from_utf8_lossy(&sync.stderr)
+        );
+    }
+    let sync_stdout = String::from_utf8_lossy(&sync.stdout);
+    let pruned_bytes = sync_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("pruned_payload_cache_bytes "))
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("sync should report pruned_payload_cache_bytes");
+    assert!(
+        pruned_bytes > 0,
+        "sync should prune synced payload cache\n{sync_stdout}"
+    );
+
+    let stat = run_mj(&home, ["cache", "stat"]);
+    if !stat.status.success() {
+        panic!(
+            "cache stat が失敗しました\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            stat.status.code(),
+            String::from_utf8_lossy(&stat.stdout),
+            String::from_utf8_lossy(&stat.stderr)
+        );
+    }
+    let stat_stdout = String::from_utf8_lossy(&stat.stdout);
+    assert!(stat_stdout.contains("payload_cache_candidates 0"));
+
+    assert_success(run_mj(&home, ["fsck"]), "fsck after cache prune");
+    assert_success(
+        run_mj(
+            &home,
+            ["restore", "apply", "--to", restore.to_str().unwrap()],
+        ),
+        "restore after cache prune",
+    );
+    assert_file(&restore.join("data/note.txt"), b"cache prune note\n");
+    assert_file(
+        &restore.join("data/payload.bin"),
+        &vec![b'x'; 2 * 1024 * 1024],
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_status_and_metrics_smoke() {

@@ -21,6 +21,7 @@ use std::env;
 use std::fs;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::cache_runtime::prune_synced_payload_cache;
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
 use crate::db_refs::{
@@ -251,11 +252,24 @@ fn sync_configured_remote(
     {
         let pruned_local_objects =
             prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff_time())?;
+        let pruned_payload_cache = if sync_local_payload_cache_prune_enabled() {
+            prune_synced_payload_cache(paths, remote, &remote_export)?
+        } else {
+            Default::default()
+        };
         trace.mark("local prune");
         println!("synced 0 objects to {}", remote.describe());
         println!("pruned_remote_exports 0");
         println!("pruned_remote_objects 0");
         println!("pruned_local_objects {}", pruned_local_objects);
+        println!(
+            "pruned_payload_cache_objects {}",
+            pruned_payload_cache.removed
+        );
+        println!(
+            "pruned_payload_cache_bytes {}",
+            pruned_payload_cache.removed_bytes
+        );
         return Ok(());
     }
     let previous_last_synced = ref_value(conn, "last-synced")?;
@@ -683,6 +697,11 @@ fn enqueue_and_drain_sync(
     };
     let pruned_local_objects =
         prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff)?;
+    let pruned_payload_cache = if sync_local_payload_cache_prune_enabled() {
+        prune_synced_payload_cache(paths, remote, &content_export)?
+    } else {
+        Default::default()
+    };
     trace.mark("local prune");
     persist_export_remote_refs(
         conn,
@@ -701,6 +720,14 @@ fn enqueue_and_drain_sync(
     println!("pruned_remote_exports {}", pruned_remote_exports);
     println!("pruned_remote_objects {}", pruned_remote_objects);
     println!("pruned_local_objects {}", pruned_local_objects);
+    println!(
+        "pruned_payload_cache_objects {}",
+        pruned_payload_cache.removed
+    );
+    println!(
+        "pruned_payload_cache_bytes {}",
+        pruned_payload_cache.removed_bytes
+    );
     Ok(())
 }
 
@@ -808,6 +835,12 @@ fn sync_gc_mark_every_time() -> bool {
         || std::env::var("MAJUTSU_SYNC_GC_MARK_EVERY_TIME")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false)
+}
+
+fn sync_local_payload_cache_prune_enabled() -> bool {
+    std::env::var("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn metadata_export_for_remote(

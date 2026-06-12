@@ -49,6 +49,7 @@ use walkdir::WalkDir;
 
 mod atomic_io;
 mod branch_runtime;
+mod cache_runtime;
 mod cli;
 mod clone_runtime;
 mod config;
@@ -127,6 +128,7 @@ mod watch_runtime;
 
 use atomic_io::write_atomic_with;
 use branch_runtime::branch_cmd;
+use cache_runtime::cache_cmd;
 #[cfg(test)]
 use cli::PackArgs;
 use cli::{Cli, Command, InitArgs, RestoreArgs, SnapshotArgs};
@@ -204,6 +206,7 @@ fn main() -> Result<()> {
         Command::Unmount(args) => unmount_cmd(&paths, args),
         Command::Hydrate(args) => hydrate_cmd(&paths, args),
         Command::Large { command } => large_cmd(&paths, command),
+        Command::Cache { command } => cache_cmd(&paths, command),
         Command::Sync(args) => sync_cmd(&paths, args),
         Command::Remote { command } => remote_cmd(&paths, command),
         Command::Lifecycle { command } => lifecycle_cmd(&paths, command),

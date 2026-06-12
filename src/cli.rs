@@ -84,6 +84,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: LargeCommand,
     },
+    #[command(about = "Inspect or prune synced local payload cache")]
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     #[command(about = "Sync metadata and objects to the configured remote")]
     Sync(SyncArgs),
     #[command(about = "Check remote reachability, integrity, and host timelines")]
@@ -588,6 +593,24 @@ pub(crate) enum LargeCommand {
     Verify,
     Pin(LargePinArgs),
     Unpin(LargeUnpinArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CacheCommand {
+    #[command(about = "Show synced local payload cache that can be evicted")]
+    Stat(CachePruneArgs),
+    #[command(about = "Remove synced local payload cache that can be hydrated from remote")]
+    Prune(CachePruneArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct CachePruneArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Report removable payload cache without deleting files"
+    )]
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Subcommand)]

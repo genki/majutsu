@@ -7969,8 +7969,15 @@ fn sync_prunes_local_loose_blobs_after_auto_pack() {
     });
     assert!(sync.contains("auto_pack unpacked_small_blobs "));
     assert!(sync.contains("pruned_local_objects "));
+    assert!(sync.contains("pruned_payload_cache_objects "));
     assert!(!state.join(&object_key).exists());
-    assert!(find_file_ending(&state.join("objects/packs/small"), ".mpack").exists());
+    assert!(
+        walkdir::WalkDir::new(state.join("objects/packs/small"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_type().is_file())
+    );
+    assert!(find_file_ending(&remote.join("packs/small"), ".mpack").exists());
 
     run({
         let mut c = mj();
