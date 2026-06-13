@@ -1,8 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use walkdir::WalkDir;
 
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
@@ -10,6 +11,7 @@ use crate::daemon_runtime::{start_daemon_ipc, start_watch_daemon};
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{record_event, record_file_event, upload_queue_stats};
 use crate::root_state::roots;
+use crate::snapshot_rules::{build_ignore, is_ignored};
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
 use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
 
@@ -152,22 +154,35 @@ fn watch_notify_loop<W: Watcher>(
 ) -> Result<()> {
     let mut watched_roots = Vec::new();
     for root in &active_roots {
-        match watcher.watch(&root.path, RecursiveMode::Recursive) {
-            Ok(()) => {
-                record_event(
-                    paths,
-                    "watch-root",
-                    &format!("{} {}", root.id, root.path.display()),
-                )?;
-                watched_roots.push(root.clone());
-            }
+        let watch_dirs = match watchable_directories(root) {
+            Ok(watch_dirs) => watch_dirs,
             Err(err) => {
                 record_event(
                     paths,
                     "watch-root-error",
-                    &format!("{} {}: {err}", root.id, root.path.display()),
+                    &format!("{} {}: {err:#}", root.id, root.path.display()),
                 )?;
+                continue;
             }
+        };
+        let mut watched = 0usize;
+        for dir in &watch_dirs {
+            match watcher.watch(dir, RecursiveMode::NonRecursive) {
+                Ok(()) => watched += 1,
+                Err(err) => record_event(
+                    paths,
+                    "watch-dir-error",
+                    &format!("{} {}: {err}", root.id, dir.display()),
+                )?,
+            }
+        }
+        if watched > 0 {
+            record_event(
+                paths,
+                "watch-root",
+                &format!("{} {} dirs={}", root.id, root.path.display(), watched),
+            )?;
+            watched_roots.push(root.clone());
         }
     }
     if watched_roots.is_empty() {
@@ -209,7 +224,7 @@ fn watch_notify_loop<W: Watcher>(
                 continue;
             }
         };
-        if !snapshot_relevant_event(&event) {
+        if !snapshot_relevant_event(&event) || !event_relevant_for_roots(&watched_roots, &event) {
             continue;
         }
         record_notify_event(paths, backend_label, &watched_roots, &event)?;
@@ -256,6 +271,31 @@ fn watch_notify_loop<W: Watcher>(
         &format!("foreground {backend_label} watch stopped"),
     )?;
     Ok(())
+}
+
+fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
+    let ignore = build_ignore(root)?;
+    let walker = WalkDir::new(&root.path)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == root.path {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root.path) else {
+                return true;
+            };
+            !is_ignored(&ignore, rel, entry.file_type().is_dir())
+        });
+    let mut dirs = Vec::new();
+    for entry in walker {
+        let entry = entry.with_context(|| format!("walk watch root {}", root.path.display()))?;
+        if entry.file_type().is_dir() {
+            dirs.push(entry.path().to_path_buf());
+        }
+    }
+    Ok(dirs)
 }
 
 fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
@@ -431,17 +471,34 @@ fn record_notify_event(
     Ok(())
 }
 
+fn event_relevant_for_roots(active_roots: &[RootConfig], event: &notify::Event) -> bool {
+    if active_roots.is_empty() {
+        return true;
+    }
+    event
+        .paths
+        .iter()
+        .any(|path| event_path_for_roots(active_roots, path).is_some())
+}
+
 fn event_path_for_roots(active_roots: &[RootConfig], path: &Path) -> Option<(String, String)> {
     active_roots.iter().find_map(|root| {
-        path.strip_prefix(&root.path).ok().map(|relative| {
-            let relative = if relative.as_os_str().is_empty() {
-                ".".into()
-            } else {
-                slash_path(relative)
-            };
-            (root.id.clone(), relative)
+        path.strip_prefix(&root.path).ok().and_then(|relative| {
+            if relative.as_os_str().is_empty() {
+                return Some((root.id.clone(), ".".into()));
+            }
+            if root_ignores_relative_path(root, relative, path.is_dir()) {
+                return None;
+            }
+            Some((root.id.clone(), slash_path(relative)))
         })
     })
+}
+
+fn root_ignores_relative_path(root: &RootConfig, relative: &Path, is_dir: bool) -> bool {
+    build_ignore(root)
+        .map(|ignore| is_ignored(&ignore, relative, is_dir))
+        .unwrap_or(false)
 }
 
 fn slash_path(path: &Path) -> String {
@@ -524,7 +581,8 @@ fn drain_watch_event_buffer(
             .max(Duration::from_millis(1));
         match rx.recv_timeout(timeout) {
             Ok(Ok(next)) => {
-                if !snapshot_relevant_event(&next) {
+                if !snapshot_relevant_event(&next) || !event_relevant_for_roots(active_roots, &next)
+                {
                     continue;
                 }
                 record_notify_event(paths, backend_label, active_roots, &next)?;
@@ -586,7 +644,9 @@ fn settle_before_flush(
                 .max(Duration::from_millis(1));
             match rx.recv_timeout(timeout) {
                 Ok(Ok(next)) => {
-                    if !snapshot_relevant_event(&next) {
+                    if !snapshot_relevant_event(&next)
+                        || !event_relevant_for_roots(active_roots, &next)
+                    {
                         continue;
                     }
                     record_notify_event(paths, backend_label, active_roots, &next)?;
@@ -680,6 +740,40 @@ mod tests {
         };
 
         assert!(snapshot_relevant_event(&event));
+    }
+
+    #[test]
+    fn watchable_directories_skip_excluded_subtrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir_all(root_path.join(".devdata/postgres")).unwrap();
+        std::fs::create_dir_all(root_path.join("src")).unwrap();
+        let root = test_root(root_path.clone(), vec![".devdata/**".into()]);
+
+        let dirs = watchable_directories(&root).unwrap();
+
+        assert!(dirs.contains(&root_path));
+        assert!(dirs.contains(&root_path.join("src")));
+        assert!(!dirs.contains(&root_path.join(".devdata")));
+        assert!(!dirs.contains(&root_path.join(".devdata/postgres")));
+    }
+
+    #[test]
+    fn excluded_events_do_not_trigger_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir_all(root_path.join(".devdata/postgres")).unwrap();
+        std::fs::create_dir_all(root_path.join("src")).unwrap();
+        let root = test_root(root_path.clone(), vec![".devdata/**".into()]);
+
+        assert!(!event_relevant_for_roots(
+            &[root.clone()],
+            &test_event_abs(root_path.join(".devdata/postgres/base"))
+        ));
+        assert!(event_relevant_for_roots(
+            &[root],
+            &test_event_abs(root_path.join("src/main.rs"))
+        ));
     }
 
     #[test]
@@ -777,6 +871,33 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Any),
             paths: vec![PathBuf::from(path)],
             attrs: Default::default(),
+        }
+    }
+
+    fn test_event_abs(path: PathBuf) -> Event {
+        Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![path],
+            attrs: Default::default(),
+        }
+    }
+
+    fn test_root(path: PathBuf, exclude: Vec<String>) -> RootConfig {
+        RootConfig {
+            id: "sample".into(),
+            name: "sample".into(),
+            path,
+            include: vec!["**".into()],
+            exclude,
+            follow_symlinks: false,
+            require_mount: false,
+            status: "active".into(),
+            snapshot_mode: "default".into(),
+            pre_snapshot: None,
+            post_snapshot: None,
+            snapshot_source: None,
+            application_plugin: None,
+            large: None,
         }
     }
 

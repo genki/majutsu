@@ -2273,7 +2273,17 @@ fn scan_root(
     let packed_blob_keys = packed_blob_object_keys(conn)?;
     let walker = WalkDir::new(&root.path)
         .follow_links(root.follow_symlinks)
-        .sort_by_file_name();
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == root.path {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root.path) else {
+                return true;
+            };
+            !is_ignored(&ignore, rel, entry.file_type().is_dir())
+        });
     for entry in walker {
         let entry = entry?;
         if entry.path() == root.path {

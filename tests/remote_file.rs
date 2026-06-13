@@ -5429,6 +5429,48 @@ fn restore_preserves_file_mode_and_mtime() {
 
 #[cfg(unix)]
 #[test]
+fn snapshot_skips_unreadable_excluded_directory_before_descending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let excluded = source.join(".devdata/postgres");
+    fs::create_dir_all(&excluded).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+    let mut perms = fs::metadata(&excluded).unwrap().permissions();
+    perms.set_mode(0o000);
+    fs::set_permissions(&excluded, perms).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--exclude")
+            .arg(".devdata/**");
+        c
+    });
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(snapshot.contains("snapshot "));
+
+    let mut restored_perms = fs::metadata(&excluded).unwrap().permissions();
+    restored_perms.set_mode(0o700);
+    fs::set_permissions(&excluded, restored_perms).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn restore_preserves_empty_directory_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -9667,7 +9709,11 @@ fn restore_prepare_requests_archive_for_missing_local_objects() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK", "0")
+            .env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0");
         c
     });
     let alpha_oid = blake3::hash(b"alpha\n").to_hex().to_string();
@@ -9790,7 +9836,11 @@ fn restore_prepare_requests_s3_archive_restore_via_provider() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK", "0")
+            .env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0");
         c
     });
 
@@ -9970,7 +10020,11 @@ fn restore_prepare_can_hydrate_from_canonical_aliases() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK", "0")
+            .env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0");
         c
     });
     fs::remove_dir_all(remote.join("objects")).unwrap();
@@ -10055,7 +10109,11 @@ fn restore_resume_uses_s3_range_get_for_packed_blobs() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE", "0")
+            .env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0");
         c
     });
 
@@ -10485,7 +10543,11 @@ fn restore_prepare_reports_objects_missing_from_local_and_remote() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK", "0")
+            .env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0");
         c
     });
     let alpha_oid = blake3::hash(b"alpha\n").to_hex().to_string();
