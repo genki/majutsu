@@ -591,6 +591,7 @@ mod tests {
             created_at: time(10),
             attempts: 0,
             retry_after: None,
+            overwrite: false,
         };
 
         let issues = item.validation_issues();
