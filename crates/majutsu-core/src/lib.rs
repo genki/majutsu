@@ -628,7 +628,7 @@ pub fn operation_log_comparison_issues(
         .collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
     pub root_id: String,
     pub path: String,
@@ -645,7 +645,7 @@ pub struct FileRecord {
     pub payload: Payload,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Payload {
     Directory,

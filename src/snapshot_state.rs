@@ -57,6 +57,25 @@ pub(crate) fn load_snapshot_by_id(
     snapshot_manifest_from_parts(paths, id, &manifest_key, &manifest_json)
 }
 
+pub(crate) fn load_snapshot_header_by_id(
+    paths: &Paths,
+    conn: &Connection,
+    id: &str,
+) -> Result<SnapshotManifest> {
+    let (manifest_key, manifest_json): (String, String) = conn.query_row(
+        "select manifest_key, manifest_json from snapshots where id=?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if !manifest_json.trim().is_empty() {
+        return serde_json::from_str(&manifest_json)
+            .with_context(|| format!("parse snapshot manifest metadata {id}"));
+    }
+    let bytes = read_snapshot_manifest_object_raw(paths, id, &manifest_key)?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
+}
+
 pub(crate) fn snapshot_manifest_from_parts(
     paths: &Paths,
     id: &str,
@@ -79,7 +98,7 @@ pub(crate) fn snapshot_manifest_from_parts(
         .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
 }
 
-fn load_snapshot_by_id_for_root(
+pub(crate) fn load_snapshot_by_id_for_root(
     paths: &Paths,
     conn: &Connection,
     id: &str,
@@ -145,6 +164,17 @@ fn read_snapshot_manifest_object_raw(
     };
     crate::decode_object(paths, &bytes)
         .with_context(|| format!("decode snapshot manifest object {id} {manifest_key}"))
+}
+
+pub(crate) fn load_root_tree_entries(
+    paths: &Paths,
+    root_tree: &RootSnapshot,
+) -> Result<BTreeMap<String, FileRecord>> {
+    let tree_bytes = crate::read_object(paths, &root_tree.tree_key)
+        .with_context(|| format!("read root tree {}", root_tree.tree_key))?;
+    let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
+        .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
+    Ok(tree.entries)
 }
 
 fn hydrate_snapshot_manifest_from_remote(paths: &Paths, manifest_key: &str) -> Result<()> {

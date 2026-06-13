@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use majutsu_core::OperationLogEntry as OperationExport;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -21,8 +22,8 @@ use crate::queue_runtime::{event_journal_records, upload_queue_stats};
 use crate::remote_store::open_remote;
 use crate::root_state::roots;
 use crate::snapshot_state::{
-    current_snapshot, load_snapshot_by_id, snapshot_contains_root, snapshot_file_map,
-    snapshot_id_at,
+    current_snapshot, load_root_tree_entries, load_snapshot_by_id, load_snapshot_header_by_id,
+    snapshot_contains_root, snapshot_file_map, snapshot_id_at,
 };
 
 pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
@@ -1822,54 +1823,88 @@ pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
 }
 
 fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {
-    let operations = recent_operations(conn)?;
     let mut printed = 0usize;
     let mut output = String::new();
     let ui = StatusUi::new();
     let file_limit = if args.full { usize::MAX } else { 120 };
-    for op in operations {
-        if printed >= args.limit {
+    let batch_size = args.limit.max(20).saturating_mul(4).min(500);
+    let mut offset = 0usize;
+    while printed < args.limit {
+        let operations = recent_change_operations(conn, batch_size, offset)?;
+        if operations.is_empty() {
             break;
         }
-        let changes = operation_file_changes(paths, conn, &op, args.root.as_deref())?;
-        if changes.is_empty() {
-            continue;
-        }
-        let summary = summarize_changes(&changes);
-        writeln!(
-            output,
-            "{}\t{}\t{}\t{}\t{}",
-            ui.paint(&op.created_at, "1;34"),
-            op.id,
-            ui.paint(&op.kind, "36"),
-            summary,
-            op.message.as_deref().unwrap_or_default()
-        )?;
-        let change_count = changes.len();
-        for change in changes.into_iter().take(file_limit) {
+        offset += operations.len();
+        for op in operations {
+            if printed >= args.limit {
+                break;
+            }
+            let changes =
+                operation_file_changes(paths, conn, &op, args.root.as_deref(), args.full)?;
+            if changes.is_empty() {
+                continue;
+            }
+            let summary = summarize_changes(&changes);
             writeln!(
                 output,
-                "{}\t{}",
-                color_change_status(&ui, change.status),
-                change.path
+                "{}\t{}\t{}\t{}\t{}",
+                ui.paint(&op.created_at, "1;34"),
+                op.id,
+                ui.paint(&op.kind, "36"),
+                summary,
+                op.message.as_deref().unwrap_or_default()
             )?;
+            let change_count = changes.len();
+            for change in changes.into_iter().take(file_limit) {
+                writeln!(
+                    output,
+                    "{}\t{}",
+                    color_change_status(&ui, change.status),
+                    change.path
+                )?;
+            }
+            if change_count > file_limit {
+                writeln!(
+                    output,
+                    "{}",
+                    ui.paint(
+                        &format!(
+                            "... {} more changed files hidden; use --full to show all",
+                            change_count - file_limit
+                        ),
+                        "2"
+                    )
+                )?;
+            }
+            printed += 1;
         }
-        if change_count > file_limit {
-            writeln!(
-                output,
-                "{}",
-                ui.paint(
-                    &format!(
-                        "... {} more changed files hidden; use --full to show all",
-                        change_count - file_limit
-                    ),
-                    "2"
-                )
-            )?;
-        }
-        printed += 1;
     }
     emit_status_output(&output, terminal_height())
+}
+
+fn recent_change_operations(
+    conn: &Connection,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<OperationExport>> {
+    let mut stmt = conn.prepare(
+        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
+         from operations
+         where after_snapshot is not null
+           and (before_snapshot is null or before_snapshot != after_snapshot)
+           and kind in ('initial-scan', 'manual-snapshot', 'file-events-batch')
+         order by rowid desc
+         limit ?1 offset ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![limit as i64, offset as i64],
+        operation_from_row,
+    )?;
+    let mut operations = Vec::new();
+    for row in rows {
+        operations.push(row?);
+    }
+    Ok(operations)
 }
 
 fn recent_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
@@ -1912,24 +1947,30 @@ fn operation_file_changes(
     conn: &Connection,
     op: &OperationExport,
     root: Option<&str>,
+    full: bool,
 ) -> Result<Vec<FileChange>> {
     let Some(after_id) = op.after_snapshot.as_deref() else {
         return Ok(Vec::new());
     };
-    let after = load_snapshot_by_id(paths, conn, after_id)?;
-    let before = op
-        .before_snapshot
-        .as_deref()
-        .map(|id| load_snapshot_by_id(paths, conn, id))
-        .transpose()?;
-    snapshot_file_changes(before.as_ref(), &after, root)
+    let after = load_snapshot_header_by_id(paths, conn, after_id)?;
+    let before = if let Some(before_id) = op.before_snapshot.as_deref() {
+        Some(load_snapshot_header_by_id(paths, conn, before_id)?)
+    } else {
+        None
+    };
+    snapshot_file_changes(paths, before.as_ref(), &after, root, full)
 }
 
 fn snapshot_file_changes(
+    paths: &Paths,
     from: Option<&majutsu_core::SnapshotManifest>,
     to: &majutsu_core::SnapshotManifest,
     root: Option<&str>,
+    full: bool,
 ) -> Result<Vec<FileChange>> {
+    if from.is_some_and(|snapshot| !snapshot.root_trees.is_empty()) || !to.root_trees.is_empty() {
+        return snapshot_file_changes_from_root_trees(paths, from, to, root, full);
+    }
     let from_files = from.map(snapshot_file_map).transpose()?.unwrap_or_default();
     let to_files = snapshot_file_map(to)?;
     let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
@@ -1956,7 +1997,7 @@ fn snapshot_file_changes(
                 status: "D",
                 path: key,
             }),
-            (Some(a), Some(b)) if serde_json::to_value(a)? != serde_json::to_value(b)? => {
+            (Some(a), Some(b)) if a != b => {
                 changes.push(FileChange {
                     status: "M",
                     path: key,
@@ -1966,6 +2007,143 @@ fn snapshot_file_changes(
         }
     }
     Ok(changes)
+}
+
+fn snapshot_file_changes_from_root_trees(
+    paths: &Paths,
+    from: Option<&majutsu_core::SnapshotManifest>,
+    to: &majutsu_core::SnapshotManifest,
+    root: Option<&str>,
+    full: bool,
+) -> Result<Vec<FileChange>> {
+    const DEFAULT_TREE_DETAIL_LIMIT: usize = 1_000;
+    let mut roots = Vec::new();
+    if let Some(root) = root {
+        roots.push(root.to_string());
+    } else {
+        if let Some(from) = from {
+            roots.extend(from.root_trees.keys().cloned());
+            roots.extend(from.roots.keys().cloned());
+        }
+        roots.extend(to.root_trees.keys().cloned());
+        roots.extend(to.roots.keys().cloned());
+        roots.sort();
+        roots.dedup();
+    }
+
+    let mut changes = Vec::new();
+    for root_id in roots {
+        let from_tree = from.and_then(|snapshot| snapshot.root_trees.get(&root_id));
+        let to_tree = to.root_trees.get(&root_id);
+        if from_tree == to_tree {
+            continue;
+        }
+        if !full && large_tree_fold_required(paths, from_tree, to_tree, DEFAULT_TREE_DETAIL_LIMIT) {
+            changes.push(FileChange {
+                status: folded_root_status(from_tree, to_tree),
+                path: format!("{root_id}/** (large tree folded; use --full for file list)"),
+            });
+            continue;
+        }
+        let from_files = root_file_map(paths, from, &root_id)?;
+        let to_files = root_file_map(paths, Some(to), &root_id)?;
+        let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
+        paths_all.extend(
+            to_files
+                .keys()
+                .filter(|key| !from_files.contains_key(*key))
+                .cloned(),
+        );
+        paths_all.sort();
+        for path in paths_all {
+            let full_path = format!("{root_id}/{path}");
+            match (from_files.get(&path), to_files.get(&path)) {
+                (None, Some(_)) => changes.push(FileChange {
+                    status: "A",
+                    path: full_path,
+                }),
+                (Some(_), None) => changes.push(FileChange {
+                    status: "D",
+                    path: full_path,
+                }),
+                (Some(a), Some(b)) if a != b => {
+                    changes.push(FileChange {
+                        status: "M",
+                        path: full_path,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(changes)
+}
+
+fn large_tree_fold_required(
+    paths: &Paths,
+    from_tree: Option<&majutsu_core::RootSnapshot>,
+    to_tree: Option<&majutsu_core::RootSnapshot>,
+    limit: usize,
+) -> bool {
+    const DEFAULT_TREE_OBJECT_DETAIL_LIMIT: u64 = 128 * 1024;
+    from_tree.is_some_and(|tree| tree.file_count > limit)
+        || to_tree.is_some_and(|tree| tree.file_count > limit)
+        || from_tree.is_some_and(|tree| {
+            tree_object_bytes(paths, &tree.tree_key) > DEFAULT_TREE_OBJECT_DETAIL_LIMIT
+        })
+        || to_tree.is_some_and(|tree| {
+            tree_object_bytes(paths, &tree.tree_key) > DEFAULT_TREE_OBJECT_DETAIL_LIMIT
+        })
+}
+
+fn tree_object_bytes(paths: &Paths, key: &str) -> u64 {
+    if let Ok(metadata) = paths.home.join(key).metadata() {
+        return metadata.len();
+    }
+    let Some(rest) = key
+        .strip_prefix("trees/")
+        .and_then(|rest| rest.strip_suffix(".cbor.zst.enc"))
+    else {
+        return 0;
+    };
+    paths
+        .home
+        .join("objects/trees")
+        .join(rest)
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn folded_root_status(
+    from_tree: Option<&majutsu_core::RootSnapshot>,
+    to_tree: Option<&majutsu_core::RootSnapshot>,
+) -> &'static str {
+    match (from_tree, to_tree) {
+        (None, Some(_)) => "A",
+        (Some(_), None) => "D",
+        _ => "M",
+    }
+}
+
+fn root_file_map(
+    paths: &Paths,
+    snapshot: Option<&majutsu_core::SnapshotManifest>,
+    root_id: &str,
+) -> Result<BTreeMap<String, majutsu_core::FileRecord>> {
+    let Some(snapshot) = snapshot else {
+        return Ok(BTreeMap::new());
+    };
+    if let Some(records) = snapshot.roots.get(root_id) {
+        return Ok(records
+            .iter()
+            .map(|record| (record.path.clone(), record.clone()))
+            .collect());
+    }
+    let Some(root_tree) = snapshot.root_trees.get(root_id) else {
+        return Ok(BTreeMap::new());
+    };
+    load_root_tree_entries(paths, root_tree)
 }
 
 fn summarize_changes(changes: &[FileChange]) -> String {
@@ -2107,7 +2285,7 @@ fn print_op_diff(
         .as_deref()
         .map(|id| load_snapshot_by_id(paths, conn, id))
         .transpose()?;
-    print_snapshot_diff(before.as_ref(), &after, root)
+    print_snapshot_diff(paths, before.as_ref(), &after, root)
 }
 
 pub(crate) fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
@@ -2132,15 +2310,16 @@ pub(crate) fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
     } else {
         None
     };
-    print_snapshot_diff(from.as_ref(), &to, args.root.as_deref())
+    print_snapshot_diff(paths, from.as_ref(), &to, args.root.as_deref())
 }
 
 fn print_snapshot_diff(
+    paths: &Paths,
     from: Option<&majutsu_core::SnapshotManifest>,
     to: &majutsu_core::SnapshotManifest,
     root: Option<&str>,
 ) -> Result<()> {
-    for change in snapshot_file_changes(from, to, root)? {
+    for change in snapshot_file_changes(paths, from, to, root, true)? {
         println!("{}\t{}", change.status, change.path);
     }
     Ok(())

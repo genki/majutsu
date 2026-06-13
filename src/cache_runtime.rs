@@ -79,7 +79,13 @@ fn cache_prune(paths: &Paths, args: CachePruneArgs, stat_only: bool) -> Result<(
     let dry_run = stat_only || args.dry_run;
     println!("payload_cache_candidates {}", stats.candidates);
     println!("payload_cache_bytes {}", stats.candidate_bytes);
+    println!("payload_cache_synced_prunable {}", stats.candidates);
+    println!(
+        "payload_cache_synced_prunable_bytes {}",
+        stats.candidate_bytes
+    );
     println!("payload_cache_remote_missing {}", stats.remote_missing);
+    println!("payload_cache_unsynced_required {}", stats.remote_missing);
     println!("payload_cache_local_missing {}", stats.local_missing);
     println!("dry_run {}", dry_run);
     if dry_run {
