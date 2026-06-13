@@ -424,14 +424,14 @@ fn wait_for_sync_catchup(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut target_current = target_current.to_string();
     loop {
-        if let Some(latest_current) = current_snapshot(conn)? {
-            if latest_current != target_current {
-                println!(
-                    "wait_target_updated {} -> {}",
-                    target_current, latest_current
-                );
-                target_current = latest_current;
-            }
+        if let Some(latest_current) = current_snapshot(conn)?
+            && latest_current != target_current
+        {
+            println!(
+                "wait_target_updated {} -> {}",
+                target_current, latest_current
+            );
+            target_current = latest_current;
         }
         let status = sync_wait_status(paths, conn, remote)?;
         if status.is_caught_up() {

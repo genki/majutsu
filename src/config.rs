@@ -147,18 +147,10 @@ impl Default for SecurityConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub(crate) struct RestoreConfig {
     #[serde(default)]
     pub(crate) archive: RestoreArchiveConfig,
-}
-
-impl Default for RestoreConfig {
-    fn default() -> Self {
-        Self {
-            archive: RestoreArchiveConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -529,10 +521,10 @@ fn configured_state_home() -> Result<Option<PathBuf>> {
     else {
         return Ok(None);
     };
-    if let Some(rest) = home.strip_prefix("~/") {
-        if let Some(user_home) = user_home {
-            return Ok(Some(user_home.join(rest)));
-        }
+    if let Some(rest) = home.strip_prefix("~/")
+        && let Some(user_home) = user_home
+    {
+        return Ok(Some(user_home.join(rest)));
     }
     Ok(Some(PathBuf::from(home)))
 }

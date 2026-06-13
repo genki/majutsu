@@ -341,14 +341,14 @@ fn validate_quick_host_metadata(
             }
         }
         let key = host_last_synced_ref_key(&host.id);
-        if let Some(head) = head.as_ref() {
-            if head.last_synced.as_ref() != Some(last_synced) {
-                *missing += 1;
-                eprintln!(
-                    "remote head last-synced does not match metadata for {}",
-                    host.id
-                );
-            }
+        if let Some(head) = head.as_ref()
+            && head.last_synced.as_ref() != Some(last_synced)
+        {
+            *missing += 1;
+            eprintln!(
+                "remote head last-synced does not match metadata for {}",
+                host.id
+            );
         }
         match remote_ref(remote, &key)? {
             Some(value) if value == *last_synced => {}

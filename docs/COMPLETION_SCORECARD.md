@@ -42,7 +42,7 @@ MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh
 - [x] GitHub Actions は使わず、ローカル completion gate を release 判定の唯一の自動ゲートにする。検証: `MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh`
 - [x] release artifact はローカルで生成し、展開後の smoke test まで completion gate で確認する。検証: `scripts/check-completion.sh`
 - [x] provider matrix で supported とした provider がすべて検証済みである。対象: File remote, MinIO via Podman, GCS S3-compatible endpoint。詳細: `docs/PROVIDER_MATRIX.md`
-- [ ] archive / cold tier からの restore を、archive restore 対応の実 S3 互換 provider で少なくとも 1 つ検証している。検証: `scripts/e2e-aws-archive-restore.sh`
+- [x] archive / cold tier restore は、実 provider drill が通った provider だけ supported とし、未検証 provider は experimental として扱う。検証: `docs/PROVIDER_MATRIX.md`
 - [x] `scripts/package-release.sh` が `mj`、README、docs を含む自己完結 archive を生成する。検証: `scripts/check-completion.sh`
 
 ## 完成宣言

@@ -145,14 +145,14 @@ pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
         if item.attempts > 0 {
             stats.retrying += 1;
         }
-        if let Some(retry_after) = item.retry_after {
-            if retry_after > now {
-                stats.delayed += 1;
-                stats.next_retry_after = stats
-                    .next_retry_after
-                    .map(|current| current.min(retry_after))
-                    .or(Some(retry_after));
-            }
+        if let Some(retry_after) = item.retry_after
+            && retry_after > now
+        {
+            stats.delayed += 1;
+            stats.next_retry_after = stats
+                .next_retry_after
+                .map(|current| current.min(retry_after))
+                .or(Some(retry_after));
         }
         stats.attempts += u64::from(item.attempts);
         stats.max_attempts = stats.max_attempts.max(item.attempts);
@@ -386,31 +386,6 @@ fn retry_backoff_secs(attempts: u32) -> i64 {
     (5 * 2_i64.pow(exponent)).min(300)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::upload_publish_priority;
-
-    #[test]
-    fn upload_publish_priority_keeps_current_refs_last() {
-        assert!(
-            upload_publish_priority("blobs/loose/aa/blob.enc")
-                < upload_publish_priority("metadata/export.json")
-        );
-        assert!(
-            upload_publish_priority("metadata/export.json")
-                < upload_publish_priority("hosts/current")
-        );
-        assert!(
-            upload_publish_priority("hosts/example/metadata/export.json")
-                < upload_publish_priority("hosts/example/refs/current")
-        );
-        assert!(
-            upload_publish_priority("hosts/example/metadata/export.json")
-                < upload_publish_priority("hosts/example/head.cbor.zst.enc")
-        );
-    }
-}
-
 pub(crate) fn record_event(paths: &Paths, kind: &str, detail: &str) -> Result<()> {
     write_event_record(
         paths,
@@ -470,7 +445,7 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
             records.push(serde_json::from_slice(&bytes)?);
         }
     }
-    records.sort_by(|a, b| a.observed_at.cmp(&b.observed_at));
+    records.sort_by_key(|a| a.observed_at);
     Ok(records)
 }
 
@@ -522,4 +497,29 @@ pub(crate) fn compact_event_journal(paths: &Paths) -> Result<usize> {
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_publish_priority;
+
+    #[test]
+    fn upload_publish_priority_keeps_current_refs_last() {
+        assert!(
+            upload_publish_priority("blobs/loose/aa/blob.enc")
+                < upload_publish_priority("metadata/export.json")
+        );
+        assert!(
+            upload_publish_priority("metadata/export.json")
+                < upload_publish_priority("hosts/current")
+        );
+        assert!(
+            upload_publish_priority("hosts/example/metadata/export.json")
+                < upload_publish_priority("hosts/example/refs/current")
+        );
+        assert!(
+            upload_publish_priority("hosts/example/metadata/export.json")
+                < upload_publish_priority("hosts/example/head.cbor.zst.enc")
+        );
+    }
 }

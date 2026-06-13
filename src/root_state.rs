@@ -67,10 +67,10 @@ impl ConfigRoot {
         existing: Option<&RootConfig>,
     ) -> Result<RootConfig> {
         validate_snapshot_mode(&self.snapshot_mode)?;
-        if let Some(large) = &self.large {
-            if let Some(chunking) = &large.default_chunking {
-                validate_large_chunking(chunking)?;
-            }
+        if let Some(large) = &self.large
+            && let Some(chunking) = &large.default_chunking
+        {
+            validate_large_chunking(chunking)?;
         }
         let snapshot_source = self
             .snapshot_source

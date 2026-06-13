@@ -257,10 +257,10 @@ pub(crate) fn start_watch_daemon(
     buffer_max_events: usize,
     periodic_rescan_secs: u64,
 ) -> Result<u32> {
-    if let Some(pid) = read_pid(&paths.daemon_pid)? {
-        if pid_alive(pid) {
-            bail!("daemon already running with pid {pid}");
-        }
+    if let Some(pid) = read_pid(&paths.daemon_pid)?
+        && pid_alive(pid)
+    {
+        bail!("daemon already running with pid {pid}");
     }
     fs::create_dir_all(&paths.runtime)?;
     fs::create_dir_all(&paths.logs)?;

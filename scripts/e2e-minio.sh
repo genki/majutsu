@@ -79,10 +79,10 @@ fi
 
 podman_cmd run \
   --rm \
-  --network "$network" \
+  --network host \
   --entrypoint /bin/sh \
   "$MC_IMAGE" \
-  -c "mc alias set local http://${minio_name}:9000 minioadmin minioadmin && mc mb --ignore-existing local/majutsu" >/dev/null
+  -c "mc alias set local http://127.0.0.1:${MINIO_PORT} minioadmin minioadmin && mc mb --ignore-existing local/majutsu" >/dev/null
 
 export AWS_ACCESS_KEY_ID=minioadmin
 export AWS_SECRET_ACCESS_KEY=minioadmin

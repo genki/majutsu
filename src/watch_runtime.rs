@@ -402,15 +402,14 @@ pub fn format_notify_event(event: &notify::Event) -> String {
 }
 
 fn notify_event_kind(event: &notify::Event) -> &'static str {
-    let kind = match &event.kind {
+    match &event.kind {
         EventKind::Create(_) => "create",
         EventKind::Modify(_) => "modify",
         EventKind::Remove(_) => "remove",
         EventKind::Access(_) => "access",
         EventKind::Other => "other",
         _ => "unknown",
-    };
-    kind
+    }
 }
 
 fn snapshot_relevant_event(event: &notify::Event) -> bool {
@@ -767,7 +766,7 @@ mod tests {
         let root = test_root(root_path.clone(), vec![".devdata/**".into()]);
 
         assert!(!event_relevant_for_roots(
-            &[root.clone()],
+            std::slice::from_ref(&root),
             &test_event_abs(root_path.join(".devdata/postgres/base"))
         ));
         assert!(event_relevant_for_roots(
@@ -840,11 +839,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path().join("home"));
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
+        let sender = thread::spawn(move || {
             for index in 0..10 {
                 thread::sleep(Duration::from_millis(15));
-                tx.send(Ok(test_event(&format!("file-{index}.txt"))))
-                    .unwrap();
+                if tx
+                    .send(Ok(test_event(&format!("file-{index}.txt"))))
+                    .is_err()
+                {
+                    break;
+                }
             }
         });
 
@@ -864,6 +867,7 @@ mod tests {
 
         assert_eq!(outcome.reason, "max-latency");
         assert!(outcome.events > 1, "{outcome:?}");
+        sender.join().unwrap();
     }
 
     fn test_event(path: &str) -> Event {

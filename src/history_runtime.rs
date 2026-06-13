@@ -37,7 +37,9 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
     let db_stats = read_status_db_stats(&conn)?;
     let storage = read_storage_stats(paths)?;
     let upload_stats = upload_queue_stats(paths)?;
-    let event_count = event_journal_records(paths)?.len();
+    let event_records = event_journal_records(paths)?;
+    let event_count = event_records.len();
+    let pending_event_count = pending_journal_event_count(&event_records);
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let daemon = daemon_health(paths)?;
     let width = terminal_width();
@@ -347,7 +349,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
             [
                 "event journal",
                 &event_count.to_string(),
-                "pending local observations",
+                &format!("{pending_event_count} pending, records retained"),
             ],
             [
                 "restore jobs",
@@ -376,7 +378,9 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let db_stats = read_status_db_stats(&conn)?;
     let storage = read_storage_stats(paths)?;
     let upload_stats = upload_queue_stats(paths)?;
-    let event_count = event_journal_records(paths)?.len();
+    let event_records = event_journal_records(paths)?;
+    let event_count = event_records.len();
+    let pending_event_count = pending_journal_event_count(&event_records);
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let remote = read_remote_status(&config)?;
     let daemon = daemon_health(paths)?;
@@ -454,6 +458,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
             uploads_delayed: upload_stats.delayed as u64,
             upload_backpressure: upload_stats.has_backpressure(),
             event_journal: event_count as u64,
+            event_journal_pending: pending_event_count as u64,
             restore_jobs: restore_queue_count as u64,
         },
         branches,
@@ -714,7 +719,10 @@ fn print_state_report(state: &StateReport) -> Result<()> {
             [
                 "event journal",
                 &state.queues.event_journal.to_string(),
-                "pending observations",
+                &format!(
+                    "{} pending, records retained",
+                    state.queues.event_journal_pending
+                ),
             ],
             [
                 "restore jobs",
@@ -832,7 +840,25 @@ struct StateQueues {
     uploads_delayed: u64,
     upload_backpressure: bool,
     event_journal: u64,
+    event_journal_pending: u64,
     restore_jobs: u64,
+}
+
+fn pending_journal_event_count(records: &[majutsu_db::EventJournalRecord]) -> usize {
+    let last_snapshot_finish = records
+        .iter()
+        .filter(|event| event.is_snapshot_finish())
+        .map(|event| event.observed_at)
+        .max();
+    records
+        .iter()
+        .filter(|event| {
+            event.is_pending_trigger()
+                && last_snapshot_finish
+                    .map(|finished_at| event.observed_at > finished_at)
+                    .unwrap_or(true)
+        })
+        .count()
 }
 
 #[derive(Serialize)]

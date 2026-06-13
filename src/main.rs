@@ -1753,17 +1753,14 @@ fn canonical_remote_object_to_local_bytes(
     key: &str,
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
-    if key.starts_with("objects/blobs/") {
-        if let Some(bytes) = compact_snapshot_manifest_to_local_bytes(paths, bytes)? {
-            return Ok(bytes);
-        }
+    if key.starts_with("objects/blobs/")
+        && let Some(bytes) = compact_snapshot_manifest_to_local_bytes(paths, bytes)?
+    {
+        return Ok(bytes);
     }
     if key.starts_with("objects/trees/") {
         let manifest: TreeManifest = decode_canonical_remote_export(paths, bytes)?;
-        return Ok(encode_object(
-            paths,
-            &serde_json::to_vec_pretty(&manifest)?,
-        )?);
+        return encode_object(paths, &serde_json::to_vec_pretty(&manifest)?);
     }
     if key.starts_with("objects/indexes/pack/") {
         let index: PackIndex = decode_canonical_remote_export(paths, bytes)?;
@@ -1771,10 +1768,7 @@ fn canonical_remote_object_to_local_bytes(
     }
     if key.starts_with("objects/large/manifests/") {
         let manifest: LargeManifest = decode_canonical_remote_export(paths, bytes)?;
-        return Ok(encode_object(
-            paths,
-            &serde_json::to_vec_pretty(&manifest)?,
-        )?);
+        return encode_object(paths, &serde_json::to_vec_pretty(&manifest)?);
     }
     Ok(bytes.to_vec())
 }
@@ -1840,10 +1834,10 @@ pub(crate) fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<St
     if remote.exists(key)? {
         return Ok(key.to_string());
     }
-    if let Some(alias) = canonical_remote_alias(key) {
-        if remote.exists(&alias)? {
-            return Ok(alias);
-        }
+    if let Some(alias) = canonical_remote_alias(key)
+        && remote.exists(&alias)?
+    {
+        return Ok(alias);
     }
     Ok(key.to_string())
 }
@@ -1906,17 +1900,17 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
     let mut files = Vec::new();
     let mut plan_roots = Vec::new();
     for (root_id, records) in &snapshot.roots {
-        if let Some(filter_root) = &args.root {
-            if filter_root != root_id {
-                continue;
-            }
+        if let Some(filter_root) = &args.root
+            && filter_root != root_id
+        {
+            continue;
         }
         plan_roots.push(root_id.clone());
         for record in records {
-            if let Some(path_filter) = &args.path {
-                if !Path::new(&record.path).starts_with(path_filter) {
-                    continue;
-                }
+            if let Some(path_filter) = &args.path
+                && !Path::new(&record.path).starts_with(path_filter)
+            {
+                continue;
             }
             files.push(FileRecord {
                 root_id: record.root_id.clone(),
@@ -2029,10 +2023,10 @@ fn build_restore_deletes(
     }
     let mut deletes = Vec::new();
     for root_id in root_ids {
-        if let Some(filter_root) = &args.root {
-            if filter_root != root_id {
-                continue;
-            }
+        if let Some(filter_root) = &args.root
+            && filter_root != root_id
+        {
+            continue;
         }
         let base = restore_root_base(args.to.as_ref(), root_paths, root_id)?;
         let scan_base = args
@@ -2699,18 +2693,16 @@ fn compress_large_chunk(
     bytes: &[u8],
 ) -> Result<majutsu_large::StoredLargeChunk> {
     let name = rel.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    Ok(majutsu_large::compress_chunk_if_useful(
-        majutsu_large::CompressionInput {
-            bytes,
-            enabled: config.compression.enabled,
-            algorithm: &config.compression.algorithm,
-            level: config.compression.level,
-            sample_bytes: config.compression.sample_bytes,
-            min_gain_ratio: config.compression.min_gain_ratio,
-            skip_extensions: &config.compression.skip_extensions,
-            file_name: name,
-        },
-    )?)
+    majutsu_large::compress_chunk_if_useful(majutsu_large::CompressionInput {
+        bytes,
+        enabled: config.compression.enabled,
+        algorithm: &config.compression.algorithm,
+        level: config.compression.level,
+        sample_bytes: config.compression.sample_bytes,
+        min_gain_ratio: config.compression.min_gain_ratio,
+        skip_extensions: &config.compression.skip_extensions,
+        file_name: name,
+    })
 }
 
 fn read_large_chunk(paths: &Paths, chunk: &LargeChunk) -> Result<Vec<u8>> {
@@ -3471,10 +3463,10 @@ pub(crate) fn write_master_key(paths: &Paths, hex_key: &str) -> Result<()> {
 }
 
 fn hostname_from_env() -> Result<String> {
-    if let Ok(hostname) = env::var("HOSTNAME") {
-        if !hostname.is_empty() {
-            return Ok(hostname);
-        }
+    if let Ok(hostname) = env::var("HOSTNAME")
+        && !hostname.is_empty()
+    {
+        return Ok(hostname);
     }
     Ok(fs::read_to_string("/etc/hostname")?.trim().to_string())
 }

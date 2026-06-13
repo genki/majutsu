@@ -4,9 +4,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
-
 #[cfg(unix)]
 pub(crate) fn file_mode(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -107,10 +104,10 @@ pub(crate) fn is_mount_point(path: &Path) -> bool {
             };
             let mut fields = before_sep.split_whitespace();
             let mount_point = fields.nth(4);
-            if let Some(mount_point) = mount_point {
-                if PathBuf::from(unescape_mountinfo_path(mount_point)) == target {
-                    return true;
-                }
+            if let Some(mount_point) = mount_point
+                && unescape_mountinfo_path(mount_point) == target
+            {
+                return true;
             }
         }
         false
@@ -133,12 +130,11 @@ fn unescape_mountinfo_path(input: &str) -> String {
             && bytes[i + 1].is_ascii_digit()
             && bytes[i + 2].is_ascii_digit()
             && bytes[i + 3].is_ascii_digit()
+            && let Ok(value) = u8::from_str_radix(&input[i + 1..i + 4], 8)
         {
-            if let Ok(value) = u8::from_str_radix(&input[i + 1..i + 4], 8) {
-                out.push(value as char);
-                i += 4;
-                continue;
-            }
+            out.push(value as char);
+            i += 4;
+            continue;
         }
         out.push(bytes[i] as char);
         i += 1;

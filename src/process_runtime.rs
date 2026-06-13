@@ -41,10 +41,10 @@ pub(crate) fn acquire_process_lock(path: &Path, name: &str) -> Result<ProcessLoc
             let owner = fs::read_to_string(path)
                 .ok()
                 .and_then(|value| value.trim().parse::<u32>().ok());
-            if let Some(pid) = owner {
-                if pid_alive(pid) {
-                    bail!("{name} already running with pid {pid}");
-                }
+            if let Some(pid) = owner
+                && pid_alive(pid)
+            {
+                bail!("{name} already running with pid {pid}");
             }
             let _ = fs::remove_file(path);
             let mut file = File::create(path)?;
@@ -64,10 +64,10 @@ pub(crate) fn process_lock_owner(path: &Path) -> Result<Option<u32>> {
     let owner = fs::read_to_string(path)
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok());
-    if let Some(pid) = owner {
-        if pid_alive(pid) {
-            return Ok(Some(pid));
-        }
+    if let Some(pid) = owner
+        && pid_alive(pid)
+    {
+        return Ok(Some(pid));
     }
     let _ = fs::remove_file(path);
     Ok(None)

@@ -227,11 +227,11 @@ impl Filesystem for MajutsuFuseFs {
             reply.error(ENOENT);
             return;
         };
-        if let FuseNodeKind::Directory { children } = &parent_node.kind {
-            if let Some(ino) = children.get(name).and_then(|ino| self.nodes.get(ino)) {
-                reply.entry(&FUSE_TTL, &ino.attr, 0);
-                return;
-            }
+        if let FuseNodeKind::Directory { children } = &parent_node.kind
+            && let Some(ino) = children.get(name).and_then(|ino| self.nodes.get(ino))
+        {
+            reply.entry(&FUSE_TTL, &ino.attr, 0);
+            return;
         }
         reply.error(ENOENT);
     }
@@ -635,19 +635,6 @@ pub(crate) fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_only_access_rejects_write_masks() {
-        assert_eq!(read_only_access(libc::W_OK), Err(EROFS));
-        assert_eq!(read_only_access(libc::R_OK | libc::W_OK), Err(EROFS));
-        assert_eq!(read_only_access(libc::R_OK), Ok(()));
-        assert_eq!(read_only_access(libc::R_OK | libc::X_OK), Ok(()));
-    }
-}
-
 pub(crate) fn is_mountpoint(path: &Path) -> Result<bool> {
     let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let needle = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -671,4 +658,17 @@ pub(crate) fn unmount_fuse(path: &Path) -> Result<()> {
         bail!("failed to unmount {}", path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_access_rejects_write_masks() {
+        assert_eq!(read_only_access(libc::W_OK), Err(EROFS));
+        assert_eq!(read_only_access(libc::R_OK | libc::W_OK), Err(EROFS));
+        assert_eq!(read_only_access(libc::R_OK), Ok(()));
+        assert_eq!(read_only_access(libc::R_OK | libc::X_OK), Ok(()));
+    }
 }

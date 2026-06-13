@@ -130,16 +130,15 @@ pub(crate) fn fsck(paths: &Paths) -> Result<()> {
     for row in rows {
         let (oid, key, pack_id) = row?;
         if let Some(pack_id) = pack_id.as_deref() {
-            if let Some(pack_key) = pack_key_by_id.get(pack_id) {
-                if !paths.home.join(pack_key).exists()
-                    && payload_cache_available_remotely(
-                        remote_payload_keys.as_ref(),
-                        &payload_cache_keys,
-                        pack_key,
-                    )
-                {
-                    continue;
-                }
+            if let Some(pack_key) = pack_key_by_id.get(pack_id)
+                && !paths.home.join(pack_key).exists()
+                && payload_cache_available_remotely(
+                    remote_payload_keys.as_ref(),
+                    &payload_cache_keys,
+                    pack_key,
+                )
+            {
+                continue;
             }
             if let Err(err) = read_blob_payload(paths, &conn, &oid, &key) {
                 missing += 1;
@@ -1835,14 +1834,14 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                     }
                 }
                 let last_synced_ref_key = host_last_synced_ref_key(&host.id);
-                if let Some(head) = head.as_ref() {
-                    if head.last_synced.as_ref() != Some(last_synced) {
-                        missing += 1;
-                        eprintln!(
-                            "remote head last-synced does not match metadata for {}",
-                            host.id
-                        );
-                    }
+                if let Some(head) = head.as_ref()
+                    && head.last_synced.as_ref() != Some(last_synced)
+                {
+                    missing += 1;
+                    eprintln!(
+                        "remote head last-synced does not match metadata for {}",
+                        host.id
+                    );
                 }
                 match remote_ref(remote, &last_synced_ref_key)? {
                     Some(remote_last_synced) if remote_last_synced == *last_synced => {}

@@ -70,7 +70,7 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
     let conn = crate::open_db(paths)?;
     let command = top_args
         .command
-        .unwrap_or_else(|| RestoreCommand::Apply(top_args.args));
+        .unwrap_or(RestoreCommand::Apply(top_args.args));
     match command {
         RestoreCommand::Plan(args) => {
             let plan = crate::build_restore_plan(paths, &conn, &args)?;
@@ -527,10 +527,10 @@ fn restore_object_stats_with_mode(
     for key in &required_chunk_keys {
         if paths.home.join(key).exists() {
             local_chunks += 1;
-            if let Some(remote) = remote.as_ref() {
-                if remote_object_available(remote, key)? {
-                    remote_chunks += 1;
-                }
+            if let Some(remote) = remote.as_ref()
+                && remote_object_available(remote, key)?
+            {
+                remote_chunks += 1;
             }
             continue;
         }
@@ -648,7 +648,7 @@ pub(crate) fn read_large_manifest_for_restore(
     match fs::read(paths.home.join(manifest_key))
         .and_then(|bytes| decode_object(paths, &bytes).map_err(std::io::Error::other))
     {
-        Ok(bytes) => return serde_json::from_slice(&bytes).map_err(Into::into),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(Into::into),
         Err(local_err) => {
             let config = read_config(paths).with_context(|| {
                 format!(
