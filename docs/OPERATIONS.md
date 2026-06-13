@@ -17,6 +17,33 @@ mj daemon metrics
 branch heads、metadata 件数を確認する用途で使い分ける。自動確認では
 `mj state --json` を使う。
 
+## remote object 監査と修復
+
+通常の `mj remote fsck` は metadata health を高速に確認する。
+payload object の存在確認まで行う場合は `--objects` を使う。
+
+```sh
+mj remote fsck --objects --parallelism 32 --timeout-secs 300
+```
+
+短時間の sample 確認だけをしたい場合は `--sample` を使う。
+
+```sh
+mj remote fsck --objects --sample 1000 --parallelism 32
+```
+
+remote に欠けている referenced object があり、local state に payload が残っている場合は
+`mj remote repair` で再送できる。実行前の確認には `--dry-run` を使う。
+
+```sh
+mj remote repair --dry-run --parallelism 32
+mj remote repair --parallelism 32 --timeout-secs 300
+```
+
+`remote repair` は local に残っている object だけを再送する。local payload cache が
+すでに prune 済みの object は修復できないため、別 host や remote backup からの復旧、
+または履歴 prune/gc の判断が必要。
+
 ## 災害復旧 drill
 
 ```sh

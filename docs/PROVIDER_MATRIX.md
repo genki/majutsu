@@ -11,7 +11,7 @@
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
 | File remote | yes | yes | n/a | yes | n/a | n/a | n/a | n/a | local gate verified | `cargo test --test e2e_local` |
 | MinIO via Podman | yes | yes | yes | yes | partial | partial | partial | n/a | local gate verified | `scripts/e2e-minio.sh` |
-| GCS S3-compatible endpoint | yes | yes | yes | provider-specific | provider-specific | provider-specific | prefer native GCS lifecycle | experimental until provider drill | verified 2026-06-13 | `~/moon` root: sync, remote check, remote fsck quick, encrypted clone, path restore, native object alias repair |
+| GCS S3-compatible endpoint | yes | yes | yes | provider-specific | provider-specific | provider-specific | prefer native GCS lifecycle | experimental until provider drill | verified 2026-06-13 | `~/moon` root: sync, remote check, remote fsck quick, encrypted clone, path restore, remote repair |
 | AWS S3 | yes | yes | yes | yes | yes | yes | yes | yes | experimental until release validation | `scripts/e2e-aws-archive-restore.sh` |
 | Cloudflare R2 | yes | yes | yes | provider-specific | provider-specific | limited | provider-specific | no Glacier-style restore | experimental | manual validation required |
 
@@ -91,8 +91,12 @@ remote_blob_keys=1720
 missing_blob_keys=0
 ```
 
-残る改善点:
+その後、`mj remote fsck --objects` に並列 probe、timeout、sample を追加し、
+local state に残る referenced object を remote に再送する `mj remote repair` を追加した。
+GCS などの実 provider では次の形で object 監査と修復を行う。
 
-- `remote fsck --objects` は S3/GCS の object probe を並列化し、進捗と timeout を持たせる。
-- remote に存在せず local に存在する canonical object を再送する `remote repair` 相当の
-  操作を CLI として用意する。
+```sh
+mj remote fsck --objects --parallelism 32 --timeout-secs 300
+mj remote repair --dry-run --parallelism 32
+mj remote repair --parallelism 32 --timeout-secs 300
+```

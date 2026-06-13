@@ -673,9 +673,56 @@ pub(crate) enum RemoteCommand {
         objects: bool,
         #[arg(
             long,
+            default_value_t = 16,
+            value_name = "N",
+            help = "Parallel remote probes for --objects"
+        )]
+        parallelism: usize,
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Check only the first N referenced objects; useful for quick sampling"
+        )]
+        sample: Option<usize>,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            help = "Stop --objects after this many seconds and report an incomplete check"
+        )]
+        timeout_secs: Option<u64>,
+        #[arg(
+            long,
             help = "Run full payload verification. Default remote fsck checks only critical metadata."
         )]
         deep: bool,
+    },
+    #[command(about = "Re-upload referenced local objects that are missing from the remote")]
+    Repair {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Report repair candidates without uploading"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            default_value_t = 16,
+            value_name = "N",
+            help = "Parallel remote probes before repair"
+        )]
+        parallelism: usize,
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Inspect only the first N referenced objects"
+        )]
+        sample: Option<usize>,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            help = "Stop scanning after this many seconds and repair only discovered missing objects"
+        )]
+        timeout_secs: Option<u64>,
     },
     Capabilities,
     Hosts,

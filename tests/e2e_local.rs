@@ -3,6 +3,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+fn first_existing_snapshot_object_key(home: &Path) -> String {
+    let conn = rusqlite::Connection::open(home.join("db/majutsu.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare("select manifest_key from snapshots order by created_at")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows.into_iter()
+        .find(|key| home.join(key).exists())
+        .expect("snapshot object key")
+}
+
+fn canonical_remote_alias(key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix("objects/trees/") {
+        Some(format!("trees/{rest}.cbor.zst.enc"))
+    } else if let Some(rest) = key.strip_prefix("objects/blobs/") {
+        Some(format!("blobs/loose/{rest}.blob.enc"))
+    } else {
+        key.strip_prefix("objects/large/manifests/")
+            .map(|rest| format!("large/manifests/{rest}.cbor.zst.enc"))
+    }
+}
+
 fn mj_bin() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_mj")
         .map(PathBuf::from)
@@ -579,7 +605,20 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
     let quick = run_mj(&home, ["remote", "fsck"]);
     assert_success(quick, "remote fsck quick");
     assert_success(
-        run_mj(&home, ["remote", "fsck", "--objects"]),
+        run_mj(
+            &home,
+            [
+                "remote",
+                "fsck",
+                "--objects",
+                "--parallelism",
+                "4",
+                "--sample",
+                "100",
+                "--timeout-secs",
+                "30",
+            ],
+        ),
         "remote fsck objects",
     );
     assert_success(
@@ -587,32 +626,31 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
         "remote fsck deep",
     );
 
-    let mut removed = 0usize;
-    for dirname in ["objects", "blobs", "packs"] {
-        let path = remote.join(dirname);
-        if !path.exists() {
-            continue;
-        }
-        let files = walkdir::WalkDir::new(path)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .map(|entry| entry.path().to_path_buf())
-            .collect::<Vec<_>>();
-        for file in files {
-            fs::remove_file(file).unwrap();
-            removed += 1;
+    let missing_key = first_existing_snapshot_object_key(&home);
+    assert!(
+        home.join(&missing_key).exists(),
+        "repair fixture must keep a local object copy"
+    );
+    for key in std::iter::once(missing_key.clone()).chain(canonical_remote_alias(&missing_key)) {
+        let path = remote.join(key);
+        if path.exists() {
+            fs::remove_file(path).unwrap();
         }
     }
-    assert!(removed > 0, "remote content object");
 
     assert_success(
         run_mj(&home, ["remote", "fsck"]),
         "remote fsck quick after content loss",
     );
     assert_failure(
-        run_mj(&home, ["remote", "fsck", "--objects"]),
+        run_mj(&home, ["remote", "fsck", "--objects", "--parallelism", "4"]),
         "remote fsck objects after content loss",
+    );
+    let repair = run_mj(&home, ["remote", "repair", "--parallelism", "4"]);
+    assert_success(repair, "remote repair");
+    assert_success(
+        run_mj(&home, ["remote", "fsck", "--objects", "--parallelism", "4"]),
+        "remote fsck objects after repair",
     );
 }
 

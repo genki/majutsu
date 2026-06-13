@@ -18,6 +18,10 @@ use crate::util::parse_db_time;
 use crate::{
     decode_object, ensure_ready, export_metadata, open_db, remote_object_available, remote_ref,
 };
+use majutsu_store::canonical_remote_alias;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, serde::Deserialize)]
 struct RemoteHeadExport {
@@ -78,11 +82,25 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 println!("range_get {}", first.len());
             }
         }
-        RemoteCommand::Fsck { objects, deep } => {
+        RemoteCommand::Fsck {
+            objects,
+            parallelism,
+            sample,
+            timeout_secs,
+            deep,
+        } => {
             if deep {
                 remote_fsck(paths, &remote)?;
             } else if objects {
-                remote_fsck_objects(paths, &remote)?;
+                remote_fsck_objects(
+                    paths,
+                    &remote,
+                    RemoteObjectScanOptions {
+                        parallelism,
+                        sample,
+                        timeout: timeout_secs.map(Duration::from_secs),
+                    },
+                )?;
             } else {
                 remote_fsck_quick(paths, &remote)?;
             }
@@ -99,6 +117,36 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                     "checked remote object existence"
                 } else {
                     "checked remote metadata health"
+                }),
+            )?;
+        }
+        RemoteCommand::Repair {
+            dry_run,
+            parallelism,
+            sample,
+            timeout_secs,
+        } => {
+            remote_repair(
+                paths,
+                &remote,
+                RemoteObjectScanOptions {
+                    parallelism,
+                    sample,
+                    timeout: timeout_secs.map(Duration::from_secs),
+                },
+                dry_run,
+            )?;
+            let conn = open_db(paths)?;
+            let current = current_snapshot(&conn)?;
+            record_op(
+                &conn,
+                "remote-repair",
+                current.as_deref(),
+                current.as_deref(),
+                Some(if dry_run {
+                    "planned remote object repair"
+                } else {
+                    "re-uploaded missing remote objects"
                 }),
             )?;
         }
@@ -432,39 +480,233 @@ fn validate_quick_gc_records(
     Ok(())
 }
 
-fn remote_fsck_objects(paths: &Paths, remote: &RemoteStore) -> Result<()> {
-    let config = read_config(paths)?;
-    let conn = open_db(paths)?;
-    let export = export_metadata(paths, &conn, &config)?;
-    if !remote.exists(REMOTE_HOST_INDEX_KEY)? && !remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+#[derive(Clone, Copy)]
+struct RemoteObjectScanOptions {
+    parallelism: usize,
+    sample: Option<usize>,
+    timeout: Option<Duration>,
+}
+
+struct RemoteObjectScan {
+    checked: usize,
+    total: usize,
+    missing: Vec<String>,
+    timed_out: bool,
+    elapsed: Duration,
+}
+
+fn remote_fsck_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    options: RemoteObjectScanOptions,
+) -> Result<()> {
+    let keys = referenced_local_object_keys(paths)?;
+    let scan = scan_remote_object_availability(remote, keys, options)?;
+    for key in &scan.missing {
+        eprintln!("missing remote object {key}");
     }
-    let keys = local_object_keys(paths, &export)?;
-    let mut missing = 0usize;
-    let start = std::time::Instant::now();
-    for (idx, key) in keys.iter().enumerate() {
-        if !remote_object_available(remote, key)? {
-            missing += 1;
-            eprintln!("missing remote object {key}");
-        }
-        if (idx + 1) % 500 == 0 {
-            eprintln!(
-                "remote fsck quick progress checked_objects={} elapsed_secs={}",
-                idx + 1,
-                start.elapsed().as_secs()
-            );
-        }
+    if scan.timed_out {
+        bail!(
+            "remote fsck objects timed out after checking {}/{} object(s); missing={}",
+            scan.checked,
+            scan.total,
+            scan.missing.len()
+        );
     }
-    if missing > 0 {
-        bail!("remote fsck objects found {missing} missing object(s)");
+    if !scan.missing.is_empty() {
+        bail!(
+            "remote fsck objects found {} missing object(s)",
+            scan.missing.len()
+        );
     }
     println!("remote fsck objects ok");
     println!("mode objects");
-    println!("checked_objects {}", keys.len());
-    println!("elapsed_secs {}", start.elapsed().as_secs());
+    println!("checked_objects {}", scan.checked);
+    println!("total_objects {}", scan.total);
+    println!("missing_objects 0");
+    println!("elapsed_secs {}", scan.elapsed.as_secs());
     println!("hint use `mj remote fsck` for quick metadata health verification");
     println!("hint use `mj remote fsck --deep` for payload decode/hash verification");
     Ok(())
+}
+
+fn referenced_local_object_keys(paths: &Paths) -> Result<Vec<String>> {
+    let config = read_config(paths)?;
+    let conn = open_db(paths)?;
+    let export = export_metadata(paths, &conn, &config)?;
+    local_object_keys(paths, &export)
+}
+
+fn scan_remote_object_availability(
+    remote: &RemoteStore,
+    mut keys: Vec<String>,
+    options: RemoteObjectScanOptions,
+) -> Result<RemoteObjectScan> {
+    if !remote.exists(REMOTE_HOST_INDEX_KEY)? && !remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
+        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    }
+    if let Some(sample) = options.sample {
+        keys.truncate(sample);
+    }
+    let total = keys.len();
+    let start = Instant::now();
+    let deadline = options.timeout.map(|timeout| start + timeout);
+    let parallelism = options.parallelism.clamp(1, 128).min(total.max(1));
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for worker in 0..parallelism {
+            let tx = tx.clone();
+            let keys = &keys;
+            scope.spawn(move || {
+                let mut checked = 0usize;
+                let mut missing = Vec::new();
+                let mut timed_out = false;
+                for (idx, key) in keys.iter().enumerate().skip(worker).step_by(parallelism) {
+                    if let Some(deadline) = deadline
+                        && Instant::now() >= deadline
+                    {
+                        timed_out = true;
+                        break;
+                    }
+                    match remote_object_available(remote, key) {
+                        Ok(true) => {}
+                        Ok(false) => missing.push(key.clone()),
+                        Err(err) => {
+                            let _ = tx.send(Err(err.context(format!("check remote object {key}"))));
+                            return;
+                        }
+                    }
+                    checked += 1;
+                    if checked.is_multiple_of(500) {
+                        let _ = tx.send(Ok(RemoteObjectWorkerResult::Progress {
+                            checked,
+                            worker,
+                            last_index: idx + 1,
+                        }));
+                    }
+                }
+                let _ = tx.send(Ok(RemoteObjectWorkerResult::Done {
+                    checked,
+                    missing,
+                    timed_out,
+                }));
+            });
+        }
+        drop(tx);
+        let mut checked = 0usize;
+        let mut missing = Vec::new();
+        let mut timed_out = false;
+        for result in rx {
+            match result? {
+                RemoteObjectWorkerResult::Progress {
+                    checked: worker_checked,
+                    worker,
+                    last_index,
+                } => eprintln!(
+                    "remote fsck objects progress worker={} worker_checked={} last_index={} elapsed_secs={}",
+                    worker,
+                    worker_checked,
+                    last_index,
+                    start.elapsed().as_secs()
+                ),
+                RemoteObjectWorkerResult::Done {
+                    checked: worker_checked,
+                    missing: worker_missing,
+                    timed_out: worker_timed_out,
+                } => {
+                    checked += worker_checked;
+                    missing.extend(worker_missing);
+                    timed_out |= worker_timed_out;
+                }
+            }
+        }
+        missing.sort();
+        Ok(RemoteObjectScan {
+            checked,
+            total,
+            missing,
+            timed_out,
+            elapsed: start.elapsed(),
+        })
+    })
+}
+
+enum RemoteObjectWorkerResult {
+    Progress {
+        checked: usize,
+        worker: usize,
+        last_index: usize,
+    },
+    Done {
+        checked: usize,
+        missing: Vec<String>,
+        timed_out: bool,
+    },
+}
+
+fn remote_repair(
+    paths: &Paths,
+    remote: &RemoteStore,
+    options: RemoteObjectScanOptions,
+    dry_run: bool,
+) -> Result<()> {
+    let keys = referenced_local_object_keys(paths)?;
+    let scan = scan_remote_object_availability(remote, keys, options)?;
+    let mut repaired = 0usize;
+    let mut missing_local = 0usize;
+    for key in &scan.missing {
+        let Some((source, remote_key)) = repair_source_and_remote_key(paths, remote, key) else {
+            missing_local += 1;
+            eprintln!("cannot repair {key}: local object is missing");
+            continue;
+        };
+        if dry_run {
+            println!("repair_candidate {key} -> {remote_key}");
+            continue;
+        }
+        if remote.put_file_if_absent(&remote_key, &source)? {
+            repaired += 1;
+            println!("repaired {key} -> {remote_key}");
+        } else {
+            println!("already_present {key} -> {remote_key}");
+        }
+    }
+    if scan.timed_out {
+        eprintln!(
+            "remote repair scan timed out after checking {}/{} object(s)",
+            scan.checked, scan.total
+        );
+    }
+    println!("remote repair complete");
+    println!("checked_objects {}", scan.checked);
+    println!("total_objects {}", scan.total);
+    println!("missing_objects {}", scan.missing.len());
+    println!("repaired_objects {repaired}");
+    println!("missing_local_objects {missing_local}");
+    println!("dry_run {dry_run}");
+    if missing_local > 0 {
+        bail!(
+            "remote repair could not repair {missing_local} object(s) because local copies are missing"
+        );
+    }
+    Ok(())
+}
+
+fn repair_source_and_remote_key(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+) -> Option<(PathBuf, String)> {
+    let source = paths.home.join(key);
+    if !source.exists() {
+        return None;
+    }
+    let remote_key = if matches!(remote, RemoteStore::S3(_)) {
+        canonical_remote_alias(key).unwrap_or_else(|| key.to_string())
+    } else {
+        key.to_string()
+    };
+    Some((source, remote_key))
 }
 
 pub(crate) fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
