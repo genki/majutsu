@@ -32,6 +32,7 @@ use majutsu_store::{
     remote_gc_mark_key, remote_gc_tombstone_prefix, remote_object_availability_issues,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -58,7 +59,8 @@ use crate::util::{blake3_hex, parse_db_time, parse_time};
 use crate::{
     decode_canonical_remote_export, decode_canonical_remote_oplog, decode_large_chunk_stored_bytes,
     decode_object, export_metadata, open_db, packed_blob_metadata, read_blob_payload,
-    read_large_chunk, read_object, remote_local_object_variants, remote_ref,
+    read_large_chunk, read_object, remote_local_object_variants, remote_object_available,
+    remote_ref,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -214,6 +216,7 @@ impl FsckScope {
 
 struct PayloadValidationContext<'a> {
     remote_payload_keys: Option<&'a BTreeSet<String>>,
+    remote: Option<&'a RemoteStore>,
     payload_cache_keys: &'a BTreeSet<String>,
     scope: Option<&'a FsckScope>,
     options: &'a FsckOptions,
@@ -239,9 +242,25 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         .remote
         .as_ref()
         .and_then(|remote_config| open_remote(remote_config).ok());
-    let remote_payload_keys = remote
-        .as_ref()
-        .and_then(|remote| remote_payload_key_index(remote).ok());
+    let use_remote_payload_index =
+        remote.is_some() && !options.quick && options.sample.is_none() && options.since.is_none();
+    if use_remote_payload_index {
+        options.phase("remote-payload-index")?;
+    }
+    let remote_payload_keys = if use_remote_payload_index {
+        Some(remote_payload_key_index(
+            remote.as_ref().expect("remote exists"),
+        )?)
+    } else {
+        None
+    };
+    if let Some(remote_payload_keys) = remote_payload_keys.as_ref() {
+        options.tick(
+            "remote-payload-index",
+            remote_payload_keys.len(),
+            Some(remote_payload_keys.len()),
+        )?;
+    }
     let pack_key_by_id = export
         .packs
         .iter()
@@ -249,6 +268,7 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         .collect::<BTreeMap<_, _>>();
     let payload_context = PayloadValidationContext {
         remote_payload_keys: remote_payload_keys.as_ref(),
+        remote: remote.as_ref(),
         payload_cache_keys: &payload_cache_keys,
         scope: scope.as_ref(),
         options: &options,
@@ -263,11 +283,7 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
             options.tick("local-object-payloads", index + 1, Some(local_keys.len()))?;
             let full = paths.home.join(key);
             if !full.exists() {
-                if !payload_cache_available_remotely(
-                    remote_payload_keys.as_ref(),
-                    &payload_cache_keys,
-                    key,
-                ) {
+                if !payload_cache_available_remotely(&payload_context, key)? {
                     missing += 1;
                     eprintln!("missing object {key}");
                 }
@@ -307,18 +323,33 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
     validate_remote_refs(&conn, &config, &mut missing)?;
     validate_local_history_graph(&export, &mut missing)?;
     if !options.quick {
-        options.phase("snapshot-manifests")?;
-        validate_local_snapshot_objects(paths, &export, scope.as_ref(), &options, &mut missing)?;
-        options.phase("large-manifests")?;
-        validate_local_large_manifest_objects(
-            paths,
-            &export,
-            scope.as_ref(),
-            &options,
-            &mut missing,
-        )?;
-        options.phase("pack-objects")?;
-        validate_local_pack_objects(paths, &export, &payload_context, &mut missing)?;
+        if scope.is_some() && options.sample.is_some() {
+            if options.progress {
+                eprintln!(
+                    "fsck progress phase=object-manifests skipped=scoped-sample elapsed_secs={}",
+                    options.started.elapsed().as_secs()
+                );
+            }
+        } else {
+            options.phase("snapshot-manifests")?;
+            validate_local_snapshot_objects(
+                paths,
+                &export,
+                scope.as_ref(),
+                &options,
+                &mut missing,
+            )?;
+            options.phase("large-manifests")?;
+            validate_local_large_manifest_objects(
+                paths,
+                &export,
+                scope.as_ref(),
+                &options,
+                &mut missing,
+            )?;
+            options.phase("pack-objects")?;
+            validate_local_pack_objects(paths, &export, &payload_context, &mut missing)?;
+        }
         options.phase("metadata-references")?;
         if scope.is_none() && options.sample.is_none() {
             validate_local_metadata_references(paths, &export, &options, &mut missing)?;
@@ -416,11 +447,16 @@ fn build_fsck_scope(
     options.phase("since-scope")?;
     let cutoff = parse_db_time(since)?;
     let mut scope = FsckScope::default();
-    let mut checked = 0usize;
+    let mut matching_snapshots = Vec::new();
     for snapshot in &export.snapshots {
-        if parse_db_time(&snapshot.created_at)? < cutoff {
-            continue;
+        let created_at = parse_db_time(&snapshot.created_at)?;
+        if created_at >= cutoff {
+            matching_snapshots.push((created_at, snapshot));
         }
+    }
+    matching_snapshots.sort_by_key(|snapshot| Reverse(snapshot.0));
+    let mut checked = 0usize;
+    for (_, snapshot) in &matching_snapshots {
         if !options.within_sample("since-scope", checked, None)? {
             break;
         }
@@ -441,6 +477,31 @@ fn build_fsck_scope(
         }
         if indexed_scope.is_empty() {
             eprintln!("fsck since scope is empty; no snapshots at or after {since}");
+        }
+        return Ok(Some(indexed_scope));
+    }
+    if options.sample.is_some() {
+        let (indexed_scope, skipped_unindexed) = build_fsck_scope_from_partial_index(conn, &scope)?;
+        if options.progress {
+            eprintln!(
+                "fsck progress phase=since-scope source=index-partial snapshots={} skipped_unindexed_snapshots={} blobs={} large={} chunks={} packs={} since={since}",
+                indexed_scope.snapshot_ids.len(),
+                skipped_unindexed,
+                indexed_scope.blob_oids.len(),
+                indexed_scope.large_oids.len(),
+                indexed_scope.chunk_oids.len(),
+                indexed_scope.pack_ids.len()
+            );
+        }
+        if skipped_unindexed > 0 {
+            eprintln!(
+                "fsck since sample skipped {skipped_unindexed} unindexed snapshot(s); run without --sample to backfill full scope"
+            );
+        }
+        if indexed_scope.is_empty() {
+            eprintln!(
+                "fsck since indexed sample scope is empty; no indexed snapshots at or after {since}"
+            );
         }
         return Ok(Some(indexed_scope));
     }
@@ -548,28 +609,59 @@ fn build_fsck_scope_from_index(
     if selected.snapshot_ids.is_empty() {
         return Ok(Some(FsckScope::default()));
     }
-    let mut indexed_count = 0usize;
+    let indexed_snapshot_ids = indexed_snapshot_ids(conn, &selected.snapshot_ids)?;
+    if indexed_snapshot_ids.len() != selected.snapshot_ids.len() {
+        return Ok(None);
+    }
+    build_fsck_scope_from_indexed_snapshot_ids(conn, indexed_snapshot_ids)
+}
+
+fn build_fsck_scope_from_partial_index(
+    conn: &Connection,
+    selected: &FsckScope,
+) -> Result<(FsckScope, usize)> {
+    let indexed_snapshot_ids = indexed_snapshot_ids(conn, &selected.snapshot_ids)?;
+    let skipped_unindexed = selected
+        .snapshot_ids
+        .len()
+        .saturating_sub(indexed_snapshot_ids.len());
+    Ok((
+        build_fsck_scope_from_indexed_snapshot_ids(conn, indexed_snapshot_ids)?
+            .unwrap_or_else(FsckScope::default),
+        skipped_unindexed,
+    ))
+}
+
+fn indexed_snapshot_ids(
+    conn: &Connection,
+    snapshot_ids: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut indexed = BTreeSet::new();
     let mut indexed_stmt =
         conn.prepare("select 1 from snapshot_payload_index where snapshot_id=?1")?;
-    for snapshot_id in &selected.snapshot_ids {
+    for snapshot_id in snapshot_ids {
         if indexed_stmt
             .query_row(params![snapshot_id], |_| Ok(()))
             .optional()?
             .is_some()
         {
-            indexed_count += 1;
+            indexed.insert(snapshot_id.clone());
         }
     }
-    if indexed_count != selected.snapshot_ids.len() {
-        return Ok(None);
-    }
+    Ok(indexed)
+}
+
+fn build_fsck_scope_from_indexed_snapshot_ids(
+    conn: &Connection,
+    snapshot_ids: BTreeSet<String>,
+) -> Result<Option<FsckScope>> {
     let mut scope = FsckScope {
-        snapshot_ids: selected.snapshot_ids.clone(),
+        snapshot_ids,
         ..FsckScope::default()
     };
     let mut payload_stmt =
         conn.prepare("select kind, oid from snapshot_payloads where snapshot_id=?1")?;
-    for snapshot_id in &selected.snapshot_ids {
+    for snapshot_id in &scope.snapshot_ids {
         let rows = payload_stmt.query_map(params![snapshot_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -652,11 +744,7 @@ fn validate_blob_payloads(
         if let Some(pack_id) = pack_id.as_deref() {
             if let Some(pack_key) = pack_key_by_id.get(pack_id)
                 && !paths.home.join(pack_key).exists()
-                && payload_cache_available_remotely(
-                    context.remote_payload_keys,
-                    context.payload_cache_keys,
-                    pack_key,
-                )
+                && payload_cache_available_remotely(context, pack_key)?
             {
                 continue;
             }
@@ -665,11 +753,7 @@ fn validate_blob_payloads(
                 eprintln!("unreadable packed blob {oid}: {err}");
             }
         } else if !paths.home.join(&key).exists() {
-            if !payload_cache_available_remotely(
-                context.remote_payload_keys,
-                context.payload_cache_keys,
-                &key,
-            ) {
+            if !payload_cache_available_remotely(context, &key)? {
                 *missing += 1;
                 eprintln!("missing blob {oid} {key}");
             }
@@ -709,11 +793,7 @@ fn validate_chunk_payloads(
         checked += 1;
         context.options.tick("chunk-records", checked, None)?;
         if !paths.home.join(&key).exists() {
-            if !payload_cache_available_remotely(
-                context.remote_payload_keys,
-                context.payload_cache_keys,
-                &key,
-            ) {
+            if !payload_cache_available_remotely(context, &key)? {
                 *missing += 1;
                 eprintln!("missing chunk {oid} {key}");
             }
@@ -758,11 +838,7 @@ fn validate_large_payloads(
             Ok(manifest) => {
                 for chunk in &manifest.chunks {
                     if !paths.home.join(&chunk.object_key).exists()
-                        && payload_cache_available_remotely(
-                            context.remote_payload_keys,
-                            context.payload_cache_keys,
-                            &chunk.object_key,
-                        )
+                        && payload_cache_available_remotely(context, &chunk.object_key)?
                     {
                         continue;
                     }
@@ -789,17 +865,20 @@ fn validate_large_payloads(
 }
 
 fn payload_cache_available_remotely(
-    remote_payload_keys: Option<&BTreeSet<String>>,
-    payload_cache_keys: &BTreeSet<String>,
+    context: &PayloadValidationContext<'_>,
     key: &str,
-) -> bool {
-    let Some(remote_payload_keys) = remote_payload_keys else {
-        return false;
-    };
-    if !payload_cache_keys.contains(key) {
-        return false;
+) -> Result<bool> {
+    if !context.payload_cache_keys.contains(key) {
+        return Ok(false);
     }
-    remote_payload_index_contains(remote_payload_keys, key)
+    if let Some(remote_payload_keys) = context.remote_payload_keys {
+        return Ok(remote_payload_index_contains(remote_payload_keys, key));
+    }
+    let Some(remote) = context.remote else {
+        return Ok(false);
+    };
+    context.options.check_timeout()?;
+    remote_object_available(remote, key)
 }
 
 fn validate_local_history_graph(export: &crate::MetadataExport, missing: &mut usize) -> Result<()> {
@@ -1320,13 +1399,7 @@ fn validate_local_pack_objects(
             }
         }
         let pack_path = paths.home.join(&pack.pack_key);
-        if !pack_path.exists()
-            && payload_cache_available_remotely(
-                context.remote_payload_keys,
-                context.payload_cache_keys,
-                &pack.pack_key,
-            )
-        {
+        if !pack_path.exists() && payload_cache_available_remotely(context, &pack.pack_key)? {
             continue;
         }
         match fs::read(&pack_path) {

@@ -31,8 +31,6 @@ use majutsu_store::{
     host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
     remote_gc_mark_key, remote_gc_tombstone_prefix,
 };
-#[cfg(test)]
-use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -3585,7 +3583,7 @@ mod tests {
             object_tags: vec![("purpose".to_string(), "backup data".to_string())],
             multipart_enabled: true,
             max_parallel_uploads: 8,
-            client: Client::new(),
+            client: crate::remote_store::s3_http_client().unwrap(),
         }
     }
 

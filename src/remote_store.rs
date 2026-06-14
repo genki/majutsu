@@ -13,6 +13,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -24,6 +25,8 @@ pub(crate) const DEFAULT_LOCAL_MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 pub(crate) const DEFAULT_CLOUD_MULTIPART_PART_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_MULTIPART_PARTS: usize = 10_000;
 pub(crate) const DEFAULT_METADATA_MULTIPART_PARALLELISM: usize = 2;
+pub(crate) const DEFAULT_S3_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub(crate) const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 pub(crate) fn adaptive_multipart_part_size(len: usize, endpoint: &str) -> usize {
     let requested = env::var("MAJUTSU_S3_MULTIPART_PART_SIZE")
@@ -66,6 +69,32 @@ fn file_remote_fsync_enabled() -> bool {
     std::env::var("MAJUTSU_FSYNC_REMOTE_FILE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn s3_timeout_secs_env(name: &str, default: u64) -> Result<u64> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("parse {name} as seconds"))
+            .map(|value| value.max(1)),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(err).with_context(|| format!("read {name}")),
+    }
+}
+
+pub(crate) fn s3_http_client() -> Result<Client> {
+    let connect_timeout = Duration::from_secs(s3_timeout_secs_env(
+        "MAJUTSU_S3_CONNECT_TIMEOUT_SECS",
+        DEFAULT_S3_CONNECT_TIMEOUT_SECS,
+    )?);
+    let request_timeout = Duration::from_secs(s3_timeout_secs_env(
+        "MAJUTSU_S3_REQUEST_TIMEOUT_SECS",
+        DEFAULT_S3_REQUEST_TIMEOUT_SECS,
+    )?);
+    Ok(Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()?)
 }
 
 #[derive(Clone)]
@@ -132,7 +161,7 @@ pub(crate) fn open_remote_with_upload_policy(
             object_tags: parse_s3_object_tags_env()?,
             multipart_enabled,
             max_parallel_uploads: max_parallel_uploads.max(1),
-            client: Client::new(),
+            client: s3_http_client()?,
         })));
     }
     bail!("unsupported remote URL: {remote_url}");
@@ -1533,7 +1562,7 @@ mod storage_characteristic_tests {
             object_tags: Vec::new(),
             multipart_enabled: true,
             max_parallel_uploads: 8,
-            client: Client::new(),
+            client: s3_http_client().unwrap(),
         };
         assert_eq!(
             remote.multipart_parallelism_for_key("metadata/export.json"),

@@ -106,6 +106,22 @@ mj fsck --deep --since "24h ago" --progress
 `--timeout-secs` で停止した場合は state 破損を意味しない。進捗の遅い phase を確認し、
 必要なら大きい timeout で再実行する。
 
+remote backend が S3 / GCS S3互換の場合、HTTP request は既定で connect timeout 10秒、
+request timeout 300秒を使う。provider 側の一時遅延を切り分けたい場合は次で調整できる。
+
+```sh
+MAJUTSU_S3_CONNECT_TIMEOUT_SECS=10 mj fsck --since "24h ago" --progress
+MAJUTSU_S3_REQUEST_TIMEOUT_SECS=300 mj sync status --deep --progress
+```
+
+`mj fsck --progress` は remote payload key の一括取得を `remote-payload-index` phase として表示する。
+`--sample` または `--since` で検査範囲を絞る場合は全 payload prefix の LIST を避け、
+欠落 local object に遭遇した時だけ対象 key を HEAD probe する。短時間 smoke 検査では
+GCS backend 全体の listing latency に引きずられにくい。
+`--since` と `--sample` を併用する場合、対象 snapshot は新しい順に選び、scope 構築に
+payload index を使う。scoped sample では深い snapshot / large / pack manifest object 検査を
+省略し、直近 payload availability の smoke を優先する。
+
 ## daemon recovery
 
 `mj status` で `Daemon stale pid` または `running, ipc unavailable` が出た場合は
