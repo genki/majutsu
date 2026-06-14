@@ -218,7 +218,7 @@ fn main() -> Result<()> {
         Command::Pack(args) => pack_cmd(&paths, args),
         Command::Prune(args) => prune_cmd(&paths, args),
         Command::Gc => gc_cmd(&paths),
-        Command::Fsck => fsck(&paths),
+        Command::Fsck(args) => fsck(&paths, args),
     }
 }
 

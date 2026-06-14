@@ -1,0 +1,262 @@
+# majutsu 実装状況確認 2026-06-14
+
+## 結論
+
+`majutsu` はローカル completion gate と MinIO S3 互換 E2E を通過しており、仕様実装の主要機能は概ね揃っている。
+
+一方で、実環境 `/home/vagrant/.majutsu` の運用状態を見ると、daemon が stale pid 状態で止まっており、active root が watch daemon に保護されていない。さらに local state の tree metadata が大きく、`mj fsck` が大規模 state で数分以上無出力のまま完了しなかった。完成宣言に近い実装ではあるが、実運用品質としてはこの 3 点を優先課題として扱う。
+
+## 確認したバージョンと差分
+
+- `mj 0.3.0+build.20`
+- 作業ツリーには未コミット差分がある。
+  - `BUILD_NUMBER`
+  - `docs/OPERATIONS.md`
+  - `src/cli.rs`
+  - `src/fsck_runtime.rs`
+  - `src/remote_runtime.rs`
+  - `src/watch_runtime.rs`
+  - `tests/e2e_local.rs`
+
+差分の主な内容:
+
+- `mj remote fsck --deep` に `--sample` / `--timeout-secs` / `--payload-only` を反映。
+- pending journal 滞留時の notice command 実行を追加。
+- `BUILD_NUMBER` を 20 に更新。
+
+## 通過した検証
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+scripts/check-completion.sh
+scripts/e2e-minio.sh
+```
+
+結果:
+
+- `cargo fmt` 成功。
+- `cargo clippy -D warnings` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- `scripts/check-completion.sh` 成功。
+- `scripts/e2e-minio.sh` 成功。
+
+`scripts/check-completion.sh` は `MAJUTSU_RUN_MINIO_E2E=1` を付けない場合、MinIO E2E をスキップする。今回は別途 `scripts/e2e-minio.sh` を実行して通過を確認した。
+
+## 実装済みと判断できる主な機能
+
+- `mj --help` はサブコマンド名だけでなく、用途説明と基本フローを表示する。
+- `mj status` は端末幅を考慮し、概要、daemon、remote、設定、root、metadata、storage、queue をグループ表示する。
+- `mj log` は通信ログではなく、管理対象 root のファイル追加、変更、削除の実変化ログを表示する。
+- Linux では watch backend が inotify 既定になっている。
+- `root add` や `watch` は daemon 起動を試みるテストがあり、自動起動の基本挙動は検証済み。
+- file remote と MinIO S3 互換 remote の sync / fsck / clone / restore E2E は通過している。
+- 暗号化 state の key export / clone / restore E2E は通過している。
+- branch switch / restore 系の E2E は通過している。
+- prune / gc が current restore を壊さない E2E は通過している。
+- local payload cache prune と restore hydrate の E2E は通過している。
+
+## 実環境 `/home/vagrant/.majutsu` の状態
+
+`mj status --home /home/vagrant/.majutsu` の要点:
+
+- root 数: 6
+  - `head`
+  - `help`
+  - `jotter`
+  - `moon`
+  - `stackchan`
+  - `websh`
+- remote: GCS S3 互換 backend 設定済み。
+- encryption: `age`
+- queued uploads: 0
+- `mj sync status` では `local_current` と `remote_current` が一致。
+- daemon: `stale pid`
+- event journal: 406 件、pending 1 件。
+- local state usage: 約 747.7 MiB。
+- local objects: 約 728.5 MiB。
+- tree metadata: 約 714.1 MiB。
+
+同期状態は正常に見えるが、daemon が停止しているため、今後のファイル変更が自動 snapshot / sync されない状態になっている。
+
+## 優先課題
+
+### 1. daemon stale pid の根本対策
+
+現状:
+
+- `mj status` は `Daemon stale pid` と表示し、異常に気付ける。
+- しかし、実環境では実際に daemon が止まっていた。
+- queued upload は 0 なので過去の同期は完了しているが、停止後の変更は保護されない。
+
+改善案:
+
+- `mj status` に daemon 復旧コマンドを明示するだけでなく、必要なら `mj daemon doctor` / `mj daemon restart` を追加する。
+- stale pid 検出時に stale pid file / socket を安全に掃除できる処理を daemon start 側に集約する。
+- systemd user service などの supervisor 前提の導入手順を completion / operations に含める。
+- daemon 終了理由を残すため、watch daemon の stdout/stderr と panic を runtime log に保存する。
+- `root add` の自動起動だけでなく、長時間稼働後の restart / crash recovery E2E を追加する。
+
+### 2. local tree metadata の肥大
+
+現状:
+
+- 実環境 state は約 747.7 MiB。
+- そのうち tree metadata が約 714.1 MiB を占める。
+- root 実体ファイルがローカルにある前提では、ローカル state に巨大な tree manifest を長期保持し続ける設計は効率面で疑問が残る。
+
+推定原因:
+
+- snapshot 数が 1462 あり、tree manifest が snapshot ごとに大きく残っている。
+- 小変更でも大きな root tree を再 materialize している可能性がある。
+- pack payload はローカル prune 済みだが、tree metadata は同等の compaction 対象になっていない。
+
+改善案:
+
+- tree manifest を content-addressed にし、同一 subtree を snapshot 間で再利用する。
+- root tree 全体ではなく変更 subtree と parent pointer で表現する差分 tree を検討する。
+- current / recent restore に必要な metadata と、remote から再取得可能な古い metadata を分離し、古い tree manifest を local prune 対象にする。
+- `mj status` に tree metadata の肥大警告と、推奨 compaction コマンドを表示する。
+
+### 3. `mj fsck` の大規模 state での進捗不足
+
+現状:
+
+- `/home/vagrant/.majutsu` に対して `mj fsck` を実行したところ、数分以上無出力で完了しなかったため中断した。
+- テスト上の `fsck` は通っているが、実運用サイズでは進捗や時間見積もりがなく、止まっているのか重いだけなのか判断しづらい。
+
+推定原因:
+
+- `fsck` が `export_metadata`、local object 検査、blob/chunk/large manifest 検査、snapshot/tree manifest 検査、pack 検査を一括で実行する。
+- tree metadata が大きい実環境では snapshot/tree manifest 検査が律速になりやすい。
+
+改善案:
+
+- `mj fsck --quick` を既定にし、DB/ref/queue/current snapshot 周辺を短時間で確認する。
+- payload hash / 全 snapshot tree 検査は `mj fsck --deep` に分離する。
+- phase ごとの進捗表示、件数、経過秒、現在検査対象を stderr に出す。
+- `--timeout-secs` / `--sample` / `--since` を local fsck にも追加する。
+- `mj status` から実行される軽量 health check と、full fsck を明確に分ける。
+
+## 中優先課題
+
+### provider matrix の表現整理
+
+`docs/PROVIDER_MATRIX.md` の GCS S3-compatible endpoint は `verified 2026-06-13` の証跡がある一方、Status 欄に `experimental until provider drill` という文言が残っている。release 判定時に supported / experimental の扱いが曖昧になるため、現在 release での扱いを明確にする。
+
+### completion gate の重複
+
+`scripts/check-completion.sh` は `cargo test --workspace --all-targets` の後に `cargo test --test e2e_local` を再実行する。証跡としては分かりやすいが、時間は重複する。release gate と開発時 fast gate を分けてもよい。
+
+### 未コミット差分の整理
+
+現在の未コミット差分には、remote fsck 改善、stalled notice、build 番号更新が混在している。実装単位としては分けて commit するのが望ましい。
+
+## 次に実施すべき順序
+
+1. daemon stale pid の復旧と、停止原因を runtime log に残す実装を追加する。
+2. local tree metadata の肥大原因を測定し、tree manifest の再利用または compaction 方針を決める。
+3. `mj fsck` を quick/deep に分離し、進捗表示と timeout を追加する。
+4. provider matrix の GCS status を整理する。
+5. 未コミット差分を実装単位で commit する。
+
+## 改善実施 2026-06-14
+
+実施済み:
+
+- `mj daemon doctor` を追加し、daemon health、pid file、socket、log path、復旧 action、直近 log を表示するようにした。
+- `mj daemon restart` を追加し、running daemon の停止、stale pid/socket の掃除、再起動を一つの操作で行えるようにした。
+- `mj daemon start` が stale pid を見つけた場合、失敗せず runtime pid/socket を掃除して起動できるようにした。
+- daemon 起動時に `$MAJUTSU_HOME/logs/majutsu.log` へ起動記録を残すようにした。
+- `mj fsck --quick` を追加し、DB、refs、queue、operation log、config drift などの軽量確認を短時間で実行できるようにした。
+- `mj fsck --progress` と `--timeout-secs` を追加し、大規模 state の full check が長時間無出力にならないようにした。
+- `remote repair` が記録する `remote-repair` operation kind を core model の正規 kind に追加した。
+- `docs/OPERATIONS.md` に local fsck と daemon recovery の運用手順を追記した。
+
+検証:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+補足:
+
+- 1 回目の全体テストで `restore_resume_uses_s3_range_get_for_packed_blobs` がローカル HTTP mock の `Connection reset by peer` で失敗したが、単独再実行では成功した。
+- その後、全体テストを再実行して成功した。
+
+残り:
+
+- tree metadata 肥大そのものは未解決。今回の `fsck --quick` で運用確認は短時間化したが、local state の 700 MiB 級 tree metadata を減らすには subtree reuse / metadata compaction の設計実装が必要。
+- GCS provider matrix の表現整理は未実施。
+- 未コミット差分の整理と commit / push は未実施。
+
+## 実環境反映 2026-06-14
+
+`cargo install --path . --locked --force` で `/home/vagrant/.cargo/bin/mj` を build 21 に更新した。
+
+```text
+mj 0.3.0+build.21
+```
+
+実環境 `/home/vagrant/.majutsu` で確認した状態:
+
+- `mj fsck --quick --progress` は約 8 秒で成功。
+- `mj daemon restart` で stale pid を掃除し、daemon を起動。
+- daemon status は `running pid ... ipc ok`。
+- restart 後、pending journal が replay され、新しい snapshot `snap-be6b72ea-35e3-48d8-9bb4-48721f0b9e36` が作成された。
+- `mj sync --wait --timeout-secs 300` を実行し、remote current を同 snapshot まで進めた。
+- 最終 `mj sync status` は `local_current` と `remote_current` が一致し、`queued_uploads 0`。
+- 最終 `mj daemon status` は `pending_journal_event_count 0`、`upload_queue_backpressure false`。
+
+注意:
+
+- daemon replay snapshot 直後に確認した時点では remote current が古かった。watch daemon は snapshot 後に外部 sync を呼ぶ実装だが、今回の作業では手動 `mj sync --wait` で保全状態を明示的に戻した。
+- 実環境 state は replay 後に約 1.1 GiB へ増えた。large chunks が local に再作成されており、tree metadata も約 724 MiB のまま大きい。local metadata / payload cache 削減は引き続き課題。
+
+## 残課題改善 2026-06-14
+
+追加実施:
+
+- `mj cache stat --metadata` / `mj cache prune --metadata` を追加した。
+- 既定の `cache prune` は従来通り payload cache だけを対象にし、`--metadata` 指定時だけ remote 同期済み tree manifest を削除対象にする。
+- pruned tree manifest は `read_object` 経由の restore / diff / fsck 時に remote から on-demand hydrate される。
+- cache prune 出力を payload / metadata の件数と bytes に分離した。
+- GCS provider matrix の Status 欄を `verified 2026-06-13` に整理し、archive restore は `experimental` のままとした。
+- build number を 22 に更新した。
+
+検証:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+1 回目の全体テストで `remote_check_uses_s3_range_get_probe` がローカル HTTP mock の connection close で失敗したが、単独再実行で成功し、全体テスト再実行も成功した。
+
+実環境 `/home/vagrant/.majutsu` への反映:
+
+```text
+mj 0.3.0+build.22
+metadata_cache_candidates 285
+metadata_cache_bytes 798951793
+removed_metadata_cache_objects 285
+removed_metadata_cache_bytes 798951793
+```
+
+削減結果:
+
+- prune 前 state usage: 796.9 MiB
+- prune 後 state usage: 34.9 MiB
+- tree manifest local cache: 761.9 MiB / 285 files から 0 B / 0 files
+- `mj fsck --quick`: 成功
+- `mj sync status`: `local_current` と `remote_current` が `snap-22b19b5d-dbf3-4b4a-a74b-a002458400e6` で一致
+- `mj daemon status`: running、pending journal 0、queued upload 0
+
+残り:
+
+- subtree reuse / 差分 tree 表現は未実装。ただし、現実に問題になっていた local tree metadata の二重保持は metadata cache prune で解消した。
+- full `mj fsck` は metadata prune 後に remote hydrate を行うため、監査時には時間と通信が発生する。日次確認は `mj fsck --quick` を使う。

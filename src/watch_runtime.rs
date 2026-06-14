@@ -1,15 +1,20 @@
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{WatchDaemonLaunchConfig, start_daemon_ipc, start_watch_daemon};
 use crate::process_runtime::acquire_process_lock;
-use crate::queue_runtime::{record_event, record_file_event, upload_queue_stats};
+use crate::queue_runtime::{
+    event_journal_records, record_event, record_file_event, upload_queue_stats,
+};
 use crate::root_state::roots;
 use crate::snapshot_rules::{build_ignore, is_ignored};
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
@@ -202,6 +207,7 @@ fn watch_notify_loop<W: Watcher>(
         let event = match recv_watch_event(&rx, args.periodic_rescan_secs) {
             Ok(Some(event)) => event,
             Ok(None) => {
+                notify_stalled_pending_journal(paths)?;
                 record_event(
                     paths,
                     "periodic-rescan",
@@ -273,6 +279,115 @@ fn watch_notify_loop<W: Watcher>(
         &format!("foreground {backend_label} watch stopped"),
     )?;
     Ok(())
+}
+
+fn notify_stalled_pending_journal(paths: &Paths) -> Result<()> {
+    let Some(command) = std::env::var("MAJUTSU_STALLED_NOTICE_CMD")
+        .ok()
+        .filter(|command| !command.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let threshold_secs = env_u64("MAJUTSU_STALLED_NOTICE_AFTER_SECS", 300);
+    let rate_limit_secs = env_u64("MAJUTSU_STALLED_NOTICE_RATE_LIMIT_SECS", 3600);
+    let Some((pending, oldest_age_secs)) = pending_journal_summary(paths)? else {
+        return Ok(());
+    };
+    if oldest_age_secs < threshold_secs || notice_recently_sent(paths, rate_limit_secs) {
+        return Ok(());
+    }
+    let status = ProcessCommand::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .env("MAJUTSU_HOME", &paths.home)
+        .env("MAJUTSU_PENDING_JOURNAL_COUNT", pending.to_string())
+        .env(
+            "MAJUTSU_PENDING_OLDEST_AGE_SECS",
+            oldest_age_secs.to_string(),
+        )
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            mark_notice_sent(paths)?;
+            record_event(
+                paths,
+                "watch-stalled-notice",
+                &format!("pending={pending} oldest_age_secs={oldest_age_secs}"),
+            )?;
+        }
+        Ok(status) => record_event(
+            paths,
+            "watch-stalled-notice-error",
+            &format!("notice command exited with status {status}"),
+        )?,
+        Err(err) => record_event(
+            paths,
+            "watch-stalled-notice-error",
+            &format!("notice command failed: {err}"),
+        )?,
+    }
+    Ok(())
+}
+
+fn pending_journal_summary(paths: &Paths) -> Result<Option<(usize, u64)>> {
+    let records = event_journal_records(paths)?;
+    let last_snapshot_finish = records
+        .iter()
+        .filter(|event| event.is_snapshot_finish())
+        .map(|event| event.observed_at)
+        .max();
+    let pending = records
+        .iter()
+        .filter(|event| {
+            event.is_pending_trigger()
+                && last_snapshot_finish
+                    .map(|finished_at| event.observed_at > finished_at)
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let oldest_age_secs = pending
+        .iter()
+        .map(|event| Utc::now().signed_duration_since(event.observed_at))
+        .filter_map(|duration| u64::try_from(duration.num_seconds().max(0)).ok())
+        .max()
+        .unwrap_or(0);
+    Ok(Some((pending.len(), oldest_age_secs)))
+}
+
+fn notice_recently_sent(paths: &Paths, rate_limit_secs: u64) -> bool {
+    let Ok(metadata) = notice_marker_path(paths).metadata() else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age.as_secs() < rate_limit_secs)
+        .unwrap_or(false)
+}
+
+fn mark_notice_sent(paths: &Paths) -> Result<()> {
+    let marker = notice_marker_path(paths);
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(marker, Utc::now().to_rfc3339())?;
+    Ok(())
+}
+
+fn notice_marker_path(paths: &Paths) -> PathBuf {
+    paths.runtime.join("stalled-notice.sent")
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
@@ -850,6 +965,20 @@ mod tests {
         assert_eq!(outcome.reason, "max-latency");
         assert!(outcome.events > 1, "{outcome:?}");
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn pending_journal_summary_counts_events_after_last_snapshot_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_event(&paths, "fs-event", "before finish").unwrap();
+        record_event(&paths, "snapshot-finish", "finished").unwrap();
+        record_event(&paths, "fs-event", "after finish").unwrap();
+
+        let (pending, oldest_age_secs) = pending_journal_summary(&paths).unwrap().unwrap();
+
+        assert_eq!(pending, 1);
+        assert!(oldest_age_secs < 10);
     }
 
     fn test_event(path: &str) -> Event {

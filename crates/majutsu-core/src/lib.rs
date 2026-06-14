@@ -425,6 +425,7 @@ pub enum OperationKind {
     LargeUnpin,
     #[serde(alias = "RemoteSync")]
     RemoteSync,
+    RemoteRepair,
     Pack,
     PackCompact,
     #[serde(alias = "Prune")]
@@ -552,6 +553,7 @@ pub fn valid_operation_kind_label(kind: &str) -> bool {
             | "large-pin"
             | "large-unpin"
             | "remote-sync"
+            | "remote-repair"
             | "key-rotation"
             | "pack"
             | "pack-compact"
@@ -1435,6 +1437,7 @@ mod tests {
             "large-pin",
             "large-unpin",
             "remote-sync",
+            "remote-repair",
             "key-rotation",
             "pack",
             "pack-compact",

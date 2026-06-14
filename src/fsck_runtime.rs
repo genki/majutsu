@@ -35,10 +35,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::cache_runtime::{
     payload_cache_key_set, remote_payload_index_contains, remote_payload_key_index,
 };
+use crate::cli::FsckArgs;
 use crate::config::{
     Config, HostConfig, METADATA_EXPORT_VERSION, Paths, RootConfig, read_config, validate_config,
 };
@@ -84,11 +86,77 @@ fn read_remote_head(
     Ok(Some(serde_cbor::from_slice(&decompressed)?))
 }
 
-pub(crate) fn fsck(paths: &Paths) -> Result<()> {
+pub(crate) struct FsckOptions {
+    quick: bool,
+    progress: bool,
+    deadline: Option<Instant>,
+    started: Instant,
+}
+
+impl FsckOptions {
+    fn from_args(args: FsckArgs) -> Self {
+        let quick = args.quick && !args.deep;
+        Self {
+            quick,
+            progress: args.progress,
+            deadline: args
+                .timeout_secs
+                .map(|timeout| Instant::now() + Duration::from_secs(timeout)),
+            started: Instant::now(),
+        }
+    }
+
+    fn phase(&self, name: &str) -> Result<()> {
+        self.check_timeout()?;
+        if self.progress {
+            eprintln!(
+                "fsck progress phase={name} elapsed_secs={}",
+                self.started.elapsed().as_secs()
+            );
+        }
+        Ok(())
+    }
+
+    fn tick(&self, name: &str, checked: usize, total: Option<usize>) -> Result<()> {
+        self.check_timeout()?;
+        if self.progress && checked > 0 && checked.is_multiple_of(500) {
+            match total {
+                Some(total) => eprintln!(
+                    "fsck progress phase={name} checked={checked}/{total} elapsed_secs={}",
+                    self.started.elapsed().as_secs()
+                ),
+                None => eprintln!(
+                    "fsck progress phase={name} checked={checked} elapsed_secs={}",
+                    self.started.elapsed().as_secs()
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn check_timeout(&self) -> Result<()> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            bail!(
+                "fsck stopped after {} second(s); rerun with a larger --timeout-secs or use --quick",
+                self.started.elapsed().as_secs()
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
+    let options = FsckOptions::from_args(args);
     crate::ensure_ready(paths)?;
+    options.phase("open-db")?;
     let conn = open_db(paths)?;
     let mut missing = 0usize;
+    options.phase("read-config")?;
     let config = read_config(paths)?;
+    options.phase("export-metadata")?;
     let export = export_metadata(paths, &conn, &config)?;
     let payload_cache_keys = payload_cache_key_set(&export);
     let remote = config
@@ -103,119 +171,54 @@ pub(crate) fn fsck(paths: &Paths) -> Result<()> {
         .iter()
         .map(|pack| (pack.pack_id.as_str(), pack.pack_key.as_str()))
         .collect::<BTreeMap<_, _>>();
-    for key in local_object_keys(paths, &export)? {
-        let full = paths.home.join(&key);
-        if !full.exists() {
-            if !payload_cache_available_remotely(
-                remote_payload_keys.as_ref(),
-                &payload_cache_keys,
-                &key,
-            ) {
-                missing += 1;
-                eprintln!("missing object {key}");
-            }
-        } else if let Err(err) = read_object(paths, &key) {
-            missing += 1;
-            eprintln!("unreadable object {key}: {err}");
-        }
-    }
-    let mut stmt = conn.prepare("select oid, object_key, pack_id from blobs")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (oid, key, pack_id) = row?;
-        if let Some(pack_id) = pack_id.as_deref() {
-            if let Some(pack_key) = pack_key_by_id.get(pack_id)
-                && !paths.home.join(pack_key).exists()
-                && payload_cache_available_remotely(
+    if !options.quick {
+        options.phase("local-object-payloads")?;
+        let local_keys = local_object_keys(paths, &export)?;
+        for (index, key) in local_keys.iter().enumerate() {
+            options.tick("local-object-payloads", index + 1, Some(local_keys.len()))?;
+            let full = paths.home.join(key);
+            if !full.exists() {
+                if !payload_cache_available_remotely(
                     remote_payload_keys.as_ref(),
                     &payload_cache_keys,
-                    pack_key,
-                )
-            {
-                continue;
-            }
-            if let Err(err) = read_blob_payload(paths, &conn, &oid, &key) {
-                missing += 1;
-                eprintln!("unreadable packed blob {oid}: {err}");
-            }
-        } else if !paths.home.join(&key).exists() {
-            if !payload_cache_available_remotely(
-                remote_payload_keys.as_ref(),
-                &payload_cache_keys,
-                &key,
-            ) {
-                missing += 1;
-                eprintln!("missing blob {oid} {key}");
-            }
-        } else if let Err(err) = read_object(paths, &key) {
-            missing += 1;
-            eprintln!("unreadable blob {oid} {key}: {err}");
-        }
-    }
-    let mut stmt = conn.prepare("select oid, object_key from chunks")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (oid, key) = row?;
-        if !paths.home.join(&key).exists() {
-            if !payload_cache_available_remotely(
-                remote_payload_keys.as_ref(),
-                &payload_cache_keys,
-                &key,
-            ) {
-                missing += 1;
-                eprintln!("missing chunk {oid} {key}");
-            }
-        } else if let Err(err) = read_object(paths, &key) {
-            missing += 1;
-            eprintln!("unreadable chunk {oid} {key}: {err}");
-        }
-    }
-    let mut stmt = conn.prepare("select oid, manifest_key from large_objects")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (oid, manifest_key) = row?;
-        match read_object(paths, &manifest_key)
-            .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
-        {
-            Ok(manifest) => {
-                for chunk in &manifest.chunks {
-                    if !paths.home.join(&chunk.object_key).exists()
-                        && payload_cache_available_remotely(
-                            remote_payload_keys.as_ref(),
-                            &payload_cache_keys,
-                            &chunk.object_key,
-                        )
-                    {
-                        continue;
-                    }
-                    match read_large_chunk(paths, chunk) {
-                        Ok(bytes) if large_chunk_hash_matches(chunk, &bytes) => {}
-                        Ok(_) => {
-                            missing += 1;
-                            eprintln!("large chunk hash mismatch {} {}", oid, chunk.object_key);
-                        }
-                        Err(err) => {
-                            missing += 1;
-                            eprintln!("unreadable large chunk {} {}: {err}", oid, chunk.object_key);
-                        }
-                    }
+                    key,
+                ) {
+                    missing += 1;
+                    eprintln!("missing object {key}");
                 }
-            }
-            Err(err) => {
+            } else if let Err(err) = read_object(paths, key) {
                 missing += 1;
-                eprintln!("unreadable large manifest {oid} {manifest_key}: {err}");
+                eprintln!("unreadable object {key}: {err}");
             }
         }
+    }
+    options.phase("blob-records")?;
+    if !options.quick {
+        validate_blob_payloads(
+            paths,
+            &conn,
+            remote_payload_keys.as_ref(),
+            &payload_cache_keys,
+            &pack_key_by_id,
+            &options,
+            &mut missing,
+        )?;
+        validate_chunk_payloads(
+            paths,
+            &conn,
+            remote_payload_keys.as_ref(),
+            &payload_cache_keys,
+            &options,
+            &mut missing,
+        )?;
+        validate_large_payloads(
+            paths,
+            &conn,
+            remote_payload_keys.as_ref(),
+            &payload_cache_keys,
+            &options,
+            &mut missing,
+        )?;
     }
     for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
         missing += 1;
@@ -228,21 +231,30 @@ pub(crate) fn fsck(paths: &Paths) -> Result<()> {
             }
         }
     }
+    options.phase("host-and-refs")?;
     validate_host_file(paths, &config, &mut missing)?;
     validate_config_roots(paths, &conn, &config, &mut missing)?;
     validate_local_refs(&conn, &mut missing)?;
     validate_remote_refs(&conn, &config, &mut missing)?;
     validate_local_history_graph(&export, &mut missing)?;
-    validate_local_snapshot_objects(paths, &export, &mut missing)?;
-    validate_local_large_manifest_objects(paths, &export, &mut missing)?;
-    validate_local_pack_objects(
-        paths,
-        &export,
-        remote_payload_keys.as_ref(),
-        &payload_cache_keys,
-        &mut missing,
-    )?;
-    validate_local_metadata_references(paths, &export, &mut missing)?;
+    if !options.quick {
+        options.phase("snapshot-manifests")?;
+        validate_local_snapshot_objects(paths, &export, &options, &mut missing)?;
+        options.phase("large-manifests")?;
+        validate_local_large_manifest_objects(paths, &export, &options, &mut missing)?;
+        options.phase("pack-objects")?;
+        validate_local_pack_objects(
+            paths,
+            &export,
+            remote_payload_keys.as_ref(),
+            &payload_cache_keys,
+            &options,
+            &mut missing,
+        )?;
+        options.phase("metadata-references")?;
+        validate_local_metadata_references(paths, &export, &mut missing)?;
+    }
+    options.phase("queues")?;
     validate_local_oplog(&conn, &mut missing)?;
     validate_upload_queue(paths, &mut missing)?;
     validate_event_queue(paths, &mut missing)?;
@@ -256,9 +268,146 @@ pub(crate) fn fsck(paths: &Paths) -> Result<()> {
         "fsck",
         current.as_deref(),
         current.as_deref(),
-        Some("checked local state"),
+        Some(if options.quick {
+            "checked local state quick"
+        } else {
+            "checked local state"
+        }),
     )?;
+    if options.progress {
+        eprintln!(
+            "fsck progress phase=done elapsed_secs={}",
+            options.started.elapsed().as_secs()
+        );
+    }
     println!("fsck ok");
+    Ok(())
+}
+
+fn validate_blob_payloads(
+    paths: &Paths,
+    conn: &Connection,
+    remote_payload_keys: Option<&BTreeSet<String>>,
+    payload_cache_keys: &BTreeSet<String>,
+    pack_key_by_id: &BTreeMap<&str, &str>,
+    options: &FsckOptions,
+    missing: &mut usize,
+) -> Result<()> {
+    let mut stmt = conn.prepare("select oid, object_key, pack_id from blobs")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for (index, row) in rows.enumerate() {
+        options.tick("blob-records", index + 1, None)?;
+        let (oid, key, pack_id) = row?;
+        if let Some(pack_id) = pack_id.as_deref() {
+            if let Some(pack_key) = pack_key_by_id.get(pack_id)
+                && !paths.home.join(pack_key).exists()
+                && payload_cache_available_remotely(
+                    remote_payload_keys,
+                    payload_cache_keys,
+                    pack_key,
+                )
+            {
+                continue;
+            }
+            if let Err(err) = read_blob_payload(paths, conn, &oid, &key) {
+                *missing += 1;
+                eprintln!("unreadable packed blob {oid}: {err}");
+            }
+        } else if !paths.home.join(&key).exists() {
+            if !payload_cache_available_remotely(remote_payload_keys, payload_cache_keys, &key) {
+                *missing += 1;
+                eprintln!("missing blob {oid} {key}");
+            }
+        } else if let Err(err) = read_object(paths, &key) {
+            *missing += 1;
+            eprintln!("unreadable blob {oid} {key}: {err}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_chunk_payloads(
+    paths: &Paths,
+    conn: &Connection,
+    remote_payload_keys: Option<&BTreeSet<String>>,
+    payload_cache_keys: &BTreeSet<String>,
+    options: &FsckOptions,
+    missing: &mut usize,
+) -> Result<()> {
+    let mut stmt = conn.prepare("select oid, object_key from chunks")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for (index, row) in rows.enumerate() {
+        options.tick("chunk-records", index + 1, None)?;
+        let (oid, key) = row?;
+        if !paths.home.join(&key).exists() {
+            if !payload_cache_available_remotely(remote_payload_keys, payload_cache_keys, &key) {
+                *missing += 1;
+                eprintln!("missing chunk {oid} {key}");
+            }
+        } else if let Err(err) = read_object(paths, &key) {
+            *missing += 1;
+            eprintln!("unreadable chunk {oid} {key}: {err}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_large_payloads(
+    paths: &Paths,
+    conn: &Connection,
+    remote_payload_keys: Option<&BTreeSet<String>>,
+    payload_cache_keys: &BTreeSet<String>,
+    options: &FsckOptions,
+    missing: &mut usize,
+) -> Result<()> {
+    let mut stmt = conn.prepare("select oid, manifest_key from large_objects")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for (index, row) in rows.enumerate() {
+        options.tick("large-payloads", index + 1, None)?;
+        let (oid, manifest_key) = row?;
+        match read_object(paths, &manifest_key)
+            .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
+        {
+            Ok(manifest) => {
+                for chunk in &manifest.chunks {
+                    if !paths.home.join(&chunk.object_key).exists()
+                        && payload_cache_available_remotely(
+                            remote_payload_keys,
+                            payload_cache_keys,
+                            &chunk.object_key,
+                        )
+                    {
+                        continue;
+                    }
+                    match read_large_chunk(paths, chunk) {
+                        Ok(bytes) if large_chunk_hash_matches(chunk, &bytes) => {}
+                        Ok(_) => {
+                            *missing += 1;
+                            eprintln!("large chunk hash mismatch {} {}", oid, chunk.object_key);
+                        }
+                        Err(err) => {
+                            *missing += 1;
+                            eprintln!("unreadable large chunk {} {}: {err}", oid, chunk.object_key);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                *missing += 1;
+                eprintln!("unreadable large manifest {oid} {manifest_key}: {err}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -565,9 +714,15 @@ fn validate_local_metadata_references(
 fn validate_local_snapshot_objects(
     paths: &Paths,
     export: &crate::MetadataExport,
+    options: &FsckOptions,
     missing: &mut usize,
 ) -> Result<()> {
-    for snapshot in &export.snapshots {
+    for (index, snapshot) in export.snapshots.iter().enumerate() {
+        options.tick(
+            "snapshot-manifests",
+            index + 1,
+            Some(export.snapshots.len()),
+        )?;
         let metadata_manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
             paths,
             &snapshot.id,
@@ -630,9 +785,15 @@ fn validate_local_snapshot_objects(
 fn validate_local_large_manifest_objects(
     paths: &Paths,
     export: &crate::MetadataExport,
+    options: &FsckOptions,
     missing: &mut usize,
 ) -> Result<()> {
-    for large in &export.large_objects {
+    for (index, large) in export.large_objects.iter().enumerate() {
+        options.tick(
+            "large-manifests",
+            index + 1,
+            Some(export.large_objects.len()),
+        )?;
         match read_object(paths, &large.manifest_key)
             .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
         {
@@ -662,6 +823,7 @@ fn validate_local_pack_objects(
     export: &crate::MetadataExport,
     remote_payload_keys: Option<&BTreeSet<String>>,
     payload_cache_keys: &BTreeSet<String>,
+    options: &FsckOptions,
     missing: &mut usize,
 ) -> Result<()> {
     let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
@@ -673,7 +835,8 @@ fn validate_local_pack_objects(
                 .insert(blob.oid.as_str(), blob);
         }
     }
-    for pack in &export.packs {
+    for (index, pack) in export.packs.iter().enumerate() {
+        options.tick("pack-objects", index + 1, Some(export.packs.len()))?;
         let expected_blobs = blobs_by_pack
             .get(pack.pack_id.as_str())
             .cloned()
@@ -1292,10 +1455,14 @@ pub(crate) fn validate_remote_large_manifest_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &crate::MetadataExport,
+    budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<()> {
     for large in &export.large_objects {
         for bytes in remote_local_object_variants(paths, remote, &large.manifest_key)? {
+            if !budget.try_take() {
+                return Ok(());
+            }
             let manifest: LargeManifest =
                 serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
                     || {
@@ -1314,7 +1481,7 @@ pub(crate) fn validate_remote_large_manifest_objects(
                 continue;
             }
             for chunk in &manifest.chunks {
-                validate_remote_large_chunk_object(paths, remote, chunk, missing)?;
+                validate_remote_large_chunk_object(paths, remote, chunk, budget, missing)?;
             }
         }
     }
@@ -1325,9 +1492,13 @@ fn validate_remote_large_chunk_object(
     paths: &Paths,
     remote: &RemoteStore,
     chunk: &majutsu_core::LargeChunk,
+    budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<()> {
     for variant in remote_local_object_variants(paths, remote, &chunk.object_key)? {
+        if !budget.try_take() {
+            return Ok(());
+        }
         let stored = decode_object(paths, &variant.bytes).with_context(|| {
             format!(
                 "decode large chunk object {} from {}",
@@ -1374,6 +1545,7 @@ pub(crate) fn validate_remote_blob_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &crate::MetadataExport,
+    budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<()> {
     for blob in &export.blobs {
@@ -1381,6 +1553,9 @@ pub(crate) fn validate_remote_blob_objects(
             continue;
         }
         for variant in remote_local_object_variants(paths, remote, &blob.object_key)? {
+            if !budget.try_take() {
+                return Ok(());
+            }
             let payload = decode_object(paths, &variant.bytes).with_context(|| {
                 format!(
                     "decode blob object {} from {}",
@@ -1411,6 +1586,7 @@ pub(crate) fn validate_remote_metadata_references(
     paths: &Paths,
     remote: &RemoteStore,
     export: &crate::MetadataExport,
+    budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<()> {
     let mut live = LiveMetadataReferences::default();
@@ -1426,6 +1602,9 @@ pub(crate) fn validate_remote_metadata_references(
         };
         for manifest_key in live.add_snapshot_manifest(&manifest) {
             for bytes in remote_local_object_variants(paths, remote, &manifest_key)? {
+                if !budget.try_take() {
+                    return Ok(());
+                }
                 let large_manifest: LargeManifest =
                     match serde_json::from_slice(&decode_object(paths, &bytes.bytes)?) {
                         Ok(manifest) => manifest,
@@ -1463,6 +1642,7 @@ pub(crate) fn validate_remote_snapshot_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &crate::MetadataExport,
+    budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<()> {
     for snapshot in &export.snapshots {
@@ -1480,6 +1660,9 @@ pub(crate) fn validate_remote_snapshot_objects(
             }
         };
         for bytes in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
+            if !budget.try_take() {
+                return Ok(());
+            }
             let payload = crate::hydrate_compact_snapshot_manifest_payload(
                 paths,
                 &snapshot.manifest_key,
@@ -1502,6 +1685,9 @@ pub(crate) fn validate_remote_snapshot_objects(
         }
         for (root_id, root_tree) in &metadata_manifest.root_trees {
             for bytes in remote_local_object_variants(paths, remote, &root_tree.tree_key)? {
+                if !budget.try_take() {
+                    return Ok(());
+                }
                 let tree: TreeManifest =
                     serde_json::from_slice(&decode_object(paths, &bytes.bytes)?).with_context(
                         || {
@@ -1528,6 +1714,7 @@ pub(crate) fn validate_remote_pack_objects(
     paths: &Paths,
     remote: &RemoteStore,
     export: &crate::MetadataExport,
+    budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<()> {
     let expected_pack_index_keys = expected_canonical_pack_index_keys(export);
@@ -1560,6 +1747,9 @@ pub(crate) fn validate_remote_pack_objects(
             .unwrap_or_default();
         let expected_blob_metadata = packed_blob_metadata(&expected_blobs);
         for bytes in remote_local_object_variants(paths, remote, &pack.index_key)? {
+            if !budget.try_take() {
+                return Ok(());
+            }
             let index: PackIndex = serde_json::from_slice(&bytes.bytes).with_context(|| {
                 format!(
                     "parse pack index {} from {}",
@@ -1601,6 +1791,9 @@ pub(crate) fn validate_remote_pack_objects(
             }
         }
         for bytes in remote_local_object_variants(paths, remote, &pack.pack_key)? {
+            if !budget.try_take() {
+                return Ok(());
+            }
             for issue in pack_object_issues(pack, bytes.bytes.len() as u64, &expected_blob_metadata)
             {
                 *missing += 1;
@@ -1661,9 +1854,78 @@ fn expected_canonical_pack_object_keys(export: &crate::MetadataExport) -> BTreeS
         .collect()
 }
 
-pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
+pub(crate) struct RemotePayloadFsckBudget {
+    sample: Option<usize>,
+    deadline: Option<Instant>,
+    checked: usize,
+    stopped: bool,
+    timed_out: bool,
+}
+
+impl RemotePayloadFsckBudget {
+    fn new(sample: Option<usize>, timeout: Option<Duration>) -> Self {
+        Self {
+            sample,
+            deadline: timeout.map(|timeout| Instant::now() + timeout),
+            checked: 0,
+            stopped: false,
+            timed_out: false,
+        }
+    }
+
+    fn try_take(&mut self) -> bool {
+        if self.stopped {
+            return false;
+        }
+        if self.sample.is_some_and(|sample| self.checked >= sample) {
+            self.stopped = true;
+            return false;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.stopped = true;
+            self.timed_out = true;
+            return false;
+        }
+        self.checked += 1;
+        true
+    }
+
+    fn limited(&self) -> bool {
+        self.stopped
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RemoteFsckOptions {
+    pub(crate) metadata: bool,
+    pub(crate) payload: bool,
+    pub(crate) payload_sample: Option<usize>,
+    pub(crate) timeout: Option<Duration>,
+}
+
+pub(crate) fn remote_fsck_with_options(
+    paths: &Paths,
+    remote: &RemoteStore,
+    options: RemoteFsckOptions,
+) -> Result<()> {
     let mut missing = 0usize;
     let mut verified_hosts = 0usize;
+    let mut payload_budget = RemotePayloadFsckBudget::new(options.payload_sample, options.timeout);
+    if !options.metadata {
+        remote_payload_fsck_current_host(paths, remote, options, &mut payload_budget)?;
+        println!("remote fsck payload ok");
+        println!("hosts 1");
+        println!("payload_objects_checked {}", payload_budget.checked);
+        println!("payload_limited {}", payload_budget.limited());
+        return Ok(());
+    }
     let has_legacy_export = remote.exists(LEGACY_METADATA_EXPORT_KEY)?;
     let has_host_index = remote.exists(REMOTE_HOST_INDEX_KEY)?;
 
@@ -1673,6 +1935,8 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
             remote,
             LEGACY_METADATA_EXPORT_KEY,
             None,
+            options,
+            &mut payload_budget,
             &mut missing,
         )?;
         if let Some(current) = export.refs.get("current") {
@@ -1725,6 +1989,8 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
                 remote,
                 &host.metadata_key,
                 Some(&host.id),
+                options,
+                &mut payload_budget,
                 &mut missing,
             )?;
             if export.config.host.id != host.id {
@@ -1893,10 +2159,65 @@ pub(crate) fn remote_fsck(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     if missing > 0 {
         bail!("remote fsck found {missing} issue(s)");
     }
+    if options.payload && payload_budget.timed_out() {
+        bail!(
+            "remote fsck payload verification stopped after checking {} object(s)",
+            payload_budget.checked
+        );
+    }
     println!("remote fsck ok");
     println!("hosts {}", verified_hosts);
+    if options.payload {
+        println!("payload_objects_checked {}", payload_budget.checked);
+        println!("payload_limited {}", payload_budget.limited());
+    }
     if has_legacy_export {
         println!("legacy_metadata ok");
+    }
+    Ok(())
+}
+
+fn remote_payload_fsck_current_host(
+    paths: &Paths,
+    remote: &RemoteStore,
+    options: RemoteFsckOptions,
+    payload_budget: &mut RemotePayloadFsckBudget,
+) -> Result<()> {
+    let config = read_config(paths)?;
+    let metadata_key = if remote.exists(REMOTE_HOST_INDEX_KEY)? {
+        let index = read_remote_host_index(remote)?;
+        index
+            .hosts
+            .iter()
+            .find(|host| host.id == config.host.id)
+            .map(|host| host.metadata_key.clone())
+            .with_context(|| {
+                format!(
+                    "host {} is not present in remote host index",
+                    config.host.id
+                )
+            })?
+    } else if remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
+        LEGACY_METADATA_EXPORT_KEY.into()
+    } else {
+        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    };
+    let metadata_bytes = remote_metadata_bytes(remote, &metadata_key)?;
+    let export: crate::MetadataExport = serde_json::from_slice(&metadata_bytes)
+        .with_context(|| format!("parse remote metadata {metadata_key}"))?;
+    let mut missing = 0usize;
+    validate_remote_snapshot_objects(paths, remote, &export, payload_budget, &mut missing)?;
+    validate_remote_blob_objects(paths, remote, &export, payload_budget, &mut missing)?;
+    validate_remote_large_manifest_objects(paths, remote, &export, payload_budget, &mut missing)?;
+    validate_remote_pack_objects(paths, remote, &export, payload_budget, &mut missing)?;
+    if missing > 0 {
+        bail!("remote fsck payload found {missing} issue(s)");
+    }
+    if options.timeout.is_some() && payload_budget.timed_out() {
+        bail!(
+            "remote fsck payload verification stopped after checking {} object(s)",
+            payload_budget.checked
+        );
     }
     Ok(())
 }
@@ -1906,6 +2227,8 @@ fn remote_fsck_export(
     remote: &RemoteStore,
     metadata_key: &str,
     host_id: Option<&str>,
+    options: RemoteFsckOptions,
+    payload_budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<crate::MetadataExport> {
     let metadata_bytes = remote_metadata_bytes(remote, metadata_key)?;
@@ -1970,11 +2293,13 @@ fn remote_fsck_export(
             }
         }
     }
-    validate_remote_snapshot_objects(paths, remote, &export, missing)?;
-    validate_remote_blob_objects(paths, remote, &export, missing)?;
-    validate_remote_large_manifest_objects(paths, remote, &export, missing)?;
-    validate_remote_pack_objects(paths, remote, &export, missing)?;
-    validate_remote_metadata_references(paths, remote, &export, missing)?;
+    if options.payload {
+        validate_remote_snapshot_objects(paths, remote, &export, payload_budget, missing)?;
+        validate_remote_blob_objects(paths, remote, &export, payload_budget, missing)?;
+        validate_remote_large_manifest_objects(paths, remote, &export, payload_budget, missing)?;
+        validate_remote_pack_objects(paths, remote, &export, payload_budget, missing)?;
+        validate_remote_metadata_references(paths, remote, &export, payload_budget, missing)?;
+    }
     if let Some(host_id) = host_id {
         validate_remote_oplog(paths, remote, host_id, &export.operations, missing)?;
         validate_remote_timeline_prefixes(remote, host_id, &export, missing)?;

@@ -21,16 +21,25 @@ struct CachePrunePlan {
 struct CachePruneCandidate {
     key: String,
     bytes: u64,
+    metadata: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PayloadCachePruneStats {
     pub(crate) candidates: usize,
     pub(crate) candidate_bytes: u64,
+    pub(crate) payload_candidates: usize,
+    pub(crate) payload_candidate_bytes: u64,
     pub(crate) remote_missing: usize,
     pub(crate) local_missing: usize,
     pub(crate) removed: usize,
     pub(crate) removed_bytes: u64,
+    pub(crate) payload_removed: usize,
+    pub(crate) payload_removed_bytes: u64,
+    pub(crate) metadata_candidates: usize,
+    pub(crate) metadata_candidate_bytes: u64,
+    pub(crate) metadata_removed: usize,
+    pub(crate) metadata_removed_bytes: u64,
 }
 
 impl CachePrunePlan {
@@ -49,10 +58,36 @@ impl CachePrunePlan {
         PayloadCachePruneStats {
             candidates: self.candidate_count(),
             candidate_bytes: self.candidate_bytes(),
+            payload_candidates: self
+                .candidates
+                .iter()
+                .filter(|candidate| !candidate.metadata)
+                .count(),
+            payload_candidate_bytes: self
+                .candidates
+                .iter()
+                .filter(|candidate| !candidate.metadata)
+                .map(|candidate| candidate.bytes)
+                .sum(),
+            metadata_candidates: self
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.metadata)
+                .count(),
+            metadata_candidate_bytes: self
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.metadata)
+                .map(|candidate| candidate.bytes)
+                .sum(),
             remote_missing: self.remote_missing,
             local_missing: self.local_missing,
             removed: 0,
             removed_bytes: 0,
+            payload_removed: 0,
+            payload_removed_bytes: 0,
+            metadata_removed: 0,
+            metadata_removed_bytes: 0,
         }
     }
 }
@@ -74,19 +109,23 @@ fn cache_prune(paths: &Paths, args: CachePruneArgs, stat_only: bool) -> Result<(
     let remote = open_remote(remote_config)?;
     let conn = open_db(paths)?;
     let export = export_metadata(paths, &conn, &config)?;
-    let plan = build_cache_prune_plan(paths, &remote, &export)?;
+    let plan = build_cache_prune_plan(paths, &remote, &export, args.metadata)?;
     let stats = plan.stats();
     let dry_run = stat_only || args.dry_run;
-    println!("payload_cache_candidates {}", stats.candidates);
-    println!("payload_cache_bytes {}", stats.candidate_bytes);
-    println!("payload_cache_synced_prunable {}", stats.candidates);
+    println!("cache_candidates {}", stats.candidates);
+    println!("cache_bytes {}", stats.candidate_bytes);
+    println!("payload_cache_candidates {}", stats.payload_candidates);
+    println!("payload_cache_bytes {}", stats.payload_candidate_bytes);
+    println!("payload_cache_synced_prunable {}", stats.payload_candidates);
     println!(
         "payload_cache_synced_prunable_bytes {}",
-        stats.candidate_bytes
+        stats.payload_candidate_bytes
     );
     println!("payload_cache_remote_missing {}", stats.remote_missing);
     println!("payload_cache_unsynced_required {}", stats.remote_missing);
     println!("payload_cache_local_missing {}", stats.local_missing);
+    println!("metadata_cache_candidates {}", stats.metadata_candidates);
+    println!("metadata_cache_bytes {}", stats.metadata_candidate_bytes);
     println!("dry_run {}", dry_run);
     if dry_run {
         return Ok(());
@@ -103,10 +142,23 @@ fn cache_prune(paths: &Paths, args: CachePruneArgs, stat_only: bool) -> Result<(
             removed_stats.removed, removed_stats.removed_bytes
         )),
     )?;
-    println!("removed_payload_cache_objects {}", removed_stats.removed);
+    println!("removed_cache_objects {}", removed_stats.removed);
+    println!("removed_cache_bytes {}", removed_stats.removed_bytes);
+    println!(
+        "removed_payload_cache_objects {}",
+        removed_stats.payload_removed
+    );
     println!(
         "removed_payload_cache_bytes {}",
-        removed_stats.removed_bytes
+        removed_stats.payload_removed_bytes
+    );
+    println!(
+        "removed_metadata_cache_objects {}",
+        removed_stats.metadata_removed
+    );
+    println!(
+        "removed_metadata_cache_bytes {}",
+        removed_stats.metadata_removed_bytes
     );
     Ok(())
 }
@@ -116,7 +168,7 @@ pub(crate) fn prune_synced_payload_cache(
     remote: &RemoteStore,
     export: &MetadataExport,
 ) -> Result<PayloadCachePruneStats> {
-    let plan = build_cache_prune_plan(paths, remote, export)?;
+    let plan = build_cache_prune_plan(paths, remote, export, false)?;
     remove_payload_cache_candidates(paths, &plan)
 }
 
@@ -131,6 +183,13 @@ fn remove_payload_cache_candidates(
             Ok(()) => {
                 stats.removed += 1;
                 stats.removed_bytes += candidate.bytes;
+                if candidate.metadata {
+                    stats.metadata_removed += 1;
+                    stats.metadata_removed_bytes += candidate.bytes;
+                } else {
+                    stats.payload_removed += 1;
+                    stats.payload_removed_bytes += candidate.bytes;
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err).with_context(|| format!("remove {}", candidate.key)),
@@ -143,6 +202,7 @@ fn build_cache_prune_plan(
     paths: &Paths,
     remote: &RemoteStore,
     export: &MetadataExport,
+    include_metadata: bool,
 ) -> Result<CachePrunePlan> {
     let mut local_missing = 0usize;
     let mut local_candidates = Vec::new();
@@ -158,7 +218,25 @@ fn build_cache_prune_plan(
         local_candidates.push(CachePruneCandidate {
             key,
             bytes: metadata.len(),
+            metadata: false,
         });
+    }
+    if include_metadata {
+        for key in metadata_cache_keys(paths, export)? {
+            let path = paths.home.join(&key);
+            let Ok(metadata) = path.metadata() else {
+                local_missing += 1;
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            local_candidates.push(CachePruneCandidate {
+                key,
+                bytes: metadata.len(),
+                metadata: true,
+            });
+        }
     }
     if local_candidates.is_empty() {
         return Ok(CachePrunePlan {
@@ -220,6 +298,8 @@ pub(crate) fn remote_payload_key_index(remote: &RemoteStore) -> Result<BTreeSet<
         "packs/",
         "objects/large/chunks/",
         "large/chunks/",
+        "objects/trees/",
+        "trees/",
     ] {
         keys.extend(remote.list(prefix)?);
     }
@@ -247,6 +327,35 @@ fn payload_cache_keys(export: &MetadataExport) -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+fn metadata_cache_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for snapshot in &export.snapshots {
+        let manifest = if snapshot.manifest_json.trim().is_empty() {
+            let path = paths.home.join(&snapshot.manifest_key);
+            if !path.exists() {
+                continue;
+            }
+            let bytes = fs::read(path)?;
+            serde_json::from_slice::<majutsu_core::SnapshotManifest>(&crate::decode_object(
+                paths, &bytes,
+            )?)?
+        } else {
+            serde_json::from_str::<majutsu_core::SnapshotManifest>(&snapshot.manifest_json)?
+        };
+        {
+            keys.extend(
+                manifest
+                    .root_trees
+                    .values()
+                    .map(|root_tree| root_tree.tree_key.clone()),
+            );
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 pub(crate) fn payload_cache_key_set(export: &MetadataExport) -> std::collections::BTreeSet<String> {

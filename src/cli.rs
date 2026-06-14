@@ -122,7 +122,7 @@ pub(crate) enum Command {
     #[command(about = "Remove unreferenced local loose objects")]
     Gc,
     #[command(about = "Check local metadata, objects, queues, and refs")]
-    Fsck,
+    Fsck(FsckArgs),
 }
 
 #[derive(Args)]
@@ -611,6 +611,12 @@ pub(crate) struct CachePruneArgs {
         help = "Report removable payload cache without deleting files"
     )]
     pub(crate) dry_run: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Also prune synced local metadata cache such as tree manifests"
+    )]
+    pub(crate) metadata: bool,
 }
 
 #[derive(Subcommand)]
@@ -681,13 +687,13 @@ pub(crate) enum RemoteCommand {
         #[arg(
             long,
             value_name = "N",
-            help = "Check only the first N referenced objects; useful for quick sampling"
+            help = "Limit --objects probes or --deep payload verification to the first N objects"
         )]
         sample: Option<usize>,
         #[arg(
             long,
             value_name = "SECONDS",
-            help = "Stop --objects after this many seconds and report an incomplete check"
+            help = "Stop --objects probes or --deep payload verification after this many seconds"
         )]
         timeout_secs: Option<u64>,
         #[arg(
@@ -695,6 +701,12 @@ pub(crate) enum RemoteCommand {
             help = "Run full payload verification. Default remote fsck checks only critical metadata."
         )]
         deep: bool,
+        #[arg(
+            long,
+            requires = "deep",
+            help = "With --deep, verify payload decode/hash for this host without full metadata graph audit"
+        )]
+        payload_only: bool,
     },
     #[command(about = "Re-upload referenced local objects that are missing from the remote")]
     Repair {
@@ -874,6 +886,15 @@ pub(crate) enum DaemonCommand {
         #[arg(long)]
         periodic_rescan_secs: Option<u64>,
     },
+    #[command(about = "Restart the watch daemon, cleaning stale runtime files if needed")]
+    Restart {
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    #[command(about = "Diagnose daemon health and show recovery guidance")]
+    Doctor,
     Service {
         #[arg(long, default_value = "systemd")]
         provider: String,
@@ -881,6 +902,31 @@ pub(crate) enum DaemonCommand {
     Stop,
     Status,
     Metrics,
+}
+
+#[derive(Args, Clone, Default)]
+pub(crate) struct FsckArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run lightweight metadata, ref, queue, and current-state checks"
+    )]
+    pub(crate) quick: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "quick",
+        help = "Run full object and historical manifest verification. This is the default unless --quick is used."
+    )]
+    pub(crate) deep: bool,
+    #[arg(long, default_value_t = false, help = "Show phase progress on stderr")]
+    pub(crate) progress: bool,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        help = "Stop after this many seconds and report an incomplete check"
+    )]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]

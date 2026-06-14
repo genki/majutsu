@@ -8123,6 +8123,53 @@ fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
 }
 
 #[test]
+fn fsck_quick_and_timeout_are_available() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let quick = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck").arg("--quick");
+        c
+    });
+    assert!(quick.contains("fsck ok"));
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("fsck")
+            .arg("--timeout-secs")
+            .arg("0");
+        c
+    });
+}
+
+#[test]
 fn fsck_detects_corrupt_local_pack_index() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -14097,6 +14144,66 @@ fn root_add_auto_starts_daemon_by_default() {
     });
     assert!(status.contains("Daemon"));
     assert!(status.contains("running"));
+    run({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_doctor_and_restart_clean_stale_pid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    fs::create_dir_all(state.join("runtime")).unwrap();
+    fs::write(state.join("runtime/daemon.pid"), "99999999").unwrap();
+
+    let doctor = output({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("daemon").arg("doctor");
+        c
+    });
+    assert!(doctor.contains("daemon stale pid"));
+    assert!(doctor.contains("action mj daemon restart"));
+
+    let restarted = output({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("daemon").arg("restart");
+        c
+    });
+    assert!(restarted.contains("cleaned stale daemon runtime"));
+    assert!(restarted.contains("started daemon pid"));
+    for _ in 0..50 {
+        if state.join("runtime/daemon.sock").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let status = output({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("daemon").arg("status");
+        c
+    });
+    assert!(status.contains("running pid") || status.contains("ipc ok"));
     run({
         let mut c = mj_auto();
         c.arg("--home").arg(&state).arg("daemon").arg("stop");

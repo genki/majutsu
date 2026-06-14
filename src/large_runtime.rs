@@ -4,6 +4,7 @@ use majutsu_core::{SnapshotManifest, payload_large_ref};
 use rusqlite::{Connection, params};
 use std::collections::BTreeSet;
 
+use crate::cli::FsckArgs;
 use crate::cli::LargeCommand;
 use crate::config::Paths;
 use crate::fsck_runtime::fsck;
@@ -49,7 +50,7 @@ pub(crate) fn large_cmd(paths: &Paths, command: LargeCommand) -> Result<()> {
             println!("chunks {chunks}");
             println!("pinned {pins}");
         }
-        LargeCommand::Verify => fsck(paths)?,
+        LargeCommand::Verify => fsck(paths, FsckArgs::default())?,
         LargeCommand::Pin(args) => {
             let snapshot =
                 current_snapshot(&conn)?.ok_or_else(|| anyhow!("no current snapshot"))?;

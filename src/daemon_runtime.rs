@@ -112,6 +112,43 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             )?;
             println!("started daemon pid {pid}");
         }
+        DaemonCommand::Restart { backend, mode } => {
+            let health = daemon_health(paths)?;
+            match health.state {
+                DaemonHealthState::Running => {
+                    let pid = health.pid.unwrap_or_default();
+                    stop_daemon_process(pid)?;
+                    cleanup_daemon_runtime(paths);
+                    println!("stopped daemon pid {pid}");
+                }
+                DaemonHealthState::Stale => {
+                    cleanup_daemon_runtime(paths);
+                    println!("cleaned stale daemon runtime");
+                }
+                DaemonHealthState::Stopped => {}
+            }
+            let configured_backend = backend.unwrap_or_else(|| config.watch.backend.clone());
+            let backend = normalize_watch_backend(&configured_backend)?;
+            let mode = mode.unwrap_or_else(|| config.watch.mode.clone());
+            validate_watch_mode(&mode)?;
+            let pid = start_watch_daemon(
+                paths,
+                WatchDaemonLaunchConfig {
+                    backend,
+                    mode,
+                    interval_secs: config.watch.interval,
+                    debounce_ms: config.watch.debounce,
+                    settle_ms: config.watch.settle,
+                    buffer_max_ms: config.watch.buffer_max,
+                    buffer_max_events: config.watch.buffer_max_events,
+                    periodic_rescan_secs: config.watch.periodic_rescan,
+                },
+            )?;
+            println!("started daemon pid {pid}");
+        }
+        DaemonCommand::Doctor => {
+            daemon_doctor(paths)?;
+        }
         DaemonCommand::Service { provider } => {
             let exe = env::current_exe()?;
             let backend = normalize_watch_backend(&config.watch.backend)?;
@@ -266,17 +303,18 @@ pub(crate) struct WatchDaemonLaunchConfig {
 }
 
 pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig) -> Result<u32> {
-    if let Some(pid) = read_pid(&paths.daemon_pid)?
-        && pid_alive(pid)
-    {
-        bail!("daemon already running with pid {pid}");
+    if let Some(pid) = read_pid(&paths.daemon_pid)? {
+        if pid_alive(pid) {
+            bail!("daemon already running with pid {pid}");
+        }
+        cleanup_daemon_runtime(paths);
     }
     fs::create_dir_all(&paths.runtime)?;
     fs::create_dir_all(&paths.logs)?;
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(paths.logs.join("majutsu.log"))?;
+        .open(daemon_log_path(paths))?;
     let mut command = ProcessCommand::new(env::current_exe()?);
     command
         .arg("--home")
@@ -309,7 +347,81 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
     let child = command.spawn()?;
     let pid = child.id();
     fs::write(&paths.daemon_pid, pid.to_string())?;
+    append_daemon_log(
+        paths,
+        &format!(
+            "daemon-launch pid={pid} backend={} mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={}",
+            config.backend,
+            config.mode,
+            config.debounce_ms,
+            config.settle_ms,
+            config.buffer_max_ms,
+            config.buffer_max_events,
+            config.periodic_rescan_secs
+        ),
+    );
     Ok(pid)
+}
+
+fn daemon_doctor(paths: &Paths) -> Result<()> {
+    let health = daemon_health(paths)?;
+    println!("daemon {}", health.label());
+    if let Some(pid) = health.pid {
+        println!("pid {pid}");
+    }
+    println!("pid_file {}", paths.daemon_pid.display());
+    println!("socket {}", paths.runtime.join("daemon.sock").display());
+    println!("log {}", daemon_log_path(paths).display());
+    match health.state {
+        DaemonHealthState::Running if health.ipc_available => {
+            println!("action none");
+        }
+        DaemonHealthState::Running => {
+            println!("action mj daemon restart");
+            println!("reason process is alive but IPC is unavailable");
+        }
+        DaemonHealthState::Stale => {
+            println!("action mj daemon restart");
+            println!("reason pid file points to a dead process");
+        }
+        DaemonHealthState::Stopped => {
+            println!("action mj daemon start");
+        }
+    }
+    if let Ok(tail) = daemon_log_tail(paths, 20)
+        && !tail.is_empty()
+    {
+        println!("recent_log");
+        print!("{tail}");
+    }
+    Ok(())
+}
+
+fn daemon_log_path(paths: &Paths) -> std::path::PathBuf {
+    paths.logs.join("majutsu.log")
+}
+
+fn append_daemon_log(paths: &Paths, line: &str) {
+    let _ = fs::create_dir_all(&paths.logs);
+    let timestamp = Utc::now().to_rfc3339();
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(daemon_log_path(paths))
+    {
+        let _ = writeln!(file, "{timestamp} {line}");
+    }
+}
+
+fn daemon_log_tail(paths: &Paths, lines: usize) -> Result<String> {
+    let content = fs::read_to_string(daemon_log_path(paths))?;
+    let mut selected = content.lines().rev().take(lines).collect::<Vec<_>>();
+    selected.reverse();
+    if selected.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!("{}\n", selected.join("\n")))
+    }
 }
 
 #[cfg(unix)]

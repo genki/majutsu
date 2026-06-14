@@ -9,7 +9,7 @@ use majutsu_store::{
 
 use crate::cli::RemoteCommand;
 use crate::config::{MetadataExport, Paths, read_config};
-use crate::fsck_runtime::remote_fsck;
+use crate::fsck_runtime::{RemoteFsckOptions, remote_fsck_with_options};
 use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
@@ -90,9 +90,19 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             sample,
             timeout_secs,
             deep,
+            payload_only,
         } => {
             if deep {
-                remote_fsck(paths, &remote)?;
+                remote_fsck_with_options(
+                    paths,
+                    &remote,
+                    RemoteFsckOptions {
+                        metadata: !payload_only,
+                        payload: true,
+                        payload_sample: sample,
+                        timeout: timeout_secs.map(Duration::from_secs),
+                    },
+                )?;
             } else if objects {
                 remote_fsck_objects(
                     paths,

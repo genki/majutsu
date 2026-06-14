@@ -18,6 +18,35 @@ fn first_existing_snapshot_object_key(home: &Path) -> String {
         .expect("snapshot object key")
 }
 
+fn first_tree_object_key(home: &Path) -> String {
+    let conn = rusqlite::Connection::open(home.join("db/majutsu.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare("select manifest_key, manifest_json from snapshots order by created_at")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (manifest_key, manifest_json) in rows {
+        let manifest: serde_json::Value = if manifest_json.trim().is_empty() {
+            serde_json::from_slice(&fs::read(home.join(manifest_key)).unwrap()).unwrap()
+        } else {
+            serde_json::from_str(&manifest_json).unwrap()
+        };
+        if let Some(tree_key) = manifest["root_trees"]
+            .as_object()
+            .and_then(|trees| trees.values().next())
+            .and_then(|root_tree| root_tree["tree_key"].as_str())
+        {
+            return tree_key.to_string();
+        }
+    }
+    panic!("tree object key not found");
+}
+
 fn canonical_remote_alias(key: &str) -> Option<String> {
     if let Some(rest) = key.strip_prefix("objects/trees/") {
         Some(format!("trees/{rest}.cbor.zst.enc"))
@@ -453,7 +482,30 @@ fn cache_prune_evicts_synced_payload_cache_and_restore_hydrates() {
     let stat_stdout = String::from_utf8_lossy(&stat.stdout);
     assert!(stat_stdout.contains("payload_cache_candidates 0"));
 
+    let tree_key = first_tree_object_key(&home);
+    assert!(
+        home.join(&tree_key).exists(),
+        "tree manifest should exist before metadata cache prune"
+    );
+    let metadata_stat = run_mj(&home, ["cache", "stat", "--metadata"]);
+    assert_success(metadata_stat, "cache stat --metadata");
+    let metadata_prune = run_mj(&home, ["cache", "prune", "--metadata"]);
+    let metadata_prune_stdout = String::from_utf8_lossy(&metadata_prune.stdout).to_string();
+    assert_success(metadata_prune, "cache prune --metadata");
+    assert!(
+        metadata_prune_stdout.contains("removed_metadata_cache_objects 1"),
+        "metadata cache prune should remove the tree manifest\n{metadata_prune_stdout}"
+    );
+    assert!(
+        !home.join(&tree_key).exists(),
+        "tree manifest should be pruned locally"
+    );
+
     assert_success(run_mj(&home, ["fsck"]), "fsck after cache prune");
+    assert!(
+        home.join(&tree_key).exists(),
+        "fsck should hydrate the pruned tree manifest from remote"
+    );
     assert_success(
         run_mj(
             &home,
@@ -624,6 +676,34 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
     assert_success(
         run_mj(&home, ["remote", "fsck", "--deep"]),
         "remote fsck deep",
+    );
+    let deep_sample = run_mj(&home, ["remote", "fsck", "--deep", "--sample", "1"]);
+    let deep_sample_stdout = String::from_utf8_lossy(&deep_sample.stdout).to_string();
+    assert_success(deep_sample, "remote fsck deep sample");
+    assert!(
+        deep_sample_stdout.contains("payload_objects_checked 1"),
+        "deep sample must limit payload checks\n{deep_sample_stdout}"
+    );
+    assert!(
+        deep_sample_stdout.contains("payload_limited true"),
+        "deep sample must report limited payload verification\n{deep_sample_stdout}"
+    );
+    let payload_only = run_mj(
+        &home,
+        [
+            "remote",
+            "fsck",
+            "--deep",
+            "--payload-only",
+            "--sample",
+            "1",
+        ],
+    );
+    let payload_only_stdout = String::from_utf8_lossy(&payload_only.stdout).to_string();
+    assert_success(payload_only, "remote fsck deep payload-only sample");
+    assert!(
+        payload_only_stdout.contains("remote fsck payload ok"),
+        "payload-only mode must skip full metadata graph audit\n{payload_only_stdout}"
     );
 
     let missing_key = first_existing_snapshot_object_key(&home);

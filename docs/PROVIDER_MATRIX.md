@@ -11,7 +11,7 @@
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
 | File remote | yes | yes | n/a | yes | n/a | n/a | n/a | n/a | local gate verified | `cargo test --test e2e_local` |
 | MinIO via Podman | yes | yes | yes | yes | partial | partial | partial | n/a | local gate verified | `scripts/e2e-minio.sh` |
-| GCS S3-compatible endpoint | yes | yes | yes | provider-specific | provider-specific | provider-specific | prefer native GCS lifecycle | experimental until provider drill | verified 2026-06-13 | `~/moon` root: sync, remote check, remote fsck quick, encrypted clone, path restore, remote repair |
+| GCS S3-compatible endpoint | yes | yes | yes | provider-specific | provider-specific | provider-specific | prefer native GCS lifecycle | experimental | verified 2026-06-13 | `~/moon` root: sync, remote check, remote fsck quick, encrypted clone, path restore, remote repair |
 | AWS S3 | yes | yes | yes | yes | yes | yes | yes | yes | experimental until release validation | `scripts/e2e-aws-archive-restore.sh` |
 | Cloudflare R2 | yes | yes | yes | provider-specific | provider-specific | limited | provider-specific | no Glacier-style restore | experimental | manual validation required |
 
