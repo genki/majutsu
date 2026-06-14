@@ -913,3 +913,50 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 - full `mj fsck --deep` の remote LIST は request timeout 依存。全履歴監査では意図的に時間枠を取る。
 - `mj fsck --backfill-index --hydrate-index-objects` は巨大 tree manifest を読むためメンテナンス用途。
 - subtree reuse / 差分tree表現は未実装。
+
+## 方針変更 2026-06-14
+
+`fsck` を定期的に実行し続ける設計ではなく、通常運用で `fsck` が必要になる状況を作らないことを
+優先する方針に変更した。
+
+通常運用で重要な signal:
+
+- daemon が running かつ IPC ok。
+- active root が欠落していない。
+- pending event journal が 0。
+- upload queue が 0。
+- local current と cached remote head が一致。
+- sync lock が残っていない。
+- remote が設定され、openできる。
+- 暗号化時にkey materialの基本状態が確認できる。
+
+`fsck` は異常時、復旧前後、release前、メンテナンス時の診断ツールとして扱う。
+
+## 残改善実施 2026-06-14 build 32
+
+実施:
+
+- `BUILD_NUMBER` 32。
+- `mj health` を追加した。
+  - text出力と `--json` を提供する。
+  - `protected` / `degraded` / `unprotected` の保護状態を返す。
+  - 判定材料は daemon、root、remote、cached remote head、upload queue、pending event journal、
+    sync lock、encryption key file。
+- `mj status` の最上段に `Protection` と `Health issues` を追加した。
+- `mj status` に `Protection` セクションを追加し、health issueを重要度付きで表示するようにした。
+- `docs/OPERATIONS.md` に、通常運用では full fsck ではなく `mj health` を見る方針を追記した。
+
+検証:
+
+- `cargo test --test remote_file health_reports_unprotected_when_active_root_has_no_daemon_or_remote --locked` 成功。
+- `cargo test --test remote_file status_reports_configured_root_state --locked` 成功。
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- 実環境 debug binary で `mj health` / `mj health --json` が `state protected` を返すことを確認。
+- 実環境 debug binary の `mj status --no-pager` 先頭に `Protection protected` が出ることを確認。
+
+残り:
+
+- daemon自身が定期的にhealthを記録する `runtime/health.json` は未実装。
+- healthが degraded / unprotected に変わった場合の notice 通知は未実装。
+- root別の最終snapshot/sync時刻やpermission degradedの詳細表示は未実装。

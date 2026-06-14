@@ -15,10 +15,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-use crate::cli::{DiffArgs, LogArgs, OpCommand, StateArgs, StatusArgs};
-use crate::config::{Config, Paths, read_config};
+use crate::cli::{DiffArgs, HealthArgs, LogArgs, OpCommand, StateArgs, StatusArgs};
+use crate::config::{Config, Paths, RootConfig, read_config};
 use crate::daemon_runtime::{DaemonHealth, DaemonHealthState, daemon_health};
 use crate::operation_log::{query_operation, record_op};
+use crate::process_runtime::process_lock_owner;
 use crate::queue_runtime::{event_journal_records, event_journal_stats, upload_queue_stats};
 use crate::remote_store::open_remote;
 use crate::root_state::roots;
@@ -44,12 +45,30 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let pending_event_count = pending_journal_event_count(&event_records);
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let daemon = daemon_health(paths)?;
+    let health = build_health_report(HealthInputs {
+        paths,
+        config: &config,
+        roots: &roots,
+        current: current.as_deref(),
+        remote: &remote,
+        remote_head: &remote_head,
+        daemon: &daemon,
+        upload_stats: &upload_stats,
+        pending_event_count,
+    })?;
     let width = terminal_width();
     let height = terminal_height();
     let ui = StatusUi::new();
     let mut output = String::new();
 
     writeln!(output, "{}", ui.heading("Status")).expect("write status output");
+    print_kv(&mut output, width, "Protection", health.state.as_str());
+    print_kv(
+        &mut output,
+        width,
+        "Health issues",
+        &health.issue_count().to_string(),
+    );
     print_kv(&mut output, width, "Current snapshot", current_label);
     print_kv(&mut output, width, "Roots", &roots.len().to_string());
     print_kv(&mut output, width, "Daemon", daemon.label());
@@ -67,6 +86,8 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         "State usage",
         &format_bytes(storage.state_bytes),
     );
+    writeln!(output).expect("write status output");
+    print_health_section(&mut output, width, &ui, &health);
     writeln!(output).expect("write status output");
 
     print_status_overview(
@@ -383,6 +404,339 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     writeln!(output, "current {current_label}").expect("write status output");
     emit_status_output(&output, height, &args)?;
     Ok(())
+}
+
+pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
+    crate::ensure_ready(paths)?;
+    let conn = crate::open_db(paths)?;
+    let config = read_config(paths)?;
+    let roots = roots(&conn)?;
+    let current = current_snapshot(&conn)?;
+    let remote = read_remote_status(&config)?;
+    let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
+    let upload_stats = upload_queue_stats(paths)?;
+    let event_records = event_journal_records(paths)?;
+    let pending_event_count = pending_journal_event_count(&event_records);
+    let daemon = daemon_health(paths)?;
+    let report = build_health_report(HealthInputs {
+        paths,
+        config: &config,
+        roots: &roots,
+        current: current.as_deref(),
+        remote: &remote,
+        remote_head: &remote_head,
+        daemon: &daemon,
+        upload_stats: &upload_stats,
+        pending_event_count,
+    })?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print_health_report(&report);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProtectionState {
+    Protected,
+    Degraded,
+    Unprotected,
+}
+
+impl ProtectionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProtectionState::Protected => "protected",
+            ProtectionState::Degraded => "degraded",
+            ProtectionState::Unprotected => "unprotected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum HealthSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthIssue {
+    severity: HealthSeverity,
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthReport {
+    state: ProtectionState,
+    current_snapshot: Option<String>,
+    active_roots: usize,
+    roots_total: usize,
+    daemon_state: String,
+    daemon_ipc: bool,
+    remote_configured: bool,
+    remote_available: bool,
+    remote_head_status: String,
+    queued_uploads: usize,
+    queued_uploads_retrying: usize,
+    queued_uploads_delayed: usize,
+    pending_journal_events: usize,
+    sync_lock_pid: Option<u32>,
+    encryption: String,
+    issues: Vec<HealthIssue>,
+}
+
+impl HealthReport {
+    fn issue_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity != HealthSeverity::Info)
+            .count()
+    }
+}
+
+struct HealthInputs<'a> {
+    paths: &'a Paths,
+    config: &'a Config,
+    roots: &'a [RootConfig],
+    current: Option<&'a str>,
+    remote: &'a RemoteStatus,
+    remote_head: &'a RemoteHeadStatus,
+    daemon: &'a DaemonHealth,
+    upload_stats: &'a crate::queue_runtime::UploadQueueStats,
+    pending_event_count: usize,
+}
+
+fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
+    let HealthInputs {
+        paths,
+        config,
+        roots,
+        current,
+        remote,
+        remote_head,
+        daemon,
+        upload_stats,
+        pending_event_count,
+    } = input;
+    let active_roots = roots.iter().filter(|root| root.status == "active").count();
+    let mut issues = Vec::new();
+
+    if active_roots == 0 {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "no-active-roots".into(),
+            message: "no active roots are configured".into(),
+        });
+    }
+
+    for root in roots {
+        if root.status == "active" && !root.path.exists() {
+            issues.push(HealthIssue {
+                severity: HealthSeverity::Critical,
+                code: "root-missing".into(),
+                message: format!(
+                    "active root {} is missing: {}",
+                    root.id,
+                    root.path.display()
+                ),
+            });
+        } else if root.status != "active" {
+            issues.push(HealthIssue {
+                severity: HealthSeverity::Warning,
+                code: "root-not-active".into(),
+                message: format!("root {} status is {}", root.id, root.status),
+            });
+        }
+    }
+
+    if active_roots > 0 && !daemon.is_healthy() {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Critical,
+            code: "daemon-unhealthy".into(),
+            message: format!("watch daemon is {}", daemon.label()),
+        });
+    }
+
+    if active_roots > 0 && !remote.configured {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Critical,
+            code: "remote-not-configured".into(),
+            message: "no remote backend is configured".into(),
+        });
+    } else if remote.open_error.is_some() {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Critical,
+            code: "remote-unavailable".into(),
+            message: remote
+                .open_error
+                .clone()
+                .unwrap_or_else(|| "remote backend is unavailable".into()),
+        });
+    }
+
+    if current.is_some() && remote.configured && remote.open_error.is_none() && !remote_head.synced
+    {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Critical,
+            code: "remote-head-lagging".into(),
+            message: format!("remote head is {}", remote_head.label()),
+        });
+    }
+
+    if upload_stats.total > 0 {
+        let severity = if upload_stats.has_backpressure() {
+            HealthSeverity::Critical
+        } else {
+            HealthSeverity::Warning
+        };
+        issues.push(HealthIssue {
+            severity,
+            code: "upload-queue-not-empty".into(),
+            message: format!(
+                "upload queue has {} item(s), retrying={}, delayed={}",
+                upload_stats.total, upload_stats.retrying, upload_stats.delayed
+            ),
+        });
+    }
+
+    if pending_event_count > 0 {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "pending-journal-events".into(),
+            message: format!("event journal has {pending_event_count} pending trigger event(s)"),
+        });
+    }
+
+    let sync_lock_pid = process_lock_owner(&paths.sync_lock)?;
+    if let Some(pid) = sync_lock_pid {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "sync-running".into(),
+            message: format!("sync is currently running with pid {pid}"),
+        });
+    }
+
+    if config.security.encryption != "none" && !paths.master_key.exists() {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "master-key-file-missing".into(),
+            message: format!(
+                "encryption is {}, but {} is not present",
+                config.security.encryption,
+                paths.master_key.display()
+            ),
+        });
+    }
+
+    let state = if issues
+        .iter()
+        .any(|issue| issue.severity == HealthSeverity::Critical)
+    {
+        ProtectionState::Unprotected
+    } else if issues
+        .iter()
+        .any(|issue| issue.severity == HealthSeverity::Warning)
+    {
+        ProtectionState::Degraded
+    } else {
+        ProtectionState::Protected
+    };
+
+    Ok(HealthReport {
+        state,
+        current_snapshot: current.map(str::to_string),
+        active_roots,
+        roots_total: roots.len(),
+        daemon_state: daemon.label().to_string(),
+        daemon_ipc: daemon.ipc_available,
+        remote_configured: remote.configured,
+        remote_available: remote.configured && remote.open_error.is_none(),
+        remote_head_status: remote_head.label().to_string(),
+        queued_uploads: upload_stats.total,
+        queued_uploads_retrying: upload_stats.retrying,
+        queued_uploads_delayed: upload_stats.delayed,
+        pending_journal_events: pending_event_count,
+        sync_lock_pid,
+        encryption: config.security.encryption.clone(),
+        issues,
+    })
+}
+
+fn print_health_report(report: &HealthReport) {
+    println!("state {}", report.state.as_str());
+    println!(
+        "current_snapshot {}",
+        report.current_snapshot.as_deref().unwrap_or("(none)")
+    );
+    println!("active_roots {}", report.active_roots);
+    println!("roots_total {}", report.roots_total);
+    println!("daemon {}", report.daemon_state);
+    println!("daemon_ipc {}", report.daemon_ipc);
+    println!("remote_configured {}", report.remote_configured);
+    println!("remote_available {}", report.remote_available);
+    println!("remote_head {}", report.remote_head_status);
+    println!("queued_uploads {}", report.queued_uploads);
+    println!("queued_uploads_retrying {}", report.queued_uploads_retrying);
+    println!("queued_uploads_delayed {}", report.queued_uploads_delayed);
+    println!("pending_journal_events {}", report.pending_journal_events);
+    println!(
+        "sync_lock_pid {}",
+        report
+            .sync_lock_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "(none)".into())
+    );
+    println!("encryption {}", report.encryption);
+    println!("issue_count {}", report.issue_count());
+    for issue in &report.issues {
+        println!(
+            "issue {:?} {} {}",
+            issue.severity, issue.code, issue.message
+        );
+    }
+}
+
+fn print_health_section(out: &mut String, width: usize, ui: &StatusUi, report: &HealthReport) {
+    writeln!(out, "{}", ui.heading("Protection")).expect("write status output");
+    let severity = match report.state {
+        ProtectionState::Protected => Severity::Good,
+        ProtectionState::Degraded => Severity::Warn,
+        ProtectionState::Unprotected => Severity::Bad,
+    };
+    print_kv(
+        out,
+        width,
+        "State",
+        &ui.severity(report.state.as_str(), severity),
+    );
+    print_kv(out, width, "Issues", &report.issue_count().to_string());
+    if report.issues.is_empty() {
+        print_kv(
+            out,
+            width,
+            "Summary",
+            "daemon, queue, and remote head are healthy",
+        );
+    } else {
+        for issue in &report.issues {
+            let severity = match issue.severity {
+                HealthSeverity::Info => Severity::Good,
+                HealthSeverity::Warning => Severity::Warn,
+                HealthSeverity::Critical => Severity::Bad,
+            };
+            print_kv(
+                out,
+                width,
+                &issue.code,
+                &ui.severity(&issue.message, severity),
+            );
+        }
+    }
 }
 
 pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {

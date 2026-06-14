@@ -13734,6 +13734,8 @@ fn status_reports_configured_root_state() {
     });
 
     assert!(status.contains("Status"));
+    assert!(status.contains("Protection"));
+    assert!(status.contains("Health issues"));
     assert!(status.contains("Roots              1"));
     assert!(status.contains("Remote             not configured"));
     assert!(status.contains("Host"));
@@ -13759,6 +13761,46 @@ fn status_reports_configured_root_state() {
             .all(|line| line.len() <= 48),
         "{status}"
     );
+}
+
+#[test]
+fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(value["state"], "unprotected");
+    let codes = value["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|issue| issue["code"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"daemon-unhealthy"), "{health}");
+    assert!(codes.contains(&"remote-not-configured"), "{health}");
 }
 
 #[test]

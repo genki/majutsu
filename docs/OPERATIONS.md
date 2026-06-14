@@ -73,7 +73,24 @@ MAJUTSU_SNAPSHOT_ALLOW_NOOP=1 mj snapshot
 
 ## local fsck
 
-日次の軽量確認では `--quick` を使う。
+通常運用の保護状態確認では full fsck ではなく `mj health` を使う。
+
+```sh
+mj health
+mj health --json
+```
+
+`mj health` は daemon、active root、remote、cached remote head、upload queue、
+pending event journal、sync lock、暗号化key fileの基本状態から、`protected` / `degraded` /
+`unprotected` を返す。クラッシュ対策として日常的に監視すべきなのは full fsck ではなくこの
+軽量 health signal である。
+
+`protected` は active root が daemon に監視され、upload queue が空で、local current と
+cached remote head が一致している状態を表す。`degraded` は一時的なsync中やpending eventなど、
+復旧可能だが注意が必要な状態、`unprotected` は daemon停止、remote未設定、remote head遅延など
+クラッシュ時の保全目的を満たさない状態を表す。
+
+fsckによる軽量診断では `--quick` を使う。
 
 ```sh
 mj fsck --quick

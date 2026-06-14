@@ -60,6 +60,8 @@ pub(crate) enum Command {
     Snapshot(SnapshotArgs),
     #[command(about = "Show roots, current snapshot, queues, and daemon state")]
     Status(StatusArgs),
+    #[command(about = "Report protection health for normal operation")]
+    Health(HealthArgs),
     #[command(about = "Inspect state home paths, refs, branches, and metadata")]
     State(StateArgs),
     #[command(about = "Show recent managed file changes")]
@@ -312,6 +314,16 @@ pub(crate) struct StatusArgs {
         help = "Force pager output even when stdout is not a terminal or output fits on screen"
     )]
     pub(crate) pager: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct HealthArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Emit machine-readable JSON instead of text"
+    )]
+    pub(crate) json: bool,
 }
 
 #[derive(Args)]
