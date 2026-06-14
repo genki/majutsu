@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use majutsu_core::OperationLogEntry as OperationExport;
 use majutsu_store::host_current_ref_key;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -15,12 +16,15 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
+use crate::atomic_io::write_atomic;
 use crate::cli::{DiffArgs, HealthArgs, LogArgs, OpCommand, StateArgs, StatusArgs};
 use crate::config::{Config, Paths, RootConfig, read_config};
 use crate::daemon_runtime::{DaemonHealth, DaemonHealthState, daemon_health};
 use crate::operation_log::{query_operation, record_op};
 use crate::process_runtime::process_lock_owner;
-use crate::queue_runtime::{event_journal_records, event_journal_stats, upload_queue_stats};
+use crate::queue_runtime::{
+    event_journal_records, event_journal_stats, record_event, upload_queue_stats,
+};
 use crate::remote_store::open_remote;
 use crate::root_state::roots;
 use crate::snapshot_state::{
@@ -408,6 +412,31 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
 
 pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
+    let report = current_health_report(paths)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print_health_report(&report);
+    Ok(())
+}
+
+pub(crate) fn refresh_runtime_health(paths: &Paths) -> Result<()> {
+    let report = current_health_report(paths)?;
+    let record = RuntimeHealthRecord {
+        observed_at: Utc::now(),
+        report,
+    };
+    fs::create_dir_all(&paths.runtime)?;
+    write_atomic(
+        &runtime_health_path(paths),
+        &serde_json::to_vec_pretty(&record)?,
+    )?;
+    maybe_send_health_notice(paths, &record)?;
+    Ok(())
+}
+
+fn current_health_report(paths: &Paths) -> Result<HealthReport> {
     let conn = crate::open_db(paths)?;
     let config = read_config(paths)?;
     let roots = roots(&conn)?;
@@ -418,7 +447,7 @@ pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
     let event_records = event_journal_records(paths)?;
     let pending_event_count = pending_journal_event_count(&event_records);
     let daemon = daemon_health(paths)?;
-    let report = build_health_report(HealthInputs {
+    build_health_report(HealthInputs {
         paths,
         config: &config,
         roots: &roots,
@@ -428,16 +457,10 @@ pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
         daemon: &daemon,
         upload_stats: &upload_stats,
         pending_event_count,
-    })?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-    print_health_report(&report);
-    Ok(())
+    })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ProtectionState {
     Protected,
@@ -455,7 +478,7 @@ impl ProtectionState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum HealthSeverity {
     Info,
@@ -463,14 +486,24 @@ enum HealthSeverity {
     Critical,
 }
 
-#[derive(Debug, Serialize)]
+impl HealthSeverity {
+    fn as_str(self) -> &'static str {
+        match self {
+            HealthSeverity::Info => "info",
+            HealthSeverity::Warning => "warning",
+            HealthSeverity::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HealthIssue {
     severity: HealthSeverity,
     code: String,
     message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HealthReport {
     state: ProtectionState,
     current_snapshot: Option<String>,
@@ -488,6 +521,19 @@ struct HealthReport {
     sync_lock_pid: Option<u32>,
     encryption: String,
     issues: Vec<HealthIssue>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeHealthRecord {
+    observed_at: DateTime<Utc>,
+    report: HealthReport,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HealthNoticeMarker {
+    state: ProtectionState,
+    issue_codes: Vec<String>,
+    sent_at: DateTime<Utc>,
 }
 
 impl HealthReport {
@@ -667,6 +713,113 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
     })
 }
 
+fn runtime_health_path(paths: &Paths) -> std::path::PathBuf {
+    paths.runtime.join("health.json")
+}
+
+fn maybe_send_health_notice(paths: &Paths, record: &RuntimeHealthRecord) -> Result<()> {
+    if record.report.state == ProtectionState::Protected {
+        let _ = fs::remove_file(health_notice_marker_path(paths));
+        return Ok(());
+    }
+    let Some(command) = std::env::var("MAJUTSU_HEALTH_NOTICE_CMD")
+        .ok()
+        .filter(|command| !command.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let issue_codes = record
+        .report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity != HealthSeverity::Info)
+        .map(|issue| issue.code.clone())
+        .collect::<Vec<_>>();
+    if health_notice_recently_sent(paths, record.report.state, &issue_codes) {
+        return Ok(());
+    }
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .env("MAJUTSU_HOME", &paths.home)
+        .env("MAJUTSU_HEALTH_STATE", record.report.state.as_str())
+        .env(
+            "MAJUTSU_HEALTH_ISSUE_COUNT",
+            record.report.issue_count().to_string(),
+        )
+        .env("MAJUTSU_HEALTH_ISSUE_CODES", issue_codes.join(","))
+        .env(
+            "MAJUTSU_HEALTH_CURRENT_SNAPSHOT",
+            record
+                .report
+                .current_snapshot
+                .as_deref()
+                .unwrap_or("(none)"),
+        )
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            let marker = HealthNoticeMarker {
+                state: record.report.state,
+                issue_codes,
+                sent_at: Utc::now(),
+            };
+            write_atomic(
+                &health_notice_marker_path(paths),
+                &serde_json::to_vec_pretty(&marker)?,
+            )?;
+            record_event(
+                paths,
+                "health-notice",
+                &format!(
+                    "state={} issues={}",
+                    record.report.state.as_str(),
+                    record.report.issue_count()
+                ),
+            )?;
+        }
+        Ok(status) => record_event(
+            paths,
+            "health-notice-error",
+            &format!("notice command exited with status {status}"),
+        )?,
+        Err(err) => record_event(
+            paths,
+            "health-notice-error",
+            &format!("notice command failed: {err}"),
+        )?,
+    }
+    Ok(())
+}
+
+fn health_notice_recently_sent(
+    paths: &Paths,
+    state: ProtectionState,
+    issue_codes: &[String],
+) -> bool {
+    let Ok(bytes) = fs::read(health_notice_marker_path(paths)) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<HealthNoticeMarker>(&bytes) else {
+        return false;
+    };
+    if marker.state != state || marker.issue_codes != issue_codes {
+        return false;
+    }
+    let rate_limit_secs = std::env::var("MAJUTSU_HEALTH_NOTICE_RATE_LIMIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(3600);
+    Utc::now()
+        .signed_duration_since(marker.sent_at)
+        .num_seconds()
+        < rate_limit_secs
+}
+
+fn health_notice_marker_path(paths: &Paths) -> std::path::PathBuf {
+    paths.runtime.join("health-notice.sent.json")
+}
+
 fn print_health_report(report: &HealthReport) {
     println!("state {}", report.state.as_str());
     println!(
@@ -695,8 +848,10 @@ fn print_health_report(report: &HealthReport) {
     println!("issue_count {}", report.issue_count());
     for issue in &report.issues {
         println!(
-            "issue {:?} {} {}",
-            issue.severity, issue.code, issue.message
+            "issue {} {} {}",
+            issue.severity.as_str(),
+            issue.code,
+            issue.message
         );
     }
 }

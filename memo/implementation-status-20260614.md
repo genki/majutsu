@@ -957,6 +957,43 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 
 残り:
 
-- daemon自身が定期的にhealthを記録する `runtime/health.json` は未実装。
-- healthが degraded / unprotected に変わった場合の notice 通知は未実装。
 - root別の最終snapshot/sync時刻やpermission degradedの詳細表示は未実装。
+
+## 残改善実施 2026-06-14 build 33
+
+実施:
+
+- `BUILD_NUMBER` 33。
+- daemon watch loop が通常処理中に `$MAJUTSU_HOME/runtime/health.json` を更新するようにした。
+  - poll watch は snapshot/sync 後に更新する。
+  - notify/inotify watch は起動時、pending journal replay 後、periodic rescan 後、
+    filesystem event snapshot 後に更新する。
+  - 更新失敗は daemon を落とさず `health-record-error` として event journal に記録する。
+- `MAJUTSU_HEALTH_NOTICE_CMD` を追加した。
+  - health が `degraded` / `unprotected` の場合だけ実行する。
+  - `MAJUTSU_HOME`、`MAJUTSU_HEALTH_STATE`、`MAJUTSU_HEALTH_ISSUE_COUNT`、
+    `MAJUTSU_HEALTH_ISSUE_CODES`、`MAJUTSU_HEALTH_CURRENT_SNAPSHOT` を通知コマンドへ渡す。
+  - 同一 state / issue set は `$MAJUTSU_HOME/runtime/health-notice.sent.json` により
+    `MAJUTSU_HEALTH_NOTICE_RATE_LIMIT_SECS`（default 3600秒）で rate limit する。
+- `mj health` の text issue severity 表示を `Debug` 由来の `Warning` ではなく、
+  `warning` / `critical` の kebab-case 表示に揃えた。
+- `docs/OPERATIONS.md` に runtime health と notice 設定を追記した。
+- E2E smoke として `watch --backend poll --once` で `runtime/health.json` と notice 実行を確認する
+  `watch_records_runtime_health_and_notices_unprotected_state` を追加した。
+
+検証:
+
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --test remote_file watch_records_runtime_health_and_notices_unprotected_state --locked` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- 実環境に `mj 0.3.0+build.33` を install し、daemon restart 済み。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `mj health` は `state protected`、issue 0。
+- 実環境の `$HOME/.majutsu/runtime/health.json` に `state: protected` が記録されることを確認。
+
+残り:
+
+- root別の最終snapshot/sync時刻やpermission degradedの詳細表示。
+- daemon停止そのものは停止した daemon から通知できないため、外部監視側で
+  `runtime/health.json` の鮮度や `mj health --json` を見る運用が必要。

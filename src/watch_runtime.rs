@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{WatchDaemonLaunchConfig, start_daemon_ipc, start_watch_daemon};
+use crate::history_runtime::refresh_runtime_health;
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{
     event_journal_records, record_event, record_file_event, upload_queue_stats,
@@ -99,6 +100,7 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
                 message: Some("watch snapshot".into()),
             },
         )?;
+        record_health(paths);
         if args.once {
             break;
         }
@@ -195,8 +197,10 @@ fn watch_notify_loop<W: Watcher>(
     if watched_roots.is_empty() {
         bail!("no active roots could be watched");
     }
+    record_health(paths);
     if replay_pending_journal_events(paths)? {
         sync_current_external(paths)?;
+        record_health(paths);
         if args.once {
             record_event(
                 paths,
@@ -222,6 +226,7 @@ fn watch_notify_loop<W: Watcher>(
                         message: Some("watch periodic rescan".into()),
                     },
                 )?;
+                record_health(paths);
                 if args.once {
                     break;
                 }
@@ -272,6 +277,7 @@ fn watch_notify_loop<W: Watcher>(
                 message: Some("watch event snapshot".into()),
             },
         )?;
+        record_health(paths);
         if args.once {
             break;
         }
@@ -282,6 +288,12 @@ fn watch_notify_loop<W: Watcher>(
         &format!("foreground {backend_label} watch stopped"),
     )?;
     Ok(())
+}
+
+fn record_health(paths: &Paths) {
+    if let Err(err) = refresh_runtime_health(paths) {
+        let _ = record_event(paths, "health-record-error", &format!("{err:#}"));
+    }
 }
 
 fn notify_stalled_pending_journal(paths: &Paths) -> Result<()> {

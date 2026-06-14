@@ -13804,6 +13804,64 @@ fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
 }
 
 #[test]
+fn watch_records_runtime_health_and_notices_unprotected_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let notice = tmp.path().join("notice.txt");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("watch")
+            .arg("--foreground")
+            .arg("true")
+            .arg("--backend")
+            .arg("poll")
+            .arg("--once")
+            .env(
+                "MAJUTSU_HEALTH_NOTICE_CMD",
+                format!(
+                    "printf '%s' \"$MAJUTSU_HEALTH_STATE:$MAJUTSU_HEALTH_ISSUE_CODES\" > {}",
+                    notice.display()
+                ),
+            );
+        c
+    });
+
+    let health_path = state.join("runtime/health.json");
+    let health: serde_json::Value =
+        serde_json::from_slice(&fs::read(&health_path).unwrap()).unwrap();
+    assert_eq!(health["report"]["state"], "unprotected");
+    assert!(health["observed_at"].as_str().is_some());
+    let notice_text = fs::read_to_string(&notice).unwrap();
+    assert!(notice_text.starts_with("unprotected:"), "{notice_text}");
+    assert!(
+        notice_text.contains("remote-not-configured"),
+        "{notice_text}"
+    );
+}
+
+#[test]
 fn event_stat_and_compact_report_processed_journal_records() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
