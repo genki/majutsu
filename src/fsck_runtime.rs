@@ -31,7 +31,7 @@ use majutsu_store::{
     host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
     remote_gc_mark_key, remote_gc_tombstone_prefix, remote_object_availability_issues,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -231,7 +231,7 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
     let export = export_metadata(paths, &conn, &config)?;
     let payload_cache_keys = payload_cache_key_set(&export);
     let scope = if !options.quick {
-        build_fsck_scope(paths, &export, &options)?
+        build_fsck_scope(paths, &conn, &export, &options)?
     } else {
         None
     };
@@ -406,6 +406,7 @@ fn fsck_metadata_cache_prune_enabled() -> bool {
 
 fn build_fsck_scope(
     paths: &Paths,
+    conn: &Connection,
     export: &crate::MetadataExport,
     options: &FsckOptions,
 ) -> Result<Option<FsckScope>> {
@@ -426,12 +427,38 @@ fn build_fsck_scope(
         checked += 1;
         options.tick("since-scope", checked, None)?;
         scope.snapshot_ids.insert(snapshot.id.clone());
+    }
+    if let Some(indexed_scope) = build_fsck_scope_from_index(conn, &scope)? {
+        if options.progress {
+            eprintln!(
+                "fsck progress phase=since-scope source=index snapshots={} blobs={} large={} chunks={} packs={} since={since}",
+                indexed_scope.snapshot_ids.len(),
+                indexed_scope.blob_oids.len(),
+                indexed_scope.large_oids.len(),
+                indexed_scope.chunk_oids.len(),
+                indexed_scope.pack_ids.len()
+            );
+        }
+        if indexed_scope.is_empty() {
+            eprintln!("fsck since scope is empty; no snapshots at or after {since}");
+        }
+        return Ok(Some(indexed_scope));
+    }
+    scope.blob_oids.clear();
+    scope.large_oids.clear();
+    scope.chunk_oids.clear();
+    scope.pack_ids.clear();
+    for snapshot in &export.snapshots {
+        if !scope.includes_snapshot(&snapshot.id) {
+            continue;
+        }
         let manifest = crate::snapshot_state::snapshot_manifest_from_parts(
             paths,
             &snapshot.id,
             &snapshot.manifest_key,
             &snapshot.manifest_json,
         )?;
+        persist_snapshot_payload_index(conn, &manifest)?;
         for root_tree in manifest.root_trees.values() {
             let tree: TreeManifest = read_object(paths, &root_tree.tree_key)
                 .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?;
@@ -458,13 +485,14 @@ fn build_fsck_scope(
         }
         let manifest: LargeManifest = read_object(paths, &large.manifest_key)
             .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?;
+        persist_large_object_chunk_index(conn, &manifest)?;
         for chunk in manifest.chunks {
             scope.chunk_oids.insert(chunk.oid);
         }
     }
     if options.progress {
         eprintln!(
-            "fsck progress phase=since-scope snapshots={} blobs={} large={} chunks={} packs={} since={since}",
+            "fsck progress phase=since-scope source=manifest snapshots={} blobs={} large={} chunks={} packs={} since={since}",
             scope.snapshot_ids.len(),
             scope.blob_oids.len(),
             scope.large_oids.len(),
@@ -474,6 +502,117 @@ fn build_fsck_scope(
     }
     if scope.is_empty() {
         eprintln!("fsck since scope is empty; no snapshots at or after {since}");
+    }
+    Ok(Some(scope))
+}
+
+fn persist_snapshot_payload_index(conn: &Connection, manifest: &SnapshotManifest) -> Result<()> {
+    conn.execute(
+        "delete from snapshot_payloads where snapshot_id=?1",
+        params![manifest.snapshot_id],
+    )?;
+    for record in manifest.roots.values().flatten() {
+        if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+            conn.execute(
+                "insert or ignore into snapshot_payloads(snapshot_id, kind, oid) values (?1, 'blob', ?2)",
+                params![manifest.snapshot_id, oid],
+            )?;
+        } else if let Some((oid, _, _)) = payload_large_ref(&record.payload) {
+            conn.execute(
+                "insert or ignore into snapshot_payloads(snapshot_id, kind, oid) values (?1, 'large', ?2)",
+                params![manifest.snapshot_id, oid],
+            )?;
+        }
+    }
+    conn.execute(
+        "insert or replace into snapshot_payload_index(snapshot_id, indexed_at) values (?1, ?2)",
+        params![manifest.snapshot_id, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn persist_large_object_chunk_index(conn: &Connection, manifest: &LargeManifest) -> Result<()> {
+    for chunk in &manifest.chunks {
+        conn.execute(
+            "insert or ignore into large_object_chunks(large_oid, chunk_oid) values (?1, ?2)",
+            params![manifest.oid, chunk.oid],
+        )?;
+    }
+    Ok(())
+}
+
+fn build_fsck_scope_from_index(
+    conn: &Connection,
+    selected: &FsckScope,
+) -> Result<Option<FsckScope>> {
+    if selected.snapshot_ids.is_empty() {
+        return Ok(Some(FsckScope::default()));
+    }
+    let mut indexed_count = 0usize;
+    let mut indexed_stmt =
+        conn.prepare("select 1 from snapshot_payload_index where snapshot_id=?1")?;
+    for snapshot_id in &selected.snapshot_ids {
+        if indexed_stmt
+            .query_row(params![snapshot_id], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            indexed_count += 1;
+        }
+    }
+    if indexed_count != selected.snapshot_ids.len() {
+        return Ok(None);
+    }
+    let mut scope = FsckScope {
+        snapshot_ids: selected.snapshot_ids.clone(),
+        ..FsckScope::default()
+    };
+    let mut payload_stmt =
+        conn.prepare("select kind, oid from snapshot_payloads where snapshot_id=?1")?;
+    for snapshot_id in &selected.snapshot_ids {
+        let rows = payload_stmt.query_map(params![snapshot_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (kind, oid) = row?;
+            match kind.as_str() {
+                "blob" => {
+                    scope.blob_oids.insert(oid);
+                }
+                "large" => {
+                    scope.large_oids.insert(oid);
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+    let mut large_stmt = conn.prepare("select chunk_count from large_objects where oid=?1")?;
+    let mut chunk_stmt =
+        conn.prepare("select chunk_oid from large_object_chunks where large_oid=?1")?;
+    for large_oid in &scope.large_oids {
+        let chunk_count = large_stmt
+            .query_row(params![large_oid], |row| row.get::<_, usize>(0))
+            .optional()?
+            .unwrap_or(0);
+        let rows = chunk_stmt.query_map(params![large_oid], |row| row.get::<_, String>(0))?;
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row?);
+        }
+        if chunks.len() != chunk_count {
+            return Ok(None);
+        }
+        scope.chunk_oids.extend(chunks);
+    }
+    let mut blob_stmt = conn.prepare("select pack_id from blobs where oid=?1")?;
+    for blob_oid in &scope.blob_oids {
+        if let Some(pack_id) = blob_stmt
+            .query_row(params![blob_oid], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten()
+        {
+            scope.pack_ids.insert(pack_id);
+        }
     }
     Ok(Some(scope))
 }

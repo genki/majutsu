@@ -8287,6 +8287,21 @@ fn fsck_since_limits_heavy_checks_to_recent_snapshots() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        let indexed: i64 = conn
+            .query_row("select count(*) from snapshot_payload_index", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let payloads: i64 = conn
+            .query_row("select count(*) from snapshot_payloads", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 2);
+        assert_eq!(payloads, 2);
+    }
     let since: String = {
         let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
         conn.query_row(

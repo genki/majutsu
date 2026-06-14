@@ -14,6 +14,9 @@ pub const REFS_TABLE: &str = "refs";
 pub const PACKS_TABLE: &str = "packs";
 pub const LARGE_PINS_TABLE: &str = "large_pins";
 pub const REMOTE_REFS_TABLE: &str = "remote_refs";
+pub const SNAPSHOT_PAYLOAD_INDEX_TABLE: &str = "snapshot_payload_index";
+pub const SNAPSHOT_PAYLOADS_TABLE: &str = "snapshot_payloads";
+pub const LARGE_OBJECT_CHUNKS_TABLE: &str = "large_object_chunks";
 
 pub const SCHEMA_SQL: &str = "
 create table if not exists roots(id text primary key, data_json text not null);
@@ -51,6 +54,21 @@ create table if not exists remote_refs(
   observed_at text not null,
   primary key(remote, name)
 );
+create table if not exists snapshot_payload_index(
+  snapshot_id text primary key,
+  indexed_at text not null
+);
+create table if not exists snapshot_payloads(
+  snapshot_id text not null,
+  kind text not null,
+  oid text not null,
+  primary key(snapshot_id, kind, oid)
+);
+create table if not exists large_object_chunks(
+  large_oid text not null,
+  chunk_oid text not null,
+  primary key(large_oid, chunk_oid)
+);
 ";
 
 pub const COMPAT_MIGRATIONS: &[&str] = &[
@@ -62,6 +80,9 @@ pub const COMPAT_MIGRATIONS: &[&str] = &[
     "alter table operations add column status text not null default 'done'",
     "alter table operations add column error text",
     "alter table operations add column remote_sync_state text",
+    "create table if not exists snapshot_payload_index(snapshot_id text primary key, indexed_at text not null)",
+    "create table if not exists snapshot_payloads(snapshot_id text not null, kind text not null, oid text not null, primary key(snapshot_id, kind, oid))",
+    "create table if not exists large_object_chunks(large_oid text not null, chunk_oid text not null, primary key(large_oid, chunk_oid))",
 ];
 
 pub fn schema_sql() -> &'static str {
@@ -498,6 +519,9 @@ mod tests {
             LARGE_PINS_TABLE,
             REFS_TABLE,
             REMOTE_REFS_TABLE,
+            SNAPSHOT_PAYLOAD_INDEX_TABLE,
+            SNAPSHOT_PAYLOADS_TABLE,
+            LARGE_OBJECT_CHUNKS_TABLE,
         ] {
             assert!(
                 SCHEMA_SQL.contains(&format!("create table if not exists {table}")),

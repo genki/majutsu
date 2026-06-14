@@ -7,7 +7,7 @@ use majutsu_core::{
     MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
     RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
     history_graph_issues, metadata_reference_issues, operation_log_comparison_issues,
-    operation_log_entry_matches, payload_large_ref, snapshot_export_matches,
+    operation_log_entry_matches, payload_blob_ref, payload_large_ref, snapshot_export_matches,
     snapshot_manifest_matches, tree_manifest_issues,
 };
 use majutsu_crypto::EncryptionMode;
@@ -537,6 +537,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         Some(&manifest.snapshot_id),
         args.message.as_deref(),
     )?;
+    insert_snapshot_payload_index(&tx, &manifest)?;
     branch_runtime::update_active_branch_head(&tx, &snapshot_id)?;
     tx.commit()?;
     println!("snapshot {}", manifest.snapshot_id);
@@ -2577,6 +2578,7 @@ fn store_large_file_buffered(
         "insert or replace into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
         params![oid, bytes.len() as u64, manifest.chunks.len(), manifest_key],
     )?;
+    insert_large_object_chunk_index(&conn, &manifest)?;
     Ok((oid, manifest_key, manifest.chunks.len()))
 }
 
@@ -2671,6 +2673,7 @@ fn store_large_file_fixed_streaming_once(
         "insert or replace into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
         params![oid, manifest.size, manifest.chunks.len(), manifest_key],
     )?;
+    insert_large_object_chunk_index(&conn, &manifest)?;
     Ok((oid, manifest_key, manifest.chunks.len()))
 }
 
@@ -2729,10 +2732,46 @@ fn existing_large_object_manifest(
     }
     let manifest: LargeManifest = serde_json::from_slice(&read_object(paths, &manifest_key)?)?;
     if manifest.chunking == config.default_chunking && manifest.chunk_size == config.chunk_size {
+        insert_large_object_chunk_index(conn, &manifest)?;
         Ok(Some((manifest_key, chunk_count)))
     } else {
         Ok(None)
     }
+}
+
+fn insert_large_object_chunk_index(conn: &Connection, manifest: &LargeManifest) -> Result<()> {
+    for chunk in &manifest.chunks {
+        conn.execute(
+            "insert or ignore into large_object_chunks(large_oid, chunk_oid) values (?1, ?2)",
+            params![manifest.oid, chunk.oid],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_snapshot_payload_index(conn: &Connection, manifest: &SnapshotManifest) -> Result<()> {
+    conn.execute(
+        "delete from snapshot_payloads where snapshot_id=?1",
+        params![manifest.snapshot_id],
+    )?;
+    for record in manifest.roots.values().flatten() {
+        if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+            conn.execute(
+                "insert or ignore into snapshot_payloads(snapshot_id, kind, oid) values (?1, 'blob', ?2)",
+                params![manifest.snapshot_id, oid],
+            )?;
+        } else if let Some((oid, _, _)) = payload_large_ref(&record.payload) {
+            conn.execute(
+                "insert or ignore into snapshot_payloads(snapshot_id, kind, oid) values (?1, 'large', ?2)",
+                params![manifest.snapshot_id, oid],
+            )?;
+        }
+    }
+    conn.execute(
+        "insert or replace into snapshot_payload_index(snapshot_id, indexed_at) values (?1, ?2)",
+        params![manifest.snapshot_id, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
 }
 
 fn compress_large_chunk(

@@ -1786,7 +1786,7 @@ struct RemoteHeadStatus {
 impl RemoteHeadStatus {
     fn label(&self) -> &str {
         if self.synced {
-            "synced"
+            "synced (cached)"
         } else {
             self.detail.as_str()
         }
@@ -1846,9 +1846,9 @@ fn read_remote_head_status(
     let synced = current.is_some() && current.map(str::to_string) == remote_current;
     let detail = match (current, remote_current.as_deref()) {
         (Some(_), Some(_)) if synced => "synced".into(),
-        (Some(_), Some(_)) => "lagging".into(),
-        (Some(_), None) => "not synced".into(),
-        (None, Some(_)) => "remote only".into(),
+        (Some(_), Some(_)) => "lagging (cached)".into(),
+        (Some(_), None) => "not synced (cached)".into(),
+        (None, Some(_)) => "remote only (cached)".into(),
         (None, None) => "no snapshot".into(),
     };
     Ok(RemoteHeadStatus {
