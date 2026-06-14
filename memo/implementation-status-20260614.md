@@ -260,3 +260,39 @@ removed_metadata_cache_bytes 798951793
 
 - subtree reuse / 差分 tree 表現は未実装。ただし、現実に問題になっていた local tree metadata の二重保持は metadata cache prune で解消した。
 - full `mj fsck` は metadata prune 後に remote hydrate を行うため、監査時には時間と通信が発生する。日次確認は `mj fsck --quick` を使う。
+
+## 再確認 2026-06-14 build 22
+
+`../majutsu` は `main` / `origin/main` ともに `6a2163062e2f1a77f95c3c8ae46427349e786081` を指し、作業ツリーは clean。
+installed CLI は `mj 0.3.0+build.22`。
+
+検証:
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --locked
+mj fsck --home /home/vagrant/.majutsu --quick
+```
+
+いずれも成功した。
+
+実環境 `/home/vagrant/.majutsu`:
+
+- current snapshot: `snap-b18528a0-090c-4af5-a00f-79b60a984200`
+- `local_current` と `remote_current` は一致。
+- daemon は running、IPC ok。
+- pending journal は 0。
+- queued uploads は 0。
+- remote は GCS S3 互換 backend の encrypted prefix。
+- state usage は約 35.0 MiB。
+- tree manifest local cache は 0 B。
+
+現時点では daemon 稼働、remote 同期、quick fsck、local cache 削減はいずれも正常。
+
+### 残る改善候補
+
+1. `mj status --no-pager` が未対応。自動化や採取時には `MJ_PAGER=cat` などで回避できるが、CLI として明示オプションがある方が自然。
+2. トップレベル `mj --help` は改善済みだが、`mj daemon --help` など一部サブコマンド配下の説明が薄い。
+3. full `mj fsck` は metadata prune 後に remote hydrate を伴う可能性がある。大規模 root 向けには `--sample` / `--since` / phase 別対象件数などの追加余地がある。
+4. `cache prune --metadata` はローカル二重保持を解消するが、snapshot ごとの tree manifest 生成量そのものは減らしていない。remote 長期効率と deep fsck コストをさらに詰めるなら、content-addressed subtree reuse や差分 tree 表現を検討する。
+5. 過去にローカル HTTP mock テストが 1 回だけ connection reset / close で失敗し、単独再実行と全体再実行では成功している。再現していないが flaky 予防として mock server の待受開始・接続終了条件を点検対象に残す。
