@@ -14836,7 +14836,10 @@ fn sync_reuploads_compacted_snapshot_manifest_payloads() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync");
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_LOCAL_METADATA_CACHE_PRUNE", "0");
         c
     });
 
