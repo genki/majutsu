@@ -508,3 +508,68 @@ cargo test --workspace --all-targets --locked
 ```
 
 全て成功。
+
+## 実装状況再確認 2026-06-14 build 25
+
+確認した状態:
+
+- repository: `main` / `14cb8d7 Improve status storage and event journal operations`
+- 作業ツリー: clean
+- installed CLI: `mj 0.3.0+build.25`
+- daemon: running、IPC ok。
+- active roots: 6。
+- pending journal: 0。
+- queued uploads: 0。
+- `local_current` と `remote_current` は一致。
+- sync lock: なし。
+- `mj fsck --home /home/vagrant/.majutsu --quick`: 成功、約 9 秒。
+- `mj fsck --home /home/vagrant/.majutsu --since '24h ago' --sample 10 --timeout-secs 60 --progress`: 成功、約 20 秒。
+- `mj status` で `Remote head synced`、storage apparent/disk、event journal removable が表示されることを確認。
+- `mj event stat` / `mj event compact --dry-run` が動作することを確認。
+
+観測値:
+
+| 項目 | 値 |
+| --- | ---: |
+| snapshots | 1489 |
+| operations | 2996 |
+| logical blobs | 785.2 MiB |
+| large objects | 739.4 MiB |
+| chunks | 812.6 MiB |
+| state apparent size | 85.3 MiB |
+| state disk usage | 89.7 MiB |
+| objects apparent size | 64.7 MiB |
+| objects disk usage | 68.7 MiB |
+| tree metadata apparent size | 50.3 MiB |
+| queue apparent size | 19.9 KiB |
+| queue disk usage | 348.0 KiB |
+| event journal records | 87 |
+| event journal removable | 84 |
+| upload queue | 0 |
+
+追加で `mj cache stat --metadata` を確認したところ、metadata cache candidates は 28 件 / 52,695,289 B
+だった。つまり build 25 の event journal compact と status 表示改善は有効だが、scoped fsck や
+daemon snapshot 後に tree metadata cache が再び数十 MiB 規模へ増える状態は残っている。
+
+現時点の評価:
+
+- データ保全の観点では、daemon 稼働、remote head 同期、upload queue 0、quick/scoped fsck 成功により正常。
+- build 25 により、remote head の同期状態と actual disk usage は通常 status で確認しやすくなった。
+- 一方で、local metadata cache の再増加と event journal removable の蓄積は、手動 prune/compact に頼る運用要素として残っている。
+
+残る改善候補:
+
+1. metadata cache の自動 prune 方針を追加する。
+   - `cache prune --metadata` は手動では有効だが、scoped fsck や通常 snapshot 後に tree metadata が再増加する。
+   - sync 完了後や fsck 完了後に synced metadata cache を best-effort prune する、または上限サイズを設定する余地がある。
+2. `fsck --since` が tree manifest を hydrate し、その後の local state を増やす点を抑える。
+   - 検査に必要な tree manifest を temporary cache として扱い、成功後に自動削除する設計を検討する。
+   - あるいは snapshot から到達する payload set を DB/index に持ち、scope 構築時に tree manifest の full hydrate を避ける。
+3. event journal compact の定期化または `cache prune` への統合。
+   - build 25 で `mj event compact` は追加済みだが、短時間でも removable が再蓄積する。
+   - daemon snapshot 後の自動 compact 閾値、または `mj cache prune --events` のような運用導線を検討する。
+4. `Remote head synced` は cached remote refs に基づくため、remote 実体の完全確認とは別であることをさらに表示する。
+   - deep object availability は `mj sync status --deep` や `mj remote fsck --objects` の担当。
+   - status 上に `quick` / `cached` の明示を加えると誤解を減らせる。
+5. subtree reuse / 差分 tree 表現は引き続き未実装。
+   - tree metadata の長期増加を根本的に抑えるには、同一 subtree の再利用や差分 tree 表現が必要。
