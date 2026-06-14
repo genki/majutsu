@@ -95,6 +95,8 @@ pub(crate) struct FsckOptions {
     progress: bool,
     sample: Option<usize>,
     since: Option<String>,
+    backfill_index: bool,
+    hydrate_index_objects: bool,
     deadline: Option<Instant>,
     started: Instant,
 }
@@ -107,6 +109,8 @@ impl FsckOptions {
             progress: args.progress,
             sample: args.sample,
             since: args.since.map(|since| parse_time(&since)).transpose()?,
+            backfill_index: args.backfill_index,
+            hydrate_index_objects: args.hydrate_index_objects,
             deadline: args
                 .timeout_secs
                 .map(|timeout| Instant::now() + Duration::from_secs(timeout)),
@@ -232,6 +236,10 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
     let config = read_config(paths)?;
     options.phase("export-metadata")?;
     let export = export_metadata(paths, &conn, &config)?;
+    if options.backfill_index {
+        backfill_snapshot_payload_indexes(paths, &conn, &export, &options)?;
+        return Ok(());
+    }
     let payload_cache_keys = payload_cache_key_set(&export);
     let scope = if !options.quick {
         build_fsck_scope(paths, &conn, &export, &options)?
@@ -433,6 +441,178 @@ fn fsck_metadata_cache_prune_enabled() -> bool {
     std::env::var("MAJUTSU_FSCK_PRUNE_METADATA_CACHE")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
         .unwrap_or(true)
+}
+
+#[derive(Default)]
+struct PayloadIndexBackfillStats {
+    selected_snapshots: usize,
+    indexed_snapshots: usize,
+    skipped_indexed_snapshots: usize,
+    skipped_missing_local_snapshots: usize,
+    indexed_large_manifests: usize,
+    skipped_large_manifests: usize,
+    skipped_missing_local_large_manifests: usize,
+}
+
+fn backfill_snapshot_payload_indexes(
+    paths: &Paths,
+    conn: &Connection,
+    export: &crate::MetadataExport,
+    options: &FsckOptions,
+) -> Result<()> {
+    options.phase("backfill-index")?;
+    let since = options.since.as_deref().map(parse_db_time).transpose()?;
+    let mut snapshots = Vec::new();
+    for snapshot in &export.snapshots {
+        let created_at = parse_db_time(&snapshot.created_at)?;
+        if since.as_ref().is_none_or(|since| created_at >= *since) {
+            snapshots.push((created_at, snapshot));
+        }
+    }
+    snapshots.sort_by_key(|snapshot| Reverse(snapshot.0));
+
+    let mut stats = PayloadIndexBackfillStats::default();
+    let mut large_oids = BTreeSet::new();
+    let mut indexed_stmt =
+        conn.prepare("select 1 from snapshot_payload_index where snapshot_id=?1")?;
+    let mut payload_stmt =
+        conn.prepare("select oid from snapshot_payloads where snapshot_id=?1 and kind='large'")?;
+
+    for (_, snapshot) in snapshots {
+        if indexed_stmt
+            .query_row(params![snapshot.id], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            stats.skipped_indexed_snapshots += 1;
+            let rows =
+                payload_stmt.query_map(params![snapshot.id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                large_oids.insert(row?);
+            }
+            continue;
+        }
+
+        if !options.within_sample("backfill-index", stats.selected_snapshots, None)? {
+            break;
+        }
+        stats.selected_snapshots += 1;
+        options.tick("backfill-index", stats.selected_snapshots, None)?;
+
+        let Some(manifest) =
+            snapshot_manifest_for_index_backfill(paths, snapshot, options.hydrate_index_objects)?
+        else {
+            stats.skipped_missing_local_snapshots += 1;
+            continue;
+        };
+        persist_snapshot_payload_index(conn, &manifest)?;
+        stats.indexed_snapshots += 1;
+        for record in manifest.roots.values().flatten() {
+            if let Some((oid, _, _)) = payload_large_ref(&record.payload) {
+                large_oids.insert(oid.to_string());
+            }
+        }
+    }
+
+    let mut chunk_count_stmt =
+        conn.prepare("select count(*) from large_object_chunks where large_oid=?1")?;
+    for large in &export.large_objects {
+        if !large_oids.contains(&large.oid) {
+            continue;
+        }
+        options.check_timeout()?;
+        let indexed_chunks = chunk_count_stmt
+            .query_row(params![large.oid], |row| row.get::<_, usize>(0))
+            .optional()?
+            .unwrap_or(0);
+        if indexed_chunks == large.chunk_count {
+            stats.skipped_large_manifests += 1;
+            continue;
+        }
+        let manifest = if options.hydrate_index_objects {
+            Some(
+                read_object(paths, &large.manifest_key)
+                    .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?,
+            )
+        } else {
+            read_local_object_if_present(paths, &large.manifest_key)?
+                .map(|bytes| serde_json::from_slice(&bytes))
+                .transpose()?
+        };
+        let Some(manifest) = manifest else {
+            stats.skipped_missing_local_large_manifests += 1;
+            continue;
+        };
+        persist_large_object_chunk_index(conn, &manifest)?;
+        stats.indexed_large_manifests += 1;
+    }
+
+    println!(
+        "backfill_index_selected_snapshots {}",
+        stats.selected_snapshots
+    );
+    println!("backfill_indexed_snapshots {}", stats.indexed_snapshots);
+    println!(
+        "backfill_skipped_indexed_snapshots {}",
+        stats.skipped_indexed_snapshots
+    );
+    println!(
+        "backfill_skipped_missing_local_snapshots {}",
+        stats.skipped_missing_local_snapshots
+    );
+    println!(
+        "backfill_indexed_large_manifests {}",
+        stats.indexed_large_manifests
+    );
+    println!(
+        "backfill_skipped_large_manifests {}",
+        stats.skipped_large_manifests
+    );
+    println!(
+        "backfill_skipped_missing_local_large_manifests {}",
+        stats.skipped_missing_local_large_manifests
+    );
+    println!("backfill index ok");
+    Ok(())
+}
+
+fn snapshot_manifest_for_index_backfill(
+    paths: &Paths,
+    snapshot: &SnapshotExport,
+    hydrate_missing: bool,
+) -> Result<Option<SnapshotManifest>> {
+    if hydrate_missing {
+        return crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &snapshot.id,
+            &snapshot.manifest_key,
+            &snapshot.manifest_json,
+        )
+        .map(Some);
+    }
+    let manifest = if !snapshot.manifest_json.trim().is_empty() {
+        serde_json::from_str::<SnapshotManifest>(&snapshot.manifest_json)
+            .with_context(|| format!("parse snapshot manifest metadata {}", snapshot.id))?
+    } else {
+        let Some(bytes) = read_local_object_if_present(paths, &snapshot.manifest_key)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice::<SnapshotManifest>(&bytes)
+            .with_context(|| format!("parse snapshot manifest object {}", snapshot.manifest_key))?
+    };
+    if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
+        return Ok(Some(manifest));
+    }
+    Ok(None)
+}
+
+fn read_local_object_if_present(paths: &Paths, key: &str) -> Result<Option<Vec<u8>>> {
+    let path = paths.home.join(key);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    decode_object(paths, &bytes).map(Some)
 }
 
 fn build_fsck_scope(
@@ -816,7 +996,12 @@ fn validate_large_payloads(
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     let mut checked = 0usize;
+    let mut checked_chunks = 0usize;
+    let mut chunk_sample_exhausted = false;
     for row in rows {
+        if chunk_sample_exhausted {
+            break;
+        }
         let (oid, manifest_key) = row?;
         if context
             .scope
@@ -837,6 +1022,24 @@ fn validate_large_payloads(
         {
             Ok(manifest) => {
                 for chunk in &manifest.chunks {
+                    context.options.check_timeout()?;
+                    if context
+                        .options
+                        .sample
+                        .is_some_and(|sample| checked_chunks >= sample)
+                    {
+                        chunk_sample_exhausted = true;
+                        if context.options.progress {
+                            eprintln!(
+                                "fsck progress phase=large-chunks sampled={} elapsed_secs={}",
+                                checked_chunks,
+                                context.options.started.elapsed().as_secs()
+                            );
+                        }
+                        break;
+                    }
+                    checked_chunks += 1;
+                    context.options.tick("large-chunks", checked_chunks, None)?;
                     if !paths.home.join(&chunk.object_key).exists()
                         && payload_cache_available_remotely(context, &chunk.object_key)?
                     {

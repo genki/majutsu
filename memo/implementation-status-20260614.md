@@ -865,3 +865,51 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
   large chunk 単位の sample 上限を別途追加する余地がある。
 - `snapshot_payload_index` の全履歴backfillコマンドは未実装。
 - subtree reuse / 差分tree表現は未実装。
+
+## 残改善実施 2026-06-14 build 31
+
+実施:
+
+- `BUILD_NUMBER` 31。
+- `mj fsck --sample` を large object 内の chunk 検査にも適用した。
+  - build 30 では large object 件数にだけ sample が効き、1つの large object が多数 chunk を持つと
+    `large-payloads sampled=10` でも時間が伸びていた。
+  - build 31 では `large-chunks sampled=N` で chunk 検査も打ち切る。
+- `mj fsck --backfill-index` を追加した。
+  - scoped fsck が使う `snapshot_payload_index` / `snapshot_payloads` を補完する。
+  - 通常は remote hydrate や巨大 compact tree manifest 展開を避け、短時間に戻る。
+  - missing metadata も含めて深く補完する場合は `--hydrate-index-objects` を明示する。
+- `docs/OPERATIONS.md` に large chunk sample と index backfill の運用を追記した。
+
+検証:
+
+- `cargo test --test remote_file fsck_backfill_index_rebuilds_missing_payload_index --locked` 成功。
+- `cargo test --test remote_file fsck_since_limits_heavy_checks_to_recent_snapshots --locked` 成功。
+- 実環境 debug binary で `mj fsck --since '24h ago' --sample 10 --timeout-secs 90 --progress` が
+  27.5秒で成功。
+  - build 30 release binary の同条件は約63秒。
+  - `large-chunks sampled=10` を確認。
+- 実環境 debug binary で `mj fsck --backfill-index --since '24h ago' --sample 2 --timeout-secs 30 --progress`
+  が短時間で戻ることを確認。
+  - remote hydrate が必要な古い compact snapshot は `backfill_skipped_missing_local_snapshots` として skip。
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+
+実環境反映:
+
+- installed CLI: `mj 0.3.0+build.31`
+- daemon restart 済み、PID `3430326`、IPC ok。
+- `mj sync --wait --timeout-secs 300` 成功。
+- `local_current == remote_current == snap-17dbae62-568f-438f-9841-185abd36f1ab`
+- queued uploads 0、sync lockなし。
+- release binary で `mj fsck --since '24h ago' --sample 10 --timeout-secs 90 --progress` が
+  17.1秒で成功。
+- release binary で `mj fsck --backfill-index --since '24h ago' --sample 2 --timeout-secs 30 --progress`
+  が短時間で成功。
+
+残り:
+
+- full `mj fsck --deep` の remote LIST は request timeout 依存。全履歴監査では意図的に時間枠を取る。
+- `mj fsck --backfill-index --hydrate-index-objects` は巨大 tree manifest を読むためメンテナンス用途。
+- subtree reuse / 差分tree表現は未実装。

@@ -121,6 +121,16 @@ GCS backend 全体の listing latency に引きずられにくい。
 `--since` と `--sample` を併用する場合、対象 snapshot は新しい順に選び、scope 構築に
 payload index を使う。scoped sample では深い snapshot / large / pack manifest object 検査を
 省略し、直近 payload availability の smoke を優先する。
+large object は object 件数だけでなく chunk 検査件数にも `--sample` を適用する。
+
+古い snapshot の payload index を補完する場合は `--backfill-index` を使う。通常は
+ローカルに残っている inline metadata のみを処理し、compact tree manifest の展開や remote hydrate は
+行わない。missing metadata も含めて補完したいメンテナンス時だけ `--hydrate-index-objects` を明示する。
+
+```sh
+mj fsck --backfill-index --since "24h ago" --sample 100 --progress
+mj fsck --backfill-index --hydrate-index-objects --timeout-secs 600 --progress
+```
 
 ## daemon recovery
 

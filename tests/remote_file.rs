@@ -8252,6 +8252,71 @@ fn fsck_quick_and_timeout_are_available() {
 }
 
 #[test]
+fn fsck_backfill_index_rebuilds_missing_payload_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.execute("delete from snapshot_payloads", []).unwrap();
+        conn.execute("delete from snapshot_payload_index", [])
+            .unwrap();
+    }
+
+    let backfill = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("fsck")
+            .arg("--backfill-index")
+            .arg("--hydrate-index-objects")
+            .arg("--sample")
+            .arg("1");
+        c
+    });
+    assert!(backfill.contains("backfill_indexed_snapshots 1"));
+    assert!(backfill.contains("backfill index ok"));
+    {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        let indexed: i64 = conn
+            .query_row("select count(*) from snapshot_payload_index", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let payloads: i64 = conn
+            .query_row("select count(*) from snapshot_payloads", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 1);
+        assert_eq!(payloads, 1);
+    }
+}
+
+#[test]
 fn fsck_since_limits_heavy_checks_to_recent_snapshots() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

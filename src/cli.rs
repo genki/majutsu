@@ -1022,6 +1022,19 @@ pub(crate) struct FsckArgs {
         help = "In full checks, inspect heavy payload and manifest phases only for snapshots at or after this time"
     )]
     pub(crate) since: Option<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Backfill local snapshot payload indexes used by scoped fsck, then exit"
+    )]
+    pub(crate) backfill_index: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "backfill_index",
+        help = "Allow index backfill to hydrate missing metadata objects from the remote"
+    )]
+    pub(crate) hydrate_index_objects: bool,
 }
 
 #[derive(Subcommand)]
