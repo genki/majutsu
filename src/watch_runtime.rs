@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
-use crate::daemon_runtime::{start_daemon_ipc, start_watch_daemon};
+use crate::daemon_runtime::{WatchDaemonLaunchConfig, start_daemon_ipc, start_watch_daemon};
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{record_event, record_file_event, upload_queue_stats};
 use crate::root_state::roots;
@@ -37,14 +37,16 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     if !args.foreground {
         let pid = start_watch_daemon(
             paths,
-            backend,
-            &args.mode,
-            args.interval_secs,
-            args.debounce_ms,
-            args.settle_ms,
-            args.buffer_max_ms,
-            args.buffer_max_events,
-            args.periodic_rescan_secs,
+            WatchDaemonLaunchConfig {
+                backend,
+                mode: args.mode.clone(),
+                interval_secs: args.interval_secs,
+                debounce_ms: args.debounce_ms,
+                settle_ms: args.settle_ms,
+                buffer_max_ms: args.buffer_max_ms,
+                buffer_max_events: args.buffer_max_events,
+                periodic_rescan_secs: args.periodic_rescan_secs,
+            },
         )?;
         println!("started daemon pid {pid}");
         return Ok(());
@@ -532,47 +534,27 @@ fn drain_watch_event_buffer(
     let started = Instant::now();
     let mut last_event = started;
     let mut events = 1usize;
+    let context = WatchEventBufferContext {
+        paths,
+        rx,
+        config,
+        backend_label,
+        active_roots,
+    };
     loop {
         if events >= config.max_events {
-            return settle_before_flush(
-                paths,
-                rx,
-                config,
-                backend_label,
-                active_roots,
-                started,
-                events,
-                "max-events",
-            );
+            return settle_before_flush(&context, started, events, "max-events");
         }
         let elapsed = started.elapsed();
         if elapsed >= config.max_latency {
-            return settle_before_flush(
-                paths,
-                rx,
-                config,
-                backend_label,
-                active_roots,
-                started,
-                events,
-                "max-latency",
-            );
+            return settle_before_flush(&context, started, events, "max-latency");
         }
         let quiet_remaining = config
             .quiet
             .checked_sub(last_event.elapsed())
             .unwrap_or(Duration::ZERO);
         if quiet_remaining.is_zero() {
-            return settle_before_flush(
-                paths,
-                rx,
-                config,
-                backend_label,
-                active_roots,
-                started,
-                events,
-                "quiet",
-            );
+            return settle_before_flush(&context, started, events, "quiet");
         }
         let max_remaining = config.max_latency.saturating_sub(elapsed);
         let timeout = quiet_remaining
@@ -598,32 +580,32 @@ fn drain_watch_event_buffer(
                 } else {
                     "quiet"
                 };
-                return settle_before_flush(
-                    paths,
-                    rx,
-                    config,
-                    backend_label,
-                    active_roots,
-                    started,
-                    events,
-                    reason,
-                );
+                return settle_before_flush(&context, started, events, reason);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
         }
     }
 }
 
-fn settle_before_flush(
-    paths: &Paths,
-    rx: &mpsc::Receiver<notify::Result<notify::Event>>,
+struct WatchEventBufferContext<'a> {
+    paths: &'a Paths,
+    rx: &'a mpsc::Receiver<notify::Result<notify::Event>>,
     config: WatchEventBufferConfig,
-    backend_label: &str,
-    active_roots: &[RootConfig],
+    backend_label: &'a str,
+    active_roots: &'a [RootConfig],
+}
+
+fn settle_before_flush(
+    context: &WatchEventBufferContext<'_>,
     started: Instant,
     mut events: usize,
     reason: &'static str,
 ) -> Result<WatchEventBufferOutcome> {
+    let paths = context.paths;
+    let rx = context.rx;
+    let config = context.config;
+    let backend_label = context.backend_label;
+    let active_roots = context.active_roots;
     if !config.settle.is_zero() && reason == "quiet" {
         record_event(
             paths,

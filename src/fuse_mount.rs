@@ -26,7 +26,7 @@ const FUSE_TTL: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 enum FuseNodeKind {
     Directory { children: BTreeMap<OsString, u64> },
-    File { record: FileRecord },
+    File { record: Box<FileRecord> },
     Symlink { target: String },
 }
 
@@ -103,10 +103,10 @@ impl MajutsuFuseFs {
                     target: target.clone(),
                 },
                 Payload::Special { .. } => FuseNodeKind::File {
-                    record: record.clone(),
+                    record: Box::new(record.clone()),
                 },
                 _ => FuseNodeKind::File {
-                    record: record.clone(),
+                    record: Box::new(record.clone()),
                 },
             };
             let file_type = fuse_record_file_type(record, &kind);

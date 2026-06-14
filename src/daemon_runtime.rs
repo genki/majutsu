@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow, bail};
+use chrono::Utc;
 use majutsu_daemon::{DaemonServiceConfig, render_daemon_service};
 use majutsu_restore::RestoreQueueItem;
 use std::collections::BTreeMap;
@@ -29,6 +30,8 @@ struct DaemonStats {
     processed_journal_events: usize,
     pending_journal_event_count: usize,
     pending_journal_events: bool,
+    pending_journal_state: String,
+    pending_journal_oldest_age_secs: u64,
     queued_uploads: usize,
     queued_uploads_retrying: usize,
     queued_uploads_delayed: usize,
@@ -95,14 +98,17 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             validate_watch_mode(&mode)?;
             let pid = start_watch_daemon(
                 paths,
-                backend,
-                &mode,
-                interval_secs.unwrap_or(config.watch.interval),
-                debounce_ms.unwrap_or(config.watch.debounce),
-                settle_ms.unwrap_or(config.watch.settle),
-                buffer_max_ms.unwrap_or(config.watch.buffer_max),
-                buffer_max_events.unwrap_or(config.watch.buffer_max_events),
-                periodic_rescan_secs.unwrap_or(config.watch.periodic_rescan),
+                WatchDaemonLaunchConfig {
+                    backend,
+                    mode,
+                    interval_secs: interval_secs.unwrap_or(config.watch.interval),
+                    debounce_ms: debounce_ms.unwrap_or(config.watch.debounce),
+                    settle_ms: settle_ms.unwrap_or(config.watch.settle),
+                    buffer_max_ms: buffer_max_ms.unwrap_or(config.watch.buffer_max),
+                    buffer_max_events: buffer_max_events.unwrap_or(config.watch.buffer_max_events),
+                    periodic_rescan_secs: periodic_rescan_secs
+                        .unwrap_or(config.watch.periodic_rescan),
+                },
             )?;
             println!("started daemon pid {pid}");
         }
@@ -216,14 +222,16 @@ pub(crate) fn ensure_daemon_running(paths: &Paths) -> Result<Option<u32>> {
     validate_watch_mode(&config.watch.mode)?;
     start_watch_daemon(
         paths,
-        backend,
-        &config.watch.mode,
-        config.watch.interval,
-        config.watch.debounce,
-        config.watch.settle,
-        config.watch.buffer_max,
-        config.watch.buffer_max_events,
-        config.watch.periodic_rescan,
+        WatchDaemonLaunchConfig {
+            backend,
+            mode: config.watch.mode.clone(),
+            interval_secs: config.watch.interval,
+            debounce_ms: config.watch.debounce,
+            settle_ms: config.watch.settle,
+            buffer_max_ms: config.watch.buffer_max,
+            buffer_max_events: config.watch.buffer_max_events,
+            periodic_rescan_secs: config.watch.periodic_rescan,
+        },
     )
     .map(Some)
 }
@@ -246,17 +254,18 @@ fn auto_daemon_enabled() -> bool {
         .unwrap_or(true)
 }
 
-pub(crate) fn start_watch_daemon(
-    paths: &Paths,
-    backend: &str,
-    mode: &str,
-    interval_secs: u64,
-    debounce_ms: u64,
-    settle_ms: u64,
-    buffer_max_ms: u64,
-    buffer_max_events: usize,
-    periodic_rescan_secs: u64,
-) -> Result<u32> {
+pub(crate) struct WatchDaemonLaunchConfig {
+    pub(crate) backend: &'static str,
+    pub(crate) mode: String,
+    pub(crate) interval_secs: u64,
+    pub(crate) debounce_ms: u64,
+    pub(crate) settle_ms: u64,
+    pub(crate) buffer_max_ms: u64,
+    pub(crate) buffer_max_events: usize,
+    pub(crate) periodic_rescan_secs: u64,
+}
+
+pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig) -> Result<u32> {
     if let Some(pid) = read_pid(&paths.daemon_pid)?
         && pid_alive(pid)
     {
@@ -276,21 +285,21 @@ pub(crate) fn start_watch_daemon(
         .arg("--foreground")
         .arg("true")
         .arg("--backend")
-        .arg(backend)
+        .arg(config.backend)
         .arg("--mode")
-        .arg(mode)
+        .arg(&config.mode)
         .arg("--interval-secs")
-        .arg(interval_secs.to_string())
+        .arg(config.interval_secs.to_string())
         .arg("--debounce-ms")
-        .arg(debounce_ms.to_string())
+        .arg(config.debounce_ms.to_string())
         .arg("--settle-ms")
-        .arg(settle_ms.to_string())
+        .arg(config.settle_ms.to_string())
         .arg("--buffer-max-ms")
-        .arg(buffer_max_ms.to_string())
+        .arg(config.buffer_max_ms.to_string())
         .arg("--buffer-max-events")
-        .arg(buffer_max_events.to_string())
+        .arg(config.buffer_max_events.to_string())
         .arg("--periodic-rescan-secs")
-        .arg(periodic_rescan_secs.to_string())
+        .arg(config.periodic_rescan_secs.to_string())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
     for (key, value) in daemon_env(paths)? {
@@ -483,6 +492,16 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
                 "pending_journal_events {}",
                 stats.pending_journal_events
             )?;
+            writeln!(
+                stream,
+                "pending_journal_state {}",
+                stats.pending_journal_state
+            )?;
+            writeln!(
+                stream,
+                "pending_journal_oldest_age_secs {}",
+                stats.pending_journal_oldest_age_secs
+            )?;
             writeln!(stream, "queued_uploads {}", stats.queued_uploads)?;
             writeln!(
                 stream,
@@ -555,6 +574,11 @@ fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -
                 "majutsu_daemon_pending_journal_events {}",
                 bool_metric(stats.pending_journal_events)
             )?;
+            writeln!(
+                stream,
+                "majutsu_daemon_pending_journal_oldest_age_secs {}",
+                stats.pending_journal_oldest_age_secs
+            )?;
             writeln!(stream, "# TYPE majutsu_daemon_queued_uploads gauge")?;
             writeln!(
                 stream,
@@ -626,7 +650,7 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
         .filter(|event| event.is_snapshot_finish())
         .map(|event| event.observed_at)
         .max();
-    let pending_journal_event_count = journal_records
+    let pending_records = journal_records
         .iter()
         .filter(|event| {
             event.is_pending_trigger()
@@ -634,12 +658,24 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
                     .map(|finished_at| event.observed_at > finished_at)
                     .unwrap_or(true)
         })
-        .count();
+        .collect::<Vec<_>>();
+    let pending_journal_event_count = pending_records.len();
+    let pending_journal_oldest_age_secs = pending_records
+        .iter()
+        .map(|event| Utc::now().signed_duration_since(event.observed_at))
+        .filter_map(|duration| u64::try_from(duration.num_seconds().max(0)).ok())
+        .max()
+        .unwrap_or(0);
+    let upload_stats = upload_queue_stats(paths)?;
+    let pending_journal_state = pending_journal_state(
+        pending_journal_event_count,
+        pending_journal_oldest_age_secs,
+        upload_stats.total,
+    );
     let pending_journal_events = pending_journal_event_count > 0;
     let processed_journal_events = journal_records
         .len()
         .saturating_sub(pending_journal_event_count);
-    let upload_stats = upload_queue_stats(paths)?;
     let restore_statuses = restore_queue_status_counts(paths)?;
     let restore_jobs = restore_statuses
         .iter()
@@ -657,6 +693,8 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
         processed_journal_events,
         pending_journal_event_count,
         pending_journal_events,
+        pending_journal_state,
+        pending_journal_oldest_age_secs,
         queued_uploads: upload_stats.total,
         queued_uploads_retrying: upload_stats.retrying,
         queued_uploads_delayed: upload_stats.delayed,
@@ -671,6 +709,18 @@ fn daemon_stats(paths: &Paths) -> Result<DaemonStats> {
         root_statuses,
         restore_statuses,
     })
+}
+
+fn pending_journal_state(pending: usize, oldest_age_secs: u64, queued_uploads: usize) -> String {
+    if pending == 0 {
+        "clear".into()
+    } else if queued_uploads > 0 {
+        "syncing".into()
+    } else if oldest_age_secs >= 300 {
+        "stalled".into()
+    } else {
+        "processing".into()
+    }
 }
 
 fn self_proc_status_kib(name: &str) -> Option<u64> {

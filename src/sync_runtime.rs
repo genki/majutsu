@@ -31,7 +31,7 @@ use crate::object_paths::{
     canonical_alias_for_legacy_key, local_object_keys, prefer_s3_canonical_remote_only,
     remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
 };
-use crate::operation_log::{record_op_with_details, update_operation_result};
+use crate::operation_log::{OperationDetails, record_op_with_details, update_operation_result};
 use crate::pack_runtime::pack_cmd;
 use crate::process_runtime::{acquire_process_lock, process_lock_owner};
 use crate::queue_runtime::{
@@ -279,14 +279,16 @@ fn sync_configured_remote(
     let sync_op = new_id("op");
     record_op_with_details(
         conn,
-        &sync_op,
-        "remote-sync",
-        current.as_deref(),
-        current.as_deref(),
-        "running",
-        Some("pushed metadata and objects"),
-        None,
-        Some("queued"),
+        OperationDetails {
+            id: &sync_op,
+            kind: "remote-sync",
+            before: current.as_deref(),
+            after: current.as_deref(),
+            status: "running",
+            message: Some("pushed metadata and objects"),
+            error: None,
+            remote_sync_state: Some("queued"),
+        },
     )?;
     trace.mark("record sync op");
     let result = enqueue_and_drain_sync(paths, conn, config, remote, &trace);

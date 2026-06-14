@@ -42,19 +42,35 @@ pub(crate) fn record_op_with_id_and_status(
     status: &str,
     message: Option<&str>,
 ) -> Result<()> {
-    record_op_with_details(conn, id, kind, before, after, status, message, None, None)
+    record_op_with_details(
+        conn,
+        OperationDetails {
+            id,
+            kind,
+            before,
+            after,
+            status,
+            message,
+            error: None,
+            remote_sync_state: None,
+        },
+    )
+}
+
+pub(crate) struct OperationDetails<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) before: Option<&'a str>,
+    pub(crate) after: Option<&'a str>,
+    pub(crate) status: &'a str,
+    pub(crate) message: Option<&'a str>,
+    pub(crate) error: Option<&'a str>,
+    pub(crate) remote_sync_state: Option<&'a str>,
 }
 
 pub(crate) fn record_op_with_details(
     conn: &Connection,
-    id: &str,
-    kind: &str,
-    before: Option<&str>,
-    after: Option<&str>,
-    status: &str,
-    message: Option<&str>,
-    error: Option<&str>,
-    remote_sync_state: Option<&str>,
+    details: OperationDetails<'_>,
 ) -> Result<()> {
     let created_at = Utc::now().to_rfc3339();
     let parent_op = current_operation(conn)?;
@@ -63,31 +79,31 @@ pub(crate) fn record_op_with_details(
         "insert into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
-            id,
+            details.id,
             parent_op,
-            kind,
+            details.kind,
             actor,
-            status,
-            before,
-            after,
+            details.status,
+            details.before,
+            details.after,
             created_at,
-            message,
-            error,
-            remote_sync_state
+            details.message,
+            details.error,
+            details.remote_sync_state
         ],
     )?;
     let op = OperationExport {
-        id: id.to_string(),
+        id: details.id.to_string(),
         parent_op,
-        kind: kind.to_string(),
+        kind: details.kind.to_string(),
         actor,
-        status: status.to_string(),
-        before_snapshot: before.map(str::to_string),
-        after_snapshot: after.map(str::to_string),
+        status: details.status.to_string(),
+        before_snapshot: details.before.map(str::to_string),
+        after_snapshot: details.after.map(str::to_string),
         created_at,
-        message: message.map(str::to_string),
-        error: error.map(str::to_string),
-        remote_sync_state: remote_sync_state.map(str::to_string),
+        message: details.message.map(str::to_string),
+        error: details.error.map(str::to_string),
+        remote_sync_state: details.remote_sync_state.map(str::to_string),
     };
     append_local_oplog(conn, &op)?;
     append_operation_audit_log(conn, &op)?;

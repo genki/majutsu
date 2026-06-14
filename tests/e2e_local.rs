@@ -646,8 +646,27 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
         run_mj(&home, ["remote", "fsck", "--objects", "--parallelism", "4"]),
         "remote fsck objects after content loss",
     );
+    let dry_run = run_mj(
+        &home,
+        ["remote", "repair", "--dry-run", "--parallelism", "4"],
+    );
+    assert_success(dry_run, "remote repair dry-run");
+    let repair_session = home.join("cache/remote-repair-session.json");
+    assert!(
+        repair_session.exists(),
+        "repair dry-run must keep resumable session"
+    );
     let repair = run_mj(&home, ["remote", "repair", "--parallelism", "4"]);
+    let repair_stdout = String::from_utf8_lossy(&repair.stdout).to_string();
     assert_success(repair, "remote repair");
+    assert!(
+        repair_stdout.contains("resumed true"),
+        "repair must resume the dry-run session\n{repair_stdout}"
+    );
+    assert!(
+        !repair_session.exists(),
+        "completed repair must remove resumable session"
+    );
     assert_success(
         run_mj(&home, ["remote", "fsck", "--objects", "--parallelism", "4"]),
         "remote fsck objects after repair",

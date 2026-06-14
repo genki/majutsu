@@ -14,11 +14,13 @@ use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
-use crate::util::parse_db_time;
+use crate::util::{blake3_hex, parse_db_time};
 use crate::{
     decode_object, ensure_ready, export_metadata, open_db, remote_object_available, remote_ref,
 };
 use majutsu_store::canonical_remote_alias;
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -493,6 +495,9 @@ struct RemoteObjectScan {
     missing: Vec<String>,
     timed_out: bool,
     elapsed: Duration,
+    resumed: bool,
+    session_path: Option<PathBuf>,
+    session_fingerprint: Option<String>,
 }
 
 fn remote_fsck_objects(
@@ -627,6 +632,9 @@ fn scan_remote_object_availability(
             missing,
             timed_out,
             elapsed: start.elapsed(),
+            resumed: false,
+            session_path: None,
+            session_fingerprint: None,
         })
     })
 }
@@ -650,18 +658,24 @@ fn remote_repair(
     options: RemoteObjectScanOptions,
     dry_run: bool,
 ) -> Result<()> {
-    let keys = referenced_local_object_keys(paths)?;
-    let scan = scan_remote_object_availability(remote, keys, options)?;
+    let mut keys = referenced_local_object_keys(paths)?;
+    if let Some(sample) = options.sample {
+        keys.truncate(sample);
+    }
+    let scan = scan_remote_object_availability_for_repair(paths, remote, keys, options)?;
     let mut repaired = 0usize;
     let mut missing_local = 0usize;
+    let mut still_missing = BTreeSet::new();
     for key in &scan.missing {
         let Some((source, remote_key)) = repair_source_and_remote_key(paths, remote, key) else {
             missing_local += 1;
+            still_missing.insert(key.clone());
             eprintln!("cannot repair {key}: local object is missing");
             continue;
         };
         if dry_run {
             println!("repair_candidate {key} -> {remote_key}");
+            still_missing.insert(key.clone());
             continue;
         }
         if remote.put_file_if_absent(&remote_key, &source)? {
@@ -677,6 +691,30 @@ fn remote_repair(
             scan.checked, scan.total
         );
     }
+    if scan.resumed {
+        println!("resumed true");
+    }
+    if let Some(session_path) = &scan.session_path {
+        println!("session {}", session_path.display());
+        if scan.timed_out || missing_local > 0 || (dry_run && !scan.missing.is_empty()) {
+            save_repair_session(
+                session_path,
+                &RepairSession {
+                    version: 1,
+                    key_fingerprint: scan
+                        .session_fingerprint
+                        .clone()
+                        .unwrap_or_else(|| remote.describe()),
+                    next_index: scan.checked,
+                    missing: still_missing.into_iter().collect(),
+                    total: scan.total,
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+            )?;
+        } else {
+            let _ = fs::remove_file(session_path);
+        }
+    }
     println!("remote repair complete");
     println!("checked_objects {}", scan.checked);
     println!("total_objects {}", scan.total);
@@ -690,6 +728,139 @@ fn remote_repair(
         );
     }
     Ok(())
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct RepairSession {
+    version: u32,
+    key_fingerprint: String,
+    next_index: usize,
+    missing: Vec<String>,
+    total: usize,
+    updated_at: String,
+}
+
+fn scan_remote_object_availability_for_repair(
+    paths: &Paths,
+    remote: &RemoteStore,
+    keys: Vec<String>,
+    options: RemoteObjectScanOptions,
+) -> Result<RemoteObjectScan> {
+    if !remote.exists(REMOTE_HOST_INDEX_KEY)? && !remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
+        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    }
+    let total = keys.len();
+    let start = Instant::now();
+    let deadline = options.timeout.map(|timeout| start + timeout);
+    let parallelism = options.parallelism.clamp(1, 128).min(total.max(1));
+    let session_path = repair_session_path(paths);
+    let fingerprint = repair_key_fingerprint(&keys, remote, options);
+    let mut session = load_repair_session(&session_path)?
+        .filter(|session| session.version == 1 && session.key_fingerprint == fingerprint)
+        .unwrap_or_else(|| RepairSession {
+            version: 1,
+            key_fingerprint: fingerprint.clone(),
+            next_index: 0,
+            missing: Vec::new(),
+            total,
+            updated_at: Utc::now().to_rfc3339(),
+        });
+    let resumed = session.next_index > 0 || !session.missing.is_empty();
+    session.total = total;
+    session.next_index = session.next_index.min(total);
+    let mut missing = session.missing.iter().cloned().collect::<BTreeSet<_>>();
+    let mut cursor = session.next_index;
+    let mut checked_this_run = 0usize;
+    let mut timed_out = false;
+
+    while cursor < total {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            timed_out = true;
+            break;
+        }
+        let end = cursor.saturating_add(parallelism).min(total);
+        let batch = &keys[cursor..end];
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            for key in batch {
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let result = remote_object_available(remote, key)
+                        .with_context(|| format!("check remote object {key}"));
+                    let _ = tx.send((key.clone(), result));
+                });
+            }
+        });
+        drop(tx);
+        for (key, available) in rx {
+            if !available? {
+                missing.insert(key);
+            }
+        }
+        cursor = end;
+        checked_this_run += batch.len();
+        if checked_this_run.is_multiple_of(512) || cursor == total {
+            session.next_index = cursor;
+            session.missing = missing.iter().cloned().collect();
+            session.updated_at = Utc::now().to_rfc3339();
+            save_repair_session(&session_path, &session)?;
+        }
+    }
+
+    session.next_index = cursor;
+    session.missing = missing.iter().cloned().collect();
+    session.updated_at = Utc::now().to_rfc3339();
+    save_repair_session(&session_path, &session)?;
+
+    Ok(RemoteObjectScan {
+        checked: cursor,
+        total,
+        missing: missing.into_iter().collect(),
+        timed_out,
+        elapsed: start.elapsed(),
+        resumed,
+        session_path: Some(session_path),
+        session_fingerprint: Some(fingerprint),
+    })
+}
+
+fn repair_session_path(paths: &Paths) -> PathBuf {
+    paths.home.join("cache/remote-repair-session.json")
+}
+
+fn load_repair_session(path: &PathBuf) -> Result<Option<RepairSession>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn save_repair_session(path: &PathBuf, session: &RepairSession) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(session)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn repair_key_fingerprint(
+    keys: &[String],
+    remote: &RemoteStore,
+    options: RemoteObjectScanOptions,
+) -> String {
+    let mut input = String::new();
+    input.push_str(&remote.describe());
+    input.push('\n');
+    input.push_str(&format!("sample={:?}\n", options.sample));
+    for key in keys {
+        input.push_str(key);
+        input.push('\n');
+    }
+    blake3_hex(input.as_bytes())
 }
 
 fn repair_source_and_remote_key(

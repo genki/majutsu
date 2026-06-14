@@ -54,7 +54,7 @@ fn default_part_size_for_endpoint(endpoint: &str) -> usize {
 #[derive(Clone)]
 pub(crate) enum RemoteStore {
     File(FileRemote),
-    S3(S3Remote),
+    S3(Box<S3Remote>),
 }
 
 #[derive(Clone)]
@@ -106,7 +106,7 @@ pub(crate) fn open_remote_with_upload_policy(
             .ok_or_else(|| anyhow!("s3 remote is missing bucket: {remote_url}"))?
             .to_string();
         let prefix = url.path().trim_matches('/').to_string();
-        return Ok(RemoteStore::S3(S3Remote {
+        return Ok(RemoteStore::S3(Box::new(S3Remote {
             bucket,
             prefix,
             endpoint: config
@@ -133,7 +133,7 @@ pub(crate) fn open_remote_with_upload_policy(
             multipart_enabled,
             max_parallel_uploads: max_parallel_uploads.max(1),
             client: Client::new(),
-        }));
+        })));
     }
     bail!("unsupported remote URL: {remote_url}");
 }

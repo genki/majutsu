@@ -154,7 +154,8 @@ use object_paths::{
     large_chunk_base, remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
 };
 use operation_log::{
-    query_operations, record_op, record_op_with_details, record_op_with_id, rewrite_local_oplog,
+    OperationDetails, query_operations, record_op, record_op_with_details, record_op_with_id,
+    rewrite_local_oplog,
 };
 use pack_runtime::pack_cmd;
 use process_runtime::acquire_process_lock;
@@ -552,14 +553,16 @@ fn record_snapshot_failure(
     let message = format!("snapshot failed for root {root_id}: {err:#}");
     record_op_with_details(
         conn,
-        op_id,
-        kind,
-        parent,
-        parent,
-        "failed",
-        Some(&message),
-        Some(&message),
-        None,
+        OperationDetails {
+            id: op_id,
+            kind,
+            before: parent,
+            after: parent,
+            status: "failed",
+            message: Some(&message),
+            error: Some(&message),
+            remote_sync_state: None,
+        },
     )
 }
 
@@ -3519,7 +3522,7 @@ mod tests {
     fn s3_capabilities_honor_multipart_policy() {
         let mut remote = test_s3_remote();
         remote.multipart_enabled = false;
-        let store = RemoteStore::S3(remote);
+        let store = RemoteStore::S3(Box::new(remote));
         assert!(!store.capabilities().multipart_upload);
     }
 
