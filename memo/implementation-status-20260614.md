@@ -331,7 +331,7 @@ cargo test --workspace --all-targets --locked
 
 結果:
 
-- current snapshot: `snap-8248c9b1-50c4-407f-bbd2-b68408f1678b`
+- current snapshot: `snap-51a15e6e-d59d-478b-b2c4-57f2e197038b`
 - daemon: running、IPC ok、pending journal 0。
 - `local_current` と `remote_current` は一致。
 - queued uploads 0。
