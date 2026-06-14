@@ -3597,7 +3597,7 @@ mod tests {
                     stream
                         .write_all(
                             format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 body.len(),
                                 body
                             )
@@ -3612,17 +3612,21 @@ mod tests {
                     };
                     stream
                         .write_all(
-                            format!("HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: 0\r\n\r\n")
+                            format!("HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                                 .as_bytes(),
                         )
                         .unwrap();
                 } else if request_line.contains("?uploadId=upload-1") {
                     stream
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
                         .unwrap();
                 } else {
                     panic!("unexpected multipart request: {request_line}");
                 }
+                stream.flush().unwrap();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 observed.push((request_line, body));
             }
             tx.send(observed).unwrap();

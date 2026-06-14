@@ -195,13 +195,16 @@ fn watch_notify_loop<W: Watcher>(
     if watched_roots.is_empty() {
         bail!("no active roots could be watched");
     }
-    if replay_pending_journal_events(paths)? && args.once {
-        record_event(
-            paths,
-            "watch-stop",
-            &format!("foreground {backend_label} watch stopped after journal replay"),
-        )?;
-        return Ok(());
+    if replay_pending_journal_events(paths)? {
+        sync_current_external(paths)?;
+        if args.once {
+            record_event(
+                paths,
+                "watch-stop",
+                &format!("foreground {backend_label} watch stopped after journal replay"),
+            )?;
+            return Ok(());
+        }
     }
     loop {
         let event = match recv_watch_event(&rx, args.periodic_rescan_secs) {
@@ -462,40 +465,47 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     }
     record_event(paths, "watch-snapshot-child", &message)?;
 
-    if read_config(paths)?.remote.is_some() {
-        let upload_stats = upload_queue_stats(paths)?;
-        if upload_stats.delayed > 0 {
-            record_event(
-                paths,
-                "watch-sync-deferred",
-                &format!(
-                    "delayed_uploads={} next_retry_after={}",
-                    upload_stats.delayed,
-                    upload_stats
-                        .next_retry_after
-                        .map(|retry_after| retry_after.to_rfc3339())
-                        .unwrap_or_else(|| "(unknown)".into())
-                ),
-            )?;
-            return Ok(());
-        }
-        let status = std::process::Command::new(&exe)
-            .arg("--home")
-            .arg(&paths.home)
-            .arg("sync")
-            .arg("--wait")
-            .arg("--timeout-secs")
-            .arg("300")
-            .status()?;
-        if status.success() {
-            record_event(paths, "watch-sync", "external sync completed")?;
-        } else {
-            record_event(
-                paths,
-                "watch-sync-error",
-                &format!("external sync exited with status {status}"),
-            )?;
-        }
+    sync_current_external(paths)?;
+    Ok(())
+}
+
+fn sync_current_external(paths: &Paths) -> Result<()> {
+    if read_config(paths)?.remote.is_none() {
+        return Ok(());
+    }
+    let upload_stats = upload_queue_stats(paths)?;
+    if upload_stats.delayed > 0 {
+        record_event(
+            paths,
+            "watch-sync-deferred",
+            &format!(
+                "delayed_uploads={} next_retry_after={}",
+                upload_stats.delayed,
+                upload_stats
+                    .next_retry_after
+                    .map(|retry_after| retry_after.to_rfc3339())
+                    .unwrap_or_else(|| "(unknown)".into())
+            ),
+        )?;
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let status = std::process::Command::new(&exe)
+        .arg("--home")
+        .arg(&paths.home)
+        .arg("sync")
+        .arg("--wait")
+        .arg("--timeout-secs")
+        .arg("300")
+        .status()?;
+    if status.success() {
+        record_event(paths, "watch-sync", "external sync completed")?;
+    } else {
+        record_event(
+            paths,
+            "watch-sync-error",
+            &format!("external sync exited with status {status}"),
+        )?;
     }
     Ok(())
 }

@@ -342,3 +342,74 @@ cargo test --workspace --all-targets --locked
 - `mj fsck --since` は未実装。履歴 graph 全体の整合性検査と snapshot 時刻フィルタの意味づけが絡むため、partial fsck の仕様を決めてから入れる。
 - tree manifest 生成量そのものを減らす subtree reuse / 差分 tree 表現は未実装。現状は local metadata cache prune でローカル二重保持を避ける。
 - 過去に観測された HTTP mock の一時的な connection reset / close は今回再現していない。全体テストで再発する場合に server lifecycle を点検する。
+
+## 残改善実施 2026-06-14 build 24
+
+実施:
+
+- `mj fsck --since TIME` を追加した。
+  - `--since` は full fsck の heavy phase を指定時刻以降の snapshot から到達する payload / manifest に絞る。
+  - refs、queue、oplog、history graph などの基本整合性は partial 指定でも全体を確認する。
+  - 対象 snapshot から tree manifest を辿り、blob、large object、chunk、pack の検査対象を絞る。
+  - `--sample` と併用した場合は scope 構築自体も sample 件数で打ち切る。
+  - `--sample` または `--since` 指定時は、全履歴を前提にした metadata dangling 検査を false positive 回避のため省略する。
+- 過去に一時失敗した S3 range GET 系テストの mock HTTP response を hardening した。
+  - `Content-Length` と `Connection: close` を明示する。
+  - response write 後に flush / shutdown し、reqwest 側の response boundary を安定させる。
+- `BUILD_NUMBER` を 24 に更新した。
+- `docs/OPERATIONS.md` に `fsck --since` の運用を追記した。
+
+検証:
+
+```sh
+cargo test --test remote_file fsck_since_limits_heavy_checks_to_recent_snapshots --locked
+cargo test --test remote_file remote_check_uses_s3_range_get_probe --locked
+cargo test --test remote_file restore_resume_uses_s3_range_get_for_packed_blobs --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+残る設計課題:
+
+- tree manifest 生成量そのものを減らす subtree reuse / 差分 tree 表現は未実装。影響範囲が大きいため、別設計タスクとして扱う。
+
+### build 24 追補: daemon replay 後の自動 sync
+
+実施:
+
+- daemon restart 時などに pending event journal を replay して snapshot が作成された場合も、watch event snapshot と同じ外部 `mj sync --wait --timeout-secs 300` 経路へ流すようにした。
+- remote が未設定の場合は何もしない。
+- upload queue に delayed item がある場合は従来どおり `watch-sync-deferred` を記録し、retry 時刻を尊重する。
+- `notify_watch_replay_syncs_current_snapshot_when_remote_is_configured` を追加し、remote 設定ありの `watch --once` が replay だけで current snapshot を remote metadata まで同期することを確認した。
+
+検証:
+
+```sh
+cargo test --test remote_file notify_watch_replays_pending_event_journal --locked
+cargo test --test remote_file notify_watch_replay_syncs_current_snapshot_when_remote_is_configured --locked
+cargo test --test remote_file daemon_watch_snapshot_can_sync_clone_and_restore --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+全て成功。
+
+実環境反映:
+
+- `cargo install --path . --locked --force`
+- installed CLI: `mj 0.3.0+build.24`
+- `mj daemon restart --home /home/vagrant/.majutsu`
+- `mj fsck --home /home/vagrant/.majutsu --since '24h ago' --sample 10 --timeout-secs 60 --progress`
+- `mj fsck --home /home/vagrant/.majutsu --quick`
+- `mj cache prune --home /home/vagrant/.majutsu --metadata`
+- `mj sync status --home /home/vagrant/.majutsu`
+
+結果:
+
+- daemon: running、IPC ok、pending journal 0。
+- `local_current` と `remote_current` の一致を確認。
+- queued uploads 0、sync lock なし。
+- scoped fsck は 25 秒程度で成功し、quick fsck も成功。
+- metadata cache prune 後の state usage は約 35.0 MiB。

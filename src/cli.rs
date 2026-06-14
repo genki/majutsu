@@ -978,6 +978,12 @@ pub(crate) struct FsckArgs {
         help = "In full checks, inspect at most N objects per heavy payload or manifest phase"
     )]
     pub(crate) sample: Option<usize>,
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "In full checks, inspect heavy payload and manifest phases only for snapshots at or after this time"
+    )]
+    pub(crate) since: Option<String>,
 }
 
 #[derive(Subcommand)]

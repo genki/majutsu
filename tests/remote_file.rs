@@ -5263,25 +5263,14 @@ fn remote_check_uses_s3_range_get_probe() {
                     "<Contents><Key>majutsu/v1/hosts/index.json</Key></Contents>",
                     "</ListBucketResult>"
                 );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
+                write_mock_http_response(&mut stream, "200 OK", body.as_bytes()).unwrap();
             } else if first.starts_with("HEAD ") {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
+                write_mock_http_response(&mut stream, "200 OK", b"").unwrap();
             } else if first.starts_with("GET ") {
-                stream
-                    .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\n\r\n{")
-                    .unwrap();
+                write_mock_http_response(&mut stream, "206 Partial Content", b"{").unwrap();
                 break;
             } else {
-                stream
-                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
+                write_mock_http_response(&mut stream, "500 Internal Server Error", b"").unwrap();
             }
         }
         tx.send(seen).unwrap();
@@ -8181,6 +8170,83 @@ fn fsck_quick_and_timeout_are_available() {
 }
 
 #[test]
+fn fsck_since_limits_heavy_checks_to_recent_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("old.txt"), b"old\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let old_oid = blake3::hash(b"old\n").to_hex().to_string();
+    let old_object_key: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select object_key from blobs where oid=?1",
+            [&old_oid],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    fs::remove_file(source.join("old.txt")).unwrap();
+    fs::write(source.join("new.txt"), b"new\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let since: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select created_at from snapshots order by created_at desc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    fs::remove_file(state.join(&old_object_key)).unwrap();
+
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+
+    let scoped = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("fsck")
+            .arg("--since")
+            .arg(&since)
+            .arg("--sample")
+            .arg("1");
+        c
+    });
+    assert!(scoped.contains("fsck ok"));
+}
+
+#[test]
 fn fsck_detects_corrupt_local_pack_index() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -10042,6 +10108,22 @@ fn line_header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+fn write_mock_http_response(
+    stream: &mut std::net::TcpStream,
+    status: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
 #[test]
 fn restore_prepare_can_hydrate_from_canonical_aliases() {
     let tmp = tempfile::tempdir().unwrap();
@@ -10246,22 +10328,16 @@ fn restore_resume_uses_s3_range_get_for_packed_blobs() {
                 .map(str::to_string);
             seen.push((first.clone(), range.clone()));
             if first.starts_with("POST ") && first.contains("?restore") {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
+                write_mock_http_response(&mut stream, "200 OK", b"").unwrap();
                 continue;
             }
             let path = remote_root.join(key);
             if !path.exists() {
-                stream
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
+                write_mock_http_response(&mut stream, "404 Not Found", b"").unwrap();
                 continue;
             }
             if first.starts_with("HEAD ") {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
+                write_mock_http_response(&mut stream, "200 OK", b"").unwrap();
                 continue;
             }
             let mut body = fs::read(&path).unwrap();
@@ -10277,16 +10353,7 @@ fn restore_resume_uses_s3_range_get_for_packed_blobs() {
                 body = body[start..=end].to_vec();
                 status = "206 Partial Content";
             }
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-            stream.write_all(&body).unwrap();
+            write_mock_http_response(&mut stream, status, &body).unwrap();
         }
         tx.send(seen).unwrap();
     });
@@ -13554,6 +13621,7 @@ fn cli_help_describes_status_and_daemon_subcommands() {
         c
     });
     assert!(fsck_help.contains("--sample"));
+    assert!(fsck_help.contains("--since"));
     assert!(fsck_help.contains("heavy payload or manifest phase"));
 }
 
@@ -14102,6 +14170,85 @@ fn notify_watch_replays_pending_event_journal() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(events.contains("event-journal-replay"));
+}
+
+#[test]
+fn notify_watch_replay_syncs_current_snapshot_when_remote_is_configured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    fs::create_dir_all(state.join("queue/events")).unwrap();
+    fs::write(
+        state.join("queue/events/event-pending.json"),
+        br#"{
+  "event_id": "event-pending",
+  "kind": "fs-event",
+  "observed_at": "2999-01-01T00:00:00Z",
+  "detail": "modify /tmp/pending"
+}"#,
+    )
+    .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("watch")
+            .arg("--once")
+            .arg("--backend")
+            .arg("notify")
+            .arg("--periodic-rescan-secs")
+            .arg("0");
+        c
+    });
+
+    assert!(db_ref(&state, "current").is_some());
+    assert!(db_ref(&state, "last-synced").is_some());
+    assert!(remote.join("hosts/index.json").exists());
+    assert!(host_metadata_export_path(&remote).exists());
+    let current_ref_name = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("refs/current").exists())
+        .map(|path| {
+            let host_id = path.file_name().unwrap().to_string_lossy();
+            format!("hosts/{host_id}/refs/current")
+        })
+        .unwrap();
+    assert_eq!(
+        db_remote_ref_value(&state, &current_ref_name),
+        db_ref(&state, "current")
+    );
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("event-journal-replay"));
+    assert!(events.contains("watch-sync"));
 }
 
 #[test]

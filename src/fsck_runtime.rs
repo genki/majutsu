@@ -5,7 +5,8 @@ use majutsu_core::{
     OperationLogEntryIssue, SnapshotExport, SnapshotManifest, TreeManifest,
     config_root_consistency_issues, decode_operation_log, history_graph_issues, host_file_issues,
     metadata_reference_issues, operation_log_comparison_issues, operation_log_entry_matches,
-    snapshot_export_matches, snapshot_manifest_matches, tree_manifest_issues,
+    payload_blob_ref, payload_large_ref, snapshot_export_matches, snapshot_manifest_matches,
+    tree_manifest_issues,
 };
 use majutsu_db::{
     EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
@@ -52,7 +53,7 @@ use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, open_remote};
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
-use crate::util::{blake3_hex, parse_db_time};
+use crate::util::{blake3_hex, parse_db_time, parse_time};
 use crate::{
     decode_canonical_remote_export, decode_canonical_remote_oplog, decode_large_chunk_stored_bytes,
     decode_object, export_metadata, open_db, packed_blob_metadata, read_blob_payload,
@@ -90,22 +91,24 @@ pub(crate) struct FsckOptions {
     quick: bool,
     progress: bool,
     sample: Option<usize>,
+    since: Option<String>,
     deadline: Option<Instant>,
     started: Instant,
 }
 
 impl FsckOptions {
-    fn from_args(args: FsckArgs) -> Self {
+    fn from_args(args: FsckArgs) -> Result<Self> {
         let quick = args.quick && !args.deep;
-        Self {
+        Ok(Self {
             quick,
             progress: args.progress,
             sample: args.sample,
+            since: args.since.map(|since| parse_time(&since)).transpose()?,
             deadline: args
                 .timeout_secs
                 .map(|timeout| Instant::now() + Duration::from_secs(timeout)),
             started: Instant::now(),
-        }
+        })
     }
 
     fn phase(&self, name: &str) -> Result<()> {
@@ -173,8 +176,50 @@ impl FsckOptions {
     }
 }
 
+#[derive(Default)]
+struct FsckScope {
+    snapshot_ids: BTreeSet<String>,
+    blob_oids: BTreeSet<String>,
+    large_oids: BTreeSet<String>,
+    chunk_oids: BTreeSet<String>,
+    pack_ids: BTreeSet<String>,
+}
+
+impl FsckScope {
+    fn includes_snapshot(&self, id: &str) -> bool {
+        self.snapshot_ids.contains(id)
+    }
+
+    fn includes_blob(&self, oid: &str) -> bool {
+        self.blob_oids.contains(oid)
+    }
+
+    fn includes_large(&self, oid: &str) -> bool {
+        self.large_oids.contains(oid)
+    }
+
+    fn includes_chunk(&self, oid: &str) -> bool {
+        self.chunk_oids.contains(oid)
+    }
+
+    fn includes_pack(&self, pack_id: &str) -> bool {
+        self.pack_ids.contains(pack_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.snapshot_ids.is_empty()
+    }
+}
+
+struct PayloadValidationContext<'a> {
+    remote_payload_keys: Option<&'a BTreeSet<String>>,
+    payload_cache_keys: &'a BTreeSet<String>,
+    scope: Option<&'a FsckScope>,
+    options: &'a FsckOptions,
+}
+
 pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
-    let options = FsckOptions::from_args(args);
+    let options = FsckOptions::from_args(args)?;
     crate::ensure_ready(paths)?;
     options.phase("open-db")?;
     let conn = open_db(paths)?;
@@ -184,6 +229,11 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
     options.phase("export-metadata")?;
     let export = export_metadata(paths, &conn, &config)?;
     let payload_cache_keys = payload_cache_key_set(&export);
+    let scope = if !options.quick {
+        build_fsck_scope(paths, &export, &options)?
+    } else {
+        None
+    };
     let remote = config
         .remote
         .as_ref()
@@ -196,7 +246,13 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         .iter()
         .map(|pack| (pack.pack_id.as_str(), pack.pack_key.as_str()))
         .collect::<BTreeMap<_, _>>();
-    if !options.quick {
+    let payload_context = PayloadValidationContext {
+        remote_payload_keys: remote_payload_keys.as_ref(),
+        payload_cache_keys: &payload_cache_keys,
+        scope: scope.as_ref(),
+        options: &options,
+    };
+    if !options.quick && scope.is_none() {
         options.phase("local-object-payloads")?;
         let local_keys = local_object_keys(paths, &export)?;
         for (index, key) in local_keys.iter().enumerate() {
@@ -225,28 +281,12 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         validate_blob_payloads(
             paths,
             &conn,
-            remote_payload_keys.as_ref(),
-            &payload_cache_keys,
             &pack_key_by_id,
-            &options,
+            &payload_context,
             &mut missing,
         )?;
-        validate_chunk_payloads(
-            paths,
-            &conn,
-            remote_payload_keys.as_ref(),
-            &payload_cache_keys,
-            &options,
-            &mut missing,
-        )?;
-        validate_large_payloads(
-            paths,
-            &conn,
-            remote_payload_keys.as_ref(),
-            &payload_cache_keys,
-            &options,
-            &mut missing,
-        )?;
+        validate_chunk_payloads(paths, &conn, &payload_context, &mut missing)?;
+        validate_large_payloads(paths, &conn, &payload_context, &mut missing)?;
     }
     for issue in large_pin_issues(&export.large_pins, &export.large_objects) {
         missing += 1;
@@ -267,20 +307,31 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
     validate_local_history_graph(&export, &mut missing)?;
     if !options.quick {
         options.phase("snapshot-manifests")?;
-        validate_local_snapshot_objects(paths, &export, &options, &mut missing)?;
+        validate_local_snapshot_objects(paths, &export, scope.as_ref(), &options, &mut missing)?;
         options.phase("large-manifests")?;
-        validate_local_large_manifest_objects(paths, &export, &options, &mut missing)?;
-        options.phase("pack-objects")?;
-        validate_local_pack_objects(
+        validate_local_large_manifest_objects(
             paths,
             &export,
-            remote_payload_keys.as_ref(),
-            &payload_cache_keys,
+            scope.as_ref(),
             &options,
             &mut missing,
         )?;
+        options.phase("pack-objects")?;
+        validate_local_pack_objects(paths, &export, &payload_context, &mut missing)?;
         options.phase("metadata-references")?;
-        validate_local_metadata_references(paths, &export, &options, &mut missing)?;
+        if scope.is_none() && options.sample.is_none() {
+            validate_local_metadata_references(paths, &export, &options, &mut missing)?;
+        } else if options.progress {
+            let reason = if scope.is_some() {
+                "since-scope"
+            } else {
+                "sample"
+            };
+            eprintln!(
+                "fsck progress phase=metadata-references skipped={reason} elapsed_secs={}",
+                options.started.elapsed().as_secs()
+            );
+        }
     }
     options.phase("queues")?;
     validate_local_oplog(&conn, &mut missing)?;
@@ -312,13 +363,85 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
     Ok(())
 }
 
+fn build_fsck_scope(
+    paths: &Paths,
+    export: &crate::MetadataExport,
+    options: &FsckOptions,
+) -> Result<Option<FsckScope>> {
+    let Some(since) = &options.since else {
+        return Ok(None);
+    };
+    options.phase("since-scope")?;
+    let cutoff = parse_db_time(since)?;
+    let mut scope = FsckScope::default();
+    let mut checked = 0usize;
+    for snapshot in &export.snapshots {
+        if parse_db_time(&snapshot.created_at)? < cutoff {
+            continue;
+        }
+        if !options.within_sample("since-scope", checked, None)? {
+            break;
+        }
+        checked += 1;
+        options.tick("since-scope", checked, None)?;
+        scope.snapshot_ids.insert(snapshot.id.clone());
+        let manifest = crate::snapshot_state::snapshot_manifest_from_parts(
+            paths,
+            &snapshot.id,
+            &snapshot.manifest_key,
+            &snapshot.manifest_json,
+        )?;
+        for root_tree in manifest.root_trees.values() {
+            let tree: TreeManifest = read_object(paths, &root_tree.tree_key)
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?;
+            for record in tree.entries.values() {
+                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+                    scope.blob_oids.insert(oid.to_string());
+                }
+                if let Some((oid, _, _)) = payload_large_ref(&record.payload) {
+                    scope.large_oids.insert(oid.to_string());
+                }
+            }
+        }
+    }
+    for blob in &export.blobs {
+        if scope.includes_blob(&blob.oid)
+            && let Some(pack_id) = &blob.pack_id
+        {
+            scope.pack_ids.insert(pack_id.clone());
+        }
+    }
+    for large in &export.large_objects {
+        if !scope.includes_large(&large.oid) {
+            continue;
+        }
+        let manifest: LargeManifest = read_object(paths, &large.manifest_key)
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?;
+        for chunk in manifest.chunks {
+            scope.chunk_oids.insert(chunk.oid);
+        }
+    }
+    if options.progress {
+        eprintln!(
+            "fsck progress phase=since-scope snapshots={} blobs={} large={} chunks={} packs={} since={since}",
+            scope.snapshot_ids.len(),
+            scope.blob_oids.len(),
+            scope.large_oids.len(),
+            scope.chunk_oids.len(),
+            scope.pack_ids.len()
+        );
+    }
+    if scope.is_empty() {
+        eprintln!("fsck since scope is empty; no snapshots at or after {since}");
+    }
+    Ok(Some(scope))
+}
+
 fn validate_blob_payloads(
     paths: &Paths,
     conn: &Connection,
-    remote_payload_keys: Option<&BTreeSet<String>>,
-    payload_cache_keys: &BTreeSet<String>,
     pack_key_by_id: &BTreeMap<&str, &str>,
-    options: &FsckOptions,
+    context: &PayloadValidationContext<'_>,
     missing: &mut usize,
 ) -> Result<()> {
     let mut stmt = conn.prepare("select oid, object_key, pack_id from blobs")?;
@@ -329,18 +452,29 @@ fn validate_blob_payloads(
             row.get::<_, Option<String>>(2)?,
         ))
     })?;
-    for (index, row) in rows.enumerate() {
-        if !options.within_sample("blob-records", index, None)? {
+    let mut checked = 0usize;
+    for row in rows {
+        let (oid, key, pack_id) = row?;
+        if context
+            .scope
+            .is_some_and(|scope| !scope.includes_blob(&oid))
+        {
+            continue;
+        }
+        if !context
+            .options
+            .within_sample("blob-records", checked, None)?
+        {
             break;
         }
-        options.tick("blob-records", index + 1, None)?;
-        let (oid, key, pack_id) = row?;
+        checked += 1;
+        context.options.tick("blob-records", checked, None)?;
         if let Some(pack_id) = pack_id.as_deref() {
             if let Some(pack_key) = pack_key_by_id.get(pack_id)
                 && !paths.home.join(pack_key).exists()
                 && payload_cache_available_remotely(
-                    remote_payload_keys,
-                    payload_cache_keys,
+                    context.remote_payload_keys,
+                    context.payload_cache_keys,
                     pack_key,
                 )
             {
@@ -351,7 +485,11 @@ fn validate_blob_payloads(
                 eprintln!("unreadable packed blob {oid}: {err}");
             }
         } else if !paths.home.join(&key).exists() {
-            if !payload_cache_available_remotely(remote_payload_keys, payload_cache_keys, &key) {
+            if !payload_cache_available_remotely(
+                context.remote_payload_keys,
+                context.payload_cache_keys,
+                &key,
+            ) {
                 *missing += 1;
                 eprintln!("missing blob {oid} {key}");
             }
@@ -366,23 +504,36 @@ fn validate_blob_payloads(
 fn validate_chunk_payloads(
     paths: &Paths,
     conn: &Connection,
-    remote_payload_keys: Option<&BTreeSet<String>>,
-    payload_cache_keys: &BTreeSet<String>,
-    options: &FsckOptions,
+    context: &PayloadValidationContext<'_>,
     missing: &mut usize,
 ) -> Result<()> {
     let mut stmt = conn.prepare("select oid, object_key from chunks")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    for (index, row) in rows.enumerate() {
-        if !options.within_sample("chunk-records", index, None)? {
+    let mut checked = 0usize;
+    for row in rows {
+        let (oid, key) = row?;
+        if context
+            .scope
+            .is_some_and(|scope| !scope.includes_chunk(&oid))
+        {
+            continue;
+        }
+        if !context
+            .options
+            .within_sample("chunk-records", checked, None)?
+        {
             break;
         }
-        options.tick("chunk-records", index + 1, None)?;
-        let (oid, key) = row?;
+        checked += 1;
+        context.options.tick("chunk-records", checked, None)?;
         if !paths.home.join(&key).exists() {
-            if !payload_cache_available_remotely(remote_payload_keys, payload_cache_keys, &key) {
+            if !payload_cache_available_remotely(
+                context.remote_payload_keys,
+                context.payload_cache_keys,
+                &key,
+            ) {
                 *missing += 1;
                 eprintln!("missing chunk {oid} {key}");
             }
@@ -397,21 +548,30 @@ fn validate_chunk_payloads(
 fn validate_large_payloads(
     paths: &Paths,
     conn: &Connection,
-    remote_payload_keys: Option<&BTreeSet<String>>,
-    payload_cache_keys: &BTreeSet<String>,
-    options: &FsckOptions,
+    context: &PayloadValidationContext<'_>,
     missing: &mut usize,
 ) -> Result<()> {
     let mut stmt = conn.prepare("select oid, manifest_key from large_objects")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    for (index, row) in rows.enumerate() {
-        if !options.within_sample("large-payloads", index, None)? {
+    let mut checked = 0usize;
+    for row in rows {
+        let (oid, manifest_key) = row?;
+        if context
+            .scope
+            .is_some_and(|scope| !scope.includes_large(&oid))
+        {
+            continue;
+        }
+        if !context
+            .options
+            .within_sample("large-payloads", checked, None)?
+        {
             break;
         }
-        options.tick("large-payloads", index + 1, None)?;
-        let (oid, manifest_key) = row?;
+        checked += 1;
+        context.options.tick("large-payloads", checked, None)?;
         match read_object(paths, &manifest_key)
             .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
         {
@@ -419,8 +579,8 @@ fn validate_large_payloads(
                 for chunk in &manifest.chunks {
                     if !paths.home.join(&chunk.object_key).exists()
                         && payload_cache_available_remotely(
-                            remote_payload_keys,
-                            payload_cache_keys,
+                            context.remote_payload_keys,
+                            context.payload_cache_keys,
                             &chunk.object_key,
                         )
                     {
@@ -705,15 +865,13 @@ fn validate_local_metadata_references(
     missing: &mut usize,
 ) -> Result<()> {
     let mut live = LiveMetadataReferences::default();
-    for (index, snapshot) in export.snapshots.iter().enumerate() {
-        if !options.within_sample("metadata-references", index, Some(export.snapshots.len()))? {
+    let mut checked = 0usize;
+    for snapshot in &export.snapshots {
+        if !options.within_sample("metadata-references", checked, None)? {
             break;
         }
-        options.tick(
-            "metadata-references",
-            index + 1,
-            Some(export.snapshots.len()),
-        )?;
+        checked += 1;
+        options.tick("metadata-references", checked, None)?;
         let manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
             paths,
             &snapshot.id,
@@ -723,7 +881,24 @@ fn validate_local_metadata_references(
             Ok(manifest) => manifest,
             Err(_) => continue,
         };
-        for manifest_key in live.add_snapshot_manifest(&manifest) {
+        let mut large_manifest_keys = live.add_snapshot_manifest(&manifest);
+        for root_tree in manifest.root_trees.values() {
+            let Ok(bytes) = read_object(paths, &root_tree.tree_key) else {
+                continue;
+            };
+            let Ok(tree) = serde_json::from_slice::<TreeManifest>(&bytes) else {
+                continue;
+            };
+            for record in tree.entries.values() {
+                if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+                    live.blobs.insert(oid.to_string());
+                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
+                    live.large_objects.insert(oid.to_string());
+                    large_manifest_keys.push(manifest_key.to_string());
+                }
+            }
+        }
+        for manifest_key in large_manifest_keys {
             let Ok(bytes) = read_object(paths, &manifest_key) else {
                 continue;
             };
@@ -733,10 +908,25 @@ fn validate_local_metadata_references(
             live.add_large_manifest(large_manifest);
         }
     }
+    let blob_oids = export
+        .blobs
+        .iter()
+        .map(|blob| blob.oid.clone())
+        .collect::<Vec<_>>();
+    let large_oids = export
+        .large_objects
+        .iter()
+        .map(|large| large.oid.clone())
+        .collect::<Vec<_>>();
+    let chunk_oids = export
+        .chunks
+        .iter()
+        .map(|chunk| chunk.oid.clone())
+        .collect::<Vec<_>>();
     for issue in metadata_reference_issues(
-        export.blobs.iter().map(|blob| blob.oid.as_str()),
-        export.large_objects.iter().map(|large| large.oid.as_str()),
-        export.chunks.iter().map(|chunk| chunk.oid.as_str()),
+        &blob_oids,
+        &large_oids,
+        &chunk_oids,
         &live.blobs,
         &live.large_objects,
         &live.chunks,
@@ -760,18 +950,20 @@ fn validate_local_metadata_references(
 fn validate_local_snapshot_objects(
     paths: &Paths,
     export: &crate::MetadataExport,
+    scope: Option<&FsckScope>,
     options: &FsckOptions,
     missing: &mut usize,
 ) -> Result<()> {
-    for (index, snapshot) in export.snapshots.iter().enumerate() {
-        if !options.within_sample("snapshot-manifests", index, Some(export.snapshots.len()))? {
+    let mut checked = 0usize;
+    for snapshot in &export.snapshots {
+        if scope.is_some_and(|scope| !scope.includes_snapshot(&snapshot.id)) {
+            continue;
+        }
+        if !options.within_sample("snapshot-manifests", checked, None)? {
             break;
         }
-        options.tick(
-            "snapshot-manifests",
-            index + 1,
-            Some(export.snapshots.len()),
-        )?;
+        checked += 1;
+        options.tick("snapshot-manifests", checked, None)?;
         let metadata_manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
             paths,
             &snapshot.id,
@@ -834,18 +1026,20 @@ fn validate_local_snapshot_objects(
 fn validate_local_large_manifest_objects(
     paths: &Paths,
     export: &crate::MetadataExport,
+    scope: Option<&FsckScope>,
     options: &FsckOptions,
     missing: &mut usize,
 ) -> Result<()> {
-    for (index, large) in export.large_objects.iter().enumerate() {
-        if !options.within_sample("large-manifests", index, Some(export.large_objects.len()))? {
+    let mut checked = 0usize;
+    for large in &export.large_objects {
+        if scope.is_some_and(|scope| !scope.includes_large(&large.oid)) {
+            continue;
+        }
+        if !options.within_sample("large-manifests", checked, None)? {
             break;
         }
-        options.tick(
-            "large-manifests",
-            index + 1,
-            Some(export.large_objects.len()),
-        )?;
+        checked += 1;
+        options.tick("large-manifests", checked, None)?;
         match read_object(paths, &large.manifest_key)
             .and_then(|bytes| serde_json::from_slice::<LargeManifest>(&bytes).map_err(Into::into))
         {
@@ -873,9 +1067,7 @@ fn validate_local_large_manifest_objects(
 fn validate_local_pack_objects(
     paths: &Paths,
     export: &crate::MetadataExport,
-    remote_payload_keys: Option<&BTreeSet<String>>,
-    payload_cache_keys: &BTreeSet<String>,
-    options: &FsckOptions,
+    context: &PayloadValidationContext<'_>,
     missing: &mut usize,
 ) -> Result<()> {
     let mut blobs_by_pack: BTreeMap<&str, BTreeMap<&str, &BlobExport>> = BTreeMap::new();
@@ -887,11 +1079,22 @@ fn validate_local_pack_objects(
                 .insert(blob.oid.as_str(), blob);
         }
     }
-    for (index, pack) in export.packs.iter().enumerate() {
-        if !options.within_sample("pack-objects", index, Some(export.packs.len()))? {
+    let mut checked = 0usize;
+    for pack in &export.packs {
+        if context
+            .scope
+            .is_some_and(|scope| !scope.includes_pack(&pack.pack_id))
+        {
+            continue;
+        }
+        if !context
+            .options
+            .within_sample("pack-objects", checked, None)?
+        {
             break;
         }
-        options.tick("pack-objects", index + 1, Some(export.packs.len()))?;
+        checked += 1;
+        context.options.tick("pack-objects", checked, None)?;
         let expected_blobs = blobs_by_pack
             .get(pack.pack_id.as_str())
             .cloned()
@@ -939,8 +1142,8 @@ fn validate_local_pack_objects(
         let pack_path = paths.home.join(&pack.pack_key);
         if !pack_path.exists()
             && payload_cache_available_remotely(
-                remote_payload_keys,
-                payload_cache_keys,
+                context.remote_payload_keys,
+                context.payload_cache_keys,
                 &pack.pack_key,
             )
         {
@@ -988,6 +1191,12 @@ fn validate_local_pack_objects(
         blobs_by_pack.keys().copied(),
         export.packs.iter().map(|pack| pack.pack_id.as_str()),
     ) {
+        if context
+            .scope
+            .is_some_and(|scope| !scope.includes_pack(&pack_id))
+        {
+            continue;
+        }
         *missing += 1;
         eprintln!("packed blob references missing pack metadata {pack_id}");
     }
