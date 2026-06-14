@@ -1190,7 +1190,16 @@ fn sync_status_quick_and_wait_target_advancement() {
     assert_success(quick, "sync status quick");
 
     let deep = run_mj(&home, ["sync", "status", "--deep"]);
+    let deep_stdout = String::from_utf8_lossy(&deep.stdout).to_string();
     assert_success(deep, "sync status deep");
+    assert!(deep_stdout.contains("remote_object_check_source list"));
+    assert!(deep_stdout.contains("missing_remote_objects_limited false"));
+
+    let sampled = run_mj(&home, ["sync", "status", "--deep", "--sample", "1"]);
+    let sampled_stdout = String::from_utf8_lossy(&sampled.stdout).to_string();
+    assert_success(sampled, "sync status deep sample");
+    assert!(sampled_stdout.contains("remote_objects_checked 1"));
+    assert!(sampled_stdout.contains("missing_remote_objects_limited true"));
 
     fs::write(root.join("file.txt"), b"v2\n").unwrap();
     assert_success(

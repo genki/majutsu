@@ -21,7 +21,10 @@ use std::env;
 use std::fs;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::cache_runtime::{prune_synced_metadata_cache, prune_synced_payload_cache};
+use crate::cache_runtime::{
+    prune_synced_metadata_cache, prune_synced_payload_cache, remote_payload_index_contains,
+    remote_payload_key_index,
+};
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
 use crate::db_refs::{
@@ -155,7 +158,7 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     )?;
     if let Some(SyncCommand::Status(status_args)) = args.command {
         if status_args.deep {
-            return sync_status(paths, &conn, &remote);
+            return sync_status(paths, &conn, &remote, &status_args);
         }
         return sync_status_quick(paths, &conn, &remote);
     }
@@ -352,7 +355,9 @@ struct SyncWaitStatus {
 
 impl SyncWaitStatus {
     fn is_caught_up(&self) -> bool {
-        self.local_current == self.remote_current && self.queued_uploads == 0
+        self.local_current == self.remote_current
+            && self.queued_uploads == 0
+            && self.sync_lock_pid.is_none()
     }
 }
 
@@ -465,6 +470,7 @@ fn wait_for_sync_catchup(
         }
         if Instant::now() >= deadline {
             print_sync_wait_status(&status);
+            println!("status_mode quick");
             bail!(
                 "timed out waiting for sync target {} after {}s; local_current={} remote_current={} queued_uploads={} delayed={} lock_pid={}",
                 target_current,
@@ -1295,10 +1301,54 @@ fn payload_fingerprint(bytes: &[u8]) -> String {
     blake3_hex(bytes)
 }
 
-fn sync_status(paths: &Paths, conn: &Connection, remote: &RemoteStore) -> Result<()> {
-    let status = sync_status_snapshot(paths, conn, remote)?;
+fn sync_status(
+    paths: &Paths,
+    conn: &Connection,
+    remote: &RemoteStore,
+    args: &crate::cli::SyncStatusArgs,
+) -> Result<()> {
+    let options = SyncStatusDeepOptions::from_args(args);
+    let status = sync_status_snapshot(paths, conn, remote, &options)?;
     print_sync_status(&status);
     Ok(())
+}
+
+struct SyncStatusDeepOptions {
+    sample: Option<usize>,
+    deadline: Option<Instant>,
+    progress: bool,
+    started: Instant,
+}
+
+impl SyncStatusDeepOptions {
+    fn from_args(args: &crate::cli::SyncStatusArgs) -> Self {
+        Self {
+            sample: args.sample,
+            deadline: args
+                .timeout_secs
+                .map(|timeout| Instant::now() + Duration::from_secs(timeout)),
+            progress: args.progress,
+            started: Instant::now(),
+        }
+    }
+
+    fn timed_out(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn prefer_head_checks(&self) -> bool {
+        self.sample.is_some() || self.deadline.is_some()
+    }
+
+    fn maybe_progress(&self, checked: usize, total: usize, source: &str) {
+        if self.progress && (checked == total || checked > 0 && checked.is_multiple_of(500)) {
+            eprintln!(
+                "sync status progress phase=remote-objects source={source} checked={checked}/{total} elapsed_secs={}",
+                self.started.elapsed().as_secs()
+            );
+        }
+    }
 }
 
 struct SyncStatusSnapshot {
@@ -1307,7 +1357,10 @@ struct SyncStatusSnapshot {
     remote_current: String,
     remote_last_synced: String,
     local_objects: usize,
+    remote_objects_checked: usize,
     missing_remote_objects: usize,
+    missing_remote_objects_limited: bool,
+    remote_object_check_source: String,
     queued_uploads: usize,
     queued_uploads_retrying: usize,
     queued_uploads_delayed: usize,
@@ -1321,6 +1374,7 @@ fn sync_status_snapshot(
     paths: &Paths,
     conn: &Connection,
     remote: &RemoteStore,
+    options: &SyncStatusDeepOptions,
 ) -> Result<SyncStatusSnapshot> {
     let local_current = current_snapshot(conn)?;
     let config = read_config(paths)?;
@@ -1346,11 +1400,52 @@ fn sync_status_snapshot(
     }
     let export = export_metadata(paths, conn, &read_config(paths)?)?;
     let local_keys = local_object_keys(paths, &export)?;
+    let total_local_objects = local_keys.len();
+    let check_limit = options
+        .sample
+        .unwrap_or(total_local_objects)
+        .min(total_local_objects);
+    let keys_to_check = local_keys.iter().take(check_limit).collect::<Vec<_>>();
+    let mut remote_object_check_source = if options.prefer_head_checks() {
+        "head".to_string()
+    } else {
+        "list".to_string()
+    };
     let mut missing_remote = 0usize;
-    for key in &local_keys {
-        if !remote_object_available(remote, key)? {
+    let mut checked = 0usize;
+    let remote_keys = if options.prefer_head_checks() {
+        None
+    } else {
+        match remote_payload_key_index(remote) {
+            Ok(keys) => Some(keys),
+            Err(err) => {
+                eprintln!(
+                    "sync status warning: remote object index unavailable; falling back to HEAD checks: {err}"
+                );
+                remote_object_check_source = "head".into();
+                None
+            }
+        }
+    };
+    let mut limited = check_limit < total_local_objects;
+    for key in keys_to_check {
+        if options.timed_out() {
+            limited = true;
+            break;
+        }
+        checked += 1;
+        let available = if let Some(remote_keys) = remote_keys.as_ref() {
+            remote_payload_index_contains(remote_keys, key)
+        } else {
+            remote_object_available(remote, key)?
+        };
+        if !available {
             missing_remote += 1;
         }
+        options.maybe_progress(checked, check_limit, &remote_object_check_source);
+    }
+    if options.timed_out() {
+        limited = true;
     }
     let upload_stats = upload_queue_stats(paths)?;
     Ok(SyncStatusSnapshot {
@@ -1358,8 +1453,11 @@ fn sync_status_snapshot(
         local_current: local_current.unwrap_or_else(|| "(none)".into()),
         remote_current: remote_current.unwrap_or_else(|| "(none)".into()),
         remote_last_synced: remote_last_synced.unwrap_or_else(|| "(none)".into()),
-        local_objects: local_keys.len(),
+        local_objects: total_local_objects,
+        remote_objects_checked: checked,
         missing_remote_objects: missing_remote,
+        missing_remote_objects_limited: limited,
+        remote_object_check_source,
         queued_uploads: upload_stats.total,
         queued_uploads_retrying: upload_stats.retrying,
         queued_uploads_delayed: upload_stats.delayed,
@@ -1379,7 +1477,16 @@ fn print_sync_status(status: &SyncStatusSnapshot) {
     println!("remote_current {}", status.remote_current);
     println!("remote_last_synced {}", status.remote_last_synced);
     println!("local_objects {}", status.local_objects);
+    println!("remote_objects_checked {}", status.remote_objects_checked);
     println!("missing_remote_objects {}", status.missing_remote_objects);
+    println!(
+        "missing_remote_objects_limited {}",
+        status.missing_remote_objects_limited
+    );
+    println!(
+        "remote_object_check_source {}",
+        status.remote_object_check_source
+    );
     println!("queued_uploads {}", status.queued_uploads);
     println!("queued_uploads_retrying {}", status.queued_uploads_retrying);
     println!("queued_uploads_delayed {}", status.queued_uploads_delayed);

@@ -213,11 +213,13 @@ metadata は hot に維持し、archive 対象は pack や large chunk などの
 mj sync status
 ```
 
-deep status は参照 object ごとに remote 存在確認 request を発行しうるため、
-監査目的の場合だけ使う。
+deep status は参照 object の remote 存在確認を行う。通常は remote の key index を
+`LIST` でまとめて取得し、local object key と canonical alias を set membership で確認する。
+調査中に待ち時間を制限したい場合は `--sample`、`--timeout-secs`、`--progress` を使う。
 
 ```sh
 mj sync status --deep
+mj sync status --deep --sample 1000 --timeout-secs 30 --progress
 ```
 
 ## local cache

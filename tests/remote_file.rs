@@ -5140,7 +5140,7 @@ fn sync_wait_reports_status_when_existing_sync_lock_is_held() {
     )
     .unwrap();
 
-    let waited = output({
+    let waited = {
         let mut c = mj();
         c.arg("--home")
             .arg(&state)
@@ -5148,11 +5148,21 @@ fn sync_wait_reports_status_when_existing_sync_lock_is_held() {
             .arg("--wait")
             .arg("--timeout-secs")
             .arg("1");
-        c
-    });
+        c.output().expect("run command")
+    };
+    assert!(
+        !waited.status.success(),
+        "sync --wait should time out while the sync lock is still held"
+    );
+    let waited = format!(
+        "{}{}",
+        String::from_utf8_lossy(&waited.stdout),
+        String::from_utf8_lossy(&waited.stderr)
+    );
     assert!(waited.contains("sync already running pid"));
     assert!(waited.contains("status_mode quick"));
     assert!(waited.contains("queued_uploads 0"));
+    assert!(waited.contains("timed out waiting for sync target"));
 }
 
 #[test]

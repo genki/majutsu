@@ -334,8 +334,12 @@ pub(crate) fn remote_payload_key_index(remote: &RemoteStore) -> Result<BTreeSet<
         "blobs/loose/",
         "objects/packs/",
         "packs/",
+        "objects/indexes/pack/",
+        "indexes/pack-index/",
         "objects/large/chunks/",
         "large/chunks/",
+        "objects/large/manifests/",
+        "large/manifests/",
         "objects/trees/",
         "trees/",
     ] {

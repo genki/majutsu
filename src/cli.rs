@@ -682,6 +682,24 @@ pub(crate) struct SyncStatusArgs {
         help = "Check every referenced remote object instead of only refs and queues"
     )]
     pub(crate) deep: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Limit deep object availability checks to the first N local objects"
+    )]
+    pub(crate) sample: Option<usize>,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        help = "Stop deep object availability checks after this many seconds"
+    )]
+    pub(crate) timeout_secs: Option<u64>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Print deep object availability check progress to stderr"
+    )]
+    pub(crate) progress: bool,
 }
 
 #[derive(Args)]
