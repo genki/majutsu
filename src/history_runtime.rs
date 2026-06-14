@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
-use crate::cli::{DiffArgs, LogArgs, OpCommand, StateArgs};
+use crate::cli::{DiffArgs, LogArgs, OpCommand, StateArgs, StatusArgs};
 use crate::config::{Config, Paths, read_config};
 use crate::daemon_runtime::{DaemonHealth, DaemonHealthState, daemon_health};
 use crate::operation_log::{query_operation, record_op};
@@ -26,7 +26,7 @@ use crate::snapshot_state::{
     snapshot_contains_root, snapshot_file_map, snapshot_id_at,
 };
 
-pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
+pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
     let config = read_config(paths)?;
@@ -362,7 +362,7 @@ pub(crate) fn status_cmd(paths: &Paths) -> Result<()> {
 
     writeln!(output, "Machine").expect("write status output");
     writeln!(output, "current {current_label}").expect("write status output");
-    emit_status_output(&output, height)?;
+    emit_status_output(&output, height, &args)?;
     Ok(())
 }
 
@@ -732,7 +732,7 @@ fn print_state_report(state: &StateReport) -> Result<()> {
         ],
     );
 
-    emit_status_output(&output, height)?;
+    emit_status_output_auto(&output, height)?;
     Ok(())
 }
 
@@ -1402,16 +1402,27 @@ fn terminal_height() -> usize {
         .unwrap_or(24)
 }
 
-fn emit_status_output(output: &str, height: usize) -> Result<()> {
-    if should_page_status(output, height) && write_to_pager(output).is_ok() {
+fn emit_status_output(output: &str, height: usize, args: &StatusArgs) -> Result<()> {
+    if !args.no_pager
+        && should_page_status(output, height, args.pager)
+        && write_to_pager(output).is_ok()
+    {
         return Ok(());
     }
     print!("{output}");
     Ok(())
 }
 
-fn should_page_status(output: &str, height: usize) -> bool {
-    io::stdout().is_terminal() && output.lines().count() > height
+fn emit_status_output_auto(output: &str, height: usize) -> Result<()> {
+    if should_page_status(output, height, false) && write_to_pager(output).is_ok() {
+        return Ok(());
+    }
+    print!("{output}");
+    Ok(())
+}
+
+fn should_page_status(output: &str, height: usize, force: bool) -> bool {
+    force || (io::stdout().is_terminal() && output.lines().count() > height)
 }
 
 fn write_to_pager(output: &str) -> Result<()> {
@@ -1905,7 +1916,7 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
             printed += 1;
         }
     }
-    emit_status_output(&output, terminal_height())
+    emit_status_output_auto(&output, terminal_height())
 }
 
 fn recent_change_operations(
@@ -2232,7 +2243,7 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
         )?;
         printed += 1;
     }
-    emit_status_output(&output, terminal_height())
+    emit_status_output_auto(&output, terminal_height())
 }
 
 pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {

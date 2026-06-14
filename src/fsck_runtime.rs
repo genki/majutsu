@@ -89,6 +89,7 @@ fn read_remote_head(
 pub(crate) struct FsckOptions {
     quick: bool,
     progress: bool,
+    sample: Option<usize>,
     deadline: Option<Instant>,
     started: Instant,
 }
@@ -99,6 +100,7 @@ impl FsckOptions {
         Self {
             quick,
             progress: args.progress,
+            sample: args.sample,
             deadline: args
                 .timeout_secs
                 .map(|timeout| Instant::now() + Duration::from_secs(timeout)),
@@ -132,6 +134,29 @@ impl FsckOptions {
             }
         }
         Ok(())
+    }
+
+    fn within_sample(&self, name: &str, index: usize, total: Option<usize>) -> Result<bool> {
+        self.check_timeout()?;
+        let Some(sample) = self.sample else {
+            return Ok(true);
+        };
+        if index < sample {
+            return Ok(true);
+        }
+        if self.progress {
+            match total {
+                Some(total) => eprintln!(
+                    "fsck progress phase={name} sampled={sample}/{total} elapsed_secs={}",
+                    self.started.elapsed().as_secs()
+                ),
+                None => eprintln!(
+                    "fsck progress phase={name} sampled={sample} elapsed_secs={}",
+                    self.started.elapsed().as_secs()
+                ),
+            }
+        }
+        Ok(false)
     }
 
     fn check_timeout(&self) -> Result<()> {
@@ -175,6 +200,9 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         options.phase("local-object-payloads")?;
         let local_keys = local_object_keys(paths, &export)?;
         for (index, key) in local_keys.iter().enumerate() {
+            if !options.within_sample("local-object-payloads", index, Some(local_keys.len()))? {
+                break;
+            }
             options.tick("local-object-payloads", index + 1, Some(local_keys.len()))?;
             let full = paths.home.join(key);
             if !full.exists() {
@@ -252,7 +280,7 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
             &mut missing,
         )?;
         options.phase("metadata-references")?;
-        validate_local_metadata_references(paths, &export, &mut missing)?;
+        validate_local_metadata_references(paths, &export, &options, &mut missing)?;
     }
     options.phase("queues")?;
     validate_local_oplog(&conn, &mut missing)?;
@@ -302,6 +330,9 @@ fn validate_blob_payloads(
         ))
     })?;
     for (index, row) in rows.enumerate() {
+        if !options.within_sample("blob-records", index, None)? {
+            break;
+        }
         options.tick("blob-records", index + 1, None)?;
         let (oid, key, pack_id) = row?;
         if let Some(pack_id) = pack_id.as_deref() {
@@ -345,6 +376,9 @@ fn validate_chunk_payloads(
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     for (index, row) in rows.enumerate() {
+        if !options.within_sample("chunk-records", index, None)? {
+            break;
+        }
         options.tick("chunk-records", index + 1, None)?;
         let (oid, key) = row?;
         if !paths.home.join(&key).exists() {
@@ -373,6 +407,9 @@ fn validate_large_payloads(
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     for (index, row) in rows.enumerate() {
+        if !options.within_sample("large-payloads", index, None)? {
+            break;
+        }
         options.tick("large-payloads", index + 1, None)?;
         let (oid, manifest_key) = row?;
         match read_object(paths, &manifest_key)
@@ -664,10 +701,19 @@ fn root_configs_match(left: &RootConfig, right: &RootConfig) -> bool {
 fn validate_local_metadata_references(
     paths: &Paths,
     export: &crate::MetadataExport,
+    options: &FsckOptions,
     missing: &mut usize,
 ) -> Result<()> {
     let mut live = LiveMetadataReferences::default();
-    for snapshot in &export.snapshots {
+    for (index, snapshot) in export.snapshots.iter().enumerate() {
+        if !options.within_sample("metadata-references", index, Some(export.snapshots.len()))? {
+            break;
+        }
+        options.tick(
+            "metadata-references",
+            index + 1,
+            Some(export.snapshots.len()),
+        )?;
         let manifest = match crate::snapshot_state::snapshot_manifest_from_parts(
             paths,
             &snapshot.id,
@@ -718,6 +764,9 @@ fn validate_local_snapshot_objects(
     missing: &mut usize,
 ) -> Result<()> {
     for (index, snapshot) in export.snapshots.iter().enumerate() {
+        if !options.within_sample("snapshot-manifests", index, Some(export.snapshots.len()))? {
+            break;
+        }
         options.tick(
             "snapshot-manifests",
             index + 1,
@@ -789,6 +838,9 @@ fn validate_local_large_manifest_objects(
     missing: &mut usize,
 ) -> Result<()> {
     for (index, large) in export.large_objects.iter().enumerate() {
+        if !options.within_sample("large-manifests", index, Some(export.large_objects.len()))? {
+            break;
+        }
         options.tick(
             "large-manifests",
             index + 1,
@@ -836,6 +888,9 @@ fn validate_local_pack_objects(
         }
     }
     for (index, pack) in export.packs.iter().enumerate() {
+        if !options.within_sample("pack-objects", index, Some(export.packs.len()))? {
+            break;
+        }
         options.tick("pack-objects", index + 1, Some(export.packs.len()))?;
         let expected_blobs = blobs_by_pack
             .get(pack.pack_id.as_str())

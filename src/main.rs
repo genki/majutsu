@@ -197,7 +197,7 @@ fn main() -> Result<()> {
         Command::Root { command } => root_cmd(&paths, command),
         Command::Branch { command } => branch_cmd(&paths, command),
         Command::Snapshot(args) => snapshot(&paths, args),
-        Command::Status => status_cmd(&paths),
+        Command::Status(args) => status_cmd(&paths, args),
         Command::State(args) => state_cmd(&paths, args),
         Command::Log(args) => log_cmd(&paths, args),
         Command::Op { command } => op_cmd(&paths, command),

@@ -8158,6 +8158,17 @@ fn fsck_quick_and_timeout_are_available() {
     });
     assert!(quick.contains("fsck ok"));
 
+    let sampled = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("fsck")
+            .arg("--sample")
+            .arg("1");
+        c
+    });
+    assert!(sampled.contains("fsck ok"));
+
     fails({
         let mut c = mj();
         c.arg("--home")
@@ -13482,9 +13493,11 @@ fn status_reports_configured_root_state() {
     let status = output({
         let mut c = mj();
         c.env("COLUMNS", "48")
+            .env("LINES", "5")
             .arg("--home")
             .arg(&state)
-            .arg("status");
+            .arg("status")
+            .arg("--no-pager");
         c
     });
 
@@ -13514,6 +13527,34 @@ fn status_reports_configured_root_state() {
             .all(|line| line.len() <= 48),
         "{status}"
     );
+}
+
+#[test]
+fn cli_help_describes_status_and_daemon_subcommands() {
+    let status_help = output({
+        let mut c = mj();
+        c.arg("status").arg("--help");
+        c
+    });
+    assert!(status_help.contains("--no-pager"));
+    assert!(status_help.contains("--pager"));
+
+    let daemon_help = output({
+        let mut c = mj();
+        c.arg("daemon").arg("--help");
+        c
+    });
+    assert!(daemon_help.contains("Start the background watch daemon"));
+    assert!(daemon_help.contains("Render a user service definition"));
+    assert!(daemon_help.contains("Show daemon pid, IPC, queue, and journal health"));
+
+    let fsck_help = output({
+        let mut c = mj();
+        c.arg("fsck").arg("--help");
+        c
+    });
+    assert!(fsck_help.contains("--sample"));
+    assert!(fsck_help.contains("heavy payload or manifest phase"));
 }
 
 #[test]

@@ -296,3 +296,49 @@ mj fsck --home /home/vagrant/.majutsu --quick
 3. full `mj fsck` は metadata prune 後に remote hydrate を伴う可能性がある。大規模 root 向けには `--sample` / `--since` / phase 別対象件数などの追加余地がある。
 4. `cache prune --metadata` はローカル二重保持を解消するが、snapshot ごとの tree manifest 生成量そのものは減らしていない。remote 長期効率と deep fsck コストをさらに詰めるなら、content-addressed subtree reuse や差分 tree 表現を検討する。
 5. 過去にローカル HTTP mock テストが 1 回だけ connection reset / close で失敗し、単独再実行と全体再実行では成功している。再現していないが flaky 予防として mock server の待受開始・接続終了条件を点検対象に残す。
+
+## 残改善実施 2026-06-14 build 23
+
+実施:
+
+- `mj status --no-pager` を追加し、出力が端末高さを超えても pager を使わず標準出力へ出せるようにした。
+- `mj status --pager` を追加し、短い出力や非 TTY でも明示的に pager を使えるようにした。
+- `mj daemon --help`、`mj lifecycle --help`、`mj large --help`、`mj remote --help`、`mj restore --help`、`mj key --help` 配下のサブコマンド説明を補強した。
+- `mj fsck --sample N` を追加し、full fsck の重い payload / manifest / pack / metadata reference phase を phase ごとに最大 N 件で smoke できるようにした。
+- `docs/OPERATIONS.md` に status pager 制御と local fsck sample 運用を追記した。
+
+検証:
+
+```sh
+cargo test --test remote_file cli_help_describes_status_and_daemon_subcommands --locked
+cargo test --test remote_file fsck_quick_and_timeout_are_available --locked
+cargo test --test remote_file status_reports_configured_root_state --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+全て成功。
+
+実環境反映:
+
+- `cargo install --path . --locked --force`
+- installed CLI: `mj 0.3.0+build.23`
+- `mj daemon restart --home /home/vagrant/.majutsu`
+- `mj cache prune --home /home/vagrant/.majutsu --metadata`
+- `mj fsck --home /home/vagrant/.majutsu --quick`
+- `mj sync status --home /home/vagrant/.majutsu`
+
+結果:
+
+- current snapshot: `snap-8248c9b1-50c4-407f-bbd2-b68408f1678b`
+- daemon: running、IPC ok、pending journal 0。
+- `local_current` と `remote_current` は一致。
+- queued uploads 0。
+- state usage は metadata prune 後に約 35.0 MiB。
+
+残る設計課題:
+
+- `mj fsck --since` は未実装。履歴 graph 全体の整合性検査と snapshot 時刻フィルタの意味づけが絡むため、partial fsck の仕様を決めてから入れる。
+- tree manifest 生成量そのものを減らす subtree reuse / 差分 tree 表現は未実装。現状は local metadata cache prune でローカル二重保持を避ける。
+- 過去に観測された HTTP mock の一時的な connection reset / close は今回再現していない。全体テストで再発する場合に server lifecycle を点検する。

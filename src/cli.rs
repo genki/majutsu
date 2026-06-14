@@ -59,7 +59,7 @@ pub(crate) enum Command {
     #[command(about = "Snapshot the current state of configured roots")]
     Snapshot(SnapshotArgs),
     #[command(about = "Show roots, current snapshot, queues, and daemon state")]
-    Status,
+    Status(StatusArgs),
     #[command(about = "Inspect state home paths, refs, branches, and metadata")]
     State(StateArgs),
     #[command(about = "Show recent managed file changes")]
@@ -293,6 +293,23 @@ pub(crate) struct BranchRenameArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct StatusArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "pager",
+        help = "Print directly without using a pager even when output is taller than the terminal"
+    )]
+    pub(crate) no_pager: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Force pager output even when stdout is not a terminal or output fits on screen"
+    )]
+    pub(crate) pager: bool,
+}
+
+#[derive(Args)]
 pub(crate) struct StateArgs {
     #[arg(
         long,
@@ -523,10 +540,17 @@ pub(crate) struct DiffArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RestoreCommand {
+    #[command(about = "Build a restore plan without changing files")]
     Plan(RestoreArgs),
+    #[command(about = "Apply a restore plan to the configured root paths or --to directory")]
     Apply(RestoreArgs),
+    #[command(about = "Prepare missing remote objects and archive restores before apply")]
     Prepare(RestoreArgs),
-    Resume { job_id: String },
+    #[command(about = "Resume a prepared restore job after missing objects become available")]
+    Resume {
+        #[arg(help = "Restore job id from `mj restore prepare`")]
+        job_id: String,
+    },
 }
 
 #[derive(Args)]
@@ -588,10 +612,15 @@ pub(crate) struct HydrateArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum LargeCommand {
+    #[command(about = "List large objects known to majutsu")]
     List,
+    #[command(about = "Show large-object counts, chunk counts, and logical sizes")]
     Stat,
+    #[command(about = "Verify large-object manifests, chunks, and pins")]
     Verify,
+    #[command(about = "Pin large objects so retention does not prune them")]
     Pin(LargePinArgs),
+    #[command(about = "Remove large-object pins, optionally by age")]
     Unpin(LargeUnpinArgs),
 }
 
@@ -670,7 +699,11 @@ pub(crate) struct LargeUnpinArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RemoteCommand {
+    #[command(about = "Check that the configured remote is reachable and supports required APIs")]
     Check,
+    #[command(
+        about = "Check remote metadata integrity; use --objects or --deep for heavier checks"
+    )]
     Fsck {
         #[arg(
             long,
@@ -736,9 +769,13 @@ pub(crate) enum RemoteCommand {
         )]
         timeout_secs: Option<u64>,
     },
+    #[command(about = "Show the remote backend capability matrix")]
     Capabilities,
+    #[command(about = "List hosts published in the shared remote backend")]
     Hosts,
+    #[command(about = "Inspect one remote host timeline")]
     Host {
+        #[arg(help = "Remote host id or unambiguous host name")]
         id: String,
         #[arg(long)]
         snapshots: bool,
@@ -783,11 +820,14 @@ pub(crate) struct OpDiffArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum LifecycleCommand {
+    #[command(about = "Render the lifecycle policy for a provider")]
     Policy {
         #[arg(long, default_value = "gcs")]
         provider: String,
     },
+    #[command(about = "Show lifecycle policy state and configured provider behavior")]
     Status,
+    #[command(about = "Apply or dry-run lifecycle policy configuration")]
     Apply {
         #[arg(long, default_value = "s3")]
         provider: String,
@@ -856,6 +896,7 @@ pub(crate) struct ResolvedWatchArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonCommand {
+    #[command(about = "Start the background watch daemon")]
     Start {
         #[arg(long)]
         backend: Option<String>,
@@ -895,12 +936,16 @@ pub(crate) enum DaemonCommand {
     },
     #[command(about = "Diagnose daemon health and show recovery guidance")]
     Doctor,
+    #[command(about = "Render a user service definition for systemd or launchd")]
     Service {
         #[arg(long, default_value = "systemd")]
         provider: String,
     },
+    #[command(about = "Stop the background watch daemon")]
     Stop,
+    #[command(about = "Show daemon pid, IPC, queue, and journal health")]
     Status,
+    #[command(about = "Export daemon health metrics in text form")]
     Metrics,
 }
 
@@ -927,14 +972,24 @@ pub(crate) struct FsckArgs {
         help = "Stop after this many seconds and report an incomplete check"
     )]
     pub(crate) timeout_secs: Option<u64>,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "In full checks, inspect at most N objects per heavy payload or manifest phase"
+    )]
+    pub(crate) sample: Option<usize>,
 }
 
 #[derive(Subcommand)]
 pub(crate) enum KeyCommand {
+    #[command(about = "Print the current encryption master key in export form")]
     Export,
+    #[command(about = "Import an encryption master key into this state home")]
     Import {
+        #[arg(help = "64-character hex master key")]
         hex: String,
     },
+    #[command(about = "Rotate encrypted local and remote metadata to a new master key")]
     Rotate {
         #[arg(long)]
         new_key: Option<String>,
