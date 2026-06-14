@@ -413,3 +413,68 @@ cargo test --workspace --all-targets --locked
 - queued uploads 0、sync lock なし。
 - scoped fsck は 25 秒程度で成功し、quick fsck も成功。
 - metadata cache prune 後の state usage は約 35.0 MiB。
+
+## 実装状況再確認 2026-06-14 build 24
+
+確認した状態:
+
+- repository: `main` / `ecff0e4 Harden fsck scope and daemon replay sync`
+- 作業ツリー: clean
+- installed CLI: `mj 0.3.0+build.24`
+- 実環境 root:
+  - `head`
+  - `help`
+  - `jotter`
+  - `moon`
+  - `stackchan`
+  - `websh`
+- daemon: running、IPC ok。
+- pending journal: 0。
+- queued uploads: 0。
+- `local_current` と `remote_current` は一致。
+- sync lock: なし。
+- `mj fsck --home /home/vagrant/.majutsu --quick`: 成功、約 10 秒。
+- `mj fsck --home /home/vagrant/.majutsu --since '24h ago' --sample 10 --timeout-secs 60 --progress`: 成功、約 24 秒。
+
+ローカル state サイズ:
+
+| 項目 | 値 |
+| --- | ---: |
+| state apparent size | 48,808,853 B |
+| state disk usage | 64,421,888 B |
+| queue apparent size | 127,851 B |
+| queue disk usage | 6,836,224 B |
+| event journal files | 545 |
+| upload queue files | 0 |
+| upload payload files | 0 |
+
+`mj status --no-pager` の表示では state usage は apparent size 寄りに見える。一方、`queue/events`
+のような小ファイル多数の領域では、実ディスク使用量が apparent size よりかなり大きくなる。
+
+現時点の評価:
+
+- daemon 稼働、自動 snapshot / sync、remote 同期、暗号化 backend、quick / scoped fsck は運用可能な状態。
+- build 20 時点で問題だった stale daemon、巨大 local tree metadata、無進捗 fsck は、build 24 時点では実環境上のブロッカーではなくなっている。
+- ただし、長期運用品質と大規模 root での効率をさらに上げる余地は残る。
+
+残る改善候補:
+
+1. `mj status` の storage 表示を apparent size と disk usage の両方に分ける。
+   - 現状は queue apparent size が 127 KiB 程度でも disk usage は 6.8 MiB あり、小ファイル多数の実コストを見落としやすい。
+   - `Local Storage` に `logical/apparent` と `disk` の列を追加するか、差が大きい場合に警告を出す。
+2. 処理済み event journal の保持方針をもう少し明確にする。
+   - pending は 0 だが、処理済み event file が 545 件残っている。
+   - 現在は閾値を超えた snapshot 後に compact される設計だが、status 上は「正常な保持」なのか「compact 推奨」なのか判断しづらい。
+   - `mj event compact` のような明示操作、または `mj cache prune` への event journal prune 統合を検討する。
+3. `mj status` に sync head の一致状況を直接表示する。
+   - `mj sync status` では `local_current == remote_current` を確認できるが、通常の `mj status` は remote configured / queued uploads 中心。
+   - クラッシュ対策ツールとしては、通常 status の上部に `Remote head synced` / `Remote lagging` を出す方が異常に気付きやすい。
+4. daemon の watch 対象 root 更新を明示する。
+   - `root add` 後の自動 daemon 起動はあるが、既存 daemon が動作中の場合に root set 変更をどう反映したかが status から分かりづらい。
+   - root 追加後に restart が必要ない設計ならその証跡を status / log に出し、必要な設計なら自動 reload を追加する。
+5. `fsck --since` の scope 構築が tree manifest 読み込みに依存しており、sample 10 でも 8 秒程度かかる。
+   - 現状は 60 秒制限内で成功しているためブロッカーではない。
+   - 大規模 root では snapshot から到達する payload set を DB/index に保持し、scope 構築をさらに短縮する余地がある。
+6. subtree reuse / 差分 tree 表現は未実装。
+   - 現状は metadata cache prune によりローカル二重保持を抑えている。
+   - remote 長期効率、deep fsck コスト、履歴がさらに増えた場合の metadata 量を詰めるなら別設計タスクとして扱う。
