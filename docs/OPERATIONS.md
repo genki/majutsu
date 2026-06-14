@@ -58,7 +58,9 @@ mj event compact
 直前 snapshot から root tree が変化していない場合、`mj snapshot` は既定で新しい
 snapshot metadata を作らない。定期 daemon snapshot や手動確認で remote metadata が
 増え続けることを避けるためである。この場合も event journal には `snapshot-noop` と
-`snapshot-finish` が残り、watch / daemon の進捗判定には使われる。
+`snapshot-finish` が残り、watch / daemon の進捗判定には使われる。no-op 判定のために
+一時的に再生成した payload cache と tree metadata は、remote に同期済みであれば同じ経路で
+prune される。
 
 監査上の checkpoint として、変化がなくても snapshot を明示的に残したい場合だけ
 `MAJUTSU_SNAPSHOT_ALLOW_NOOP=1` を付ける。

@@ -128,7 +128,7 @@ mod watch_runtime;
 
 use atomic_io::write_atomic_with;
 use branch_runtime::branch_cmd;
-use cache_runtime::cache_cmd;
+use cache_runtime::{cache_cmd, prune_synced_metadata_cache, prune_synced_payload_cache};
 #[cfg(test)]
 use cli::PackArgs;
 use cli::{Cli, Command, InitArgs, RestoreArgs, SnapshotArgs};
@@ -492,6 +492,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             &format!("noop current={current_id}"),
         )?;
         let _ = compact_event_journal_force(paths);
+        prune_noop_snapshot_cache(paths, &conn, &config);
         println!("snapshot unchanged {current_id}");
         println!("files {total_files}, large {large_files}");
         return Ok(());
@@ -555,6 +556,22 @@ fn snapshot_allows_noop() -> bool {
     env::var("MAJUTSU_SNAPSHOT_ALLOW_NOOP")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn prune_noop_snapshot_cache(paths: &Paths, conn: &Connection, config: &Config) {
+    let Some(remote_config) = config.remote.as_ref() else {
+        return;
+    };
+    let result = (|| -> Result<()> {
+        let remote = open_remote(remote_config)?;
+        let export = export_metadata(paths, conn, config)?;
+        prune_synced_payload_cache(paths, &remote, &export)?;
+        prune_synced_metadata_cache(paths, &remote, &export)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!("snapshot noop cache prune skipped: {err:#}");
+    }
 }
 
 fn snapshot_operation_kind(message: Option<&str>, parent: Option<&str>) -> &'static str {

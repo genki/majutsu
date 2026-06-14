@@ -4628,6 +4628,24 @@ fn unchanged_snapshot_is_skipped_by_default() {
         serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
     let snapshots = export["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 1);
+
+    let third = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(third.contains("snapshot unchanged snap-"), "{third}");
+    let cache = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("cache")
+            .arg("stat")
+            .arg("--metadata");
+        c
+    });
+    assert!(cache.contains("payload_cache_candidates 0"), "{cache}");
+    assert!(cache.contains("metadata_cache_candidates 0"), "{cache}");
 }
 
 #[test]
