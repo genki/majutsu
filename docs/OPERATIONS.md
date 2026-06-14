@@ -84,6 +84,9 @@ mj health --json
 pending event journal、sync lock、暗号化key fileの基本状態から、`protected` / `degraded` /
 `unprotected` を返す。クラッシュ対策として日常的に監視すべきなのは full fsck ではなくこの
 軽量 health signal である。
+`mj health --json` には root 別に `present`、`current_snapshot_includes`、
+`current_file_count`、`current_tree_id` も含まれる。`mj status` の Roots 表も current
+snapshot 上の file count と tree id を表示する。
 
 `protected` は active root が daemon に監視され、upload queue が空で、local current と
 cached remote head が一致している状態を表す。`degraded` は一時的なsync中やpending eventなど、

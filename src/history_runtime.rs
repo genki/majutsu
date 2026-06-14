@@ -38,6 +38,10 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let config = read_config(paths)?;
     let roots = roots(&conn)?;
     let current = current_snapshot(&conn)?;
+    let current_manifest = current
+        .as_deref()
+        .map(|id| load_snapshot_by_id(paths, &conn, id))
+        .transpose()?;
     let current_label = current.as_deref().unwrap_or("(none)");
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
@@ -59,6 +63,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         daemon: &daemon,
         upload_stats: &upload_stats,
         pending_event_count,
+        current_manifest: current_manifest.as_ref(),
     })?;
     let width = terminal_width();
     let height = terminal_height();
@@ -234,39 +239,47 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     if roots.is_empty() {
         writeln!(output, "  (none)").expect("write status output");
     } else {
-        let (id_width, status_width) = root_table_widths(width);
-        writeln!(
-            output,
-            "  {:<id_width$} {:<status_width$} PATH",
-            "ID",
-            "STATUS",
-            id_width = id_width,
-            status_width = status_width
-        )
-        .expect("write status output");
-        writeln!(
-            output,
-            "  {:<id_width$} {:<status_width$} {}",
-            "-".repeat(id_width),
-            "-".repeat(status_width),
-            "-".repeat(4),
-            id_width = id_width,
-            status_width = status_width
-        )
-        .expect("write status output");
-    }
-    for root in &roots {
-        let state = if root.status == "active" && !root.path.exists() {
-            "missing"
-        } else {
-            root.status.as_str()
-        };
-        print_root_row(
+        let root_rows = roots
+            .iter()
+            .map(|root| {
+                let state = if root.status == "active" && !root.path.exists() {
+                    "missing".to_string()
+                } else {
+                    root.status.clone()
+                };
+                let current_root = current_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.root_trees.get(&root.id));
+                [
+                    root.id.clone(),
+                    state,
+                    current_root
+                        .map(|root_tree| root_tree.file_count.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    current_root
+                        .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
+                        .unwrap_or_else(|| "-".into()),
+                    root.path.display().to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let root_row_refs = root_rows
+            .iter()
+            .map(|row| {
+                [
+                    row[0].as_str(),
+                    row[1].as_str(),
+                    row[2].as_str(),
+                    row[3].as_str(),
+                    row[4].as_str(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(
             &mut output,
             width,
-            &root.id,
-            state,
-            &root.path.display().to_string(),
+            &["ID", "STATUS", "FILES", "TREE", "PATH"],
+            &root_row_refs,
         );
     }
     writeln!(output).expect("write status output");
@@ -441,6 +454,10 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
     let config = read_config(paths)?;
     let roots = roots(&conn)?;
     let current = current_snapshot(&conn)?;
+    let current_manifest = current
+        .as_deref()
+        .map(|id| load_snapshot_by_id(paths, &conn, id))
+        .transpose()?;
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let upload_stats = upload_queue_stats(paths)?;
@@ -457,6 +474,7 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
         daemon: &daemon,
         upload_stats: &upload_stats,
         pending_event_count,
+        current_manifest: current_manifest.as_ref(),
     })
 }
 
@@ -504,6 +522,17 @@ struct HealthIssue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct RootHealth {
+    id: String,
+    status: String,
+    path: String,
+    present: bool,
+    current_snapshot_includes: bool,
+    current_file_count: Option<usize>,
+    current_tree_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HealthReport {
     state: ProtectionState,
     current_snapshot: Option<String>,
@@ -520,6 +549,7 @@ struct HealthReport {
     pending_journal_events: usize,
     sync_lock_pid: Option<u32>,
     encryption: String,
+    roots: Vec<RootHealth>,
     issues: Vec<HealthIssue>,
 }
 
@@ -555,6 +585,7 @@ struct HealthInputs<'a> {
     daemon: &'a DaemonHealth,
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
+    current_manifest: Option<&'a majutsu_core::SnapshotManifest>,
 }
 
 fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
@@ -568,9 +599,26 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         daemon,
         upload_stats,
         pending_event_count,
+        current_manifest,
     } = input;
     let active_roots = roots.iter().filter(|root| root.status == "active").count();
     let mut issues = Vec::new();
+    let root_health = roots
+        .iter()
+        .map(|root| {
+            let current_root =
+                current_manifest.and_then(|manifest| manifest.root_trees.get(&root.id));
+            RootHealth {
+                id: root.id.clone(),
+                status: root.status.clone(),
+                path: root.path.display().to_string(),
+                present: root.path.exists(),
+                current_snapshot_includes: current_root.is_some(),
+                current_file_count: current_root.map(|root_tree| root_tree.file_count),
+                current_tree_id: current_root.map(|root_tree| root_tree.tree_id.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
 
     if active_roots == 0 {
         issues.push(HealthIssue {
@@ -596,6 +644,16 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
                 severity: HealthSeverity::Warning,
                 code: "root-not-active".into(),
                 message: format!("root {} status is {}", root.id, root.status),
+            });
+        } else if current.is_some()
+            && current_manifest
+                .and_then(|manifest| manifest.root_trees.get(&root.id))
+                .is_none()
+        {
+            issues.push(HealthIssue {
+                severity: HealthSeverity::Critical,
+                code: "root-missing-from-current-snapshot".into(),
+                message: format!("active root {} is not present in current snapshot", root.id),
             });
         }
     }
@@ -709,6 +767,7 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         pending_journal_events: pending_event_count,
         sync_lock_pid,
         encryption: config.security.encryption.clone(),
+        roots: root_health,
         issues,
     })
 }
@@ -845,6 +904,19 @@ fn print_health_report(report: &HealthReport) {
             .unwrap_or_else(|| "(none)".into())
     );
     println!("encryption {}", report.encryption);
+    for root in &report.roots {
+        println!(
+            "root {} status={} present={} current={} files={} tree={}",
+            root.id,
+            root.status,
+            root.present,
+            root.current_snapshot_includes,
+            root.current_file_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            root.current_tree_id.as_deref().unwrap_or("-")
+        );
+    }
     println!("issue_count {}", report.issue_count());
     for issue in &report.issues {
         println!(
@@ -1902,26 +1974,6 @@ fn print_table_row<const N: usize>(
         print_wrapped(out, &line_prefix, row[N - 1], terminal_width);
     } else if let Some(value) = row.first() {
         print_wrapped(out, &line_prefix, value, terminal_width);
-    }
-}
-
-fn print_root_row(out: &mut String, width: usize, id: &str, state: &str, path: &str) {
-    let (id_width, status_width) = root_table_widths(width);
-    let prefix = format!(
-        "  {id:<id_width$} {state:<status_width$} ",
-        id_width = id_width,
-        status_width = status_width
-    );
-    print_wrapped(out, &prefix, path, width);
-}
-
-fn root_table_widths(width: usize) -> (usize, usize) {
-    if width < 60 {
-        (18, 10)
-    } else if width < 88 {
-        (24, 18)
-    } else {
-        (32, 18)
     }
 }
 

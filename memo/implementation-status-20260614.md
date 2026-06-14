@@ -997,3 +997,40 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 - root別の最終snapshot/sync時刻やpermission degradedの詳細表示。
 - daemon停止そのものは停止した daemon から通知できないため、外部監視側で
   `runtime/health.json` の鮮度や `mj health --json` を見る運用が必要。
+
+## 残改善実施 2026-06-14 build 34
+
+実施:
+
+- `BUILD_NUMBER` 34。
+- `mj health --json` に root 別 details を追加した。
+  - `id`
+  - `status`
+  - `path`
+  - `present`
+  - `current_snapshot_includes`
+  - `current_file_count`
+  - `current_tree_id`
+- active root が current snapshot に含まれていない場合は
+  `root-missing-from-current-snapshot` を critical issue として扱う。
+- `mj health` text 出力にも root 別 status/current/files/tree を表示する。
+- `mj status` の Roots 表に `FILES` と `TREE` を追加し、root が current snapshot に含まれているかを
+  人間が確認しやすくした。
+
+検証:
+
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --test remote_file health_reports_unprotected_when_active_root_has_no_daemon_or_remote --locked` 成功。
+- `cargo test --test remote_file status_reports_configured_root_state --locked` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- 実環境に `mj 0.3.0+build.34` を install し、daemon restart 済み。
+- 実環境の `mj status --no-pager` で Roots 表に `FILES` / `TREE` が表示されることを確認。
+- 実環境の `mj health --json` で全 active root が `present=true` / `current_snapshot_includes=true` になることを確認。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `local_current == remote_current == snap-4b86efee-bbc1-4dc7-a9bc-9d5353da3f78`、issue 0。
+
+残り:
+
+- root別の「最終変更時刻」はまだ tree id の変化を ancestry 方向へ探索する必要があるため未実装。
+- permission degraded の詳細は fs scan 時の permission skip 結果を root health に永続化する設計が必要。

@@ -13741,6 +13741,8 @@ fn status_reports_configured_root_state() {
     assert!(status.contains("Host"));
     assert!(status.contains("Configuration"));
     assert!(status.contains("Roots"));
+    assert!(status.contains("FILES"));
+    assert!(status.contains("TREE"));
     assert!(status.contains("sample"));
     assert!(status.contains("paused"));
     assert!(status.contains("Metadata"));
@@ -13793,6 +13795,9 @@ fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
     });
     let value: serde_json::Value = serde_json::from_str(&health).unwrap();
     assert_eq!(value["state"], "unprotected");
+    assert_eq!(value["roots"][0]["id"], "sample");
+    assert_eq!(value["roots"][0]["present"], true);
+    assert_eq!(value["roots"][0]["current_snapshot_includes"], false);
     let codes = value["issues"]
         .as_array()
         .unwrap()
