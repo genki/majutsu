@@ -13597,6 +13597,70 @@ fn status_reports_configured_root_state() {
 }
 
 #[test]
+fn event_stat_and_compact_report_processed_journal_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let stat = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("event").arg("stat");
+        c
+    });
+    assert!(stat.contains("event_journal_records "));
+    assert!(stat.contains("event_journal_pending 0"));
+    assert!(stat.contains("event_journal_removable "));
+
+    let dry_run = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("event")
+            .arg("compact")
+            .arg("--dry-run");
+        c
+    });
+    assert!(dry_run.contains("dry_run true"));
+
+    let compact = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("event").arg("compact");
+        c
+    });
+    assert!(compact.contains("dry_run false"));
+    assert!(compact.contains("event_journal_pending 0"));
+}
+
+#[test]
 fn cli_help_describes_status_and_daemon_subcommands() {
     let status_help = output({
         let mut c = mj();

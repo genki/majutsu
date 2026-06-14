@@ -478,3 +478,33 @@ cargo test --workspace --all-targets --locked
 6. subtree reuse / 差分 tree 表現は未実装。
    - 現状は metadata cache prune によりローカル二重保持を抑えている。
    - remote 長期効率、deep fsck コスト、履歴がさらに増えた場合の metadata 量を詰めるなら別設計タスクとして扱う。
+
+## 残改善実施 2026-06-14 build 25
+
+実施:
+
+- `mj status` の上部と overview に remote head 同期状態を表示するようにした。
+  - local current と cached remote current ref が一致すれば `synced`。
+  - 不一致、未同期、remote unavailable などは status で判別できる。
+- `mj status` / `mj state` の storage 表示に apparent size と disk usage の両方を出すようにした。
+  - 小ファイル多数の queue / event journal で実ディスク使用量を見落としにくくするため。
+  - 狭い端末幅では列幅を収縮し、非末尾列を切り詰めて表示崩れを避ける。
+- `mj event stat` と `mj event compact [--dry-run]` を追加した。
+  - `stat` は総数、processed、pending、removable、oldest/newest、last snapshot finish を表示する。
+  - `compact` は最新 snapshot finish より古い処理済み event record だけを削除する。
+  - 自動 compact の閾値付き挙動は維持し、明示 compact だけ force 実行できる。
+- `BUILD_NUMBER` を 25 に更新した。
+- `docs/OPERATIONS.md` に remote head 表示、storage apparent/disk 表示、event journal retention を追記した。
+
+検証:
+
+```sh
+cargo fmt --all -- --check
+cargo test --test remote_file status_reports_configured_root_state --locked
+cargo test --test remote_file event_stat_and_compact_report_processed_journal_records --locked
+cargo test --test remote_file cli_help_describes_status_and_daemon_subcommands --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+全て成功。

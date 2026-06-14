@@ -160,7 +160,7 @@ use operation_log::{
 use pack_runtime::pack_cmd;
 use process_runtime::acquire_process_lock;
 use prune_runtime::{gc_cmd, prune_cmd};
-use queue_runtime::{compact_event_journal, has_pending_journal_events, record_event};
+use queue_runtime::{compact_event_journal, event_cmd, has_pending_journal_events, record_event};
 use remote_runtime::remote_cmd;
 #[cfg(test)]
 use remote_store::{
@@ -208,6 +208,7 @@ fn main() -> Result<()> {
         Command::Hydrate(args) => hydrate_cmd(&paths, args),
         Command::Large { command } => large_cmd(&paths, command),
         Command::Cache { command } => cache_cmd(&paths, command),
+        Command::Event { command } => event_cmd(&paths, command),
         Command::Sync(args) => sync_cmd(&paths, args),
         Command::Remote { command } => remote_cmd(&paths, command),
         Command::Lifecycle { command } => lifecycle_cmd(&paths, command),

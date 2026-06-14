@@ -8,6 +8,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::cli::EventCommand;
 use crate::config::Paths;
 use crate::object_paths::prefer_canonical_remote_only;
 use crate::remote_store::RemoteStore;
@@ -455,24 +456,143 @@ pub(crate) fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
 }
 
 pub(crate) fn compact_event_journal(paths: &Paths) -> Result<usize> {
+    compact_event_journal_inner(paths, false, false).map(|result| result.removed)
+}
+
+pub(crate) fn event_cmd(paths: &Paths, command: EventCommand) -> Result<()> {
+    crate::ensure_ready(paths)?;
+    match command {
+        EventCommand::Stat => {
+            let stats = event_journal_stats(paths)?;
+            print_event_journal_stats(&stats);
+        }
+        EventCommand::Compact { dry_run } => {
+            let result = compact_event_journal_inner(paths, true, dry_run)?;
+            println!("event_journal_records {}", result.total);
+            println!("event_journal_pending {}", result.pending);
+            println!("event_journal_removable {}", result.removable);
+            println!("event_journal_removed {}", result.removed);
+            println!("dry_run {}", dry_run);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EventJournalStats {
+    pub(crate) total: usize,
+    pub(crate) pending: usize,
+    pub(crate) processed: usize,
+    pub(crate) removable: usize,
+    pub(crate) oldest: Option<DateTime<Utc>>,
+    pub(crate) newest: Option<DateTime<Utc>>,
+    pub(crate) last_snapshot_finish: Option<DateTime<Utc>>,
+}
+
+pub(crate) fn event_journal_stats(paths: &Paths) -> Result<EventJournalStats> {
+    let records = event_journal_records(paths)?;
+    Ok(event_journal_stats_from_records(&records))
+}
+
+fn print_event_journal_stats(stats: &EventJournalStats) {
+    println!("event_journal_records {}", stats.total);
+    println!("event_journal_processed {}", stats.processed);
+    println!("event_journal_pending {}", stats.pending);
+    println!("event_journal_removable {}", stats.removable);
+    println!(
+        "event_journal_oldest {}",
+        stats
+            .oldest
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "(none)".into())
+    );
+    println!(
+        "event_journal_newest {}",
+        stats
+            .newest
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "(none)".into())
+    );
+    println!(
+        "event_journal_last_snapshot_finish {}",
+        stats
+            .last_snapshot_finish
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "(none)".into())
+    );
+}
+
+fn event_journal_stats_from_records(records: &[EventJournalRecord]) -> EventJournalStats {
+    let last_snapshot_finish = records
+        .iter()
+        .filter(|event| event.is_snapshot_finish())
+        .map(|event| event.observed_at)
+        .max();
+    let pending = records
+        .iter()
+        .filter(|event| {
+            event.is_pending_trigger()
+                && last_snapshot_finish
+                    .map(|finished_at| event.observed_at > finished_at)
+                    .unwrap_or(true)
+        })
+        .count();
+    let removable = last_snapshot_finish
+        .map(|finished_at| {
+            records
+                .iter()
+                .filter(|event| event.observed_at < finished_at)
+                .count()
+        })
+        .unwrap_or(0);
+    EventJournalStats {
+        total: records.len(),
+        pending,
+        processed: records.len().saturating_sub(pending),
+        removable,
+        oldest: records.iter().map(|event| event.observed_at).min(),
+        newest: records.iter().map(|event| event.observed_at).max(),
+        last_snapshot_finish,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventJournalCompactResult {
+    total: usize,
+    pending: usize,
+    removable: usize,
+    removed: usize,
+}
+
+fn compact_event_journal_inner(
+    paths: &Paths,
+    force: bool,
+    dry_run: bool,
+) -> Result<EventJournalCompactResult> {
     if !paths.event_queue.exists() {
-        return Ok(0);
+        return Ok(EventJournalCompactResult::default());
     }
     let records = event_journal_records(paths)?;
+    let stats = event_journal_stats_from_records(&records);
     let min_records = std::env::var("MAJUTSU_EVENT_COMPACT_MIN_RECORDS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1024);
-    if records.len() <= min_records {
-        return Ok(0);
+    if !force && records.len() <= min_records {
+        return Ok(EventJournalCompactResult {
+            total: stats.total,
+            pending: stats.pending,
+            removable: stats.removable,
+            removed: 0,
+        });
     }
-    let Some(last_snapshot_finish) = records
-        .iter()
-        .filter(|event| event.is_snapshot_finish())
-        .map(|event| event.observed_at)
-        .max()
-    else {
-        return Ok(0);
+    let Some(last_snapshot_finish) = stats.last_snapshot_finish else {
+        return Ok(EventJournalCompactResult {
+            total: stats.total,
+            pending: stats.pending,
+            removable: stats.removable,
+            removed: 0,
+        });
     };
     let mut removed = 0usize;
     for entry in fs::read_dir(&paths.event_queue)? {
@@ -489,14 +609,23 @@ pub(crate) fn compact_event_journal(paths: &Paths) -> Result<usize> {
         };
         let event: EventJournalRecord = serde_json::from_slice(&bytes)?;
         if event.observed_at < last_snapshot_finish {
-            match fs::remove_file(entry.path()) {
-                Ok(()) => removed += 1,
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+            if dry_run {
+                removed += 1;
+            } else {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                }
             }
         }
     }
-    Ok(removed)
+    Ok(EventJournalCompactResult {
+        total: stats.total,
+        pending: stats.pending,
+        removable: stats.removable,
+        removed,
+    })
 }
 
 #[cfg(test)]

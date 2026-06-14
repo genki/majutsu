@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use majutsu_core::OperationLogEntry as OperationExport;
+use majutsu_store::host_current_ref_key;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -18,7 +19,7 @@ use crate::cli::{DiffArgs, LogArgs, OpCommand, StateArgs, StatusArgs};
 use crate::config::{Config, Paths, read_config};
 use crate::daemon_runtime::{DaemonHealth, DaemonHealthState, daemon_health};
 use crate::operation_log::{query_operation, record_op};
-use crate::queue_runtime::{event_journal_records, upload_queue_stats};
+use crate::queue_runtime::{event_journal_records, event_journal_stats, upload_queue_stats};
 use crate::remote_store::open_remote;
 use crate::root_state::roots;
 use crate::snapshot_state::{
@@ -34,6 +35,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let current = current_snapshot(&conn)?;
     let current_label = current.as_deref().unwrap_or("(none)");
     let remote = read_remote_status(&config)?;
+    let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let db_stats = read_status_db_stats(&conn)?;
     let storage = read_storage_stats(paths)?;
     let upload_stats = upload_queue_stats(paths)?;
@@ -52,6 +54,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     print_kv(&mut output, width, "Roots", &roots.len().to_string());
     print_kv(&mut output, width, "Daemon", daemon.label());
     print_kv(&mut output, width, "Remote", remote.summary());
+    print_kv(&mut output, width, "Remote head", remote_head.label());
     print_kv(
         &mut output,
         width,
@@ -80,14 +83,18 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                 .count(),
             daemon: &daemon,
             remote: &remote,
+            remote_head: &remote_head,
             upload_total: upload_stats.total,
             upload_retrying: upload_stats.retrying,
             upload_delayed: upload_stats.delayed,
             upload_backpressure: upload_stats.has_backpressure(),
             encryption: config.security.encryption.as_str(),
             state_bytes: storage.state_bytes,
+            state_disk_bytes: storage.state_disk_bytes,
             object_bytes: storage.objects_bytes,
+            object_disk_bytes: storage.objects_disk_bytes,
             queue_bytes: storage.queue_bytes,
+            queue_disk_bytes: storage.queue_disk_bytes,
             blob_bytes: storage.loose_blob_bytes,
             pack_bytes: storage.pack_bytes,
             chunk_bytes: storage.large_bytes,
@@ -278,52 +285,61 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     print_table(
         &mut output,
         width,
-        &["SCOPE", "FILES", "SIZE"],
+        &["SCOPE", "FILES", "APPARENT", "DISK"],
         &[
             [
                 "state",
                 &storage.state_files.to_string(),
                 &format_bytes(storage.state_bytes),
+                &format_bytes(storage.state_disk_bytes),
             ],
             [
                 "objects",
                 &storage.objects_files.to_string(),
                 &format_bytes(storage.objects_bytes),
+                &format_bytes(storage.objects_disk_bytes),
             ],
             [
                 "loose blobs",
                 &storage.loose_blob_files.to_string(),
                 &format_bytes(storage.loose_blob_bytes),
+                &format_bytes(storage.loose_blob_disk_bytes),
             ],
             [
                 "packs",
                 &storage.pack_files.to_string(),
                 &format_bytes(storage.pack_bytes),
+                &format_bytes(storage.pack_disk_bytes),
             ],
             [
                 "large/chunks",
                 &storage.large_files.to_string(),
                 &format_bytes(storage.large_bytes),
+                &format_bytes(storage.large_disk_bytes),
             ],
             [
                 "trees",
                 &storage.tree_files.to_string(),
                 &format_bytes(storage.tree_bytes),
+                &format_bytes(storage.tree_disk_bytes),
             ],
             [
                 "logs",
                 &storage.logs_files.to_string(),
                 &format_bytes(storage.logs_bytes),
+                &format_bytes(storage.logs_disk_bytes),
             ],
             [
                 "queue",
                 &storage.queue_files.to_string(),
                 &format_bytes(storage.queue_bytes),
+                &format_bytes(storage.queue_disk_bytes),
             ],
         ],
     );
     writeln!(output).expect("write status output");
 
+    let event_stats = event_journal_stats(paths)?;
     writeln!(output, "{}", ui.heading("Queues")).expect("write status output");
     print_table(
         &mut output,
@@ -349,7 +365,10 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
             [
                 "event journal",
                 &event_count.to_string(),
-                &format!("{pending_event_count} pending, records retained"),
+                &format!(
+                    "{pending_event_count} pending, {} removable, records retained",
+                    event_stats.removable
+                ),
             ],
             [
                 "restore jobs",
@@ -383,6 +402,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let pending_event_count = pending_journal_event_count(&event_records);
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let remote = read_remote_status(&config)?;
+    let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let daemon = daemon_health(paths)?;
 
     let state = StateReport {
@@ -415,6 +435,9 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
             resolved: remote.resolved.clone(),
             available: remote.configured && remote.open_error.is_none(),
             open_error: remote.open_error.clone(),
+            head_status: remote_head.label().to_string(),
+            current: remote_head.current.clone(),
+            remote_current: remote_head.remote_current.clone(),
         },
         daemon: StateDaemon {
             state: daemon_state_label(&daemon).to_string(),
@@ -445,12 +468,16 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
         storage: StateStorage {
             state_files: storage.state_files,
             state_bytes: storage.state_bytes,
+            state_disk_bytes: storage.state_disk_bytes,
             objects_files: storage.objects_files,
             objects_bytes: storage.objects_bytes,
+            objects_disk_bytes: storage.objects_disk_bytes,
             logs_files: storage.logs_files,
             logs_bytes: storage.logs_bytes,
+            logs_disk_bytes: storage.logs_disk_bytes,
             queue_files: storage.queue_files,
             queue_bytes: storage.queue_bytes,
+            queue_disk_bytes: storage.queue_disk_bytes,
         },
         queues: StateQueues {
             uploads: upload_stats.total as u64,
@@ -518,6 +545,7 @@ fn print_state_report(state: &StateReport) -> Result<()> {
         },
     );
     print_kv(&mut output, width, "Daemon", &state.daemon.state);
+    print_kv(&mut output, width, "Remote head", &state.remote.head_status);
     print_kv(&mut output, width, "Encryption", &state.security.encryption);
     writeln!(output).expect("write state output");
 
@@ -578,6 +606,10 @@ fn print_state_report(state: &StateReport) -> Result<()> {
                 state.timeline.latest_parent.as_deref().unwrap_or("(none)"),
             ],
             ["branches", &state.timeline.branch_count.to_string()],
+            [
+                "remote current",
+                state.remote.remote_current.as_deref().unwrap_or("(none)"),
+            ],
         ],
     );
     writeln!(output).expect("write state output");
@@ -674,27 +706,31 @@ fn print_state_report(state: &StateReport) -> Result<()> {
     print_table(
         &mut output,
         width,
-        &["SCOPE", "FILES", "SIZE"],
+        &["SCOPE", "FILES", "APPARENT", "DISK"],
         &[
             [
                 "state",
                 &state.storage.state_files.to_string(),
                 &format_bytes(state.storage.state_bytes),
+                &format_bytes(state.storage.state_disk_bytes),
             ],
             [
                 "objects",
                 &state.storage.objects_files.to_string(),
                 &format_bytes(state.storage.objects_bytes),
+                &format_bytes(state.storage.objects_disk_bytes),
             ],
             [
                 "logs",
                 &state.storage.logs_files.to_string(),
                 &format_bytes(state.storage.logs_bytes),
+                &format_bytes(state.storage.logs_disk_bytes),
             ],
             [
                 "queue",
                 &state.storage.queue_files.to_string(),
                 &format_bytes(state.storage.queue_bytes),
+                &format_bytes(state.storage.queue_disk_bytes),
             ],
         ],
     );
@@ -787,6 +823,9 @@ struct StateRemote {
     resolved: Option<String>,
     available: bool,
     open_error: Option<String>,
+    head_status: String,
+    current: Option<String>,
+    remote_current: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -825,12 +864,16 @@ struct StateMetadata {
 struct StateStorage {
     state_files: u64,
     state_bytes: u64,
+    state_disk_bytes: u64,
     objects_files: u64,
     objects_bytes: u64,
+    objects_disk_bytes: u64,
     logs_files: u64,
     logs_bytes: u64,
+    logs_disk_bytes: u64,
     queue_files: u64,
     queue_bytes: u64,
+    queue_disk_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -982,14 +1025,18 @@ struct StatusOverview<'a> {
     roots_problem: usize,
     daemon: &'a DaemonHealth,
     remote: &'a RemoteStatus,
+    remote_head: &'a RemoteHeadStatus,
     upload_total: usize,
     upload_retrying: usize,
     upload_delayed: usize,
     upload_backpressure: bool,
     encryption: &'a str,
     state_bytes: u64,
+    state_disk_bytes: u64,
     object_bytes: u64,
+    object_disk_bytes: u64,
     queue_bytes: u64,
+    queue_disk_bytes: u64,
     blob_bytes: u64,
     pack_bytes: u64,
     chunk_bytes: u64,
@@ -1013,6 +1060,8 @@ fn print_status_overview(
         Severity::Warn
     } else if overview.remote.open_error.is_some() {
         Severity::Bad
+    } else if !overview.remote_head.synced {
+        Severity::Warn
     } else {
         Severity::Good
     };
@@ -1059,8 +1108,12 @@ fn print_status_overview(
         },
         StatusCard {
             title: "remote".into(),
-            state: overview.remote.summary().into(),
-            detail: overview.remote.backend.clone(),
+            state: overview.remote_head.label().into(),
+            detail: if overview.remote.configured {
+                overview.remote.backend.clone()
+            } else {
+                overview.remote.summary().into()
+            },
             severity: remote_severity,
         },
         StatusCard {
@@ -1089,7 +1142,7 @@ fn print_status_overview(
         StatusCard {
             title: "state".into(),
             state: format_bytes_compact(overview.state_bytes),
-            detail: format!("objects {}", format_bytes_compact(overview.object_bytes)),
+            detail: format!("disk {}", format_bytes_compact(overview.state_disk_bytes)),
             severity: Severity::Info,
         },
     ];
@@ -1101,6 +1154,15 @@ fn print_status_overview(
             ("state", overview.state_bytes),
             ("objects", overview.object_bytes),
             ("queue", overview.queue_bytes),
+        ],
+    );
+    print_usage_bars(
+        out,
+        width,
+        &[
+            ("disk", overview.state_disk_bytes),
+            ("obj-d", overview.object_disk_bytes),
+            ("que-d", overview.queue_disk_bytes),
         ],
     );
     print_usage_bars(
@@ -1262,12 +1324,24 @@ fn print_table<const N: usize>(
             *column_width = (*column_width).max(row[i].len());
         }
     }
+    let available_width = width.saturating_sub(2 + ((N.saturating_sub(1)) * 2));
+    while widths.iter().sum::<usize>() > available_width {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, column_width)| **column_width > headers[*index].len().max(8))
+            .max_by_key(|(_, column_width)| **column_width)
+        else {
+            break;
+        };
+        widths[index] = widths[index].saturating_sub(1);
+    }
     if N > 1 {
         let fixed_width: usize = widths[..N - 1].iter().sum::<usize>() + ((N - 1) * 2) + 2;
         let max_last = width
             .saturating_sub(fixed_width)
             .max(headers[N - 1].len())
-            .max(12);
+            .max(4);
         widths[N - 1] = widths[N - 1].min(max_last);
     }
     write!(out, "  ").expect("write status output");
@@ -1308,7 +1382,11 @@ fn print_table_row<const N: usize>(
         if i > 0 {
             line_prefix.push_str("  ");
         }
-        line_prefix.push_str(&format!("{:<width$}", row[i], width = widths[i]));
+        line_prefix.push_str(&format!(
+            "{:<width$}",
+            truncate_text(row[i], widths[i]),
+            width = widths[i]
+        ));
     }
     if N > 1 {
         line_prefix.push_str("  ");
@@ -1339,7 +1417,7 @@ fn root_table_widths(width: usize) -> (usize, usize) {
 }
 
 fn print_wrapped(out: &mut String, prefix: &str, value: &str, width: usize) {
-    let available = width.saturating_sub(prefix.len()).max(16);
+    let available = width.saturating_sub(prefix.len()).max(4);
     let lines = wrap_text(value, available);
     if let Some((first, rest)) = lines.split_first() {
         writeln!(out, "{prefix}{first}").expect("write status output");
@@ -1570,20 +1648,28 @@ fn sum_i64(conn: &Connection, sql: &str) -> Result<i64> {
 struct StorageStats {
     state_files: u64,
     state_bytes: u64,
+    state_disk_bytes: u64,
     objects_files: u64,
     objects_bytes: u64,
+    objects_disk_bytes: u64,
     loose_blob_files: u64,
     loose_blob_bytes: u64,
+    loose_blob_disk_bytes: u64,
     pack_files: u64,
     pack_bytes: u64,
+    pack_disk_bytes: u64,
     large_files: u64,
     large_bytes: u64,
+    large_disk_bytes: u64,
     tree_files: u64,
     tree_bytes: u64,
+    tree_disk_bytes: u64,
     logs_files: u64,
     logs_bytes: u64,
+    logs_disk_bytes: u64,
     queue_files: u64,
     queue_bytes: u64,
+    queue_disk_bytes: u64,
 }
 
 fn read_storage_stats(paths: &Paths) -> Result<StorageStats> {
@@ -1598,20 +1684,28 @@ fn read_storage_stats(paths: &Paths) -> Result<StorageStats> {
     Ok(StorageStats {
         state_files: state.files,
         state_bytes: state.bytes,
+        state_disk_bytes: state.disk_bytes,
         objects_files: objects.files,
         objects_bytes: objects.bytes,
+        objects_disk_bytes: objects.disk_bytes,
         loose_blob_files: loose_blobs.files,
         loose_blob_bytes: loose_blobs.bytes,
+        loose_blob_disk_bytes: loose_blobs.disk_bytes,
         pack_files: packs.files,
         pack_bytes: packs.bytes,
+        pack_disk_bytes: packs.disk_bytes,
         large_files: large.files,
         large_bytes: large.bytes,
+        large_disk_bytes: large.disk_bytes,
         tree_files: trees.files,
         tree_bytes: trees.bytes,
+        tree_disk_bytes: trees.disk_bytes,
         logs_files: logs.files,
         logs_bytes: logs.bytes,
+        logs_disk_bytes: logs.disk_bytes,
         queue_files: queue.files,
         queue_bytes: queue.bytes,
+        queue_disk_bytes: queue.disk_bytes,
     })
 }
 
@@ -1619,6 +1713,7 @@ fn read_storage_stats(paths: &Paths) -> Result<StorageStats> {
 struct DirStats {
     files: u64,
     bytes: u64,
+    disk_bytes: u64,
 }
 
 fn dir_stats(path: &Path) -> Result<DirStats> {
@@ -1630,10 +1725,24 @@ fn dir_stats(path: &Path) -> Result<DirStats> {
         let entry = entry?;
         if entry.file_type().is_file() {
             stats.files += 1;
-            stats.bytes += entry.metadata()?.len();
+            let metadata = entry.metadata()?;
+            stats.bytes += metadata.len();
+            stats.disk_bytes += file_disk_bytes(&metadata);
         }
     }
     Ok(stats)
+}
+
+#[cfg(unix)]
+fn file_disk_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn file_disk_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
 }
 
 fn count_json_files(path: &Path) -> Result<usize> {
@@ -1667,6 +1776,23 @@ struct RemoteStatus {
     conditional_put: Option<bool>,
 }
 
+struct RemoteHeadStatus {
+    current: Option<String>,
+    remote_current: Option<String>,
+    synced: bool,
+    detail: String,
+}
+
+impl RemoteHeadStatus {
+    fn label(&self) -> &str {
+        if self.synced {
+            "synced"
+        } else {
+            self.detail.as_str()
+        }
+    }
+}
+
 impl RemoteStatus {
     fn summary(&self) -> &str {
         if !self.configured {
@@ -1677,6 +1803,60 @@ impl RemoteStatus {
         }
         "configured"
     }
+}
+
+fn read_remote_head_status(
+    conn: &Connection,
+    config: &Config,
+    remote: &RemoteStatus,
+    current: Option<&str>,
+) -> Result<RemoteHeadStatus> {
+    if !remote.configured {
+        return Ok(RemoteHeadStatus {
+            current: current.map(str::to_string),
+            remote_current: None,
+            synced: false,
+            detail: "not configured".into(),
+        });
+    }
+    if remote.open_error.is_some() {
+        return Ok(RemoteHeadStatus {
+            current: current.map(str::to_string),
+            remote_current: None,
+            synced: false,
+            detail: "remote unavailable".into(),
+        });
+    }
+    let Some(remote_name) = remote.resolved.as_deref() else {
+        return Ok(RemoteHeadStatus {
+            current: current.map(str::to_string),
+            remote_current: None,
+            synced: false,
+            detail: "unknown".into(),
+        });
+    };
+    let ref_name = host_current_ref_key(&config.host.id);
+    let remote_current = conn
+        .query_row(
+            "select value from remote_refs where remote=?1 and name=?2",
+            params![remote_name, ref_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let synced = current.is_some() && current.map(str::to_string) == remote_current;
+    let detail = match (current, remote_current.as_deref()) {
+        (Some(_), Some(_)) if synced => "synced".into(),
+        (Some(_), Some(_)) => "lagging".into(),
+        (Some(_), None) => "not synced".into(),
+        (None, Some(_)) => "remote only".into(),
+        (None, None) => "no snapshot".into(),
+    };
+    Ok(RemoteHeadStatus {
+        current: current.map(str::to_string),
+        remote_current,
+        synced,
+        detail,
+    })
 }
 
 fn read_remote_status(config: &Config) -> Result<RemoteStatus> {

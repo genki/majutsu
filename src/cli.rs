@@ -89,6 +89,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    #[command(about = "Inspect or compact the local filesystem event journal")]
+    Event {
+        #[command(subcommand)]
+        command: EventCommand,
+    },
     #[command(about = "Sync metadata and objects to the configured remote")]
     Sync(SyncArgs),
     #[command(about = "Check remote reachability, integrity, and host timelines")]
@@ -630,6 +635,21 @@ pub(crate) enum CacheCommand {
     Stat(CachePruneArgs),
     #[command(about = "Remove synced local payload cache that can be hydrated from remote")]
     Prune(CachePruneArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum EventCommand {
+    #[command(about = "Show local filesystem event journal retention state")]
+    Stat,
+    #[command(about = "Remove processed event journal records older than the latest snapshot")]
+    Compact {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Report removable event records without deleting files"
+        )]
+        dry_run: bool,
+    },
 }
 
 #[derive(Args)]
