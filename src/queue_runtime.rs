@@ -455,8 +455,8 @@ pub(crate) fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
     Ok(majutsu_db::has_pending_journal_events(&records))
 }
 
-pub(crate) fn compact_event_journal(paths: &Paths) -> Result<usize> {
-    compact_event_journal_inner(paths, false, false).map(|result| result.removed)
+pub(crate) fn compact_event_journal_force(paths: &Paths) -> Result<usize> {
+    compact_event_journal_inner(paths, true, false).map(|result| result.removed)
 }
 
 pub(crate) fn event_cmd(paths: &Paths, command: EventCommand) -> Result<()> {
@@ -487,6 +487,7 @@ pub(crate) struct EventJournalStats {
     pub(crate) oldest: Option<DateTime<Utc>>,
     pub(crate) newest: Option<DateTime<Utc>>,
     pub(crate) last_snapshot_finish: Option<DateTime<Utc>>,
+    pub(crate) compact_before: Option<DateTime<Utc>>,
 }
 
 pub(crate) fn event_journal_stats(paths: &Paths) -> Result<EventJournalStats> {
@@ -520,14 +521,22 @@ fn print_event_journal_stats(stats: &EventJournalStats) {
             .map(|ts| ts.to_rfc3339())
             .unwrap_or_else(|| "(none)".into())
     );
+    println!(
+        "event_journal_compact_before {}",
+        stats
+            .compact_before
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "(none)".into())
+    );
 }
 
 fn event_journal_stats_from_records(records: &[EventJournalRecord]) -> EventJournalStats {
-    let last_snapshot_finish = records
+    let snapshot_finishes = records
         .iter()
         .filter(|event| event.is_snapshot_finish())
         .map(|event| event.observed_at)
-        .max();
+        .collect::<Vec<_>>();
+    let last_snapshot_finish = snapshot_finishes.iter().copied().max();
     let pending = records
         .iter()
         .filter(|event| {
@@ -537,11 +546,12 @@ fn event_journal_stats_from_records(records: &[EventJournalRecord]) -> EventJour
                     .unwrap_or(true)
         })
         .count();
-    let removable = last_snapshot_finish
-        .map(|finished_at| {
+    let compact_before = previous_snapshot_finish(&snapshot_finishes);
+    let removable = compact_before
+        .map(|cutoff| {
             records
                 .iter()
-                .filter(|event| event.observed_at < finished_at)
+                .filter(|event| event.observed_at < cutoff)
                 .count()
         })
         .unwrap_or(0);
@@ -553,7 +563,15 @@ fn event_journal_stats_from_records(records: &[EventJournalRecord]) -> EventJour
         oldest: records.iter().map(|event| event.observed_at).min(),
         newest: records.iter().map(|event| event.observed_at).max(),
         last_snapshot_finish,
+        compact_before,
     }
+}
+
+fn previous_snapshot_finish(finishes: &[DateTime<Utc>]) -> Option<DateTime<Utc>> {
+    let mut finishes = finishes.to_vec();
+    finishes.sort();
+    finishes.dedup();
+    finishes.iter().rev().nth(1).copied()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -586,7 +604,7 @@ fn compact_event_journal_inner(
             removed: 0,
         });
     }
-    let Some(last_snapshot_finish) = stats.last_snapshot_finish else {
+    let Some(compact_before) = stats.compact_before else {
         return Ok(EventJournalCompactResult {
             total: stats.total,
             pending: stats.pending,
@@ -608,7 +626,7 @@ fn compact_event_journal_inner(
             Err(err) => return Err(err.into()),
         };
         let event: EventJournalRecord = serde_json::from_slice(&bytes)?;
-        if event.observed_at < last_snapshot_finish {
+        if event.observed_at < compact_before {
             if dry_run {
                 removed += 1;
             } else {

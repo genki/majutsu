@@ -160,7 +160,9 @@ use operation_log::{
 use pack_runtime::pack_cmd;
 use process_runtime::acquire_process_lock;
 use prune_runtime::{gc_cmd, prune_cmd};
-use queue_runtime::{compact_event_journal, event_cmd, has_pending_journal_events, record_event};
+use queue_runtime::{
+    compact_event_journal_force, event_cmd, has_pending_journal_events, record_event,
+};
 use remote_runtime::remote_cmd;
 #[cfg(test)]
 use remote_store::{
@@ -481,6 +483,19 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         root_trees,
         roots: by_root,
     };
+    if snapshot_is_noop(parent_manifest.as_ref(), &manifest) && !snapshot_allows_noop() {
+        let current_id = parent.as_deref().unwrap_or("(none)");
+        record_event(paths, "snapshot-noop", current_id)?;
+        record_event(
+            paths,
+            "snapshot-finish",
+            &format!("noop current={current_id}"),
+        )?;
+        let _ = compact_event_journal_force(paths);
+        println!("snapshot unchanged {current_id}");
+        println!("files {total_files}, large {large_files}");
+        return Ok(());
+    }
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
     let manifest_oid = blake3_hex(&manifest_json);
     let manifest_key = store_encoded_object_bytes(
@@ -526,8 +541,20 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     println!("snapshot {}", manifest.snapshot_id);
     println!("files {total_files}, large {large_files}");
     record_event(paths, "snapshot-finish", &manifest.snapshot_id)?;
-    let _ = compact_event_journal(paths);
+    let _ = compact_event_journal_force(paths);
     Ok(())
+}
+
+fn snapshot_is_noop(parent: Option<&SnapshotManifest>, manifest: &SnapshotManifest) -> bool {
+    parent
+        .map(|parent| parent.root_trees == manifest.root_trees)
+        .unwrap_or(false)
+}
+
+fn snapshot_allows_noop() -> bool {
+    env::var("MAJUTSU_SNAPSHOT_ALLOW_NOOP")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn snapshot_operation_kind(message: Option<&str>, parent: Option<&str>) -> &'static str {

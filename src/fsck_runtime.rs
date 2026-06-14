@@ -39,7 +39,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::cache_runtime::{
-    payload_cache_key_set, remote_payload_index_contains, remote_payload_key_index,
+    payload_cache_key_set, prune_synced_metadata_cache, prune_synced_payload_cache,
+    remote_payload_index_contains, remote_payload_key_index,
 };
 use crate::cli::FsckArgs;
 use crate::config::{
@@ -359,8 +360,48 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
             options.started.elapsed().as_secs()
         );
     }
+    if !options.quick
+        && fsck_payload_cache_prune_enabled()
+        && let Some(remote) = remote.as_ref()
+    {
+        let pruned = prune_synced_payload_cache(paths, remote, &export)?;
+        if pruned.payload_removed > 0 || options.progress {
+            eprintln!(
+                "fsck progress phase=payload-cache-prune removed={} bytes={} elapsed_secs={}",
+                pruned.payload_removed,
+                pruned.payload_removed_bytes,
+                options.started.elapsed().as_secs()
+            );
+        }
+    }
+    if !options.quick
+        && fsck_metadata_cache_prune_enabled()
+        && let Some(remote) = remote.as_ref()
+    {
+        let pruned = prune_synced_metadata_cache(paths, remote, &export)?;
+        if pruned.metadata_removed > 0 || options.progress {
+            eprintln!(
+                "fsck progress phase=metadata-cache-prune removed={} bytes={} elapsed_secs={}",
+                pruned.metadata_removed,
+                pruned.metadata_removed_bytes,
+                options.started.elapsed().as_secs()
+            );
+        }
+    }
     println!("fsck ok");
     Ok(())
+}
+
+fn fsck_payload_cache_prune_enabled() -> bool {
+    std::env::var("MAJUTSU_FSCK_PRUNE_PAYLOAD_CACHE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
+}
+
+fn fsck_metadata_cache_prune_enabled() -> bool {
+    std::env::var("MAJUTSU_FSCK_PRUNE_METADATA_CACHE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn build_fsck_scope(

@@ -503,8 +503,8 @@ fn cache_prune_evicts_synced_payload_cache_and_restore_hydrates() {
 
     assert_success(run_mj(&home, ["fsck"]), "fsck after cache prune");
     assert!(
-        home.join(&tree_key).exists(),
-        "fsck should hydrate the pruned tree manifest from remote"
+        !home.join(&tree_key).exists(),
+        "fsck should prune synced tree manifest after temporary hydration"
     );
     assert_success(
         run_mj(

@@ -172,6 +172,44 @@ pub(crate) fn prune_synced_payload_cache(
     remove_payload_cache_candidates(paths, &plan)
 }
 
+pub(crate) fn prune_synced_metadata_cache(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+) -> Result<PayloadCachePruneStats> {
+    let mut local_missing = 0usize;
+    let mut local_candidates = Vec::new();
+    for key in metadata_cache_keys(paths, export)? {
+        let path = paths.home.join(&key);
+        let Ok(metadata) = path.metadata() else {
+            local_missing += 1;
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        local_candidates.push(CachePruneCandidate {
+            key,
+            bytes: metadata.len(),
+            metadata: true,
+        });
+    }
+    let mut plan = if local_candidates.is_empty() {
+        CachePrunePlan {
+            local_missing,
+            ..CachePrunePlan::default()
+        }
+    } else if local_candidates.len() <= 64 {
+        filter_remote_available_by_head(remote, local_candidates)?
+    } else {
+        let remote_keys = remote_payload_key_index(remote)?;
+        filter_remote_available_from_index(&remote_keys, local_candidates)
+    };
+    plan.local_missing = local_missing;
+    plan.candidates.sort_by(|a, b| a.key.cmp(&b.key));
+    remove_payload_cache_candidates(paths, &plan)
+}
+
 fn remove_payload_cache_candidates(
     paths: &Paths,
     plan: &CachePrunePlan,

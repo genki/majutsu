@@ -4580,7 +4580,58 @@ fn clone_rejects_corrupt_canonical_tree_manifest_without_creating_home() {
 }
 
 #[test]
-fn unchanged_root_reuses_previous_tree_object() {
+fn unchanged_snapshot_is_skipped_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let second = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(second.contains("snapshot unchanged snap-"), "{second}");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let snapshots = export["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 1);
+}
+
+#[test]
+fn unchanged_snapshot_can_be_forced_for_checkpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let remote = tmp.path().join("remote");
@@ -4614,7 +4665,10 @@ fn unchanged_root_reuses_previous_tree_object() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("snapshot");
+        c.env("MAJUTSU_SNAPSHOT_ALLOW_NOOP", "1")
+            .arg("--home")
+            .arg(&state)
+            .arg("snapshot");
         c
     });
     run({
@@ -12097,7 +12151,10 @@ fn encrypted_chunked_blob_reuses_stable_payload_refs_across_snapshots() {
     });
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("snapshot");
+        c.env("MAJUTSU_SNAPSHOT_ALLOW_NOOP", "1")
+            .arg("--home")
+            .arg(&state)
+            .arg("snapshot");
         c
     });
     let diff = output({
