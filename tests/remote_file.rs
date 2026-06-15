@@ -141,6 +141,36 @@ fn remote_snapshot_manifest(
     serde_json::from_slice(&fs::read(remote.join(manifest_key)).unwrap()).unwrap()
 }
 
+fn write_test_remote_head(
+    remote: &std::path::Path,
+    metadata: &serde_json::Value,
+    root_acks: serde_json::Value,
+) {
+    let host = &metadata["config"]["host"];
+    let host_id = host["id"].as_str().unwrap();
+    let head = serde_json::json!({
+        "version": 1,
+        "host_id": host_id,
+        "host_name": host["name"].as_str().unwrap(),
+        "current_snapshot": metadata["refs"]["current"].as_str(),
+        "last_synced": metadata["refs"]["last-synced"].as_str(),
+        "root_acks": root_acks,
+        "metadata_key": format!("hosts/{host_id}/metadata/export.json"),
+        "host_index_key": "hosts/index.json",
+        "gc_mark_key": format!("gc/marks/{host_id}.json"),
+        "latest_snapshot_key": metadata["refs"]["current"]
+            .as_str()
+            .map(|snapshot| format!("hosts/{host_id}/snapshots/{snapshot}.cbor.zst.enc")),
+        "latest_operation_key": null,
+        "updated_at": Utc::now().to_rfc3339(),
+    });
+    let cbor = serde_cbor::to_vec(&head).unwrap();
+    let compressed = zstd::stream::encode_all(cbor.as_slice(), 3).unwrap();
+    let head_path = remote.join(format!("hosts/{host_id}/head.cbor.zst.enc"));
+    fs::create_dir_all(head_path.parent().unwrap()).unwrap();
+    fs::write(head_path, compressed).unwrap();
+}
+
 fn canonical_loose_blob_key(object_key: &str) -> String {
     let rest = object_key
         .strip_prefix("objects/blobs/")
@@ -3890,6 +3920,99 @@ fn remote_fsck_detects_invalid_metadata_refs() {
     export["refs"]["legacy"] = serde_json::Value::String("snap-legacy".into());
     fs::write(&export_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
 
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("fsck")
+            .arg("--deep");
+        c
+    });
+}
+
+#[test]
+fn remote_fsck_detects_invalid_remote_head_root_ack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let export_path = host_metadata_export_path(&remote);
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
+    let current = metadata["refs"]["current"].as_str().unwrap();
+    let snapshot = metadata["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|snapshot| snapshot["id"] == current)
+        .unwrap();
+    let manifest = remote_snapshot_manifest(&remote, snapshot);
+    let root_tree = &manifest["root_trees"]["sample"];
+    let valid_acks = serde_json::json!({
+        "sample": {
+            "snapshot_id": current,
+            "tree_id": root_tree["tree_id"].as_str().unwrap(),
+            "tree_key": root_tree["tree_key"].as_str().unwrap(),
+            "file_count": root_tree["file_count"].as_u64().unwrap() as usize,
+            "synced_at": metadata["refs"]["last-synced"].as_str().unwrap(),
+        }
+    });
+    write_test_remote_head(&remote, &metadata, valid_acks);
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
+
+    let invalid_acks = serde_json::json!({
+        "sample": {
+            "snapshot_id": current,
+            "tree_id": "tree-corrupt",
+            "tree_key": root_tree["tree_key"].as_str().unwrap(),
+            "file_count": root_tree["file_count"].as_u64().unwrap() as usize,
+            "synced_at": metadata["refs"]["last-synced"].as_str().unwrap(),
+        }
+    });
+    write_test_remote_head(&remote, &metadata, invalid_acks);
+    fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("fsck");
+        c
+    });
     fails({
         let mut c = mj();
         c.arg("--home")

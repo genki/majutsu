@@ -1162,6 +1162,33 @@ status表示では `MM-DD HH:MM:SS` の短い形式にした。`mj health --json
   共有する場合の root ack 表示は、その host の head を読む operation 後に最新化される。
 - root ack の破損検出は remote/fsck の head 構造検査へ追加する余地がある。
 
+## 残改善実施 2026-06-15 build 40
+
+実施:
+
+- `BUILD_NUMBER` 40。
+- `mj remote fsck` quick と `mj remote fsck --deep` で compact head の `root_acks` を検査するようにした。
+- 検査内容:
+  - current snapshot が無いのに `root_acks` がある場合は異常。
+  - current snapshot manifest に存在する root の ack 不足を検出。
+  - manifest に存在しない root の余分な ack を検出。
+  - root別 `snapshot_id`、`tree_id`、`tree_key`、`file_count` の不一致を検出。
+  - `synced_at` の timestamp 不正と head `last_synced` との不一致を検出。
+- 非暗号 file remote に手動 compact head を配置する回帰テストを追加し、quick/deep 両方で
+  壊れた root ack を検出することを確認する。
+
+検証:
+
+- `cargo test --test remote_file remote_fsck_detects_invalid_remote_head_root_ack --locked` 成功。
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- 実環境に `mj 0.3.0+build.40` を install し、daemon restart 済み。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `mj remote fsck` 成功。compact head の root ack 検査を含む metadata quick check が通過。
+- 実環境で `mj health` は `state protected`、issue 0、全 root `root_remote ... synced=true`。
+- 実環境で `local_current == remote_current == snap-e554e36c-3f0b-443c-8609-e8d117208152`。
+
 検証:
 
 - `cargo fmt --all -- --check` 成功。

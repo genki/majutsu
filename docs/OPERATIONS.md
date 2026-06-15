@@ -193,6 +193,9 @@ daemon の stdout/stderr と起動記録は `$MAJUTSU_HOME/logs/majutsu.log` に
 
 通常の `mj remote fsck` は metadata health を高速に確認する。
 payload object の存在確認まで行う場合は `--objects` を使う。
+compact head がある場合、通常の `mj remote fsck` と `--deep` は `root_acks` も
+current snapshot の root tree と照合し、root別 `snapshot_id`、`tree_id`、`tree_key`、
+`file_count`、`synced_at` の不一致を検出する。
 
 ```sh
 mj remote fsck --objects --parallelism 32 --timeout-secs 300

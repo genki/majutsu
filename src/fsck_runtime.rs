@@ -70,7 +70,18 @@ struct RemoteHeadExport {
     host_name: String,
     current_snapshot: Option<String>,
     last_synced: Option<String>,
+    #[serde(default)]
+    root_acks: BTreeMap<String, RemoteRootAck>,
     metadata_key: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoteRootAck {
+    snapshot_id: String,
+    tree_id: String,
+    tree_key: String,
+    file_count: usize,
+    synced_at: Option<String>,
 }
 
 fn remote_head_key(host_id: &str) -> String {
@@ -2772,6 +2783,7 @@ pub(crate) fn remote_fsck_with_options(
                         host.id
                     );
                 }
+                validate_remote_head_root_acks(paths, remote, &export, head, &mut missing)?;
             }
             let current_ref_key = host_current_ref_key(&host.id);
             if let Some(current) = current {
@@ -3162,6 +3174,99 @@ fn validate_remote_host_prefix_hosts(
         }
     }
     Ok(())
+}
+
+fn validate_remote_head_root_acks(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &crate::MetadataExport,
+    head: &RemoteHeadExport,
+    missing: &mut usize,
+) -> Result<()> {
+    let Some(current) = export.refs.get("current") else {
+        if !head.root_acks.is_empty() {
+            *missing += 1;
+            eprintln!("remote head has root_acks without current snapshot");
+        }
+        return Ok(());
+    };
+    let manifest = match remote_current_snapshot_manifest(paths, remote, export, current) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            *missing += 1;
+            eprintln!("remote head root_acks cannot load current snapshot {current}: {err:#}");
+            return Ok(());
+        }
+    };
+    for root_id in manifest.root_trees.keys() {
+        if !head.root_acks.contains_key(root_id) {
+            *missing += 1;
+            eprintln!("remote head root_acks missing root {root_id}");
+        }
+    }
+    for (root_id, ack) in &head.root_acks {
+        let Some(root_tree) = manifest.root_trees.get(root_id) else {
+            *missing += 1;
+            eprintln!("remote head root_acks contains unexpected root {root_id}");
+            continue;
+        };
+        if ack.snapshot_id != *current {
+            *missing += 1;
+            eprintln!(
+                "remote head root_acks {root_id} snapshot {} does not match current {current}",
+                ack.snapshot_id
+            );
+        }
+        if ack.tree_id != root_tree.tree_id {
+            *missing += 1;
+            eprintln!("remote head root_acks {root_id} tree_id does not match current snapshot");
+        }
+        if ack.tree_key != root_tree.tree_key {
+            *missing += 1;
+            eprintln!("remote head root_acks {root_id} tree_key does not match current snapshot");
+        }
+        if ack.file_count != root_tree.file_count {
+            *missing += 1;
+            eprintln!("remote head root_acks {root_id} file_count does not match current snapshot");
+        }
+        if let Some(synced_at) = ack.synced_at.as_deref()
+            && let Err(err) = parse_db_time(synced_at)
+        {
+            *missing += 1;
+            eprintln!("remote head root_acks {root_id} synced_at is invalid: {err}");
+        }
+        if ack.synced_at != head.last_synced {
+            *missing += 1;
+            eprintln!("remote head root_acks {root_id} synced_at does not match head last-synced");
+        }
+    }
+    Ok(())
+}
+
+fn remote_current_snapshot_manifest(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &crate::MetadataExport,
+    current: &str,
+) -> Result<SnapshotManifest> {
+    let snapshot = export
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.id == current)
+        .ok_or_else(|| anyhow::anyhow!("metadata is missing current snapshot export {current}"))?;
+    if !snapshot.manifest_json.trim().is_empty() {
+        return serde_json::from_str(&snapshot.manifest_json)
+            .with_context(|| format!("parse current snapshot manifest {current}"));
+    }
+    let bytes = crate::download_local_object_from_remote(paths, remote, &snapshot.manifest_key)
+        .with_context(|| {
+            format!(
+                "download current snapshot manifest {}",
+                snapshot.manifest_key
+            )
+        })?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse current snapshot manifest {}", snapshot.manifest_key))
 }
 
 fn validate_remote_host_ref_prefix(
