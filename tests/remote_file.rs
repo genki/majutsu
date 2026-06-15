@@ -13861,6 +13861,91 @@ fn health_reports_root_last_changed_snapshot() {
 }
 
 #[test]
+fn health_reports_root_remote_ack_from_cached_remote_current() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs");
+    let projects = tmp.path().join("projects");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(docs.join("notes.txt"), b"docs v1\n").unwrap();
+    fs::write(projects.join("app.rs"), b"fn main() {}\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("docs")
+            .arg(&docs);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("projects")
+            .arg(&projects);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fs::write(
+        projects.join("app.rs"),
+        b"fn main() { println!(\"v2\"); }\n",
+    )
+    .unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&health).unwrap();
+    let roots = value["roots"].as_array().unwrap();
+    let docs_health = roots.iter().find(|root| root["id"] == "docs").unwrap();
+    let projects_health = roots.iter().find(|root| root["id"] == "projects").unwrap();
+    assert_eq!(docs_health["remote_snapshot_includes"], true, "{health}");
+    assert_eq!(docs_health["remote_synced"], true, "{health}");
+    assert!(
+        docs_health["remote_synced_at"].as_str().is_some(),
+        "{health}"
+    );
+    assert_eq!(
+        projects_health["remote_snapshot_includes"], true,
+        "{health}"
+    );
+    assert_eq!(projects_health["remote_synced"], false, "{health}");
+    assert_eq!(projects_health["remote_synced_at"], serde_json::Value::Null);
+}
+
+#[test]
 fn watch_records_runtime_health_and_notices_unprotected_state() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

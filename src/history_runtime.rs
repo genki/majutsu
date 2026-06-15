@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use majutsu_core::OperationLogEntry as OperationExport;
-use majutsu_store::host_current_ref_key;
+use majutsu_store::{host_current_ref_key, host_last_synced_ref_key};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -45,6 +45,10 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let current_label = current.as_deref().unwrap_or("(none)");
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
+    let remote_manifest = remote_head
+        .remote_current
+        .as_deref()
+        .and_then(|id| load_snapshot_by_id(paths, &conn, id).ok());
     let db_stats = read_status_db_stats(&conn)?;
     let storage = read_storage_stats(paths)?;
     let upload_stats = upload_queue_stats(paths)?;
@@ -64,6 +68,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         upload_stats: &upload_stats,
         pending_event_count,
         current_manifest: current_manifest.as_ref(),
+        remote_manifest: remote_manifest.as_ref(),
         conn: &conn,
     })?;
     let width = terminal_width();
@@ -330,6 +335,16 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                             .transpose()?
                             .map(|changed_at| compact_timestamp(&changed_at))
                             .unwrap_or_else(|| "-".into()),
+                        current_root
+                            .map(|root_tree| {
+                                root_remote_sync_label(
+                                    remote_manifest.as_ref(),
+                                    &root.id,
+                                    &root_tree.tree_id,
+                                    remote_head.remote_last_synced.as_deref(),
+                                )
+                            })
+                            .unwrap_or_else(|| "-".into()),
                         root.path.display().to_string(),
                     ])
                 })
@@ -345,13 +360,16 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                         row[4].as_str(),
                         row[5].as_str(),
                         row[6].as_str(),
+                        row[7].as_str(),
                     ]
                 })
                 .collect::<Vec<_>>();
             print_table(
                 &mut output,
                 width,
-                &["ID", "STATUS", "ISSUE", "FILES", "TREE", "CHANGED", "PATH"],
+                &[
+                    "ID", "STATUS", "ISSUE", "FILES", "TREE", "CHANGED", "REMOTE", "PATH",
+                ],
                 &root_row_refs,
             );
         }
@@ -534,6 +552,10 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
         .transpose()?;
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
+    let remote_manifest = remote_head
+        .remote_current
+        .as_deref()
+        .and_then(|id| load_snapshot_by_id(paths, &conn, id).ok());
     let upload_stats = upload_queue_stats(paths)?;
     let event_records = event_journal_records(paths)?;
     let pending_event_count = pending_journal_event_count(&event_records);
@@ -549,6 +571,7 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
         upload_stats: &upload_stats,
         pending_event_count,
         current_manifest: current_manifest.as_ref(),
+        remote_manifest: remote_manifest.as_ref(),
         conn: &conn,
     })
 }
@@ -610,6 +633,11 @@ struct RootHealth {
     degraded_kind: Option<String>,
     degraded_at: Option<String>,
     degraded_message: Option<String>,
+    remote_snapshot_includes: bool,
+    remote_tree_id: Option<String>,
+    remote_synced: bool,
+    remote_synced_snapshot: Option<String>,
+    remote_synced_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +700,7 @@ struct HealthInputs<'a> {
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
     current_manifest: Option<&'a majutsu_core::SnapshotManifest>,
+    remote_manifest: Option<&'a majutsu_core::SnapshotManifest>,
     conn: &'a Connection,
 }
 
@@ -687,6 +716,7 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         upload_stats,
         pending_event_count,
         current_manifest,
+        remote_manifest,
         conn,
     } = input;
     let active_roots = roots.iter().filter(|root| root.status == "active").count();
@@ -696,6 +726,12 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         .map(|root| {
             let current_root =
                 current_manifest.and_then(|manifest| manifest.root_trees.get(&root.id));
+            let remote_root =
+                remote_manifest.and_then(|manifest| manifest.root_trees.get(&root.id));
+            let remote_synced = current_root
+                .zip(remote_root)
+                .map(|(current_root, remote_root)| current_root.tree_id == remote_root.tree_id)
+                .unwrap_or(false);
             let last_change = current
                 .zip(current_root)
                 .map(|(current_id, root_tree)| {
@@ -723,6 +759,19 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
                     .degraded
                     .as_ref()
                     .map(|degraded| degraded.message.clone()),
+                remote_snapshot_includes: remote_root.is_some(),
+                remote_tree_id: remote_root.map(|root_tree| root_tree.tree_id.clone()),
+                remote_synced,
+                remote_synced_snapshot: if remote_synced {
+                    remote_head.remote_current.clone()
+                } else {
+                    None
+                },
+                remote_synced_at: if remote_synced {
+                    remote_head.remote_last_synced.clone()
+                } else {
+                    None
+                },
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1086,6 +1135,15 @@ fn print_health_report(report: &HealthReport) {
                 root.degraded_message.as_deref().unwrap_or("-")
             );
         }
+        println!(
+            "root_remote {} current={} synced={} snapshot={} at={} tree={}",
+            root.id,
+            root.remote_snapshot_includes,
+            root.remote_synced,
+            root.remote_synced_snapshot.as_deref().unwrap_or("-"),
+            root.remote_synced_at.as_deref().unwrap_or("-"),
+            root.remote_tree_id.as_deref().unwrap_or("-")
+        );
     }
     println!("issue_count {}", report.issue_count());
     for issue in &report.issues {
@@ -2065,6 +2123,26 @@ fn compact_timestamp(value: &str) -> String {
     }
 }
 
+fn root_remote_sync_label(
+    remote_manifest: Option<&majutsu_core::SnapshotManifest>,
+    root_id: &str,
+    current_tree_id: &str,
+    remote_last_synced: Option<&str>,
+) -> String {
+    let Some(remote_manifest) = remote_manifest else {
+        return "-".into();
+    };
+    let Some(remote_root) = remote_manifest.root_trees.get(root_id) else {
+        return "missing".into();
+    };
+    if remote_root.tree_id != current_tree_id {
+        return "lagging".into();
+    }
+    remote_last_synced
+        .map(compact_timestamp)
+        .unwrap_or_else(|| "synced".into())
+}
+
 fn print_kv(out: &mut String, width: usize, key: &str, value: &str) {
     let prefix = format!("  {key:<18} ");
     print_wrapped(out, &prefix, value, width);
@@ -2520,6 +2598,7 @@ struct RemoteStatus {
 struct RemoteHeadStatus {
     current: Option<String>,
     remote_current: Option<String>,
+    remote_last_synced: Option<String>,
     synced: bool,
     detail: String,
 }
@@ -2556,6 +2635,7 @@ fn read_remote_head_status(
         return Ok(RemoteHeadStatus {
             current: current.map(str::to_string),
             remote_current: None,
+            remote_last_synced: None,
             synced: false,
             detail: "not configured".into(),
         });
@@ -2564,6 +2644,7 @@ fn read_remote_head_status(
         return Ok(RemoteHeadStatus {
             current: current.map(str::to_string),
             remote_current: None,
+            remote_last_synced: None,
             synced: false,
             detail: "remote unavailable".into(),
         });
@@ -2572,15 +2653,24 @@ fn read_remote_head_status(
         return Ok(RemoteHeadStatus {
             current: current.map(str::to_string),
             remote_current: None,
+            remote_last_synced: None,
             synced: false,
             detail: "unknown".into(),
         });
     };
     let ref_name = host_current_ref_key(&config.host.id);
+    let last_synced_ref_name = host_last_synced_ref_key(&config.host.id);
     let remote_current = conn
         .query_row(
             "select value from remote_refs where remote=?1 and name=?2",
             params![remote_name, ref_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let remote_last_synced = conn
+        .query_row(
+            "select value from remote_refs where remote=?1 and name=?2",
+            params![remote_name, last_synced_ref_name],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -2595,6 +2685,7 @@ fn read_remote_head_status(
     Ok(RemoteHeadStatus {
         current: current.map(str::to_string),
         remote_current,
+        remote_last_synced,
         synced,
         detail,
     })

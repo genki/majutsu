@@ -1088,6 +1088,40 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 
 - root別 remote ack / sync 時刻は host単位 remote current だけでは表現できないため、root単位 ack metadata の設計が必要。
 
+## 残改善実施 2026-06-15 build 38
+
+実施:
+
+- `BUILD_NUMBER` 38。
+- cached remote current / remote last-synced から root別 remote ack を算出するようにした。
+- `mj health --json` に root別の以下を追加した。
+  - `remote_snapshot_includes`
+  - `remote_tree_id`
+  - `remote_synced`
+  - `remote_synced_snapshot`
+  - `remote_synced_at`
+- `mj health` text に `root_remote ...` 行を追加した。
+- `mj status` の広い端末向け Roots 表に `REMOTE` 列を追加した。
+- host単位 remote current が lagging していても、変更されていない root が remote current snapshot に
+  同じ tree id で含まれていれば root単位では `remote_synced=true` と判定する。
+
+検証:
+
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --test remote_file health_reports_root_remote_ack_from_cached_remote_current --locked` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- 実環境に `mj 0.3.0+build.38` を install し、daemon restart 済み。
+- 実環境の `mj status --no-pager` で Roots 表に `REMOTE` 列が表示されることを確認。
+- 実環境の `mj health` で全 root に `root_remote ... synced=true` が表示されることを確認。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `local_current == remote_current == snap-8dc76def-7ac9-427a-b2b5-1c965852d231`。
+
+残り:
+
+- remote 側に root単位 ack metadata を独立して publish する設計は未実装。現状は cached remote current
+  snapshot から導出している。
+
 ## 表示改善 2026-06-14 build 36
 
 `mj status` の Roots 表に追加した `CHANGED` 列が ISO timestamp の middle-shortening により読みにくかったため、
