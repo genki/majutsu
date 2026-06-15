@@ -2993,14 +2993,23 @@ fn import_metadata(conn: &mut Connection, export: &MetadataExport) -> Result<()>
         )?;
     }
     for op in &export.operations {
+        let process_path_json = op
+            .process_path
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         tx.execute(
-            "insert or replace into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "insert or replace into operations(id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 op.id,
                 op.parent_op,
                 op.kind,
                 op.actor,
+                op.session_id,
+                op.session_label,
+                op.process_id,
+                process_path_json,
                 op.status,
                 op.before_snapshot,
                 op.after_snapshot,

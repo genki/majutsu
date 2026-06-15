@@ -11111,6 +11111,8 @@ fn operations_are_appended_to_local_oplog() {
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
+        c.env("MAJUTSU_SESSION_ID", "session-test-1")
+            .env("MAJUTSU_SESSION_LABEL", "agent-test");
         c
     });
     assert!(fs::metadata(&oplog).unwrap().len() > root_add_len);
@@ -11119,9 +11121,10 @@ fn operations_are_appended_to_local_oplog() {
         c.arg("--home").arg(&state).arg("op").arg("log");
         c
     });
+    assert!(op_log.contains("agent-test:session-test-1"), "{op_log}");
     let snapshot_op = op_log
         .lines()
-        .find(|line| line.contains("initial-scan"))
+        .find(|line| line.contains("agent-test:session-test-1"))
         .and_then(|line| line.split('\t').next())
         .unwrap()
         .to_string();
@@ -11136,6 +11139,10 @@ fn operations_are_appended_to_local_oplog() {
     });
     assert!(op_show.contains("parent op-"));
     assert!(op_show.contains("actor "));
+    assert!(op_show.contains("session_id session-test-1"));
+    assert!(op_show.contains("session_label agent-test"));
+    assert!(op_show.contains("process_id "));
+    assert!(op_show.contains("process_path "));
     assert!(op_show.contains("status done"));
     run({
         let mut c = mj();
@@ -11173,6 +11180,10 @@ fn operations_are_appended_to_local_oplog() {
     assert!(op["parent_op"].as_str().unwrap().starts_with("op-"));
     assert_eq!(op["status"], "done");
     assert!(op["actor"].as_str().unwrap().contains('@'));
+    assert_eq!(op["session_id"], "session-test-1");
+    assert_eq!(op["session_label"], "agent-test");
+    assert!(op["process_id"].as_u64().unwrap() > 0);
+    assert!(!op["process_path"].as_array().unwrap().is_empty());
 }
 
 #[test]

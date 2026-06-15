@@ -417,6 +417,24 @@ mj op diff <op-id> --root moon
 `mj op log` は操作単位の履歴、`mj op diff` はその操作の before / after snapshot から
 導出した file-level diff を表示する。
 
+`mj op log` と `mj op show` は、操作を記録した session / process の手掛かりも表示する。
+複数の coding agent や terminal が同じ root を操作する場合は、次の環境変数を設定しておくと
+op log 上で識別しやすい。
+
+```sh
+export MAJUTSU_SESSION_ID=codex-20260615-a
+export MAJUTSU_SESSION_LABEL=codex
+```
+
+`session_id` は `MAJUTSU_SESSION_ID` を優先し、未設定の場合は Codex / Claude / Cursor /
+terminal 系の session 環境変数、最後に記録元 pid へフォールバックする。`session_label` は
+`MAJUTSU_SESSION_LABEL` または `MAJUTSU_AGENT_NAME` を優先する。
+
+`process_id` は操作を記録した `mj` process の pid、`process_path` は OS の root process から
+その pid に至る枝だけを pid 列として保存する。全 process tree は保存しない。daemon / inotify
+経由のファイル変更では、kernel の filesystem event から元の editor pid は通常得られないため、
+変更を観測して snapshot / sync を記録した daemon または子 `mj` process が source process として残る。
+
 
 ## remote metadata storage efficiency
 

@@ -33,6 +33,10 @@ create table if not exists operations(
   parent_op text,
   kind text not null,
   actor text not null default 'local',
+  session_id text,
+  session_label text,
+  process_id integer,
+  process_path text,
   status text not null default 'done',
   before_snapshot text,
   after_snapshot text,
@@ -77,6 +81,10 @@ pub const COMPAT_MIGRATIONS: &[&str] = &[
     "alter table blobs add column pack_len integer",
     "alter table operations add column parent_op text",
     "alter table operations add column actor text not null default 'local'",
+    "alter table operations add column session_id text",
+    "alter table operations add column session_label text",
+    "alter table operations add column process_id integer",
+    "alter table operations add column process_path text",
     "alter table operations add column status text not null default 'done'",
     "alter table operations add column error text",
     "alter table operations add column remote_sync_state text",
@@ -630,6 +638,10 @@ mod tests {
             "parent_op",
             "kind text not null",
             "actor text not null default 'local'",
+            "session_id text",
+            "session_label text",
+            "process_id integer",
+            "process_path text",
             "status text not null default 'done'",
             "before_snapshot",
             "after_snapshot",
@@ -651,6 +663,26 @@ mod tests {
                 .any(|sql| sql.contains("parent_op"))
         );
         assert!(COMPAT_MIGRATIONS.iter().any(|sql| sql.contains("actor")));
+        assert!(
+            COMPAT_MIGRATIONS
+                .iter()
+                .any(|sql| sql.contains("session_id"))
+        );
+        assert!(
+            COMPAT_MIGRATIONS
+                .iter()
+                .any(|sql| sql.contains("session_label"))
+        );
+        assert!(
+            COMPAT_MIGRATIONS
+                .iter()
+                .any(|sql| sql.contains("process_id"))
+        );
+        assert!(
+            COMPAT_MIGRATIONS
+                .iter()
+                .any(|sql| sql.contains("process_path"))
+        );
         assert!(COMPAT_MIGRATIONS.iter().any(|sql| sql.contains("status")));
     }
 

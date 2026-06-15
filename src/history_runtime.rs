@@ -2973,10 +2973,11 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
             let summary = summarize_changes(&changes);
             writeln!(
                 output,
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 ui.paint(&op.created_at, "1;34"),
                 op.id,
                 ui.paint(&op.kind, "36"),
+                operation_session_label(&op),
                 summary,
                 op.message.as_deref().unwrap_or_default()
             )?;
@@ -3014,7 +3015,7 @@ fn recent_change_operations(
     offset: usize,
 ) -> Result<Vec<OperationExport>> {
     let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
+        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
          from operations
          where after_snapshot is not null
            and (before_snapshot is null or before_snapshot != after_snapshot)
@@ -3035,7 +3036,7 @@ fn recent_change_operations(
 
 fn recent_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
     let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
+        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
          from operations order by rowid desc",
     )?;
     let rows = stmt.query_map([], operation_from_row)?;
@@ -3047,18 +3048,25 @@ fn recent_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
 }
 
 fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationExport> {
+    let process_path_json: Option<String> = row.get(7)?;
     Ok(OperationExport {
         id: row.get(0)?,
         parent_op: row.get(1)?,
         kind: row.get(2)?,
         actor: row.get(3)?,
-        status: row.get(4)?,
-        before_snapshot: row.get(5)?,
-        after_snapshot: row.get(6)?,
-        created_at: row.get(7)?,
-        message: row.get(8)?,
-        error: row.get(9)?,
-        remote_sync_state: row.get(10)?,
+        session_id: row.get(4)?,
+        session_label: row.get(5)?,
+        process_id: row.get::<_, Option<i64>>(6)?.map(|pid| pid as u32),
+        process_path: process_path_json
+            .and_then(|value| serde_json::from_str::<Vec<u32>>(&value).ok())
+            .filter(|tree| !tree.is_empty()),
+        status: row.get(8)?,
+        before_snapshot: row.get(9)?,
+        after_snapshot: row.get(10)?,
+        created_at: row.get(11)?,
+        message: row.get(12)?,
+        error: row.get(13)?,
+        remote_sync_state: row.get(14)?,
     })
 }
 
@@ -3295,6 +3303,7 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
     let mut output = String::new();
     let ui = StatusUi::new();
     for row in rows {
+        let session = operation_session_label(&row);
         let id = row.id;
         let kind = row.kind;
         let before = row.before_snapshot;
@@ -3324,7 +3333,7 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
         let kind = ui.paint(&kind, "36");
         writeln!(
             output,
-            "{id}\t{created}\t{kind}\t{status}\t{}\t{} -> {}\t{}",
+            "{id}\t{created}\t{kind}\t{status}\t{}\t{session}\t{} -> {}\t{}",
             remote_sync_state.unwrap_or_else(|| "-".into()),
             before.unwrap_or_default(),
             after.unwrap_or_default(),
@@ -3333,6 +3342,16 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
         printed += 1;
     }
     emit_status_output_auto(&output, terminal_height())
+}
+
+fn operation_session_label(op: &OperationExport) -> String {
+    op.session_label
+        .as_deref()
+        .zip(op.session_id.as_deref())
+        .map(|(label, id)| format!("{label}:{id}"))
+        .or_else(|| op.session_id.clone())
+        .or_else(|| op.process_id.map(|pid| format!("pid:{pid}")))
+        .unwrap_or_else(|| "-".into())
 }
 
 pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
@@ -3346,6 +3365,27 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
             println!("parent {}", op.parent_op.as_deref().unwrap_or("(none)"));
             println!("kind {}", op.kind);
             println!("actor {}", op.actor);
+            println!("session_id {}", op.session_id.as_deref().unwrap_or(""));
+            println!(
+                "session_label {}",
+                op.session_label.as_deref().unwrap_or("")
+            );
+            println!(
+                "process_id {}",
+                op.process_id.map(|pid| pid.to_string()).unwrap_or_default()
+            );
+            println!(
+                "process_path {}",
+                op.process_path
+                    .as_ref()
+                    .map(|tree| {
+                        tree.iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default()
+            );
             println!("status {}", op.status);
             println!(
                 "before {}",

@@ -1053,6 +1053,41 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
 - `cargo test --test remote_file health_reports_root_last_changed_snapshot --locked` 成功。
 - `cargo test --workspace --all-targets --locked` 成功。
+
+## 残改善実施 2026-06-15 build 41
+
+実施:
+
+- `BUILD_NUMBER` 41。
+- operation log / remote metadata の operation export に `session_id`、`session_label`、
+  `process_id`、`process_path` を追加した。
+- `process_path` は全 process tree ではなく、OS の root process から操作記録元 process へ至る
+  1本の pid 枝として保存する。
+- `mj op log` / `mj log --operations` に session 表示を追加した。
+- `mj op show` で session / process 情報を確認できるようにした。
+- session は `MAJUTSU_SESSION_ID`、`CODEX_THREAD_ID`、`CLAUDE_SESSION_ID`、
+  `CURSOR_SESSION_ID`、`TERM_SESSION_ID`、最後に `pid-<pid>` の順で決める。
+- session label は `MAJUTSU_SESSION_LABEL`、`MAJUTSU_AGENT_NAME`、Codex / Claude /
+  Cursor の既知環境変数から決める。
+- daemon / inotify 経由では、filesystem event から元の editor pid は通常得られないため、
+  変更を観測して operation を記録した daemon または子 `mj` process が source process になる。
+
+検証:
+
+- `cargo test --test remote_file operations_are_appended_to_local_oplog --locked` 成功。
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+
+実環境反映:
+
+- `/home/vagrant/.cargo/bin/mj` を `mj 0.3.0+build.41` に更新した。
+- `mj daemon restart` 成功。
+- `MAJUTSU_SESSION_ID=verify-build-41 MAJUTSU_SESSION_LABEL=codex mj fsck --quick` 成功。
+- 生成された `fsck` operation の `mj op show` で `session_id verify-build-41`、
+  `session_label codex`、`process_id`、root から記録元 process へ至る `process_path` を確認した。
+- `mj sync --wait --timeout-secs 300` 成功。
+- `mj health` は `state protected`、issue 0、全 root `root_remote ... synced=true`。
 - 実環境に `mj 0.3.0+build.36` を install し、daemon restart 済み。
 - 実環境の `mj status --no-pager` で Roots 表の `CHANGED` が `MM-DD HH:MM:SS` 形式になることを確認。
 - 実環境で `mj sync --wait --timeout-secs 300` 成功。

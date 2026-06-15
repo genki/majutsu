@@ -75,14 +75,25 @@ pub(crate) fn record_op_with_details(
     let created_at = Utc::now().to_rfc3339();
     let parent_op = current_operation(conn)?;
     let actor = operation_actor();
+    let session = operation_session();
+    let process = operation_process();
+    let process_path_json = process
+        .path
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
     conn.execute(
-        "insert into operations(id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "insert into operations(id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             details.id,
             parent_op,
             details.kind,
             actor,
+            session.id,
+            session.label,
+            process.id,
+            process_path_json,
             details.status,
             details.before,
             details.after,
@@ -97,6 +108,10 @@ pub(crate) fn record_op_with_details(
         parent_op,
         kind: details.kind.to_string(),
         actor,
+        session_id: session.id,
+        session_label: session.label,
+        process_id: process.id,
+        process_path: process.path,
         status: details.status.to_string(),
         before_snapshot: details.before.map(str::to_string),
         after_snapshot: details.after.map(str::to_string),
@@ -231,23 +246,107 @@ fn operation_actor() -> String {
     format!("{user}@{host}")
 }
 
+#[derive(Debug, Clone)]
+struct OperationSession {
+    id: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OperationProcess {
+    id: Option<u32>,
+    path: Option<Vec<u32>>,
+}
+
+fn operation_session() -> OperationSession {
+    let id = first_non_empty_env(&[
+        "MAJUTSU_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CLAUDE_SESSION_ID",
+        "CURSOR_SESSION_ID",
+        "TERM_SESSION_ID",
+    ])
+    .or_else(|| Some(format!("pid-{}", std::process::id())));
+    let label = first_non_empty_env(&["MAJUTSU_SESSION_LABEL", "MAJUTSU_AGENT_NAME"])
+        .or_else(|| env::var("CODEX_THREAD_ID").ok().map(|_| "codex".into()))
+        .or_else(|| env::var("CLAUDE_SESSION_ID").ok().map(|_| "claude".into()))
+        .or_else(|| env::var("CURSOR_SESSION_ID").ok().map(|_| "cursor".into()));
+    OperationSession { id, label }
+}
+
+fn operation_process() -> OperationProcess {
+    let pid = std::process::id();
+    OperationProcess {
+        id: Some(pid),
+        path: Some(process_path(pid)),
+    }
+}
+
+fn process_path(pid: u32) -> Vec<u32> {
+    let mut path = Vec::new();
+    let mut current = pid;
+    for _ in 0..64 {
+        path.push(current);
+        let Some(parent) = parent_pid(current) else {
+            break;
+        };
+        if parent == 0 || parent == current {
+            break;
+        }
+        current = parent;
+    }
+    path.reverse();
+    path
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_linux_stat_parent_pid(&stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_stat_parent_pid(stat: &str) -> Option<u32> {
+    let close = stat.rfind(") ")?;
+    let rest = stat.get(close + 2..)?;
+    let mut parts = rest.split_whitespace();
+    let _state = parts.next()?;
+    parts.next()?.parse().ok()
+}
+
+fn first_non_empty_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+}
+
 pub(crate) fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {
     conn.query_row(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state from operations where id=?1",
+        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state from operations where id=?1",
         params![op_id],
         |row| {
+            let process_path_json: Option<String> = row.get(7)?;
             Ok(OperationExport {
                 id: row.get(0)?,
                 parent_op: row.get(1)?,
                 kind: row.get(2)?,
                 actor: row.get(3)?,
-                status: row.get(4)?,
-                before_snapshot: row.get(5)?,
-                after_snapshot: row.get(6)?,
-                created_at: row.get(7)?,
-                message: row.get(8)?,
-                error: row.get(9)?,
-                remote_sync_state: row.get(10)?,
+                session_id: row.get(4)?,
+                session_label: row.get(5)?,
+                process_id: row.get::<_, Option<i64>>(6)?.map(|pid| pid as u32),
+                process_path: parse_process_path_json(process_path_json.as_deref()),
+                status: row.get(8)?,
+                before_snapshot: row.get(9)?,
+                after_snapshot: row.get(10)?,
+                created_at: row.get(11)?,
+                message: row.get(12)?,
+                error: row.get(13)?,
+                remote_sync_state: row.get(14)?,
             })
         },
     )
@@ -257,21 +356,26 @@ pub(crate) fn query_operation(conn: &Connection, op_id: &str) -> Result<Operatio
 
 pub(crate) fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
     let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state from operations order by created_at",
+        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state from operations order by created_at",
     )?;
     let rows = stmt.query_map([], |row| {
+        let process_path_json: Option<String> = row.get(7)?;
         Ok(OperationExport {
             id: row.get(0)?,
             parent_op: row.get(1)?,
             kind: row.get(2)?,
             actor: row.get(3)?,
-            status: row.get(4)?,
-            before_snapshot: row.get(5)?,
-            after_snapshot: row.get(6)?,
-            created_at: row.get(7)?,
-            message: row.get(8)?,
-            error: row.get(9)?,
-            remote_sync_state: row.get(10)?,
+            session_id: row.get(4)?,
+            session_label: row.get(5)?,
+            process_id: row.get::<_, Option<i64>>(6)?.map(|pid| pid as u32),
+            process_path: parse_process_path_json(process_path_json.as_deref()),
+            status: row.get(8)?,
+            before_snapshot: row.get(9)?,
+            after_snapshot: row.get(10)?,
+            created_at: row.get(11)?,
+            message: row.get(12)?,
+            error: row.get(13)?,
+            remote_sync_state: row.get(14)?,
         })
     })?;
     let mut operations = Vec::new();
@@ -279,4 +383,10 @@ pub(crate) fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>
         operations.push(row?);
     }
     Ok(operations)
+}
+
+fn parse_process_path_json(value: Option<&str>) -> Option<Vec<u32>> {
+    value
+        .and_then(|value| serde_json::from_str::<Vec<u32>>(value).ok())
+        .filter(|tree| !tree.is_empty())
 }
