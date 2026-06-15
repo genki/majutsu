@@ -1,5 +1,9 @@
 # majutsu
 
+<p align="center">
+  <img src="docs/assets/majutsu-logo.png" alt="majutsu logo" width="720">
+</p>
+
 `majutsu` is a host-level, multi-root snapshot history tool. The installed CLI
 command is `mj`.
 
