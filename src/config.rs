@@ -368,6 +368,8 @@ pub(crate) struct ConfigRoot {
     pub(crate) require_mount: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) degraded: Option<RootDegraded>,
     #[serde(default = "default_snapshot_mode")]
     pub(crate) snapshot_mode: String,
     #[serde(default)]
@@ -428,6 +430,8 @@ pub(crate) struct RootConfig {
     pub(crate) require_mount: bool,
     #[serde(default = "default_root_status")]
     pub(crate) status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) degraded: Option<RootDegraded>,
     #[serde(default = "default_snapshot_mode")]
     pub(crate) snapshot_mode: String,
     #[serde(default)]
@@ -440,6 +444,13 @@ pub(crate) struct RootConfig {
     pub(crate) application_plugin: Option<String>,
     #[serde(default)]
     pub(crate) large: Option<RootLargeConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct RootDegraded {
+    pub(crate) kind: String,
+    pub(crate) at: DateTime<Utc>,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

@@ -1058,10 +1058,35 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 - 実環境で `mj sync --wait --timeout-secs 300` 成功。
 - 実環境で `local_current == remote_current == snap-a27e8573-b8af-4949-ae02-e454a394f3de`、issue 0。
 
+## 残改善実施 2026-06-15 build 37
+
+実施:
+
+- `BUILD_NUMBER` 37。
+- `RootConfig` / `ConfigRoot` に optional な `degraded` detail を追加した。
+- permission denied で root scan が失敗した場合、root status を `permission-denied` にするだけでなく、
+  `degraded.kind`、`degraded.at`、`degraded.message` を保存するようにした。
+- `root resume` などで status が `active` へ戻る時は degraded detail を消す。
+- `mj health --json` に root別の `degraded_kind` / `degraded_at` / `degraded_message` を追加した。
+- `mj health` text に `root_degraded ...` 行を追加した。
+- `mj status` の Roots 表に `ISSUE` 列を追加し、degraded kind と時刻を表示するようにした。
+
+検証:
+
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --test remote_file permission_denied_root_is_skipped_without_mass_deletion --locked` 成功。
+- `cargo test --test remote_file status_reports_configured_root_state --locked` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- 実環境に `mj 0.3.0+build.37` を install し、daemon restart 済み。
+- 実環境の `mj status --no-pager` で Roots 表に `ISSUE` 列が表示されることを確認。
+- 実環境で `mj health` は `state protected`、issue 0。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `local_current == remote_current == snap-25067cab-0470-4f49-b7ba-1f251f5b809a`。
+
 残り:
 
-- permission degraded の詳細は fs scan 時の permission skip 結果を root health に永続化する設計が必要。
-- root別の最終 sync 時刻は現状 remote current が host単位であり、root単位の remote ack を持っていないため未実装。
+- root別 remote ack / sync 時刻は host単位 remote current だけでは表現できないため、root単位 ack metadata の設計が必要。
 
 ## 表示改善 2026-06-14 build 36
 

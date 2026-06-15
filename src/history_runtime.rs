@@ -240,59 +240,121 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     if roots.is_empty() {
         writeln!(output, "  (none)").expect("write status output");
     } else {
-        let root_rows = roots
-            .iter()
-            .map(|root| {
-                let state = if root.status == "active" && !root.path.exists() {
-                    "missing".to_string()
-                } else {
-                    root.status.clone()
-                };
-                let current_root = current_manifest
-                    .as_ref()
-                    .and_then(|manifest| manifest.root_trees.get(&root.id));
-                Ok([
-                    root.id.clone(),
-                    state,
-                    current_root
-                        .map(|root_tree| root_tree.file_count.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    current_root
-                        .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
-                        .unwrap_or_else(|| "-".into()),
-                    current
-                        .as_deref()
-                        .zip(current_root)
-                        .map(|(current_id, root_tree)| {
-                            root_last_change(paths, &conn, current_id, &root.id, &root_tree.tree_id)
+        if width < 64 {
+            let root_rows = roots
+                .iter()
+                .map(|root| {
+                    let state = if root.status == "active" && !root.path.exists() {
+                        "missing".to_string()
+                    } else {
+                        root.status.clone()
+                    };
+                    let current_root = current_manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.root_trees.get(&root.id));
+                    [
+                        root.id.clone(),
+                        state,
+                        current_root
+                            .map(|root_tree| root_tree.file_count.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        current_root
+                            .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
+                            .unwrap_or_else(|| "-".into()),
+                        root.path.display().to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let root_row_refs = root_rows
+                .iter()
+                .map(|row| {
+                    [
+                        row[0].as_str(),
+                        row[1].as_str(),
+                        row[2].as_str(),
+                        row[3].as_str(),
+                        row[4].as_str(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(
+                &mut output,
+                width,
+                &["ID", "STATUS", "FILES", "TREE", "PATH"],
+                &root_row_refs,
+            );
+        } else {
+            let root_rows = roots
+                .iter()
+                .map(|root| {
+                    let state = if root.status == "active" && !root.path.exists() {
+                        "missing".to_string()
+                    } else {
+                        root.status.clone()
+                    };
+                    let current_root = current_manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.root_trees.get(&root.id));
+                    Ok([
+                        root.id.clone(),
+                        state,
+                        root.degraded
+                            .as_ref()
+                            .map(|degraded| {
+                                format!(
+                                    "{} {}",
+                                    degraded.kind,
+                                    compact_timestamp(&degraded.at.to_rfc3339())
+                                )
+                            })
+                            .unwrap_or_else(|| "-".into()),
+                        current_root
+                            .map(|root_tree| root_tree.file_count.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        current_root
+                            .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
+                            .unwrap_or_else(|| "-".into()),
+                        current
+                            .as_deref()
+                            .zip(current_root)
+                            .map(|(current_id, root_tree)| {
+                                root_last_change(
+                                    paths,
+                                    &conn,
+                                    current_id,
+                                    &root.id,
+                                    &root_tree.tree_id,
+                                )
                                 .map(|change| change.changed_at)
-                        })
-                        .transpose()?
-                        .map(|changed_at| compact_timestamp(&changed_at))
-                        .unwrap_or_else(|| "-".into()),
-                    root.path.display().to_string(),
-                ])
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let root_row_refs = root_rows
-            .iter()
-            .map(|row| {
-                [
-                    row[0].as_str(),
-                    row[1].as_str(),
-                    row[2].as_str(),
-                    row[3].as_str(),
-                    row[4].as_str(),
-                    row[5].as_str(),
-                ]
-            })
-            .collect::<Vec<_>>();
-        print_table(
-            &mut output,
-            width,
-            &["ID", "STATUS", "FILES", "TREE", "CHANGED", "PATH"],
-            &root_row_refs,
-        );
+                            })
+                            .transpose()?
+                            .map(|changed_at| compact_timestamp(&changed_at))
+                            .unwrap_or_else(|| "-".into()),
+                        root.path.display().to_string(),
+                    ])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let root_row_refs = root_rows
+                .iter()
+                .map(|row| {
+                    [
+                        row[0].as_str(),
+                        row[1].as_str(),
+                        row[2].as_str(),
+                        row[3].as_str(),
+                        row[4].as_str(),
+                        row[5].as_str(),
+                        row[6].as_str(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(
+                &mut output,
+                width,
+                &["ID", "STATUS", "ISSUE", "FILES", "TREE", "CHANGED", "PATH"],
+                &root_row_refs,
+            );
+        }
     }
     writeln!(output).expect("write status output");
 
@@ -545,6 +607,9 @@ struct RootHealth {
     current_tree_id: Option<String>,
     last_changed_snapshot: Option<String>,
     last_changed_at: Option<String>,
+    degraded_kind: Option<String>,
+    degraded_at: Option<String>,
+    degraded_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -649,6 +714,15 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
                     .as_ref()
                     .map(|change| change.snapshot_id.clone()),
                 last_changed_at: last_change.map(|change| change.changed_at),
+                degraded_kind: root.degraded.as_ref().map(|degraded| degraded.kind.clone()),
+                degraded_at: root
+                    .degraded
+                    .as_ref()
+                    .map(|degraded| degraded.at.to_rfc3339()),
+                degraded_message: root
+                    .degraded
+                    .as_ref()
+                    .map(|degraded| degraded.message.clone()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1001,6 +1075,15 @@ fn print_health_report(report: &HealthReport) {
                 root.id,
                 root.last_changed_snapshot.as_deref().unwrap_or("-"),
                 changed_at
+            );
+        }
+        if let Some(kind) = &root.degraded_kind {
+            println!(
+                "root_degraded {} kind={} at={} message={}",
+                root.id,
+                kind,
+                root.degraded_at.as_deref().unwrap_or("-"),
+                root.degraded_message.as_deref().unwrap_or("-")
             );
         }
     }

@@ -28,6 +28,7 @@ impl From<&RootConfig> for ConfigRoot {
             follow_symlinks: root.follow_symlinks,
             require_mount: root.require_mount,
             status: Some(root.status.clone()),
+            degraded: root.degraded.clone(),
             snapshot_mode: root.snapshot_mode.clone(),
             pre_snapshot: root.pre_snapshot.clone(),
             post_snapshot: root.post_snapshot.clone(),
@@ -96,6 +97,10 @@ impl ConfigRoot {
                 .clone()
                 .or_else(|| existing.map(|root| root.status.clone()))
                 .unwrap_or_else(default_root_status),
+            degraded: self
+                .degraded
+                .clone()
+                .or_else(|| existing.and_then(|root| root.degraded.clone())),
             snapshot_mode: self.snapshot_mode.clone(),
             pre_snapshot: self.pre_snapshot.clone(),
             post_snapshot: self.post_snapshot.clone(),
@@ -141,5 +146,20 @@ pub(crate) fn save_root(conn: &Connection, root: &RootConfig) -> Result<()> {
 pub(crate) fn update_root_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
     let mut root = root_by_id(conn, id)?;
     root.status = status.to_string();
+    if status == "active" {
+        root.degraded = None;
+    }
+    save_root(conn, &root)
+}
+
+pub(crate) fn update_root_degraded(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    degraded: crate::config::RootDegraded,
+) -> Result<()> {
+    let mut root = root_by_id(conn, id)?;
+    root.status = status.to_string();
+    root.degraded = Some(degraded);
     save_root(conn, &root)
 }

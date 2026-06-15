@@ -14134,6 +14134,29 @@ fn permission_denied_root_is_skipped_without_mass_deletion() {
         c
     });
     assert!(roots.contains("sample\tpermission-denied"));
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status").arg("--no-pager");
+        c
+    });
+    assert!(status.contains("ISSUE"));
+    assert!(status.contains("permission-denied"));
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--json");
+        c
+    });
+    let health: serde_json::Value = serde_json::from_str(&health).unwrap();
+    let root = &health["roots"][0];
+    assert_eq!(root["status"], "permission-denied");
+    assert_eq!(root["degraded_kind"], "permission-denied");
+    assert!(root["degraded_at"].as_str().is_some());
+    assert!(
+        root["degraded_message"]
+            .as_str()
+            .unwrap()
+            .contains("Permission")
+    );
     let ops = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("op").arg("log");

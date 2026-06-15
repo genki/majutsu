@@ -133,8 +133,8 @@ use cli::{Cli, Command, InitArgs, RestoreArgs, SnapshotArgs};
 use clone_runtime::clone_cmd;
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
-    MetadataExport, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig, SecurityConfig,
-    TieringConfig, WatchConfig, default_chunk_size, default_large_binary_min_size,
+    MetadataExport, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig, RootDegraded,
+    SecurityConfig, TieringConfig, WatchConfig, default_chunk_size, default_large_binary_min_size,
     default_large_chunked_chunk_size, default_large_chunked_min_size, default_large_chunking,
     default_large_max_parallel_uploads, default_large_min_size, default_security_hash,
     default_security_key_id, encryption_enabled, encryption_mode, read_config, resolve_paths,
@@ -173,7 +173,9 @@ use restore_runtime::{
     write_restore_job,
 };
 use root_runtime::root_cmd;
-use root_state::{roots, sync_config_roots, sync_roots_to_config, update_root_status};
+use root_state::{
+    roots, sync_config_roots, sync_roots_to_config, update_root_degraded, update_root_status,
+};
 use snapshot_rules::{
     build_ignore, classify_large, effective_large_config, is_ignored, is_included,
     large_pointer_compression, looks_binary,
@@ -394,7 +396,17 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         let scanned = match scan_result {
             Ok(scanned) => scanned,
             Err(err) if is_permission_denied_error(&err) => {
-                update_root_status(&conn, &root.id, "permission-denied")?;
+                let detail = format!("{err:#}");
+                update_root_degraded(
+                    &conn,
+                    &root.id,
+                    "permission-denied",
+                    RootDegraded {
+                        kind: "permission-denied".into(),
+                        at: Utc::now(),
+                        message: detail.clone(),
+                    },
+                )?;
                 sync_roots_to_config(paths, &conn)?;
                 record_op(
                     &conn,
@@ -411,7 +423,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 record_event(
                     paths,
                     "root-permission-denied",
-                    &format!("{} {}", root.id, root.path.display()),
+                    &format!("{} {}: {detail}", root.id, root.path.display()),
                 )?;
                 carry_forward_root_snapshot(
                     parent_manifest.as_ref(),

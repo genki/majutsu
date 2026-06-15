@@ -87,6 +87,9 @@ pending event journal、sync lock、暗号化key fileの基本状態から、`pr
 `mj health --json` には root 別に `present`、`current_snapshot_includes`、
 `current_file_count`、`current_tree_id`、`last_changed_snapshot`、`last_changed_at` も含まれる。
 `mj status` の Roots 表も current snapshot 上の file count、tree id、最終変更時刻を表示する。
+root が `permission-denied` など degraded 状態になった場合は、root別に `degraded_kind`、
+`degraded_at`、`degraded_message` も出力される。`mj status` の Roots 表では `ISSUE` 列で
+degraded kind と発生時刻を確認できる。
 
 `protected` は active root が daemon に監視され、upload queue が空で、local current と
 cached remote head が一致している状態を表す。`degraded` は一時的なsync中やpending eventなど、

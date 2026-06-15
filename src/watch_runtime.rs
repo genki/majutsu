@@ -1029,6 +1029,7 @@ mod tests {
             follow_symlinks: false,
             require_mount: false,
             status: "active".into(),
+            degraded: None,
             snapshot_mode: "default".into(),
             pre_snapshot: None,
             post_snapshot: None,

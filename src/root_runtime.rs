@@ -59,6 +59,7 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 follow_symlinks: args.follow_symlinks,
                 require_mount: args.require_mount,
                 status: "active".into(),
+                degraded: None,
                 snapshot_mode: args.snapshot_mode,
                 pre_snapshot: args.pre_snapshot,
                 post_snapshot: args.post_snapshot,
