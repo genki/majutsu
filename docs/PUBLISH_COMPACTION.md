@@ -18,9 +18,14 @@ hosts/<host-id>/head.cbor.zst.enc
 
 この object には current snapshot、last-synced、host metadata key、host index key、
 GC mark key、最新 snapshot/operation export key を含める。
+あわせて current snapshot に含まれる root 別の `tree_id`、`tree_key`、`file_count`、
+`synced_at` を `root_acks` として同梱する。これにより host単位 current が同じでも、
+root 別にどの tree が remote 側で保全済みかを追加 request なしで確認できる。
 
 `mj sync status` と `mj sync --wait` は compact head を優先して読み、存在しない古い
 remote では従来の canonical ref にフォールバックする。
+compact head から読んだ root ack は local `remote_refs` cache に保存され、`mj status` と
+`mj health` は通常 remote へ通信せずに root 別 remote 同期状態を表示する。
 
 ## ref object の扱い
 

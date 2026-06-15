@@ -11,8 +11,9 @@ use majutsu_store::{
     canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
     host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
     host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
-    host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
-    is_content_addressed_remote_key, remote_gc_mark_key, remote_gc_tombstone_key,
+    host_ops_prefix, host_root_ack_ref_key, host_snapshot_canonical_key, host_snapshot_key,
+    host_snapshots_prefix, is_content_addressed_remote_key, remote_gc_mark_key,
+    remote_gc_tombstone_key,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,8 @@ struct RemoteHeadExport {
     host_name: String,
     current_snapshot: Option<String>,
     last_synced: Option<String>,
+    #[serde(default)]
+    root_acks: BTreeMap<String, RemoteRootAck>,
     metadata_key: String,
     host_index_key: String,
     gc_mark_key: String,
@@ -70,15 +73,25 @@ struct RemoteHeadExport {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteRootAck {
+    snapshot_id: String,
+    tree_id: String,
+    tree_key: String,
+    file_count: usize,
+    synced_at: Option<String>,
+}
+
 fn remote_head_key(host_id: &str) -> String {
     format!("hosts/{host_id}/head.cbor.zst.enc")
 }
 
 fn build_remote_head_export(
+    paths: &Paths,
     config: &Config,
     export: &MetadataExport,
     metadata_key: &str,
-) -> RemoteHeadExport {
+) -> Result<RemoteHeadExport> {
     let current_snapshot = export.refs.get("current").cloned();
     let latest_snapshot_key = current_snapshot
         .as_ref()
@@ -87,19 +100,72 @@ fn build_remote_head_export(
         .operations
         .last()
         .map(|operation| host_operation_canonical_key(&config.host.id, &operation.id));
-    RemoteHeadExport {
+    let root_acks = build_remote_root_acks(paths, export)?;
+    Ok(RemoteHeadExport {
         version: REMOTE_HEAD_VERSION,
         host_id: config.host.id.clone(),
         host_name: config.host.name.clone(),
         current_snapshot,
         last_synced: export.refs.get("last-synced").cloned(),
+        root_acks,
         metadata_key: metadata_key.to_string(),
         host_index_key: REMOTE_HOST_INDEX_KEY.to_string(),
         gc_mark_key: remote_gc_mark_key(&config.host.id),
         latest_snapshot_key,
         latest_operation_key,
         updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+fn build_remote_root_acks(
+    paths: &Paths,
+    export: &MetadataExport,
+) -> Result<BTreeMap<String, RemoteRootAck>> {
+    let Some(current) = export.refs.get("current") else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(snapshot) = export
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.id == *current)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let manifest = current_snapshot_manifest_for_object_keys(paths, snapshot)?;
+    let synced_at = export.refs.get("last-synced").cloned();
+    Ok(manifest
+        .root_trees
+        .into_iter()
+        .map(|(root_id, root)| {
+            (
+                root_id,
+                RemoteRootAck {
+                    snapshot_id: current.clone(),
+                    tree_id: root.tree_id,
+                    tree_key: root.tree_key,
+                    file_count: root.file_count,
+                    synced_at: synced_at.clone(),
+                },
+            )
+        })
+        .collect())
+}
+
+fn persist_remote_root_acks(
+    conn: &Connection,
+    remote: &str,
+    host_id: &str,
+    root_acks: &BTreeMap<String, RemoteRootAck>,
+) -> Result<()> {
+    for (root_id, ack) in root_acks {
+        set_remote_ref_value(
+            conn,
+            remote,
+            &host_root_ack_ref_key(host_id, root_id),
+            &serde_json::to_string(ack)?,
+        )?;
     }
+    Ok(())
 }
 
 fn decode_remote_head(paths: &Paths, bytes: &[u8]) -> Result<RemoteHeadExport> {
@@ -735,6 +801,14 @@ fn enqueue_and_drain_sync(
         &config.host.id,
         &remote_export.refs,
     )?;
+    if matches!(remote, RemoteStore::S3(_)) {
+        persist_remote_root_acks(
+            conn,
+            &remote.describe(),
+            &config.host.id,
+            &build_remote_root_acks(paths, &remote_export)?,
+        )?;
+    }
     trace.mark("persist remote refs");
     println!(
         "synced {} objects to {}",
@@ -1037,7 +1111,7 @@ fn enqueue_remote_head_if_supported(
         return Ok(());
     }
     let key = remote_head_key(&config.host.id);
-    let head = build_remote_head_export(config, export, metadata_key);
+    let head = build_remote_head_export(paths, config, export, metadata_key)?;
     enqueue_inline_upload(paths, &key, encode_canonical_remote_export(paths, &head)?)
 }
 
@@ -1380,16 +1454,16 @@ fn sync_status_snapshot(
     let config = read_config(paths)?;
     let canonical_current = host_current_ref_key(&config.host.id);
     let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
-    let (remote_current, remote_last_synced) =
+    let (remote_current, remote_last_synced, remote_root_acks) =
         match read_remote_head(paths, remote, &config.host.id)? {
-            Some(head) => (head.current_snapshot, head.last_synced),
+            Some(head) => (head.current_snapshot, head.last_synced, head.root_acks),
             None => {
                 let mut remote_current = remote_ref(remote, &canonical_current)?;
                 if remote_current.is_none() {
                     remote_current = remote_ref(remote, "hosts/current")?;
                 }
                 let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
-                (remote_current, remote_last_synced)
+                (remote_current, remote_last_synced, BTreeMap::new())
             }
         };
     if let Some(value) = remote_current.as_deref() {
@@ -1398,6 +1472,7 @@ fn sync_status_snapshot(
     if let Some(value) = remote_last_synced.as_deref() {
         set_remote_ref_value(conn, &remote.describe(), &canonical_last_synced, value)?;
     }
+    persist_remote_root_acks(conn, &remote.describe(), &config.host.id, &remote_root_acks)?;
     let export = export_metadata(paths, conn, &read_config(paths)?)?;
     let local_keys = local_object_keys(paths, &export)?;
     let total_local_objects = local_keys.len();

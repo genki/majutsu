@@ -402,6 +402,19 @@ pub enum RemoteRefIssue {
     UnsupportedRefName {
         name: String,
     },
+    InvalidRootAck {
+        name: String,
+        error: String,
+    },
+    InvalidRootAckSnapshot {
+        name: String,
+        value: String,
+    },
+    InvalidRootAckSyncedAt {
+        name: String,
+        value: String,
+        error: String,
+    },
 }
 
 impl RemoteRefIssue {
@@ -433,8 +446,26 @@ impl RemoteRefIssue {
             Self::UnsupportedRefName { name } => {
                 format!("remote ref has unsupported ref name {name}")
             }
+            Self::InvalidRootAck { name, error } => {
+                format!("remote root ack {name} is invalid: {error}")
+            }
+            Self::InvalidRootAckSnapshot { name, value } => {
+                format!("remote root ack {name} points to missing snapshot {value}")
+            }
+            Self::InvalidRootAckSyncedAt { name, value, error } => {
+                format!("remote root ack {name} has invalid synced_at {value}: {error}")
+            }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteRootAckCache {
+    snapshot_id: String,
+    tree_id: String,
+    tree_key: String,
+    file_count: usize,
+    synced_at: Option<String>,
 }
 
 pub fn remote_ref_issues<I>(
@@ -457,7 +488,12 @@ where
                 error: err.to_string(),
             });
         }
-        let Some((host_id, ref_name)) = parse_canonical_host_ref_name(&name) else {
+        let parsed_ref = parse_canonical_host_ref_name(&name);
+        let parsed_root_ack = parse_canonical_host_root_ack_ref_name(&name);
+        let Some(host_id) = parsed_ref
+            .map(|(host_id, _)| host_id)
+            .or_else(|| parsed_root_ack.map(|(host_id, _)| host_id))
+        else {
             issues.push(RemoteRefIssue::UnsupportedName { name });
             continue;
         };
@@ -467,6 +503,15 @@ where
                 config_host_id: config_host_id.to_string(),
             });
         }
+        if let Some((_, root_id)) = parsed_root_ack {
+            let root_id = root_id.to_string();
+            validate_remote_root_ack_ref(&mut issues, name, &root_id, value, snapshot_ids);
+            continue;
+        }
+        let Some((_, ref_name)) = parsed_ref else {
+            issues.push(RemoteRefIssue::UnsupportedName { name });
+            continue;
+        };
         match ref_name {
             "current" => {
                 if !snapshot_ids.contains(&value) {
@@ -488,6 +533,45 @@ where
     issues
 }
 
+fn validate_remote_root_ack_ref(
+    issues: &mut Vec<RemoteRefIssue>,
+    name: String,
+    _root_id: &str,
+    value: String,
+    snapshot_ids: &BTreeSet<String>,
+) {
+    match serde_json::from_str::<RemoteRootAckCache>(&value) {
+        Ok(ack) => {
+            let _file_count = ack.file_count;
+            if !snapshot_ids.contains(&ack.snapshot_id) {
+                issues.push(RemoteRefIssue::InvalidRootAckSnapshot {
+                    name: name.clone(),
+                    value: ack.snapshot_id,
+                });
+            }
+            if ack.tree_id.trim().is_empty() || ack.tree_key.trim().is_empty() {
+                issues.push(RemoteRefIssue::InvalidRootAck {
+                    name: name.clone(),
+                    error: "empty tree_id or tree_key".into(),
+                });
+            }
+            if let Some(synced_at) = ack.synced_at
+                && let Err(err) = DateTime::parse_from_rfc3339(&synced_at)
+            {
+                issues.push(RemoteRefIssue::InvalidRootAckSyncedAt {
+                    name,
+                    value: synced_at,
+                    error: err.to_string(),
+                });
+            }
+        }
+        Err(err) => issues.push(RemoteRefIssue::InvalidRootAck {
+            name,
+            error: err.to_string(),
+        }),
+    }
+}
+
 pub fn parse_canonical_host_ref_name(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix("hosts/")?;
     let (host_id, rest) = rest.split_once("/refs/")?;
@@ -495,6 +579,16 @@ pub fn parse_canonical_host_ref_name(name: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((host_id, rest))
+}
+
+pub fn parse_canonical_host_root_ack_ref_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("hosts/")?;
+    let (host_id, rest) = rest.split_once("/roots/")?;
+    let root_id = rest.strip_suffix("/ack")?;
+    if host_id.is_empty() || root_id.is_empty() || root_id.contains('/') {
+        return None;
+    }
+    Some((host_id, root_id))
 }
 
 #[cfg(test)]
@@ -894,6 +988,64 @@ mod tests {
                 },
                 RemoteRefIssue::UnsupportedName {
                     name: "legacy/current".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_ref_validation_accepts_and_checks_root_ack_cache() {
+        let valid_ack = serde_json::json!({
+            "snapshot_id": "snap-1",
+            "tree_id": "tree-1",
+            "tree_key": "objects/trees/tree-1",
+            "file_count": 2,
+            "synced_at": "2026-06-07T00:00:00Z"
+        })
+        .to_string();
+        let invalid_ack = serde_json::json!({
+            "snapshot_id": "missing-snap",
+            "tree_id": "",
+            "tree_key": "",
+            "file_count": 0,
+            "synced_at": "bad-time"
+        })
+        .to_string();
+
+        let issues = remote_ref_issues(
+            [
+                (
+                    "s3://remote".to_string(),
+                    "hosts/host-a/roots/docs/ack".to_string(),
+                    valid_ack,
+                    "2026-06-07T00:00:00Z".to_string(),
+                ),
+                (
+                    "s3://remote".to_string(),
+                    "hosts/host-a/roots/projects/ack".to_string(),
+                    invalid_ack,
+                    "2026-06-07T00:00:00Z".to_string(),
+                ),
+            ],
+            "host-a",
+            &BTreeSet::from(["snap-1".to_string()]),
+        );
+
+        assert_eq!(
+            issues,
+            vec![
+                RemoteRefIssue::InvalidRootAckSnapshot {
+                    name: "hosts/host-a/roots/projects/ack".into(),
+                    value: "missing-snap".into(),
+                },
+                RemoteRefIssue::InvalidRootAck {
+                    name: "hosts/host-a/roots/projects/ack".into(),
+                    error: "empty tree_id or tree_key".into(),
+                },
+                RemoteRefIssue::InvalidRootAckSyncedAt {
+                    name: "hosts/host-a/roots/projects/ack".into(),
+                    value: "bad-time".into(),
+                    error: "premature end of input".into(),
                 },
             ]
         );

@@ -1128,6 +1128,40 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 status表示では `MM-DD HH:MM:SS` の短い形式にした。`mj health --json` は復旧・機械処理向けなので
 従来通り full timestamp を保持する。
 
+## 残改善実施 2026-06-15 build 39
+
+実施:
+
+- `BUILD_NUMBER` 39。
+- S3互換 backend の compact head `hosts/<host-id>/head.cbor.zst.enc` に `root_acks` を追加した。
+- `root_acks` には current snapshot の root別 `snapshot_id`、`tree_id`、`tree_key`、`file_count`、
+  `synced_at` を保存する。
+- `mj sync` 成功後と `mj sync status` で compact head を読んだ後、root ack を local `remote_refs`
+  cache に保存する。
+- `mj status` / `mj health` は root ack cache を優先し、古い cache では build 38 と同じく
+  cached remote current snapshot から導出する。
+- これにより root別 remote 保全状態が host current snapshot の読み直しに依存せず、
+  compact head の単一 object publish で明示される。
+
+検証:
+
+- `cargo fmt --all` 実行。
+- `cargo test --test remote_file health_reports_root_remote_ack_from_cached_remote_current --locked` 成功。
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- 実環境に `mj 0.3.0+build.39` を install し、daemon restart 済み。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `mj status --no-pager` の Roots 表に root ack 由来の `REMOTE` timestamp が表示されることを確認。
+- 実環境で `mj health` は `state protected`、issue 0、全 root `root_remote ... synced=true`。
+- 実環境で `local_current == remote_current == snap-744b3796-df5e-4578-a9a1-6886f3675ac8`。
+
+残り:
+
+- root ack cache は compact head 読み取りまたは sync 成功時に更新される。別 host が同じ backend を
+  共有する場合の root ack 表示は、その host の head を読む operation 後に最新化される。
+- root ack の破損検出は remote/fsck の head 構造検査へ追加する余地がある。
+
 検証:
 
 - `cargo fmt --all -- --check` 成功。

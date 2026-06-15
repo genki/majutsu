@@ -89,6 +89,14 @@ pub fn host_last_synced_ref_key(host_id: &str) -> String {
     host_ref_key(host_id, "last-synced")
 }
 
+pub fn host_root_ack_ref_key(host_id: &str, root_id: &str) -> String {
+    format!("hosts/{host_id}/roots/{root_id}/ack")
+}
+
+pub fn host_root_ack_ref_prefix(host_id: &str) -> String {
+    format!("hosts/{host_id}/roots/")
+}
+
 pub fn host_snapshot_key(host_id: &str, snapshot_id: &str) -> String {
     format!("hosts/{host_id}/snapshots/{snapshot_id}.json")
 }

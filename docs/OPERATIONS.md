@@ -90,10 +90,11 @@ pending event journal、sync lock、暗号化key fileの基本状態から、`pr
 root が `permission-denied` など degraded 状態になった場合は、root別に `degraded_kind`、
 `degraded_at`、`degraded_message` も出力される。`mj status` の Roots 表では `ISSUE` 列で
 degraded kind と発生時刻を確認できる。
-cached remote current がある場合は root 別に `remote_snapshot_includes`、`remote_tree_id`、
-`remote_synced`、`remote_synced_snapshot`、`remote_synced_at` も出力される。これは host単位
-remote current が lagging していても、変更されていない root が remote 側に保全済みかを判定するための
-軽量 signal である。
+cached remote current または compact head の root ack がある場合は root 別に
+`remote_snapshot_includes`、`remote_tree_id`、`remote_synced`、`remote_synced_snapshot`、
+`remote_synced_at` も出力される。S3互換 backend では compact head の `root_acks` を優先し、
+古い backend/cache では remote current snapshot から導出する。これは host単位 remote current が
+lagging していても、変更されていない root が remote 側に保全済みかを判定するための軽量 signal である。
 
 `protected` は active root が daemon に監視され、upload queue が空で、local current と
 cached remote head が一致している状態を表す。`degraded` は一時的なsync中やpending eventなど、

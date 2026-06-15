@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use majutsu_core::OperationLogEntry as OperationExport;
-use majutsu_store::{host_current_ref_key, host_last_synced_ref_key};
+use majutsu_store::{
+    host_current_ref_key, host_last_synced_ref_key, host_root_ack_ref_key, host_root_ack_ref_prefix,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -338,6 +340,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                         current_root
                             .map(|root_tree| {
                                 root_remote_sync_label(
+                                    remote_head.root_acks.get(&root.id),
                                     remote_manifest.as_ref(),
                                     &root.id,
                                     &root_tree.tree_id,
@@ -728,10 +731,16 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
                 current_manifest.and_then(|manifest| manifest.root_trees.get(&root.id));
             let remote_root =
                 remote_manifest.and_then(|manifest| manifest.root_trees.get(&root.id));
-            let remote_synced = current_root
+            let remote_ack = remote_head.root_acks.get(&root.id);
+            let remote_ack_synced = current_root
+                .zip(remote_ack)
+                .map(|(current_root, ack)| current_root.tree_id == ack.tree_id)
+                .unwrap_or(false);
+            let remote_manifest_synced = current_root
                 .zip(remote_root)
                 .map(|(current_root, remote_root)| current_root.tree_id == remote_root.tree_id)
                 .unwrap_or(false);
+            let remote_synced = remote_ack_synced || remote_manifest_synced;
             let last_change = current
                 .zip(current_root)
                 .map(|(current_id, root_tree)| {
@@ -759,16 +768,22 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
                     .degraded
                     .as_ref()
                     .map(|degraded| degraded.message.clone()),
-                remote_snapshot_includes: remote_root.is_some(),
-                remote_tree_id: remote_root.map(|root_tree| root_tree.tree_id.clone()),
+                remote_snapshot_includes: remote_ack.is_some() || remote_root.is_some(),
+                remote_tree_id: remote_ack
+                    .map(|ack| ack.tree_id.clone())
+                    .or_else(|| remote_root.map(|root_tree| root_tree.tree_id.clone())),
                 remote_synced,
                 remote_synced_snapshot: if remote_synced {
-                    remote_head.remote_current.clone()
+                    remote_ack
+                        .map(|ack| ack.snapshot_id.clone())
+                        .or_else(|| remote_head.remote_current.clone())
                 } else {
                     None
                 },
                 remote_synced_at: if remote_synced {
-                    remote_head.remote_last_synced.clone()
+                    remote_ack
+                        .and_then(|ack| ack.synced_at.clone())
+                        .or_else(|| remote_head.remote_last_synced.clone())
                 } else {
                     None
                 },
@@ -2124,11 +2139,23 @@ fn compact_timestamp(value: &str) -> String {
 }
 
 fn root_remote_sync_label(
+    remote_ack: Option<&RemoteRootAck>,
     remote_manifest: Option<&majutsu_core::SnapshotManifest>,
     root_id: &str,
     current_tree_id: &str,
     remote_last_synced: Option<&str>,
 ) -> String {
+    if let Some(remote_ack) = remote_ack {
+        if remote_ack.tree_id != current_tree_id {
+            return "lagging".into();
+        }
+        return remote_ack
+            .synced_at
+            .as_deref()
+            .or(remote_last_synced)
+            .map(compact_timestamp)
+            .unwrap_or_else(|| "synced".into());
+    }
     let Some(remote_manifest) = remote_manifest else {
         return "-".into();
     };
@@ -2599,8 +2626,18 @@ struct RemoteHeadStatus {
     current: Option<String>,
     remote_current: Option<String>,
     remote_last_synced: Option<String>,
+    root_acks: BTreeMap<String, RemoteRootAck>,
     synced: bool,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteRootAck {
+    snapshot_id: String,
+    tree_id: String,
+    tree_key: String,
+    file_count: usize,
+    synced_at: Option<String>,
 }
 
 impl RemoteHeadStatus {
@@ -2636,6 +2673,7 @@ fn read_remote_head_status(
             current: current.map(str::to_string),
             remote_current: None,
             remote_last_synced: None,
+            root_acks: BTreeMap::new(),
             synced: false,
             detail: "not configured".into(),
         });
@@ -2645,6 +2683,7 @@ fn read_remote_head_status(
             current: current.map(str::to_string),
             remote_current: None,
             remote_last_synced: None,
+            root_acks: BTreeMap::new(),
             synced: false,
             detail: "remote unavailable".into(),
         });
@@ -2654,6 +2693,7 @@ fn read_remote_head_status(
             current: current.map(str::to_string),
             remote_current: None,
             remote_last_synced: None,
+            root_acks: BTreeMap::new(),
             synced: false,
             detail: "unknown".into(),
         });
@@ -2674,6 +2714,7 @@ fn read_remote_head_status(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
+    let root_acks = read_remote_root_acks(conn, remote_name, &config.host.id)?;
     let synced = current.is_some() && current.map(str::to_string) == remote_current;
     let detail = match (current, remote_current.as_deref()) {
         (Some(_), Some(_)) if synced => "synced".into(),
@@ -2686,9 +2727,45 @@ fn read_remote_head_status(
         current: current.map(str::to_string),
         remote_current,
         remote_last_synced,
+        root_acks,
         synced,
         detail,
     })
+}
+
+fn read_remote_root_acks(
+    conn: &Connection,
+    remote_name: &str,
+    host_id: &str,
+) -> Result<BTreeMap<String, RemoteRootAck>> {
+    let prefix = host_root_ack_ref_prefix(host_id);
+    let suffix = "/ack";
+    let mut stmt = conn.prepare(
+        "select name, value from remote_refs
+         where remote=?1 and name like ?2
+         order by name",
+    )?;
+    let rows = stmt.query_map(params![remote_name, format!("{prefix}%")], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut acks = BTreeMap::new();
+    for row in rows {
+        let (name, value) = row?;
+        let Some(root_id) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        let expected = host_root_ack_ref_key(host_id, root_id);
+        if name != expected {
+            continue;
+        }
+        let ack: RemoteRootAck = serde_json::from_str(&value)
+            .with_context(|| format!("parse cached remote root ack {name}"))?;
+        acks.insert(root_id.to_string(), ack);
+    }
+    Ok(acks)
 }
 
 fn read_remote_status(config: &Config) -> Result<RemoteStatus> {
