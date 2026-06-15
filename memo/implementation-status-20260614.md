@@ -1135,6 +1135,47 @@ root追加、初期 snapshot、追加/編集/削除、sync、clone、restore、d
 - 実環境 `/home/vagrant/.majutsu` の daemon を build 42 で restart 済み。
 - 実環境で `mj sync --wait --timeout-secs 300` 成功。
 - 実環境で `mj health` は `state protected`、issue 0、全 root `root_remote ... synced=true`。
+
+## tree manifest compact 化 2026-06-15 build 43
+
+実施:
+
+- `BUILD_NUMBER` 43。
+- 新規 snapshot で保存する tree manifest を `serde_json::to_vec_pretty` から compact JSON
+  `serde_json::to_vec` に変更した。
+- key rotation 時に再生成する tree manifest も compact JSON にした。
+- canonical remote tree manifest を local object として hydrate する場合も compact JSON で保存する。
+- 既存の pretty JSON tree manifest は serde_json 経由で従来通り読み取れるため、format 互換性は維持する。
+
+狙い:
+
+- subtree reuse / 差分 tree 表現のような大きな format 変更の前に、既存 format のまま新規 tree metadata
+  の保存サイズと upload 対象 bytes を削減する。
+- snapshot ごとの tree manifest 生成量そのものをゼロにはできないが、巨大 root での metadata 効率を
+  低リスクに改善する。
+
+検証:
+
+- `cargo test --test remote_file tree_manifests_are_stored_as_compact_json --locked` 成功。
+- `cargo test --test remote_file unchanged_snapshot_can_be_forced_for_checkpoint --locked` 成功。
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+
+実測:
+
+- `/tmp/majutsu-tree-compact-lab` に 200 file の検証 root を作成。
+- tree manifest は compact 71,734 bytes、pretty 97,466 bytes。
+- 削減量は 25,732 bytes、26.4%。
+- `contains_newline false` を確認。
+- file remote へ sync 後、clone / restore で 200 files を復元できた。
+
+実環境反映:
+
+- `/home/vagrant/.cargo/bin/mj` を `mj 0.3.0+build.43` に更新した。
+- 実環境 `/home/vagrant/.majutsu` の daemon を build 43 で restart 済み。
+- `mj sync --wait --timeout-secs 300` 成功。
+- `mj health` は `state protected`、issue 0、全 root `root_remote ... synced=true`。
 - 実環境に `mj 0.3.0+build.36` を install し、daemon restart 済み。
 - 実環境の `mj status --no-pager` で Roots 表の `CHANGED` が `MM-DD HH:MM:SS` 形式になることを確認。
 - 実環境で `mj sync --wait --timeout-secs 300` 成功。

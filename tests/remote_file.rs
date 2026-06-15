@@ -4772,6 +4772,50 @@ fn unchanged_snapshot_is_skipped_by_default() {
 }
 
 #[test]
+fn tree_manifests_are_stored_as_compact_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("nested/beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let manifest = local_snapshot_manifest(&state, "asc");
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap();
+    let tree_bytes = fs::read(state.join(tree_key)).unwrap();
+    let tree_text = String::from_utf8(tree_bytes.clone()).unwrap();
+    let tree: serde_json::Value = serde_json::from_slice(&tree_bytes).unwrap();
+    let pretty = serde_json::to_vec_pretty(&tree).unwrap();
+
+    assert!(!tree_text.contains('\n'), "{tree_text}");
+    assert!(tree_bytes.len() < pretty.len());
+    assert_eq!(tree["entries"].as_object().unwrap().len(), 3);
+}
+
+#[test]
 fn unchanged_snapshot_can_be_forced_for_checkpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

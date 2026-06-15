@@ -474,7 +474,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         {
             previous.clone()
         } else {
-            let tree_json = serde_json::to_vec_pretty(&tree)?;
+            let tree_json = serde_json::to_vec(&tree)?;
             let tree_oid = blake3_hex(&tree_json);
             let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
             RootSnapshot {
@@ -1820,7 +1820,7 @@ fn canonical_remote_object_to_local_bytes(
     }
     if key.starts_with("objects/trees/") {
         let manifest: TreeManifest = decode_canonical_remote_export(paths, bytes)?;
-        return encode_object(paths, &serde_json::to_vec_pretty(&manifest)?);
+        return encode_object(paths, &serde_json::to_vec(&manifest)?);
     }
     if key.starts_with("objects/indexes/pack/") {
         let index: PackIndex = decode_canonical_remote_export(paths, bytes)?;

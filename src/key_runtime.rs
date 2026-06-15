@@ -151,7 +151,7 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
         manifest.root_trees.clear();
         for (root_id, records) in &manifest.roots {
             let tree = build_tree_manifest(root_id, records.clone())?;
-            let tree_json = serde_json::to_vec_pretty(&tree)?;
+            let tree_json = serde_json::to_vec(&tree)?;
             let tree_oid = blake3_hex(&tree_json);
             let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
             manifest.root_trees.insert(
