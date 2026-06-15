@@ -64,6 +64,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         upload_stats: &upload_stats,
         pending_event_count,
         current_manifest: current_manifest.as_ref(),
+        conn: &conn,
     })?;
     let width = terminal_width();
     let height = terminal_height();
@@ -250,7 +251,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                 let current_root = current_manifest
                     .as_ref()
                     .and_then(|manifest| manifest.root_trees.get(&root.id));
-                [
+                Ok([
                     root.id.clone(),
                     state,
                     current_root
@@ -259,10 +260,20 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                     current_root
                         .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
                         .unwrap_or_else(|| "-".into()),
+                    current
+                        .as_deref()
+                        .zip(current_root)
+                        .map(|(current_id, root_tree)| {
+                            root_last_change(paths, &conn, current_id, &root.id, &root_tree.tree_id)
+                                .map(|change| change.changed_at)
+                        })
+                        .transpose()?
+                        .map(|changed_at| compact_timestamp(&changed_at))
+                        .unwrap_or_else(|| "-".into()),
                     root.path.display().to_string(),
-                ]
+                ])
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let root_row_refs = root_rows
             .iter()
             .map(|row| {
@@ -272,13 +283,14 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                     row[2].as_str(),
                     row[3].as_str(),
                     row[4].as_str(),
+                    row[5].as_str(),
                 ]
             })
             .collect::<Vec<_>>();
         print_table(
             &mut output,
             width,
-            &["ID", "STATUS", "FILES", "TREE", "PATH"],
+            &["ID", "STATUS", "FILES", "TREE", "CHANGED", "PATH"],
             &root_row_refs,
         );
     }
@@ -475,6 +487,7 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
         upload_stats: &upload_stats,
         pending_event_count,
         current_manifest: current_manifest.as_ref(),
+        conn: &conn,
     })
 }
 
@@ -530,6 +543,14 @@ struct RootHealth {
     current_snapshot_includes: bool,
     current_file_count: Option<usize>,
     current_tree_id: Option<String>,
+    last_changed_snapshot: Option<String>,
+    last_changed_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RootChange {
+    snapshot_id: String,
+    changed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,6 +607,7 @@ struct HealthInputs<'a> {
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
     current_manifest: Option<&'a majutsu_core::SnapshotManifest>,
+    conn: &'a Connection,
 }
 
 fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
@@ -600,6 +622,7 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         upload_stats,
         pending_event_count,
         current_manifest,
+        conn,
     } = input;
     let active_roots = roots.iter().filter(|root| root.status == "active").count();
     let mut issues = Vec::new();
@@ -608,7 +631,13 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         .map(|root| {
             let current_root =
                 current_manifest.and_then(|manifest| manifest.root_trees.get(&root.id));
-            RootHealth {
+            let last_change = current
+                .zip(current_root)
+                .map(|(current_id, root_tree)| {
+                    root_last_change(paths, conn, current_id, &root.id, &root_tree.tree_id)
+                })
+                .transpose()?;
+            Ok(RootHealth {
                 id: root.id.clone(),
                 status: root.status.clone(),
                 path: root.path.display().to_string(),
@@ -616,9 +645,13 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
                 current_snapshot_includes: current_root.is_some(),
                 current_file_count: current_root.map(|root_tree| root_tree.file_count),
                 current_tree_id: current_root.map(|root_tree| root_tree.tree_id.clone()),
-            }
+                last_changed_snapshot: last_change
+                    .as_ref()
+                    .map(|change| change.snapshot_id.clone()),
+                last_changed_at: last_change.map(|change| change.changed_at),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     if active_roots == 0 {
         issues.push(HealthIssue {
@@ -772,6 +805,52 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
     })
 }
 
+fn root_last_change(
+    paths: &Paths,
+    conn: &Connection,
+    current_id: &str,
+    root_id: &str,
+    current_tree_id: &str,
+) -> Result<RootChange> {
+    let mut candidate_id = current_id.to_string();
+    let mut candidate_changed_at = snapshot_created_at(conn, current_id)?;
+    let mut cursor_id = current_id.to_string();
+    loop {
+        let snapshot = load_snapshot_header_by_id(paths, conn, &cursor_id)?;
+        let Some(parent_id) = snapshot.parent.as_deref() else {
+            return Ok(RootChange {
+                snapshot_id: candidate_id,
+                changed_at: candidate_changed_at,
+            });
+        };
+        let parent = load_snapshot_header_by_id(paths, conn, parent_id)?;
+        let parent_tree_matches = parent
+            .root_trees
+            .get(root_id)
+            .map(|root_tree| root_tree.tree_id.as_str() == current_tree_id)
+            .unwrap_or(false);
+        if !parent_tree_matches {
+            return Ok(RootChange {
+                snapshot_id: candidate_id,
+                changed_at: candidate_changed_at,
+            });
+        }
+        candidate_id = parent_id.to_string();
+        candidate_changed_at = snapshot_created_at(conn, parent_id)?;
+        cursor_id = parent_id.to_string();
+    }
+}
+
+fn snapshot_created_at(conn: &Connection, snapshot_id: &str) -> Result<String> {
+    conn.query_row(
+        "select created_at from snapshots where id=?1",
+        params![snapshot_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("snapshot not found: {snapshot_id}"))
+}
+
 fn runtime_health_path(paths: &Paths) -> std::path::PathBuf {
     paths.runtime.join("health.json")
 }
@@ -916,6 +995,14 @@ fn print_health_report(report: &HealthReport) {
                 .unwrap_or_else(|| "-".into()),
             root.current_tree_id.as_deref().unwrap_or("-")
         );
+        if let Some(changed_at) = &root.last_changed_at {
+            println!(
+                "root_last_changed {} snapshot={} at={}",
+                root.id,
+                root.last_changed_snapshot.as_deref().unwrap_or("-"),
+                changed_at
+            );
+        }
     }
     println!("issue_count {}", report.issue_count());
     for issue in &report.issues {
@@ -1883,6 +1970,16 @@ fn shorten_middle(value: &str, width: usize) -> String {
         .skip(chars.len().saturating_sub(suffix))
         .collect::<String>();
     format!("{left}~{right}")
+}
+
+fn compact_timestamp(value: &str) -> String {
+    if value.len() >= 19 {
+        let month_day = &value[5..10];
+        let time = &value[11..19];
+        format!("{month_day} {time}")
+    } else {
+        value.to_string()
+    }
 }
 
 fn print_kv(out: &mut String, width: usize, key: &str, value: &str) {

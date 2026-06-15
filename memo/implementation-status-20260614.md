@@ -1034,3 +1034,44 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
 
 - root別の「最終変更時刻」はまだ tree id の変化を ancestry 方向へ探索する必要があるため未実装。
 - permission degraded の詳細は fs scan 時の permission skip 結果を root health に永続化する設計が必要。
+
+## 残改善実施 2026-06-14 build 35
+
+実施:
+
+- `BUILD_NUMBER` 35。
+- root別の最終変更時刻を `mj health` / `mj health --json` / `mj status` に追加した。
+- current snapshot の root tree id と同じ tree id が親方向に続く範囲を辿り、tree id が変わった直後の
+  snapshot を `last_changed_snapshot` / `last_changed_at` として返す。
+- `mj status` の Roots 表に `CHANGED` 列を追加した。
+- active root が current snapshot に未収録の場合の critical issue と合わせて、rootが保全対象として
+  currentに入っているか、いつ変わったかを通常の health signal で確認できるようにした。
+
+検証:
+
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --test remote_file health_reports_root_last_changed_snapshot --locked` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+- 実環境に `mj 0.3.0+build.36` を install し、daemon restart 済み。
+- 実環境の `mj status --no-pager` で Roots 表の `CHANGED` が `MM-DD HH:MM:SS` 形式になることを確認。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `local_current == remote_current == snap-a27e8573-b8af-4949-ae02-e454a394f3de`、issue 0。
+
+残り:
+
+- permission degraded の詳細は fs scan 時の permission skip 結果を root health に永続化する設計が必要。
+- root別の最終 sync 時刻は現状 remote current が host単位であり、root単位の remote ack を持っていないため未実装。
+
+## 表示改善 2026-06-14 build 36
+
+`mj status` の Roots 表に追加した `CHANGED` 列が ISO timestamp の middle-shortening により読みにくかったため、
+status表示では `MM-DD HH:MM:SS` の短い形式にした。`mj health --json` は復旧・機械処理向けなので
+従来通り full timestamp を保持する。
+
+検証:
+
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --test remote_file health_reports_root_last_changed_snapshot --locked` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。

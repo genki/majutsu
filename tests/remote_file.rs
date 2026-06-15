@@ -13798,6 +13798,10 @@ fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
     assert_eq!(value["roots"][0]["id"], "sample");
     assert_eq!(value["roots"][0]["present"], true);
     assert_eq!(value["roots"][0]["current_snapshot_includes"], false);
+    assert_eq!(
+        value["roots"][0]["last_changed_snapshot"],
+        serde_json::Value::Null
+    );
     let codes = value["issues"]
         .as_array()
         .unwrap()
@@ -13806,6 +13810,54 @@ fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
         .collect::<Vec<_>>();
     assert!(codes.contains(&"daemon-unhealthy"), "{health}");
     assert!(codes.contains(&"remote-not-configured"), "{health}");
+}
+
+#[test]
+fn health_reports_root_last_changed_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"beta\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&health).unwrap();
+    let root = &value["roots"][0];
+    assert_eq!(root["id"], "sample");
+    assert_eq!(root["current_snapshot_includes"], true);
+    assert_eq!(root["last_changed_snapshot"], value["current_snapshot"]);
+    assert!(root["last_changed_at"].as_str().is_some(), "{health}");
 }
 
 #[test]
