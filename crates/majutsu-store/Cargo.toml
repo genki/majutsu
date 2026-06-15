@@ -2,11 +2,15 @@
 name = "majutsu-store"
 version = "0.4.0"
 edition = "2024"
+description = "Remote object store metadata helpers for majutsu"
+license = "MIT"
+repository = "https://github.com/genki/majutsu"
+homepage = "https://github.com/genki/majutsu"
 
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-majutsu-core = { path = "../majutsu-core" }
+majutsu-core = { path = "../majutsu-core", version = "0.4.0" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

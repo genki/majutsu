@@ -2,5 +2,9 @@
 name = "majutsu-daemon"
 version = "0.4.0"
 edition = "2024"
+description = "Daemon service rendering helpers for majutsu"
+license = "MIT"
+repository = "https://github.com/genki/majutsu"
+homepage = "https://github.com/genki/majutsu"
 
 [dependencies]

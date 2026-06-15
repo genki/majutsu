@@ -2,6 +2,13 @@
 name = "majutsu"
 version = "0.4.0"
 edition = "2024"
+description = "Host-level multi-root snapshot history agent"
+license = "MIT"
+repository = "https://github.com/genki/majutsu"
+homepage = "https://github.com/genki/majutsu"
+readme = "README.md"
+keywords = ["backup", "snapshot", "history", "s3", "cli"]
+categories = ["command-line-utilities", "filesystem"]
 
 [workspace]
 members = [
@@ -30,17 +37,17 @@ hex = "0.4"
 hmac = "0.12"
 ignore = "0.4"
 libc = "0.2"
-majutsu-core = { path = "crates/majutsu-core" }
-majutsu-cli = { path = "crates/majutsu-cli" }
-majutsu-crypto = { path = "crates/majutsu-crypto" }
-majutsu-daemon = { path = "crates/majutsu-daemon" }
-majutsu-db = { path = "crates/majutsu-db" }
-majutsu-large = { path = "crates/majutsu-large" }
-majutsu-pack = { path = "crates/majutsu-pack" }
-majutsu-policy = { path = "crates/majutsu-policy" }
-majutsu-restore = { path = "crates/majutsu-restore" }
-majutsu-store = { path = "crates/majutsu-store" }
-majutsu-watch = { path = "crates/majutsu-watch" }
+majutsu-core = { path = "crates/majutsu-core", version = "0.4.0" }
+majutsu-cli = { path = "crates/majutsu-cli", version = "0.4.0" }
+majutsu-crypto = { path = "crates/majutsu-crypto", version = "0.4.0" }
+majutsu-daemon = { path = "crates/majutsu-daemon", version = "0.4.0" }
+majutsu-db = { path = "crates/majutsu-db", version = "0.4.0" }
+majutsu-large = { path = "crates/majutsu-large", version = "0.4.0" }
+majutsu-pack = { path = "crates/majutsu-pack", version = "0.4.0" }
+majutsu-policy = { path = "crates/majutsu-policy", version = "0.4.0" }
+majutsu-restore = { path = "crates/majutsu-restore", version = "0.4.0" }
+majutsu-store = { path = "crates/majutsu-store", version = "0.4.0" }
+majutsu-watch = { path = "crates/majutsu-watch", version = "0.4.0" }
 notify = "8"
 quick-xml = "0.37"
 reqwest = { version = "0.12", features = ["blocking"] }
