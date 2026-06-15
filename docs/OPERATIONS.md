@@ -434,6 +434,8 @@ terminal 系の session 環境変数、最後に記録元 pid へフォールバ
 その pid に至る枝だけを pid 列として保存する。全 process tree は保存しない。daemon / inotify
 経由のファイル変更では、kernel の filesystem event から元の editor pid は通常得られないため、
 変更を観測して snapshot / sync を記録した daemon または子 `mj` process が source process として残る。
+daemon は起動者の `MAJUTSU_SESSION_ID` を継承せず、`session_label=daemon` と
+`session_id=daemon-pid-<pid>` で記録する。
 
 
 ## remote metadata storage efficiency

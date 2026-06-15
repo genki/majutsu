@@ -259,6 +259,12 @@ struct OperationProcess {
 }
 
 fn operation_session() -> OperationSession {
+    if env_truthy("MAJUTSU_DAEMON") {
+        return OperationSession {
+            id: Some(format!("daemon-pid-{}", std::process::id())),
+            label: Some("daemon".into()),
+        };
+    }
     let id = first_non_empty_env(&[
         "MAJUTSU_SESSION_ID",
         "CODEX_THREAD_ID",
@@ -323,6 +329,12 @@ fn first_non_empty_env(names: &[&str]) -> Option<String> {
     names
         .iter()
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn query_operation(conn: &Connection, op_id: &str) -> Result<OperationExport> {

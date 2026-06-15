@@ -15453,6 +15453,8 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
             .arg("50")
             .arg("--periodic-rescan-secs")
             .arg("3600");
+        c.env("MAJUTSU_SESSION_ID", "operator-session")
+            .env("MAJUTSU_SESSION_LABEL", "operator");
         c
     });
     assert!(started.contains("started daemon pid"));
@@ -15489,6 +15491,31 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
         captured,
         "daemon did not create a snapshot for the file event"
     );
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(op_log.contains("daemon:daemon-pid-"), "{op_log}");
+    assert!(!op_log.contains("operator-session"), "{op_log}");
+    let daemon_op = op_log
+        .lines()
+        .find(|line| line.contains("file-events-batch"))
+        .and_then(|line| line.split('\t').next())
+        .unwrap()
+        .to_string();
+    let op_show = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("show")
+            .arg(daemon_op);
+        c
+    });
+    assert!(op_show.contains("session_label daemon"), "{op_show}");
+    assert!(op_show.contains("process_id "), "{op_show}");
+    assert!(op_show.contains("process_path "), "{op_show}");
     let mut synced = false;
     for _ in 0..100 {
         let queue_empty = fs::read_dir(state.join("queue/uploads"))

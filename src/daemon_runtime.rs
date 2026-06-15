@@ -343,6 +343,7 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
     for (key, value) in daemon_env(paths)? {
         command.env(key, value);
     }
+    configure_daemon_operation_attribution(&mut command);
     detach_daemon_process(&mut command);
     let child = command.spawn()?;
     let pid = child.id();
@@ -422,6 +423,21 @@ fn daemon_log_tail(paths: &Paths, lines: usize) -> Result<String> {
     } else {
         Ok(format!("{}\n", selected.join("\n")))
     }
+}
+
+fn configure_daemon_operation_attribution(command: &mut ProcessCommand) {
+    for key in [
+        "MAJUTSU_SESSION_ID",
+        "MAJUTSU_SESSION_LABEL",
+        "MAJUTSU_AGENT_NAME",
+        "CODEX_THREAD_ID",
+        "CLAUDE_SESSION_ID",
+        "CURSOR_SESSION_ID",
+        "TERM_SESSION_ID",
+    ] {
+        command.env_remove(key);
+    }
+    command.env("MAJUTSU_DAEMON", "1");
 }
 
 #[cfg(unix)]

@@ -1088,6 +1088,53 @@ build 29 を実環境に入れて `mj fsck --since '24h ago' --sample 10 --timeo
   `session_label codex`、`process_id`、root から記録元 process へ至る `process_path` を確認した。
 - `mj sync --wait --timeout-secs 300` 成功。
 - `mj health` は `state protected`、issue 0、全 root `root_remote ... synced=true`。
+
+## 実利用検証と修正 2026-06-15 build 42
+
+`/tmp/majutsu-attribution-lab` に独立した `--home`、file remote、検証 root を作り、実際の CLI で
+root追加、初期 snapshot、追加/編集/削除、sync、clone、restore、daemon/inotify 経由の追加を確認した。
+
+確認結果:
+
+- `MAJUTSU_SESSION_ID` / `MAJUTSU_SESSION_LABEL` 付きの手動 snapshot は `mj op log` と
+  `mj op show` に期待通り表示された。
+- `mj log --full` は `A`、`M`、`D` と session を表示した。
+- `process_path` は root process から記録元 `mj` process へ至る pid 枝として表示された。
+- file remote へ sync 後、clone / restore で最新内容を復元できた。
+- daemon/inotify 経由の file event も `file-events-batch` として記録・同期された。
+
+検証で見つけた問題:
+
+- daemon を `MAJUTSU_SESSION_ID` 付きコマンドから起動すると、後続の daemon file event が
+  起動者 session として表示されていた。
+
+修正:
+
+- daemon 起動時に `MAJUTSU_SESSION_ID`、`MAJUTSU_SESSION_LABEL`、`MAJUTSU_AGENT_NAME`、
+  Codex / Claude / Cursor / terminal 系 session env を child process から除去する。
+- daemon process には内部 marker `MAJUTSU_DAEMON=1` を設定し、operation 記録時は
+  `session_label=daemon`、`session_id=daemon-pid-<pid>` とする。
+- 回帰テスト `daemon_watch_snapshot_can_sync_clone_and_restore` に、起動者 session が
+  file event operation に漏れないことを追加した。
+
+検証:
+
+- `cargo test --test remote_file daemon_watch_snapshot_can_sync_clone_and_restore --locked` 成功。
+- `cargo fmt --all -- --check` 成功。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` 成功。
+- `cargo test --workspace --all-targets --locked` 成功。
+
+実環境反映:
+
+- `/home/vagrant/.cargo/bin/mj` を `mj 0.3.0+build.42` に更新した。
+- build 42 の installed CLI で `/tmp/majutsu-attribution-lab-build42` を作り直し、
+  session env 付きで daemon を起動して file event を発生させた。
+- daemon file event は `session_label daemon`、`session_id daemon-pid-<pid>` として記録され、
+  起動者の `operator-session` は `op log` に出なかった。
+- file remote から clone / restore し、追加された `lab/one.txt` と `lab/two.txt` を復元できた。
+- 実環境 `/home/vagrant/.majutsu` の daemon を build 42 で restart 済み。
+- 実環境で `mj sync --wait --timeout-secs 300` 成功。
+- 実環境で `mj health` は `state protected`、issue 0、全 root `root_remote ... synced=true`。
 - 実環境に `mj 0.3.0+build.36` を install し、daemon restart 済み。
 - 実環境の `mj status --no-pager` で Roots 表の `CHANGED` が `MM-DD HH:MM:SS` 形式になることを確認。
 - 実環境で `mj sync --wait --timeout-secs 300` 成功。
