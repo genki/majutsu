@@ -12,6 +12,8 @@ large object handling.
 
 - Host-level state under CLI `--home`, `$MAJUTSU_HOME`, XDG config, or
   `$HOME/.majutsu`
+- Separate `mj --system` state for root-owned host configuration under
+  `/etc/majutsu/config.toml` or `/var/lib/majutsu`
 - Multiple roots managed from one timeline
 - SQLite metadata database
 - Append-only local operation log under `ops/local-oplog.cborl`
@@ -37,13 +39,15 @@ large object handling.
 - Stable read retry/backoff
 - Root pause/resume/missing-state handling
 - OS-native filesystem watch backend with debounce
-- Polling watch fallback and minimal daemon start/stop/status
+- Polling watch fallback and daemon start/stop/status/metrics
+- User or root-owned systemd service rendering for watch daemons
 - Restore planning and restore to an alternate directory
 - Restore prepare/resume queue
 - Materialized and kernel-backed FUSE mount restore views
 - Lifecycle policy generation for GCS and S3
 - Large object pin/unpin metadata
 - Basic object-store fsck
+- Human-oriented root list, root size, daemon status, and status dashboard output
 
 FUSE mounts run in the foreground and hydrate large-file chunks on read.
 
@@ -94,6 +98,22 @@ Example XDG config:
 [state]
 home = "/var/lib/majutsu"
 ```
+
+For root-owned host configuration such as `/etc/systemd/system`,
+root-readable environment files, and local service scripts, use a separate
+system instance instead of running the user instance with sudo:
+
+```sh
+sudo mj --system init --encrypt --remote s3://bucket/prefix/system
+sudo mj --system root add systemd-system /etc/systemd/system --include '**'
+sudo mj --system daemon service --provider systemd --scope system \
+  > /etc/systemd/system/majutsu.service
+sudo systemctl enable --now majutsu.service
+```
+
+`mj --system` resolves state home from `/etc/majutsu/config.toml` and then
+falls back to `/var/lib/majutsu`. Keep the system backend prefix and encryption
+key separate from the user instance.
 
 State home の内部状態を確認するには `mj state` を使う。`status` が運用上の要点を
 ダッシュボード表示するのに対し、`state` は paths、refs、branch heads、metadata
@@ -564,7 +584,8 @@ mj daemon start --interval-secs 60 --debounce-ms 1500
 mj daemon status
 mj daemon metrics
 mj daemon stop
-mj daemon service --provider systemd > ~/.config/systemd/user/majutsu.service
+mj daemon service --provider systemd --scope user > ~/.config/systemd/user/majutsu.service
+mj --system daemon service --provider systemd --scope system > /etc/systemd/system/majutsu.service
 mj daemon service --provider launchd > ~/Library/LaunchAgents/dev.majutsu.watch.plist
 ```
 
@@ -585,9 +606,10 @@ recovery visible before running `mj snapshot`, `mj sync`, or
 `mj restore resume`.
 `mj daemon metrics` returns the same daemon health and backlog counters in a
 Prometheus-compatible text format for local scraping or service watchdogs.
-`daemon service` renders a user-level systemd unit or launchd plist using the
-resolved state home and `[watch]` timing settings, so the same daemon command
-line can be supervised by the host init system.
+`daemon service` renders a user-level systemd unit, root-owned systemd system
+unit, or launchd plist using the resolved state home and `[watch]` timing
+settings, so the same daemon command line can be supervised by the host init
+system.
 When timing flags are omitted, watch and daemon start use `[watch]` from
 `config.toml`:
 
@@ -608,6 +630,28 @@ a low-frequency safety net for missed events or long idle periods; set
 `--periodic-rescan-secs 0` to disable it.
 
 ## Root State
+
+`mj root list` renders a compact table with root counts and issue count:
+
+```text
+Roots
+  total 18  active 18  issues 0
+
+  ID       STATUS  NAME     PATH
+  ------   ------  -------  ------------------
+  moon     active  moon     /home/vagrant/moon
+```
+
+`mj root size` separates client-side file size from remote backend accounting:
+
+```text
+root  files  dirs  client  |  backend  used  payload  metadata  objects  missing
+```
+
+Columns to the left of `|` are local client-side data. Columns to the right are
+remote-side data. `backend` is the full remote object set required to restore
+the root, while `used` is the pack-slice-adjusted amount actually used by that
+root.
 
 Roots can be paused and resumed:
 

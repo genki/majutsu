@@ -36,6 +36,33 @@ mj status --pager
 `Local Storage` は apparent size と disk usage を分けて表示する。小ファイル多数の
 event journal や queue では、apparent size が小さくても disk usage が大きくなることがある。
 
+## user/system インスタンス分離
+
+通常の開発repoやユーザー作業領域は、ユーザー権限の `mj` で保護する。
+
+```sh
+mj init --encrypt --remote s3://bucket/prefix/user
+mj root add moon ~/moon --preset git-working-tree
+mj daemon service --provider systemd --scope user
+```
+
+`/etc`、systemd system unit、root所有のenvファイル、`/usr/local/sbin` の手製スクリプトなど、
+ホスト復旧に必要で通常ユーザーから読めない構成は、root権限のsystemインスタンスで保護する。
+systemインスタンスはユーザー用 `~/.majutsu` とstateを共有しない。
+
+```sh
+sudo mj --system init --encrypt --remote s3://bucket/prefix/system
+sudo mj --system root add systemd-system /etc/systemd/system --include '**'
+sudo mj --system root add etc-service-config /etc --include 'stackchan-control.env'
+sudo mj --system daemon service --provider systemd --scope system > /etc/systemd/system/majutsu.service
+sudo systemctl enable --now majutsu.service
+```
+
+`mj --system` は `--home` がない場合に `/etc/majutsu/config.toml` の `[state].home` を読み、
+未設定なら `/var/lib/majutsu` を使う。root用backend prefixと暗号鍵はユーザー用と分ける。
+単一のroot権限daemonでユーザーrepoまで管理すると、復元時の所有権や誤操作時の影響範囲が
+大きくなるため避ける。
+
 ## event journal retention
 
 filesystem event journal は daemon の crash recovery と運用調査に使う。通常は snapshot 後の

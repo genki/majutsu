@@ -15,6 +15,7 @@ pub struct DaemonStatus {
 #[derive(Debug, Clone, Copy)]
 pub struct DaemonServiceConfig<'a> {
     pub provider: &'a str,
+    pub scope: DaemonServiceScope,
     pub exe: &'a Path,
     pub home: &'a Path,
     pub backend: &'a str,
@@ -27,11 +28,23 @@ pub struct DaemonServiceConfig<'a> {
     pub periodic_rescan_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonServiceScope {
+    User,
+    System,
+}
+
 pub fn render_daemon_service(config: DaemonServiceConfig<'_>) -> Result<String, String> {
     let args = daemon_watch_args(&config);
     match config.provider {
-        "systemd" => Ok(render_systemd_user_service(&config, args)),
-        "launchd" => Ok(render_launchd_plist(&config, args)),
+        "systemd" => Ok(render_systemd_service(&config, args)),
+        "launchd" => {
+            if config.scope == DaemonServiceScope::System {
+                Err("launchd system scope is not supported; use systemd or render a user launchd plist".into())
+            } else {
+                Ok(render_launchd_plist(&config, args))
+            }
+        }
         other => Err(format!("unsupported daemon service provider: {other}")),
     }
 }
@@ -63,7 +76,7 @@ fn daemon_watch_args(config: &DaemonServiceConfig<'_>) -> Vec<String> {
     ]
 }
 
-fn render_systemd_user_service(config: &DaemonServiceConfig<'_>, args: Vec<String>) -> String {
+fn render_systemd_service(config: &DaemonServiceConfig<'_>, args: Vec<String>) -> String {
     let args = args
         .into_iter()
         .map(|arg| systemd_quote(&arg))
@@ -77,6 +90,14 @@ fn render_systemd_user_service(config: &DaemonServiceConfig<'_>, args: Vec<Strin
         "-{}",
         systemd_quote(&format!("{}/s3.env", config.home.display()))
     );
+    let wanted_by = match config.scope {
+        DaemonServiceScope::User => "default.target",
+        DaemonServiceScope::System => "multi-user.target",
+    };
+    let service_scope = match config.scope {
+        DaemonServiceScope::User => "",
+        DaemonServiceScope::System => "User=root\nUMask=0077\n",
+    };
     format!(
         "[Unit]\n\
          Description=Majutsu watch daemon\n\
@@ -87,10 +108,11 @@ fn render_systemd_user_service(config: &DaemonServiceConfig<'_>, args: Vec<Strin
          EnvironmentFile={daemon_env}\n\
          EnvironmentFile={s3_env}\n\
          ExecStart={args}\n\
+         {service_scope}\
          Restart=on-failure\n\
          RestartSec=10s\n\n\
          [Install]\n\
-         WantedBy=default.target\n"
+         WantedBy={wanted_by}\n"
     )
 }
 
@@ -156,6 +178,7 @@ mod tests {
     fn renders_systemd_service_with_quoted_paths() {
         let service = render_daemon_service(DaemonServiceConfig {
             provider: "systemd",
+            scope: DaemonServiceScope::User,
             exe: Path::new("/opt/Majutsu Bin/mj"),
             home: Path::new("/home/alice/.majutsu%prod"),
             backend: "inotify",
@@ -177,12 +200,39 @@ mod tests {
         assert!(service.contains("\"/opt/Majutsu Bin/mj\""));
         assert!(service.contains("/home/alice/.majutsu%%prod"));
         assert!(service.contains("Restart=on-failure"));
+        assert!(service.contains("WantedBy=default.target"));
+        assert!(!service.contains("User=root"));
+    }
+
+    #[test]
+    fn renders_systemd_system_service() {
+        let service = render_daemon_service(DaemonServiceConfig {
+            provider: "systemd",
+            scope: DaemonServiceScope::System,
+            exe: Path::new("/usr/local/bin/mj"),
+            home: Path::new("/var/lib/majutsu"),
+            backend: "inotify",
+            mode: "default",
+            interval_secs: 60,
+            debounce_ms: 1500,
+            settle_ms: 500,
+            buffer_max_ms: 60000,
+            buffer_max_events: 1000,
+            periodic_rescan_secs: 3600,
+        })
+        .unwrap();
+
+        assert!(service.contains("User=root"));
+        assert!(service.contains("UMask=0077"));
+        assert!(service.contains("WantedBy=multi-user.target"));
+        assert!(service.contains("/var/lib/majutsu"));
     }
 
     #[test]
     fn renders_launchd_plist_with_escaped_paths() {
         let service = render_daemon_service(DaemonServiceConfig {
             provider: "launchd",
+            scope: DaemonServiceScope::User,
             exe: Path::new("/opt/majutsu/mj"),
             home: Path::new("/Users/alice/.majutsu&prod"),
             backend: "notify",
@@ -207,6 +257,7 @@ mod tests {
         assert!(
             render_daemon_service(DaemonServiceConfig {
                 provider: "cron",
+                scope: DaemonServiceScope::User,
                 exe: Path::new("/usr/bin/mj"),
                 home: Path::new("/tmp/majutsu"),
                 backend: "poll",

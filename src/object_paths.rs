@@ -9,8 +9,25 @@ use majutsu_store::{canonical_remote_alias, canonical_remote_aliases};
 use std::fs;
 
 pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<String>> {
+    local_object_keys_inner(paths, export, None)
+}
+
+pub(crate) fn local_object_keys_with_progress(
+    paths: &Paths,
+    export: &MetadataExport,
+    phase: &str,
+) -> Result<Vec<String>> {
+    local_object_keys_inner(paths, export, Some(phase))
+}
+
+fn local_object_keys_inner(
+    paths: &Paths,
+    export: &MetadataExport,
+    progress_phase: Option<&str>,
+) -> Result<Vec<String>> {
     let mut keys = Vec::new();
-    for snapshot in &export.snapshots {
+    let snapshot_total = export.snapshots.len();
+    for (index, snapshot) in export.snapshots.iter().enumerate() {
         keys.push(snapshot.manifest_key.clone());
         if let Ok(manifest) = snapshot_manifest_for_object_keys(paths, snapshot) {
             for root_tree in manifest.root_trees.values() {
@@ -23,6 +40,15 @@ pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Resul
                     }
                 }
             }
+        }
+        let checked = index + 1;
+        if let Some(phase) = progress_phase
+            && (checked == snapshot_total || checked.is_multiple_of(100))
+        {
+            eprintln!(
+                "gc progress phase={phase} checked={checked}/{snapshot_total} keys={}",
+                keys.len()
+            );
         }
     }
     for blob in &export.blobs {

@@ -19,7 +19,8 @@ Remote recovery flow:
   mj remote fsck
   mj clone --remote file:///mnt/backup/majutsu --home /tmp/recovered-majutsu
 
-State home is resolved in this order: `--home`, `MAJUTSU_HOME`, XDG config, then `$HOME/.majutsu`."#;
+State home is resolved in this order: `--home`, `MAJUTSU_HOME`, XDG config, then `$HOME/.majutsu`.
+For host-level system protection, use `mj --system ...`; that reads `/etc/majutsu/config.toml` and falls back to `/var/lib/majutsu`."#;
 
 #[derive(Parser)]
 #[command(
@@ -38,6 +39,14 @@ pub(crate) struct Cli {
         long_help = "Use a specific majutsu state directory containing `config.toml`, the SQLite database, local objects, and the operation log. If omitted, majutsu checks MAJUTSU_HOME, XDG config, and $HOME/.majutsu in that order."
     )]
     pub(crate) home: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Use the system majutsu instance",
+        long_help = "Use the system majutsu instance intended for root-owned host configuration such as /etc and systemd units. If --home is not also provided, majutsu checks /etc/majutsu/config.toml and then falls back to /var/lib/majutsu."
+    )]
+    pub(crate) system: bool,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -159,6 +168,8 @@ pub(crate) enum RootCommand {
     Set(RootSetArgs),
     #[command(about = "List configured roots")]
     List,
+    #[command(about = "Show client and backend sizes for current roots")]
+    Size,
     #[command(about = "Remove a root from the configuration")]
     Remove { id: String },
     #[command(about = "Temporarily pause snapshots for a root")]
@@ -986,10 +997,17 @@ pub(crate) enum DaemonCommand {
     },
     #[command(about = "Diagnose daemon health and show recovery guidance")]
     Doctor,
-    #[command(about = "Render a user service definition for systemd or launchd")]
+    #[command(about = "Render a user or system service definition for systemd or launchd")]
     Service {
         #[arg(long, default_value = "systemd")]
         provider: String,
+        #[arg(
+            long,
+            default_value = "user",
+            value_parser = ["user", "system"],
+            help = "Render a user service or root-owned system service"
+        )]
+        scope: String,
     },
     #[command(about = "Stop the background watch daemon")]
     Stop,

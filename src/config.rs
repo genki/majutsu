@@ -478,10 +478,17 @@ pub(crate) struct RootLargeConfig {
 }
 
 pub(crate) fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
+    resolve_paths_with_scope(home_arg, false)
+}
+
+pub(crate) fn resolve_paths_with_scope(home_arg: Option<PathBuf>, system: bool) -> Result<Paths> {
     let home = if let Some(home) = home_arg {
         home
     } else if let Ok(home) = env::var("MAJUTSU_HOME") {
         PathBuf::from(home)
+    } else if system {
+        configured_state_home_from(PathBuf::from("/etc/majutsu/config.toml"), None)?
+            .unwrap_or_else(|| PathBuf::from("/var/lib/majutsu"))
     } else if let Some(home) = configured_state_home()? {
         home
     } else {
@@ -521,6 +528,16 @@ fn configured_state_home() -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let path = config_home.join("majutsu/config.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    configured_state_home_from(path, user_home)
+}
+
+fn configured_state_home_from(
+    path: PathBuf,
+    user_home: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }

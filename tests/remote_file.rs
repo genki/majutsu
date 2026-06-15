@@ -55,6 +55,22 @@ fn synced_object_count(output: &str) -> usize {
         .unwrap_or_else(|| panic!("missing synced object count in output:\n{output}"))
 }
 
+fn root_list_has(root_list: &str, id: &str, status: &str) -> bool {
+    root_list.lines().any(|line| {
+        let mut columns = line.split_whitespace();
+        columns.next() == Some(id) && columns.next() == Some(status)
+    })
+}
+
+fn root_list_has_path(root_list: &str, id: &str, status: &str, path: &std::path::Path) -> bool {
+    root_list.lines().any(|line| {
+        let mut columns = line.split_whitespace();
+        columns.next() == Some(id)
+            && columns.next() == Some(status)
+            && line.contains(&path.display().to_string())
+    })
+}
+
 fn fails(mut command: Command) {
     let output = command.output().expect("run command");
     assert!(
@@ -968,8 +984,8 @@ fn remote_recovery_preserves_paused_resumed_and_missing_roots() {
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(root_list.contains("docs\tactive"));
-    assert!(root_list.contains("photos\tmissing"));
+    assert!(root_list_has(&root_list, "docs", "active"));
+    assert!(root_list_has(&root_list, "photos", "missing"));
 
     run({
         let mut c = mj();
@@ -990,8 +1006,8 @@ fn remote_recovery_preserves_paused_resumed_and_missing_roots() {
         c.arg("--home").arg(&clone).arg("root").arg("list");
         c
     });
-    assert!(clone_root_list.contains("docs\tactive"));
-    assert!(clone_root_list.contains("photos\tmissing"));
+    assert!(root_list_has(&clone_root_list, "docs", "active"));
+    assert!(root_list_has(&clone_root_list, "photos", "missing"));
 
     run({
         let mut c = mj();
@@ -12679,6 +12695,65 @@ fn root_commands_sync_config_roots() {
 }
 
 #[test]
+fn root_size_reports_client_and_backend_totals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("--wait");
+        c
+    });
+
+    let sizes = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("size");
+        c
+    });
+    assert!(sizes.contains("root"));
+    assert!(sizes.contains("backend"));
+    assert!(sizes.contains("used"));
+    assert!(sizes.contains("objects"));
+    assert!(sizes.contains("root") && sizes.contains("|") && sizes.contains("missing"));
+    assert!(sizes.contains("左はclient側、右はremote側"));
+    assert!(sizes.contains("------"));
+    assert!(sizes.contains("sample"));
+    assert!(sizes.contains("0.00 MiB"));
+    assert!(!sizes.contains("| root |"));
+    assert!(sizes.contains("全体:"));
+    assert!(sizes.contains("- current snapshotのユニークbackend復元単位:"));
+    assert!(sizes.contains("- GCS backend prefix全体:"));
+}
+
+#[test]
 fn root_add_rejects_duplicate_id_without_overwriting_existing_root() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -12718,7 +12793,7 @@ fn root_add_rejects_duplicate_id_without_overwriting_existing_root() {
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(roots.contains(&format!("sample\tactive\tsample\t{}", source.display())));
+    assert!(root_list_has_path(&roots, "sample", "active", &source));
     assert!(!roots.contains(&other.display().to_string()));
     let ops = output({
         let mut c = mj();
@@ -12932,7 +13007,7 @@ min_size = "1 KiB"
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(roots.contains("cfg\tactive\tcfg\t"));
+    assert!(root_list_has(&roots, "cfg", "active"));
     assert!(roots.contains(&source.display().to_string()));
     let snapshot = output({
         let mut c = mj();
@@ -12955,7 +13030,7 @@ min_size = "1 KiB"
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(roots.contains("cfg\tpaused\tcfg\t"));
+    assert!(root_list_has(&roots, "cfg", "paused"));
 }
 
 #[test]
@@ -13648,7 +13723,7 @@ fn missing_root_is_not_snapshotted_as_deletion() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("sample\tmissing"));
+    assert!(root_list_has(&stdout, "sample", "missing"));
     run({
         let mut c = mj();
         c.arg("--home")
@@ -13702,7 +13777,7 @@ fn root_mark_deleted_requires_explicit_operator_action() {
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(roots.contains("sample\tdeleted"));
+    assert!(root_list_has(&roots, "sample", "deleted"));
     let snapshot = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
@@ -13755,7 +13830,11 @@ fn root_remove_detaches_root_and_records_operation() {
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(!roots.contains("sample\t"));
+    assert!(
+        !roots
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("sample"))
+    );
     let snapshot = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
@@ -13835,7 +13914,7 @@ fn root_pause_and_resume_control_snapshot_participation() {
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(roots.contains("sample\tpaused"));
+    assert!(root_list_has(&roots, "sample", "paused"));
     let paused_snapshot = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
@@ -14261,7 +14340,7 @@ fn cli_help_describes_status_and_daemon_subcommands() {
         c
     });
     assert!(daemon_help.contains("Start the background watch daemon"));
-    assert!(daemon_help.contains("Render a user service definition"));
+    assert!(daemon_help.contains("Render a user or system service definition"));
     assert!(daemon_help.contains("Show daemon pid, IPC, queue, and journal health"));
 
     let fsck_help = output({
@@ -14324,7 +14403,7 @@ fn require_mount_root_is_skipped_as_unmounted_without_mass_deletion() {
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(roots.contains("sample\tunmounted"));
+    assert!(root_list_has(&roots, "sample", "unmounted"));
     let ops = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("op").arg("log");
@@ -14396,7 +14475,7 @@ fn permission_denied_root_is_skipped_without_mass_deletion() {
         c.arg("--home").arg(&state).arg("root").arg("list");
         c
     });
-    assert!(roots.contains("sample\tpermission-denied"));
+    assert!(root_list_has(&roots, "sample", "permission-denied"));
     let status = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("status").arg("--no-pager");
@@ -14949,6 +15028,21 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(systemd.contains("/daemon.env"));
     assert!(systemd.contains("/s3.env"));
     assert!(systemd.contains("Restart=on-failure"));
+    assert!(systemd.contains("WantedBy=default.target"));
+
+    let systemd_system = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("service")
+            .arg("--scope")
+            .arg("system");
+        c
+    });
+    assert!(systemd_system.contains("User=root"));
+    assert!(systemd_system.contains("UMask=0077"));
+    assert!(systemd_system.contains("WantedBy=multi-user.target"));
 
     let launchd = output({
         let mut c = mj();
@@ -15149,22 +15243,26 @@ fn daemon_status_uses_ipc_socket() {
         c.arg("--home").arg(&state).arg("daemon").arg("status");
         c
     });
-    assert!(status.contains("ipc ok"));
-    assert!(status.contains("rss_kib "));
-    assert!(status.contains("vm_size_kib "));
-    assert!(status.contains("roots 1"));
-    assert!(status.contains("root_status active 1"));
-    assert!(status.contains("journal_events "));
-    assert!(status.contains("pending_journal_events false"));
-    assert!(status.contains("queued_uploads 1"));
-    assert!(status.contains("queued_uploads_retrying 1"));
-    assert!(status.contains("queued_uploads_delayed 1"));
-    assert!(status.contains("queued_upload_next_retry_after 2999-01-01T00:00:00+00:00"));
-    assert!(status.contains("queued_upload_attempts 2"));
-    assert!(status.contains("queued_upload_max_attempts 2"));
-    assert!(status.contains("upload_queue_backpressure true"));
-    assert!(status.contains("restore_jobs 1"));
-    assert!(status.contains("restore_status prepared 1"));
+    assert!(status.contains("Daemon"));
+    assert!(status.contains("IPC                ok"));
+    assert!(status.contains("RSS"));
+    assert!(status.contains("VM size"));
+    assert!(status.contains("Roots              1"));
+    assert!(status.contains("Root Status"));
+    assert!(status.contains("active             1"));
+    assert!(status.contains("Journal"));
+    assert!(status.contains("Pending            0"));
+    assert!(status.contains("Queues"));
+    assert!(status.contains("Uploads            1"));
+    assert!(status.contains("Retrying           1"));
+    assert!(status.contains("Delayed            1"));
+    assert!(status.contains("Next retry         2999-01-01T00:00:00+00:00"));
+    assert!(status.contains("Attempts           2"));
+    assert!(status.contains("Max attempts       2"));
+    assert!(status.contains("Backpressure       true"));
+    assert!(status.contains("Restore jobs       1"));
+    assert!(status.contains("Restore Status"));
+    assert!(status.contains("prepared           1"));
     let metrics = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("daemon").arg("metrics");

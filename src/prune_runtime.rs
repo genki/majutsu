@@ -7,7 +7,7 @@ use std::fs;
 
 use crate::cli::PruneArgs;
 use crate::config::{Paths, read_config};
-use crate::object_paths::{all_local_object_keys, local_object_keys};
+use crate::object_paths::{all_local_object_keys, local_object_keys_with_progress};
 use crate::operation_log::record_op;
 use crate::snapshot_state::current_snapshot;
 use crate::util::parse_db_time;
@@ -174,17 +174,30 @@ pub(crate) fn gc_cmd(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
     let config = read_config(paths)?;
+    eprintln!("gc progress phase=metadata-export");
     let export = export_metadata(paths, &conn, &config)?;
-    let referenced = local_object_keys(paths, &export)?
+    eprintln!(
+        "gc progress phase=referenced-objects snapshots={}",
+        export.snapshots.len()
+    );
+    let referenced = local_object_keys_with_progress(paths, &export, "referenced-objects")?
         .into_iter()
         .collect::<BTreeSet<_>>();
+    eprintln!(
+        "gc progress phase=local-object-scan referenced={}",
+        referenced.len()
+    );
     let mut removed = 0usize;
     for key in all_local_object_keys(paths)? {
         if !referenced.contains(&key) {
             fs::remove_file(paths.home.join(&key))?;
             removed += 1;
+            if removed.is_multiple_of(500) {
+                eprintln!("gc progress phase=remove-unreferenced removed={removed}");
+            }
         }
     }
+    eprintln!("gc progress phase=compact-snapshot-manifests");
     let (compacted_manifests, compacted_manifest_objects) =
         compact_snapshot_manifest_metadata(paths, &conn)?;
     record_op(
@@ -216,6 +229,11 @@ fn compact_snapshot_manifest_metadata(paths: &Paths, conn: &Connection) -> Resul
     let mut compacted_objects = 0usize;
     for row in rows {
         let (id, manifest_key, manifest_json) = row?;
+        if manifest_json.is_empty()
+            && local_snapshot_manifest_object_is_compact(paths, &manifest_key)?
+        {
+            continue;
+        }
         let manifest = crate::snapshot_state::snapshot_manifest_from_parts(
             paths,
             &id,
@@ -227,9 +245,6 @@ fn compact_snapshot_manifest_metadata(paths: &Paths, conn: &Connection) -> Resul
             crate::encode_compact_snapshot_manifest_for_local(paths, &manifest)?,
         )?;
         compacted_objects += 1;
-        if manifest_json.is_empty() {
-            continue;
-        }
         conn.execute(
             "update snapshots set manifest_json='' where id=?1",
             params![id],
@@ -237,4 +252,19 @@ fn compact_snapshot_manifest_metadata(paths: &Paths, conn: &Connection) -> Resul
         compacted_metadata += 1;
     }
     Ok((compacted_metadata, compacted_objects))
+}
+
+fn local_snapshot_manifest_object_is_compact(paths: &Paths, manifest_key: &str) -> Result<bool> {
+    let bytes = fs::read(paths.home.join(manifest_key))?;
+    let decoded = crate::decode_object(paths, &bytes)?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded)?;
+    let roots_omitted = value
+        .get("roots_omitted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let roots_empty = value
+        .get("roots")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(serde_json::Map::is_empty);
+    Ok(roots_omitted && roots_empty)
 }

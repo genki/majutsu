@@ -138,7 +138,7 @@ use config::{
     default_large_chunked_chunk_size, default_large_chunked_min_size, default_large_chunking,
     default_large_max_parallel_uploads, default_large_min_size, default_security_hash,
     default_security_key_id, encryption_enabled, encryption_mode, read_config, resolve_paths,
-    validate_restore_archive_config, write_config,
+    resolve_paths_with_scope, validate_restore_archive_config, write_config,
 };
 use daemon_runtime::{apply_env_files, daemon_cmd};
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
@@ -192,7 +192,7 @@ use watch_runtime::watch_cmd;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let paths = resolve_paths(cli.home)?;
+    let paths = resolve_paths_with_scope(cli.home, cli.system)?;
     apply_env_files(&paths)?;
     match cli.command {
         Command::Init(args) => init(&paths, args),

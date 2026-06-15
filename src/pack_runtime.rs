@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use majutsu_pack::{PackEntry, PackIndex, PackTier};
+use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
 use majutsu_store::BlobExport;
 use rusqlite::{Connection, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +13,8 @@ use crate::operation_log::record_op;
 use crate::snapshot_state::current_snapshot;
 use crate::util::new_id;
 use crate::{
-    encode_object, ensure_ready, open_db, query_blobs, query_packs, read_blob_payload, read_object,
+    decode_object, encode_object, ensure_ready, open_db, pack_entry_payload, query_blobs,
+    query_packs, read_blob_payload, read_object,
 };
 
 pub(crate) fn pack_cmd(paths: &Paths, args: PackArgs) -> Result<()> {
@@ -231,29 +232,42 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
     let mut conn = open_db(paths)?;
-    let blobs = query_blobs(&conn)?;
+    let mut blobs = query_blobs(&conn)?;
     let packed = blobs.iter().filter(|blob| blob.pack_id.is_some()).count();
     if packed == 0 {
         println!("compacted 0 objects");
         return Ok(());
     }
-    let old_pack_ids = query_packs(&conn)?
+    let packs = query_packs(&conn)?;
+    let packs_by_id = packs
+        .iter()
+        .map(|pack| (pack.pack_id.clone(), pack.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_pack_ids = packs
         .into_iter()
         .map(|pack| pack.pack_id)
         .collect::<BTreeSet<_>>();
-    let mut payloads = BTreeMap::new();
-    for blob in &blobs {
-        payloads.insert(
-            blob.oid.clone(),
-            read_blob_payload(paths, &conn, &blob.oid, &blob.object_key)?,
-        );
-    }
+    blobs.sort_by(|left, right| {
+        left.pack_id
+            .cmp(&right.pack_id)
+            .then_with(|| left.pack_offset.cmp(&right.pack_offset))
+            .then_with(|| left.oid.cmp(&right.oid))
+    });
+    eprintln!(
+        "compact reading {} blob(s), {} currently packed",
+        blobs.len(),
+        packed
+    );
+    let mut reader = CompactPayloadReader::new(paths, &packs_by_id);
+    let mut read_count = 0usize;
     let indexes = write_tiered_blob_packs(paths, &config.pack, &blobs, |blob| {
-        payloads
-            .get(&blob.oid)
-            .cloned()
-            .ok_or_else(|| anyhow!("missing compact payload {}", blob.oid))
+        read_count += 1;
+        if read_count == 1 || read_count.is_multiple_of(500) || read_count == blobs.len() {
+            eprintln!("compact read progress {}/{}", read_count, blobs.len());
+        }
+        reader.read_blob(paths, &conn, blob)
     })?;
+    eprintln!("compact wrote {} pack(s)", indexes.len());
     persist_written_packs(&mut conn, &indexes)?;
     let new_pack_ids = indexes
         .iter()
@@ -275,4 +289,58 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
         indexes.len()
     );
     Ok(())
+}
+
+struct CompactPayloadReader<'a> {
+    paths: &'a Paths,
+    packs_by_id: &'a BTreeMap<String, PackExport>,
+    current_pack_id: Option<String>,
+    current_pack_bytes: Vec<u8>,
+}
+
+impl<'a> CompactPayloadReader<'a> {
+    fn new(paths: &'a Paths, packs_by_id: &'a BTreeMap<String, PackExport>) -> Self {
+        Self {
+            paths,
+            packs_by_id,
+            current_pack_id: None,
+            current_pack_bytes: Vec::new(),
+        }
+    }
+
+    fn read_blob(
+        &mut self,
+        paths: &Paths,
+        conn: &Connection,
+        blob: &BlobExport,
+    ) -> Result<Vec<u8>> {
+        let Some(pack_id) = blob.pack_id.as_deref() else {
+            return read_object(paths, &blob.object_key);
+        };
+        let Some(pack) = self.packs_by_id.get(pack_id) else {
+            return read_blob_payload(paths, conn, &blob.oid, &blob.object_key);
+        };
+        if !self.paths.home.join(&pack.pack_key).exists() {
+            if self.paths.home.join(&blob.object_key).exists() {
+                return read_object(paths, &blob.object_key);
+            }
+            return read_blob_payload(paths, conn, &blob.oid, &blob.object_key);
+        }
+        if self.current_pack_id.as_deref() != Some(pack_id) {
+            self.current_pack_bytes = fs::read(self.paths.home.join(&pack.pack_key))?;
+            self.current_pack_id = Some(pack_id.to_string());
+        }
+        let offset = blob
+            .pack_offset
+            .ok_or_else(|| anyhow!("missing pack offset for {}", blob.oid))?
+            as usize;
+        let len =
+            blob.pack_len
+                .ok_or_else(|| anyhow!("missing pack len for {}", blob.oid))? as usize;
+        let slice = self
+            .current_pack_bytes
+            .get(offset..offset + len)
+            .ok_or_else(|| anyhow!("pack entry out of range for {}", blob.oid))?;
+        decode_object(paths, pack_entry_payload(&blob.oid, slice)?)
+    }
 }

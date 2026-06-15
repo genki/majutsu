@@ -115,17 +115,22 @@ pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQu
     let mut items = Vec::new();
     for entry in fs::read_dir(&paths.upload_queue)? {
         let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry.path().extension().and_then(OsStr::to_str) == Some("json")
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if !file_type.is_file() || entry.path().extension().and_then(OsStr::to_str) != Some("json")
         {
-            let bytes = match fs::read(entry.path()) {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                Err(err) => return Err(err.into()),
-            };
-            let item: UploadQueueItem = serde_json::from_slice(&bytes)?;
-            items.push((entry.path(), item));
+            continue;
         }
+        let bytes = match fs::read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let item: UploadQueueItem = serde_json::from_slice(&bytes)?;
+        items.push((entry.path(), item));
     }
     items.sort_by(|a, b| a.1.key.cmp(&b.1.key));
     Ok(items)

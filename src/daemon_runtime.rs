@@ -1,9 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
-use majutsu_daemon::{DaemonServiceConfig, render_daemon_service};
+use majutsu_daemon::{DaemonServiceConfig, DaemonServiceScope, render_daemon_service};
 use majutsu_restore::RestoreQueueItem;
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -149,11 +150,17 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         DaemonCommand::Doctor => {
             daemon_doctor(paths)?;
         }
-        DaemonCommand::Service { provider } => {
+        DaemonCommand::Service { provider, scope } => {
             let exe = env::current_exe()?;
             let backend = normalize_watch_backend(&config.watch.backend)?;
+            let scope = match scope.as_str() {
+                "user" => DaemonServiceScope::User,
+                "system" => DaemonServiceScope::System,
+                other => bail!("unsupported daemon service scope: {other}"),
+            };
             let service = render_daemon_service(DaemonServiceConfig {
                 provider: &provider,
+                scope,
                 exe: &exe,
                 home: &paths.home,
                 backend,
@@ -181,7 +188,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 DaemonHealthState::Running => {
                     let pid = health.pid.unwrap_or_default();
                     if let Ok(reply) = daemon_ipc_request(paths, "status") {
-                        println!("{reply}");
+                        print!("{}", format_daemon_status_reply(&reply));
                     } else {
                         println!("running pid {pid}");
                         println!("ipc unavailable");
@@ -214,6 +221,126 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn format_daemon_status_reply(reply: &str) -> String {
+    let mut values = BTreeMap::new();
+    let mut root_statuses = Vec::new();
+    let mut restore_statuses = Vec::new();
+    for line in reply.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        match key {
+            "root_status" => root_statuses.push(value.to_string()),
+            "restore_status" => restore_statuses.push(value.to_string()),
+            _ => {
+                values.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    let mut out = String::new();
+    out.push_str("Daemon\n");
+    write_status_kv(
+        &mut out,
+        "State",
+        &format!(
+            "running pid {}",
+            values
+                .get("pid")
+                .or_else(|| { values.get("running").and_then(|_| values.get("pid")) })
+                .cloned()
+                .unwrap_or_else(|| {
+                    reply
+                        .lines()
+                        .find_map(|line| line.strip_prefix("running pid "))
+                        .unwrap_or("?")
+                        .to_string()
+                })
+        ),
+    );
+    write_status_kv(
+        &mut out,
+        "IPC",
+        if reply.lines().any(|line| line == "ipc ok") {
+            "ok"
+        } else {
+            values.get("ipc").map(String::as_str).unwrap_or("unknown")
+        },
+    );
+    if let Some(current) = values.get("current") {
+        write_status_kv(&mut out, "Current", current);
+    }
+    if let Some(roots) = values.get("roots") {
+        write_status_kv(&mut out, "Roots", roots);
+    }
+    out.push('\n');
+
+    out.push_str("Queues\n");
+    for (label, key) in [
+        ("Uploads", "queued_uploads"),
+        ("Retrying", "queued_uploads_retrying"),
+        ("Delayed", "queued_uploads_delayed"),
+        ("Next retry", "queued_upload_next_retry_after"),
+        ("Attempts", "queued_upload_attempts"),
+        ("Max attempts", "queued_upload_max_attempts"),
+        ("Backpressure", "upload_queue_backpressure"),
+        ("Restore jobs", "restore_jobs"),
+    ] {
+        if let Some(value) = values.get(key) {
+            write_status_kv(&mut out, label, value);
+        }
+    }
+    out.push('\n');
+
+    out.push_str("Journal\n");
+    for (label, key) in [
+        ("Records", "journal_events"),
+        ("Processed", "processed_journal_events"),
+        ("Pending", "pending_journal_event_count"),
+        ("Pending state", "pending_journal_state"),
+        ("Oldest pending", "pending_journal_oldest_age_secs"),
+    ] {
+        if let Some(value) = values.get(key) {
+            write_status_kv(&mut out, label, value);
+        }
+    }
+    out.push('\n');
+
+    out.push_str("Memory\n");
+    if let Some(value) = values.get("rss_kib") {
+        write_status_kv(&mut out, "RSS", &format!("{value} KiB"));
+    }
+    if let Some(value) = values.get("vm_size_kib") {
+        write_status_kv(&mut out, "VM size", &format!("{value} KiB"));
+    }
+
+    if !root_statuses.is_empty() {
+        out.push('\n');
+        out.push_str("Root Status\n");
+        for status in root_statuses {
+            write_status_parts(&mut out, &status);
+        }
+    }
+    if !restore_statuses.is_empty() {
+        out.push('\n');
+        out.push_str("Restore Status\n");
+        for status in restore_statuses {
+            write_status_parts(&mut out, &status);
+        }
+    }
+    out
+}
+
+fn write_status_kv(out: &mut String, key: &str, value: &str) {
+    let _ = writeln!(out, "  {key:<18} {value}");
+}
+
+fn write_status_parts(out: &mut String, value: &str) {
+    let mut parts = value.split_whitespace();
+    let status = parts.next().unwrap_or("-");
+    let count = parts.next().unwrap_or("0");
+    let _ = writeln!(out, "  {status:<18} {count}");
 }
 
 pub(crate) fn daemon_health(paths: &Paths) -> Result<DaemonHealth> {

@@ -268,6 +268,20 @@ fn lifecycle_policy_and_package_facing_commands_are_renderable() {
         run_mj(&home, ["daemon", "service", "--provider", "systemd"]),
         "daemon systemd service render",
     );
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "daemon",
+                "service",
+                "--provider",
+                "systemd",
+                "--scope",
+                "system",
+            ],
+        ),
+        "daemon systemd system service render",
+    );
 }
 
 fn run_mj_with_env<I, S>(home: &Path, args: I, envs: &[(&str, String)]) -> Output
@@ -564,7 +578,7 @@ fn daemon_status_and_metrics_smoke() {
         let status = run_mj(&home, ["daemon", "status"]);
         if status.status.success() {
             let text = String::from_utf8_lossy(&status.stdout);
-            if text.contains("running pid") && text.contains("roots 1") {
+            if text.contains("running pid") && text.contains("Roots              1") {
                 status_ok = true;
                 break;
             }

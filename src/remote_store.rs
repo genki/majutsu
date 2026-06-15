@@ -113,6 +113,12 @@ pub(crate) struct S3Remote {
     pub(crate) client: Client,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RemoteObjectStat {
+    pub(crate) key: String,
+    pub(crate) size: u64,
+}
+
 pub(crate) fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
     open_remote_with_upload_policy(config, true, default_large_max_parallel_uploads())
 }
@@ -328,6 +334,13 @@ impl RemoteStore {
         match self {
             RemoteStore::File(remote) => list_file_remote(&remote.root, prefix),
             RemoteStore::S3(remote) => remote.list(prefix),
+        }
+    }
+
+    pub(crate) fn list_with_sizes(&self, prefix: &str) -> Result<Vec<RemoteObjectStat>> {
+        match self {
+            RemoteStore::File(remote) => list_file_remote_with_sizes(&remote.root, prefix),
+            RemoteStore::S3(remote) => remote.list_with_sizes(prefix),
         }
     }
 
@@ -1022,7 +1035,15 @@ impl S3Remote {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
+        Ok(self
+            .list_with_sizes(prefix)?
+            .into_iter()
+            .map(|object| object.key)
+            .collect())
+    }
+
+    fn list_with_sizes(&self, prefix: &str) -> Result<Vec<RemoteObjectStat>> {
+        let mut objects = Vec::new();
         let remote_prefix = self.remote_key(prefix);
         let mut continuation_token: Option<String> = None;
         loop {
@@ -1039,9 +1060,12 @@ impl S3Remote {
             }
             let xml = self.list_objects_page(&query)?;
             let page = parse_s3_list_objects_v2(&xml)?;
-            for key in page.keys {
-                if let Some(local) = self.local_key(&key) {
-                    keys.push(local);
+            for object in page.objects {
+                if let Some(local) = self.local_key(&object.key) {
+                    objects.push(RemoteObjectStat {
+                        key: local,
+                        size: object.size,
+                    });
                 }
             }
             if !page.is_truncated {
@@ -1052,9 +1076,9 @@ impl S3Remote {
                 bail!("s3 list response was truncated but did not include NextContinuationToken");
             }
         }
-        keys.sort();
-        keys.dedup();
-        Ok(keys)
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        objects.dedup_by(|left, right| left.key == right.key);
+        Ok(objects)
     }
 
     fn list_objects_page(&self, query: &str) -> Result<String> {
@@ -1256,20 +1280,30 @@ struct CompletedPart {
 }
 
 fn list_file_remote(root: &Path, prefix: &str) -> Result<Vec<String>> {
+    Ok(list_file_remote_with_sizes(root, prefix)?
+        .into_iter()
+        .map(|object| object.key)
+        .collect())
+}
+
+fn list_file_remote_with_sizes(root: &Path, prefix: &str) -> Result<Vec<RemoteObjectStat>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let mut keys = Vec::new();
+    let mut objects = Vec::new();
     for entry in WalkDir::new(root).sort_by_file_name() {
         let entry = entry?;
         if entry.file_type().is_file() {
             let rel = path_to_slash(entry.path().strip_prefix(root)?);
             if rel.starts_with(prefix) {
-                keys.push(rel);
+                objects.push(RemoteObjectStat {
+                    key: rel,
+                    size: entry.metadata()?.len(),
+                });
             }
         }
     }
-    Ok(keys)
+    Ok(objects)
 }
 
 fn path_to_slash(path: &Path) -> String {
@@ -1351,7 +1385,7 @@ fn canonical_query(params: &[(&str, String)]) -> String {
 }
 
 struct S3ListPage {
-    keys: Vec<String>,
+    objects: Vec<RemoteObjectStat>,
     is_truncated: bool,
     next_continuation_token: Option<String>,
 }
@@ -1361,7 +1395,9 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
     reader.config_mut().trim_text(true);
     let mut current = String::new();
     let mut in_contents = false;
-    let mut keys = Vec::new();
+    let mut objects = Vec::new();
+    let mut object_key: Option<String> = None;
+    let mut object_size: Option<u64> = None;
     let mut is_truncated = false;
     let mut next_continuation_token = None;
     loop {
@@ -1370,10 +1406,18 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
                 current = std::str::from_utf8(event.name().as_ref())?.to_string();
                 if current == "Contents" {
                     in_contents = true;
+                    object_key = None;
+                    object_size = None;
                 }
             }
             Ok(Event::End(event)) => {
                 if event.name().as_ref() == b"Contents" {
+                    if let Some(key) = object_key.take() {
+                        objects.push(RemoteObjectStat {
+                            key,
+                            size: object_size.unwrap_or(0),
+                        });
+                    }
                     in_contents = false;
                 }
                 current.clear();
@@ -1381,7 +1425,8 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
             Ok(Event::Text(text)) => {
                 let value = text.unescape()?.into_owned();
                 match current.as_str() {
-                    "Key" if in_contents => keys.push(value),
+                    "Key" if in_contents => object_key = Some(value),
+                    "Size" if in_contents => object_size = Some(value.parse()?),
                     "IsTruncated" => is_truncated = value == "true" || value == "1",
                     "NextContinuationToken" => next_continuation_token = Some(value),
                     _ => {}
@@ -1393,7 +1438,7 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
         }
     }
     Ok(S3ListPage {
-        keys,
+        objects,
         is_truncated,
         next_continuation_token,
     })
@@ -1580,12 +1625,21 @@ mod storage_characteristic_tests {
 
     #[test]
     fn parses_paginated_s3_list_v2_response() {
-        let xml = r#"<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>prefix/a</Key></Contents><Contents><Key>prefix/b</Key></Contents><NextContinuationToken>next-token</NextContinuationToken></ListBucketResult>"#;
+        let xml = r#"<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>prefix/a</Key><Size>123</Size></Contents><Contents><Key>prefix/b</Key><Size>456</Size></Contents><NextContinuationToken>next-token</NextContinuationToken></ListBucketResult>"#;
         let page = parse_s3_list_objects_v2(xml).unwrap();
         assert!(page.is_truncated);
         assert_eq!(
-            page.keys,
-            vec!["prefix/a".to_string(), "prefix/b".to_string()]
+            page.objects,
+            vec![
+                RemoteObjectStat {
+                    key: "prefix/a".to_string(),
+                    size: 123,
+                },
+                RemoteObjectStat {
+                    key: "prefix/b".to_string(),
+                    size: 456,
+                }
+            ]
         );
         assert_eq!(page.next_continuation_token.as_deref(), Some("next-token"));
     }
