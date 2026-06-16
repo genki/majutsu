@@ -169,7 +169,7 @@ pub(crate) enum RootCommand {
     #[command(about = "List configured roots")]
     List,
     #[command(about = "Show client and backend sizes for current roots")]
-    Size,
+    Size(RootSizeArgs),
     #[command(about = "Remove a root from the configuration")]
     Remove { id: String },
     #[command(about = "Temporarily pause snapshots for a root")]
@@ -178,6 +178,16 @@ pub(crate) enum RootCommand {
     Resume { id: String },
     #[command(about = "Record a root as deleted")]
     MarkDeleted { id: String },
+}
+
+#[derive(Args)]
+pub(crate) struct RootSizeArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Emit machine-readable JSON instead of the aligned table"
+    )]
+    pub(crate) json: bool,
 }
 
 #[derive(Subcommand)]

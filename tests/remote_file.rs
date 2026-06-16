@@ -12751,6 +12751,33 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(sizes.contains("全体:"));
     assert!(sizes.contains("- current snapshotのユニークbackend復元単位:"));
     assert!(sizes.contains("- GCS backend prefix全体:"));
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--json");
+        c
+    });
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["roots"][0]["root"], "sample");
+    assert_eq!(report["roots"][0]["files"], 1);
+    assert_eq!(report["roots"][0]["dirs"], 0);
+    assert_eq!(report["roots"][0]["client_bytes"], 5);
+    assert!(report["roots"][0]["backend_bytes"].as_u64().unwrap() > 0);
+    assert!(report["roots"][0]["used_bytes"].as_u64().unwrap() > 0);
+    assert!(report["roots"][0]["payload_bytes"].as_u64().unwrap() > 0);
+    assert!(report["roots"][0]["metadata_bytes"].as_u64().unwrap() > 0);
+    assert!(report["roots"][0]["backend_objects"].as_u64().unwrap() > 0);
+    assert_eq!(report["roots"][0]["missing_objects"], 0);
+    assert!(report["totals"]["current_backend_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["payload_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["metadata_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["objects"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["backend_prefix_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["backend_prefix_objects"].as_u64().unwrap() > 0);
 }
 
 #[test]

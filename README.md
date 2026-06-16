@@ -672,6 +672,16 @@ remote-side data. `backend` is the full remote object set required to restore
 the root, while `used` is the pack-slice-adjusted amount actually used by that
 root.
 
+Use `mj root size --json` when automation needs byte counts and object counts
+without parsing terminal tables. The JSON report contains per-root
+`client_bytes`, `backend_bytes`, `used_bytes`, `payload_bytes`,
+`metadata_bytes`, object, and missing counts plus the same overall totals shown
+in the text output.
+
+```sh
+mj root size --json
+```
+
 Roots can be paused and resumed:
 
 ```sh

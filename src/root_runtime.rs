@@ -10,7 +10,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 
-use crate::cli::RootCommand;
+use crate::cli::{RootCommand, RootSizeArgs};
 use crate::config::{
     Paths, RootConfig, default_include, read_config, validate_large_chunking,
     validate_snapshot_mode,
@@ -175,8 +175,8 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
         RootCommand::List => {
             root_list_cmd(&conn)?;
         }
-        RootCommand::Size => {
-            root_size_cmd(paths, &conn)?;
+        RootCommand::Size(args) => {
+            root_size_cmd(paths, &conn, &args)?;
         }
         RootCommand::Remove { id } => {
             let _ = root_by_id(&conn, &id)?;
@@ -259,6 +259,7 @@ struct RootSizeStat {
     packed_slice_bytes: u64,
 }
 
+#[derive(Serialize)]
 struct RootSizeRow {
     root: String,
     files: usize,
@@ -270,6 +271,22 @@ struct RootSizeRow {
     metadata_bytes: u64,
     backend_objects: usize,
     missing_objects: usize,
+}
+
+#[derive(Serialize)]
+struct RootSizeReport<'a> {
+    roots: &'a [RootSizeRow],
+    totals: RootSizeTotals,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct RootSizeTotals {
+    current_backend_bytes: u64,
+    payload_bytes: u64,
+    metadata_bytes: u64,
+    objects: usize,
+    backend_prefix_bytes: u64,
+    backend_prefix_objects: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -287,7 +304,7 @@ struct PackedBlobSizeRef {
     pack_len: u64,
 }
 
-fn root_size_cmd(paths: &Paths, conn: &Connection) -> Result<()> {
+fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Result<()> {
     let current: String = conn
         .query_row("select value from refs where name='current'", [], |row| {
             row.get(0)
@@ -372,14 +389,24 @@ fn root_size_cmd(paths: &Paths, conn: &Connection) -> Result<()> {
             missing_objects: payload_keys.missing + metadata_keys.missing,
         });
     }
-    print_root_size_table(
-        &rows,
+    let totals = root_size_totals(
         &remote_sizes,
         &remote_size_map,
         &unique_keys,
         &unique_payload_keys,
         &unique_metadata_keys,
     );
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&RootSizeReport {
+                roots: &rows,
+                totals,
+            })?
+        );
+    } else {
+        print_root_size_table(&rows, &totals);
+    }
     Ok(())
 }
 
@@ -594,14 +621,24 @@ fn sum_remote_keys(remote_size_map: &BTreeMap<String, u64>, keys: &BTreeSet<Stri
         .sum()
 }
 
-fn print_root_size_table(
-    rows: &[RootSizeRow],
+fn root_size_totals(
     remote_sizes: &[RemoteObjectStat],
     remote_size_map: &BTreeMap<String, u64>,
     unique_keys: &BTreeSet<String>,
     unique_payload_keys: &BTreeSet<String>,
     unique_metadata_keys: &BTreeSet<String>,
-) {
+) -> RootSizeTotals {
+    RootSizeTotals {
+        current_backend_bytes: sum_remote_keys(remote_size_map, unique_keys),
+        payload_bytes: sum_remote_keys(remote_size_map, unique_payload_keys),
+        metadata_bytes: sum_remote_keys(remote_size_map, unique_metadata_keys),
+        objects: unique_keys.len(),
+        backend_prefix_bytes: remote_sizes.iter().map(|object| object.size).sum(),
+        backend_prefix_objects: remote_sizes.len(),
+    }
+}
+
+fn print_root_size_table(rows: &[RootSizeRow], totals: &RootSizeTotals) {
     let table_rows = rows
         .iter()
         .map(|row| {
@@ -630,10 +667,6 @@ fn print_root_size_table(
         ],
         &table_rows,
     );
-    let unique_backend_bytes = sum_remote_keys(remote_size_map, unique_keys);
-    let unique_payload_bytes = sum_remote_keys(remote_size_map, unique_payload_keys);
-    let unique_metadata_bytes = sum_remote_keys(remote_size_map, unique_metadata_keys);
-    let total_backend_bytes = remote_sizes.iter().map(|object| object.size).sum::<u64>();
     println!();
     println!(
         "注: `|` より左はclient側、右はremote側。backend は復元に必要なremote object全体、used はpack内slice換算の実利用量。"
@@ -642,16 +675,19 @@ fn print_root_size_table(
     println!("全体:");
     println!(
         "- current snapshotのユニークbackend復元単位: {}",
-        format_mib(unique_backend_bytes)
+        format_mib(totals.current_backend_bytes)
     );
-    println!("  - payload: {}", format_mib(unique_payload_bytes));
-    println!("  - metadata: {}", format_mib(unique_metadata_bytes));
-    println!("  - objects: {}", format_count(unique_keys.len()));
+    println!("  - payload: {}", format_mib(totals.payload_bytes));
+    println!("  - metadata: {}", format_mib(totals.metadata_bytes));
+    println!("  - objects: {}", format_count(totals.objects));
     println!(
         "- GCS backend prefix全体: {}",
-        format_mib(total_backend_bytes)
+        format_mib(totals.backend_prefix_bytes)
     );
-    println!("  - objects: {}", format_count(remote_sizes.len()));
+    println!(
+        "  - objects: {}",
+        format_count(totals.backend_prefix_objects)
+    );
 }
 
 fn terminal_width() -> usize {
