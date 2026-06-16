@@ -180,6 +180,16 @@ MAJUTSU_S3_CONNECT_TIMEOUT_SECS=10 mj fsck --since "24h ago" --progress
 MAJUTSU_S3_REQUEST_TIMEOUT_SECS=300 mj sync status --deep --progress
 ```
 
+`mj sync` の S3/GCS request 数と転送 body bytes を確認したい場合は次を使う。
+
+```sh
+MAJUTSU_TRACE_REMOTE=1 mj sync
+```
+
+stderr に `remote_trace` が1行出力される。`requests` は S3互換 API の HTTP request 数、
+`upload_bytes` / `download_bytes` は HTTP body の合計で、TLS や HTTP header の overhead は含まない。
+`MAJUTSU_TRACE_S3=1` も同じ意味で使える。
+
 `mj fsck --progress` は remote payload key の一括取得を `remote-payload-index` phase として表示する。
 `--sample` または `--since` で検査範囲を絞る場合は全 payload prefix の LIST を避け、
 欠落 local object に遭遇した時だけ対象 key を HEAD probe する。短時間 smoke 検査では

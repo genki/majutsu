@@ -53,6 +53,17 @@ index は毎回 publish しない。最新 current、last-synced、root ack は 
 MAJUTSU_SYNC_S3_HOST_INDEX_EVERY_TIME=1 mj sync
 ```
 
+2026-06-16 の GCS S3互換 endpoint 実測では、1ファイル追記後の小変更 sync は次の結果だった。
+
+| mode | requests | PUT | HEAD | uploaded body | elapsed |
+|---|---:|---:|---:|---:|---:|
+| compact default | 19 | 7 | 11 | 4,554 bytes | 5.325s |
+| legacy compatibility env | 21 | 9 | 11 | 5,548 bytes | 5.006s |
+
+legacy compatibility env は `MAJUTSU_SYNC_S3_HOST_INDEX_EVERY_TIME=1`
+と `MAJUTSU_SYNC_S3_BOOTSTRAP_EVERY_TIME=1` を同時指定したもの。
+単発 elapsed は GCS latency の揺れで逆転しうるため、評価では request 数と uploaded body を重視する。
+
 ## GC mark
 
 S3/GCS 互換 backend では compact head を通常復旧の正とするため、GC mark は初回だけ seed し、

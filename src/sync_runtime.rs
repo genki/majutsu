@@ -43,7 +43,7 @@ use crate::queue_runtime::{
     enqueue_inline_upload_overwrite, upload_queue_stats,
 };
 use crate::remote_runtime::read_remote_host_index;
-use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
+use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
 use crate::util::{blake3_hex, new_id, parse_db_time};
 use crate::{
@@ -299,6 +299,7 @@ fn sync_configured_remote(
     config: &Config,
     remote: &RemoteStore,
 ) -> Result<()> {
+    let _remote_trace = RemoteTrafficTraceGuard::new("sync");
     let trace = SyncTrace::new();
     let _lock = acquire_process_lock(&paths.sync_lock, "sync")?;
     trace.mark("lock");
@@ -680,7 +681,14 @@ fn enqueue_and_drain_sync(
         )?;
     }
     enqueue_remote_head_if_supported(paths, remote, config, &remote_export, &host_metadata)?;
-    enqueue_clone_bootstrap_if_supported(paths, remote, host_index, host_index_changed)?;
+    enqueue_clone_bootstrap_if_supported(
+        paths,
+        remote,
+        &sync_cache,
+        &mut sync_fingerprints,
+        host_index,
+        host_index_changed,
+    )?;
     trace.mark("clone bootstrap");
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
@@ -1121,6 +1129,8 @@ fn enqueue_remote_head_if_supported(
 fn enqueue_clone_bootstrap_if_supported(
     paths: &Paths,
     remote: &RemoteStore,
+    cache: &RemoteSyncCache,
+    fingerprints: &mut BTreeMap<String, String>,
     host_index: RemoteHostIndex,
     force: bool,
 ) -> Result<()> {
@@ -1131,19 +1141,26 @@ fn enqueue_clone_bootstrap_if_supported(
         version: CLONE_BOOTSTRAP_VERSION,
         host_index,
     };
-    if !force && !should_upload_s3_clone_bootstrap(remote)? {
-        return Ok(());
-    }
     let json = serde_json::to_vec(&bootstrap)?;
     let compressed = zstd::stream::encode_all(json.as_slice(), 3)?;
+    let fingerprint = payload_fingerprint(&compressed);
+    fingerprints.insert(CLONE_BOOTSTRAP_KEY.to_string(), fingerprint.clone());
+    let force_upload = force || sync_s3_bootstrap_every_time();
+    if !force_upload && cache_matches(cache, CLONE_BOOTSTRAP_KEY, &fingerprint) {
+        return Ok(());
+    }
+    if !force_upload && !should_upload_s3_clone_bootstrap(remote)? {
+        return Ok(());
+    }
     enqueue_inline_upload(paths, CLONE_BOOTSTRAP_KEY, compressed)
 }
 
 fn should_upload_s3_clone_bootstrap(remote: &RemoteStore) -> Result<bool> {
-    if env::var("MAJUTSU_SYNC_S3_BOOTSTRAP_EVERY_TIME").as_deref() == Ok("1") {
-        return Ok(true);
-    }
     Ok(!remote.exists(CLONE_BOOTSTRAP_KEY)?)
+}
+
+fn sync_s3_bootstrap_every_time() -> bool {
+    env::var("MAJUTSU_SYNC_S3_BOOTSTRAP_EVERY_TIME").as_deref() == Ok("1")
 }
 
 fn enqueue_cached_inline_upload(

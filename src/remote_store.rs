@@ -15,6 +15,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use url::Url;
 use walkdir::WalkDir;
@@ -97,6 +98,138 @@ pub(crate) fn s3_http_client() -> Result<Client> {
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
         .build()?)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RemoteTrafficMetrics {
+    pub(crate) put_requests: u64,
+    pub(crate) get_requests: u64,
+    pub(crate) head_requests: u64,
+    pub(crate) list_requests: u64,
+    pub(crate) post_requests: u64,
+    pub(crate) delete_requests: u64,
+    pub(crate) upload_bytes: u64,
+    pub(crate) download_bytes: u64,
+}
+
+impl RemoteTrafficMetrics {
+    pub(crate) fn total_requests(&self) -> u64 {
+        self.put_requests
+            + self.get_requests
+            + self.head_requests
+            + self.list_requests
+            + self.post_requests
+            + self.delete_requests
+    }
+}
+
+static S3_PUT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static S3_GET_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static S3_HEAD_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static S3_LIST_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static S3_POST_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static S3_DELETE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static S3_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+static S3_DOWNLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct RemoteTrafficTraceGuard {
+    label: &'static str,
+    enabled: bool,
+}
+
+impl RemoteTrafficTraceGuard {
+    pub(crate) fn new(label: &'static str) -> Self {
+        let enabled = remote_traffic_trace_enabled();
+        if enabled {
+            reset_remote_traffic_metrics();
+        }
+        Self { label, enabled }
+    }
+}
+
+impl Drop for RemoteTrafficTraceGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let metrics = remote_traffic_metrics();
+        eprintln!(
+            "remote_trace label={} requests={} put={} get={} head={} list={} post={} delete={} upload_bytes={} download_bytes={}",
+            self.label,
+            metrics.total_requests(),
+            metrics.put_requests,
+            metrics.get_requests,
+            metrics.head_requests,
+            metrics.list_requests,
+            metrics.post_requests,
+            metrics.delete_requests,
+            metrics.upload_bytes,
+            metrics.download_bytes
+        );
+    }
+}
+
+pub(crate) fn remote_traffic_trace_enabled() -> bool {
+    env_bool("MAJUTSU_TRACE_REMOTE") || env_bool("MAJUTSU_TRACE_S3")
+}
+
+pub(crate) fn reset_remote_traffic_metrics() {
+    S3_PUT_REQUESTS.store(0, Ordering::Relaxed);
+    S3_GET_REQUESTS.store(0, Ordering::Relaxed);
+    S3_HEAD_REQUESTS.store(0, Ordering::Relaxed);
+    S3_LIST_REQUESTS.store(0, Ordering::Relaxed);
+    S3_POST_REQUESTS.store(0, Ordering::Relaxed);
+    S3_DELETE_REQUESTS.store(0, Ordering::Relaxed);
+    S3_UPLOAD_BYTES.store(0, Ordering::Relaxed);
+    S3_DOWNLOAD_BYTES.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn remote_traffic_metrics() -> RemoteTrafficMetrics {
+    RemoteTrafficMetrics {
+        put_requests: S3_PUT_REQUESTS.load(Ordering::Relaxed),
+        get_requests: S3_GET_REQUESTS.load(Ordering::Relaxed),
+        head_requests: S3_HEAD_REQUESTS.load(Ordering::Relaxed),
+        list_requests: S3_LIST_REQUESTS.load(Ordering::Relaxed),
+        post_requests: S3_POST_REQUESTS.load(Ordering::Relaxed),
+        delete_requests: S3_DELETE_REQUESTS.load(Ordering::Relaxed),
+        upload_bytes: S3_UPLOAD_BYTES.load(Ordering::Relaxed),
+        download_bytes: S3_DOWNLOAD_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+fn record_s3_put(upload_bytes: u64) {
+    S3_PUT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    S3_UPLOAD_BYTES.fetch_add(upload_bytes, Ordering::Relaxed);
+}
+
+fn record_s3_get(download_bytes: u64) {
+    S3_GET_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    S3_DOWNLOAD_BYTES.fetch_add(download_bytes, Ordering::Relaxed);
+}
+
+fn record_s3_head() {
+    S3_HEAD_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_s3_list(download_bytes: u64) {
+    S3_LIST_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    S3_DOWNLOAD_BYTES.fetch_add(download_bytes, Ordering::Relaxed);
+}
+
+fn record_s3_post(upload_bytes: u64, download_bytes: u64) {
+    S3_POST_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    S3_UPLOAD_BYTES.fetch_add(upload_bytes, Ordering::Relaxed);
+    S3_DOWNLOAD_BYTES.fetch_add(download_bytes, Ordering::Relaxed);
+}
+
+fn record_s3_delete() {
+    S3_DELETE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
@@ -441,6 +574,7 @@ impl S3Remote {
             let file = File::open(source)?;
             request.body(Body::sized(file, len)).send()?
         };
+        record_s3_put(len);
         advise_path_dontneed(source);
         if if_absent && matches!(response.status().as_u16(), 409 | 412) {
             return Ok(false);
@@ -492,6 +626,7 @@ impl S3Remote {
             }
             request.body(bytes.to_vec()).send()?
         };
+        record_s3_put(bytes.len() as u64);
         if if_absent && matches!(response.status().as_u16(), 409 | 412) {
             return Ok(false);
         }
@@ -548,6 +683,7 @@ impl S3Remote {
             .header(CONTENT_TYPE, "application/xml")
             .body(policy_xml.to_string())
             .send()?;
+        record_s3_put(policy_xml.len() as u64);
         if !response.status().is_success() {
             bail!(
                 "s3 put lifecycle configuration failed: HTTP {} {}",
@@ -735,6 +871,7 @@ impl S3Remote {
             request = request.header(name.as_str(), value.as_str());
         }
         let response = request.body(Vec::new()).send()?;
+        record_s3_post(0, 0);
         if !response.status().is_success() {
             bail!(
                 "s3 initiate multipart failed: HTTP {} {}",
@@ -742,8 +879,9 @@ impl S3Remote {
                 response.text().unwrap_or_default()
             );
         }
-        parse_xml_text(&response.text()?, "UploadId")?
-            .ok_or_else(|| anyhow!("missing multipart UploadId"))
+        let text = response.text()?;
+        S3_DOWNLOAD_BYTES.fetch_add(text.len() as u64, Ordering::Relaxed);
+        parse_xml_text(&text, "UploadId")?.ok_or_else(|| anyhow!("missing multipart UploadId"))
     }
 
     fn upload_part(
@@ -768,6 +906,7 @@ impl S3Remote {
             .header(AUTHORIZATION, auth.authorization)
             .body(bytes.to_vec())
             .send()?;
+        record_s3_put(bytes.len() as u64);
         if !response.status().is_success() {
             bail!(
                 "s3 upload part {part_number} failed: HTTP {} {}",
@@ -794,6 +933,7 @@ impl S3Remote {
             ("partNumber", part_number.to_string()),
             ("uploadId", upload_id.to_string()),
         ]);
+        let bytes_len = bytes.len() as u64;
         let payload_hash = sha256_hex(&bytes);
         let auth = self.auth_v4("PUT", remote_key, &query, &payload_hash, &[])?;
         let response = self
@@ -805,6 +945,7 @@ impl S3Remote {
             .header(AUTHORIZATION, auth.authorization)
             .body(bytes)
             .send()?;
+        record_s3_put(bytes_len);
         if !response.status().is_success() {
             bail!(
                 "s3 upload part {part_number} failed: HTTP {} {}",
@@ -837,6 +978,7 @@ impl S3Remote {
             body.push_str("</Part>");
         }
         body.push_str("</CompleteMultipartUpload>");
+        let body_len = body.len() as u64;
         let payload_hash = sha256_hex(body.as_bytes());
         let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &[])?;
         let response = self
@@ -849,6 +991,7 @@ impl S3Remote {
             .header(CONTENT_TYPE, "application/xml")
             .body(body)
             .send()?;
+        record_s3_post(body_len, 0);
         if !response.status().is_success() {
             bail!(
                 "s3 complete multipart failed: HTTP {} {}",
@@ -872,6 +1015,7 @@ impl S3Remote {
             .header(AUTHORIZATION, auth.authorization)
             .body(Vec::new())
             .send()?;
+        record_s3_delete();
         if response.status().is_success() {
             Ok(())
         } else {
@@ -883,6 +1027,7 @@ impl S3Remote {
         let remote_key = self.remote_key(key);
         let query = "restore=".to_string();
         let body = s3_archive_restore_request_xml(days, tier)?;
+        let body_len = body.len() as u64;
         if self.uses_sigv2() {
             let date = http_date();
             let path = format!("/{}/{}?restore", self.bucket, remote_key);
@@ -895,6 +1040,7 @@ impl S3Remote {
                 .header(AUTHORIZATION, auth)
                 .body(body)
                 .send()?;
+            record_s3_post(body_len, 0);
             return archive_restore_status(key, response.status().as_u16());
         }
         let payload_hash = sha256_hex(body.as_bytes());
@@ -909,6 +1055,7 @@ impl S3Remote {
             .header(CONTENT_TYPE, "application/xml")
             .body(body)
             .send()?;
+        record_s3_post(body_len, 0);
         archive_restore_status(key, response.status().as_u16())
     }
 
@@ -942,6 +1089,7 @@ impl S3Remote {
                 .header(AUTHORIZATION, auth.authorization)
                 .send()?
         };
+        record_s3_delete();
         if response.status().is_success() || response.status().as_u16() == 404 {
             Ok(())
         } else {
@@ -996,13 +1144,17 @@ impl S3Remote {
             }
             request.send()?
         };
+        if !response.status().is_success() && response.status().as_u16() == 404 {
+            record_s3_get(0);
+            return Ok(None);
+        }
         if !response.status().is_success() {
-            if response.status().as_u16() == 404 {
-                return Ok(None);
-            }
+            record_s3_get(0);
             bail!("s3 get failed for {key}: HTTP {}", response.status());
         }
-        Ok(Some(response.bytes()?.to_vec()))
+        let bytes = response.bytes()?.to_vec();
+        record_s3_get(bytes.len() as u64);
+        Ok(Some(bytes))
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -1027,6 +1179,7 @@ impl S3Remote {
                 .header(AUTHORIZATION, auth.authorization)
                 .send()?
         };
+        record_s3_head();
         if response.status().is_success() {
             Ok(true)
         } else if response.status().as_u16() == 404 {
@@ -1105,9 +1258,12 @@ impl S3Remote {
                 .send()?
         };
         if !response.status().is_success() {
+            record_s3_list(0);
             bail!("s3 list failed: HTTP {}", response.status());
         }
-        Ok(response.text()?)
+        let text = response.text()?;
+        record_s3_list(text.len() as u64);
+        Ok(text)
     }
 
     fn auth_v2(
@@ -1623,6 +1779,29 @@ mod storage_characteristic_tests {
             remote.multipart_parallelism_for_key("blobs/loose/aa/blob.enc"),
             8
         );
+    }
+
+    #[test]
+    fn remote_traffic_metrics_count_requests_and_body_bytes() {
+        reset_remote_traffic_metrics();
+
+        record_s3_put(10);
+        record_s3_get(20);
+        record_s3_head();
+        record_s3_list(30);
+        record_s3_post(40, 50);
+        record_s3_delete();
+
+        let metrics = remote_traffic_metrics();
+        assert_eq!(metrics.total_requests(), 6);
+        assert_eq!(metrics.put_requests, 1);
+        assert_eq!(metrics.get_requests, 1);
+        assert_eq!(metrics.head_requests, 1);
+        assert_eq!(metrics.list_requests, 1);
+        assert_eq!(metrics.post_requests, 1);
+        assert_eq!(metrics.delete_requests, 1);
+        assert_eq!(metrics.upload_bytes, 50);
+        assert_eq!(metrics.download_bytes, 100);
     }
 
     #[test]
