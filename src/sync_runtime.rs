@@ -55,6 +55,7 @@ const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v7";
 const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
 const CLONE_BOOTSTRAP_VERSION: u32 = 2;
 const REMOTE_HEAD_VERSION: u32 = 1;
+const S3_LEGACY_METADATA_PRESENT_FINGERPRINT: &str = "present-v1:s3-legacy-metadata";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteHeadExport {
@@ -602,6 +603,8 @@ fn enqueue_and_drain_sync(
     let host_metadata = enqueue_metadata_uploads(
         paths,
         remote,
+        &sync_cache,
+        &mut sync_fingerprints,
         legacy_metadata,
         &host_metadata_plain,
         &remote_metadata_json,
@@ -1051,6 +1054,8 @@ fn compact_snapshot_manifest_value(value: &mut serde_json::Value) {
 fn enqueue_metadata_uploads(
     paths: &Paths,
     remote: &RemoteStore,
+    cache: &RemoteSyncCache,
+    fingerprints: &mut BTreeMap<String, String>,
     legacy_key: &str,
     host_key: &str,
     metadata_json: &[u8],
@@ -1062,7 +1067,13 @@ fn enqueue_metadata_uploads(
     }
     let compressed = zstd::stream::encode_all(metadata_json, 3)?;
     let legacy_compressed_key = compressed_metadata_key(legacy_key);
-    if should_seed_s3_legacy_metadata(remote, legacy_key, &legacy_compressed_key)? {
+    if should_seed_s3_legacy_metadata(
+        cache,
+        fingerprints,
+        remote,
+        legacy_key,
+        &legacy_compressed_key,
+    )? {
         enqueue_inline_upload(paths, &legacy_compressed_key, compressed.clone())?;
     }
     enqueue_inline_upload(paths, &compressed_metadata_key(host_key), compressed)?;
@@ -1074,12 +1085,19 @@ fn compressed_metadata_key(key: &str) -> String {
 }
 
 fn should_seed_s3_legacy_metadata(
+    cache: &RemoteSyncCache,
+    fingerprints: &mut BTreeMap<String, String>,
     remote: &RemoteStore,
     legacy_key: &str,
     compressed_key: &str,
 ) -> Result<bool> {
+    let fingerprint = S3_LEGACY_METADATA_PRESENT_FINGERPRINT.to_string();
+    fingerprints.insert(compressed_key.to_string(), fingerprint.clone());
     if env::var("MAJUTSU_SYNC_S3_LEGACY_METADATA_EVERY_TIME").as_deref() == Ok("1") {
         return Ok(true);
+    }
+    if cache_matches(cache, compressed_key, &fingerprint) {
+        return Ok(false);
     }
     Ok(!remote.exists(legacy_key)? && !remote.exists(compressed_key)?)
 }
@@ -2077,8 +2095,15 @@ fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteHostSummary, compact_s3_host_index_summary};
+    use super::{
+        RemoteHostSummary, S3_LEGACY_METADATA_PRESENT_FINGERPRINT, compact_s3_host_index_summary,
+        empty_remote_sync_cache, should_seed_s3_legacy_metadata,
+    };
     use chrono::{DateTime, Utc};
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    use crate::remote_store::{FileRemote, RemoteStore};
 
     fn host_summary(name: &str, current: Option<&str>, metadata_key: &str) -> RemoteHostSummary {
         RemoteHostSummary {
@@ -2132,5 +2157,87 @@ mod tests {
         assert!(changed);
         assert_eq!(summary.name, "new-name");
         assert_eq!(summary.current_snapshot.as_deref(), Some("snap-new"));
+    }
+
+    #[test]
+    fn s3_legacy_metadata_seed_cache_skips_remote_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = RemoteStore::File(FileRemote {
+            root: temp.path().join("remote"),
+        });
+        fs::create_dir_all(temp.path().join("remote")).unwrap();
+        let mut cache = empty_remote_sync_cache(&remote);
+        cache.entries.insert(
+            "metadata/export.json.zst".into(),
+            S3_LEGACY_METADATA_PRESENT_FINGERPRINT.into(),
+        );
+        let mut fingerprints = BTreeMap::new();
+
+        let seed = should_seed_s3_legacy_metadata(
+            &cache,
+            &mut fingerprints,
+            &remote,
+            "metadata/export.json",
+            "metadata/export.json.zst",
+        )
+        .unwrap();
+
+        assert!(!seed);
+        assert_eq!(
+            fingerprints
+                .get("metadata/export.json.zst")
+                .map(String::as_str),
+            Some(S3_LEGACY_METADATA_PRESENT_FINGERPRINT)
+        );
+    }
+
+    #[test]
+    fn s3_legacy_metadata_seed_detects_missing_remote_seed() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = RemoteStore::File(FileRemote {
+            root: temp.path().join("remote"),
+        });
+        fs::create_dir_all(temp.path().join("remote")).unwrap();
+        let cache = empty_remote_sync_cache(&remote);
+        let mut fingerprints = BTreeMap::new();
+
+        let seed = should_seed_s3_legacy_metadata(
+            &cache,
+            &mut fingerprints,
+            &remote,
+            "metadata/export.json",
+            "metadata/export.json.zst",
+        )
+        .unwrap();
+
+        assert!(seed);
+    }
+
+    #[test]
+    fn s3_legacy_metadata_seed_records_existing_remote_seed() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote_root = temp.path().join("remote");
+        fs::create_dir_all(remote_root.join("metadata")).unwrap();
+        fs::write(remote_root.join("metadata/export.json.zst"), b"seed").unwrap();
+        let remote = RemoteStore::File(FileRemote { root: remote_root });
+        let cache = empty_remote_sync_cache(&remote);
+        let mut fingerprints = BTreeMap::new();
+
+        let seed = should_seed_s3_legacy_metadata(
+            &cache,
+            &mut fingerprints,
+            &remote,
+            "metadata/export.json",
+            "metadata/export.json.zst",
+        )
+        .unwrap();
+
+        assert!(!seed);
+        assert_eq!(
+            fingerprints
+                .get("metadata/export.json.zst")
+                .map(String::as_str),
+            Some(S3_LEGACY_METADATA_PRESENT_FINGERPRINT)
+        );
     }
 }
