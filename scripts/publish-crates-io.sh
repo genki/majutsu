@@ -3,17 +3,19 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/publish-crates-io.sh [--execute] [--allow-dirty]
+Usage: scripts/publish-crates-io.sh [--execute] [--allow-dirty] [--no-skip-existing]
 
 Publish majutsu workspace crates to crates.io in dependency order.
 
 Default mode is dry-run. Use --execute only after local release checks pass.
 Set CARGO_REGISTRY_TOKEN in the environment before --execute.
+Already-published package versions are skipped by default.
 USAGE
 }
 
 execute=0
 allow_dirty=0
+skip_existing=1
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -22,6 +24,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --allow-dirty)
       allow_dirty=1
+      ;;
+    --no-skip-existing)
+      skip_existing=0
       ;;
     -h|--help)
       usage
@@ -55,8 +60,33 @@ packages=(
   majutsu
 )
 
+package_version() {
+  local pkg="$1"
+  cargo metadata --no-deps --format-version 1 \
+    | jq -r --arg pkg "$pkg" '.packages[] | select(.name == $pkg) | .version' \
+    | head -n 1
+}
+
+crate_version_exists() {
+  local pkg="$1"
+  local version="$2"
+  cargo search "$pkg" --limit 1 2>/dev/null \
+    | grep -Eq "^${pkg} = \"${version}\"([[:space:]]|$)"
+}
+
 publish_one() {
   local pkg="$1"
+  local version
+  version="$(package_version "$pkg")"
+  if [ -z "$version" ]; then
+    echo "could not resolve package version for $pkg" >&2
+    return 2
+  fi
+  if [ "$skip_existing" -eq 1 ] && crate_version_exists "$pkg" "$version"; then
+    echo "== skip $pkg $version: already published =="
+    return 0
+  fi
+
   local args=(-p "$pkg")
   if [ "$allow_dirty" -eq 1 ]; then
     args+=(--allow-dirty)

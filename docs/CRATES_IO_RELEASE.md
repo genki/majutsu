@@ -45,6 +45,11 @@ last.
    scripts/publish-crates-io.sh
    ```
 
+   The helper requires `jq` because it reads package versions from
+   `cargo metadata`. It skips package versions that already exist on crates.io
+   by default. Use `--no-skip-existing` only when checking the exact package
+   command output for an unpublished version.
+
 3. Publish only after the dry-run passes and the release commit is pushed.
 
    ```sh
@@ -63,6 +68,9 @@ last.
 crates.io applies a strict rate limit to publishing many new crates in a short
 period. The publish helper retries `Too Many Requests` responses in execute
 mode, sleeping for `PUBLISH_RETRY_SECS` seconds, defaulting to 610 seconds.
+
+The helper also skips already-published versions before calling
+`cargo publish`, which avoids unnecessary registry requests during reruns.
 
 For future releases of already-created crates, this limit should be less
 painful than the first 0.4.0 publish.
