@@ -10,11 +10,11 @@ readme = "README.md"
 keywords = ["backup", "snapshot", "history", "s3", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 include = [
-    "BUILD_NUMBER",
-    "LICENSE",
-    "README.md",
-    "build.rs",
-    "src/**",
+    "/BUILD_NUMBER",
+    "/LICENSE",
+    "/README.md",
+    "/build.rs",
+    "/src/**",
 ]
 
 [workspace]
