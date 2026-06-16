@@ -1,5 +1,7 @@
+use crate::majutsu_core::{
+    RootSnapshot, SnapshotManifest, payload_blob_ref_mut, payload_large_ref_mut,
+};
 use anyhow::{Result, anyhow, bail};
-use majutsu_core::{RootSnapshot, SnapshotManifest, payload_blob_ref_mut, payload_large_ref_mut};
 use rusqlite::params;
 use std::collections::BTreeMap;
 
@@ -75,7 +77,7 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
     }
     let mut large_manifests = BTreeMap::new();
     for large in &large_objects {
-        let manifest: majutsu_core::LargeManifest =
+        let manifest: crate::majutsu_core::LargeManifest =
             serde_json::from_slice(&read_object(paths, &large.manifest_key)?)?;
         large_manifests.insert(large.oid.clone(), manifest);
     }

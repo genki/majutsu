@@ -72,7 +72,7 @@ cargo install --path .
 ## Workspace
 
 The repository is a Cargo workspace. The current `mj` binary remains in the
-root package while domain boundaries are represented by these crates:
+root package while domain boundaries are represented by private support crates:
 
 ```text
 crates/majutsu-cli
@@ -88,8 +88,10 @@ crates/majutsu-restore
 crates/majutsu-policy
 ```
 
-They provide the stable model, policy, and trait surfaces used as extraction
-targets while the production CLI continues to preserve compatibility.
+They provide model, policy, and trait extraction targets while the production
+CLI continues to preserve compatibility. These support crates are not published
+to crates.io; the public package is the root `majutsu` crate, and its publish
+tarball embeds the same support source under `src/internal/`.
 
 ## State Home
 

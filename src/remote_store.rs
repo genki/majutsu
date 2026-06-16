@@ -1,8 +1,10 @@
+use crate::majutsu_store::{
+    RemoteCapabilities, archive_restore_status, s3_archive_restore_request_xml,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use majutsu_store::{RemoteCapabilities, archive_restore_status, s3_archive_restore_request_xml};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::blocking::{Body, Client};
@@ -572,7 +574,7 @@ impl S3Remote {
                 }
             }
         }
-        majutsu_policy::s3_lifecycle_configuration_xml(&prefixed)
+        crate::majutsu_policy::s3_lifecycle_configuration_xml(&prefixed)
     }
 
     fn upload_multipart_parts(

@@ -1,8 +1,27 @@
-use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
-use clap::Parser;
-use hmac::{Hmac, Mac};
-use majutsu_core::{
+#[path = "internal/majutsu_cli.rs"]
+mod majutsu_cli;
+#[path = "internal/majutsu_core.rs"]
+mod majutsu_core;
+#[path = "internal/majutsu_crypto.rs"]
+mod majutsu_crypto;
+#[path = "internal/majutsu_daemon.rs"]
+mod majutsu_daemon;
+#[path = "internal/majutsu_db.rs"]
+mod majutsu_db;
+#[path = "internal/majutsu_large.rs"]
+mod majutsu_large;
+#[path = "internal/majutsu_pack.rs"]
+mod majutsu_pack;
+#[path = "internal/majutsu_policy.rs"]
+mod majutsu_policy;
+#[path = "internal/majutsu_restore.rs"]
+mod majutsu_restore;
+#[path = "internal/majutsu_store.rs"]
+mod majutsu_store;
+#[path = "internal/majutsu_watch.rs"]
+mod majutsu_watch;
+
+use crate::majutsu_core::{
     FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, LiveMetadataReferences,
     MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
     RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
@@ -10,19 +29,19 @@ use majutsu_core::{
     operation_log_entry_matches, payload_blob_ref, payload_large_ref, snapshot_export_matches,
     snapshot_manifest_matches, tree_manifest_issues,
 };
-use majutsu_crypto::EncryptionMode;
-use majutsu_large::{
+use crate::majutsu_crypto::EncryptionMode;
+use crate::majutsu_large::{
     ChunkExport, LargeObjectExport, LargePinExport, LargePinIssue, large_manifest_issues,
     large_pin_issues,
 };
-use majutsu_pack::{
+use crate::majutsu_pack::{
     PackExport, PackIndex, PackIndexIssue, PackObjectIssue, PackedBlobMetadata,
     missing_pack_metadata_ids, pack_index_issues, pack_object_issues,
 };
-use majutsu_restore::{
+use crate::majutsu_restore::{
     RestoreQueueItem, classify_restore_object_availability, validate_relative_filter_path,
 };
-use majutsu_store::{
+use crate::majutsu_store::{
     BlobExport, REMOTE_CHUNK_INDEX_SHARD_KEY, RemoteChunkIndexShard as ChunkIndexShard,
     RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostSummary,
     canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
@@ -31,6 +50,10 @@ use majutsu_store::{
     host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
     remote_gc_mark_key, remote_gc_tombstone_prefix,
 };
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
+use clap::Parser;
+use hmac::{Hmac, Mac};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -252,8 +275,8 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
                 chunk_size: default_chunk_size(),
                 max_parallel_uploads: default_large_max_parallel_uploads(),
                 multipart: true,
-                always: majutsu_large::default_large_always_patterns(),
-                never: majutsu_large::default_large_never_patterns(),
+                always: crate::majutsu_large::default_large_always_patterns(),
+                never: crate::majutsu_large::default_large_never_patterns(),
                 compression: LargeCompressionConfig::default(),
             },
             pack: PackConfig::default(),
@@ -277,7 +300,7 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
         write_master_key(paths, &random_key_hex()?)?;
     }
     if config.security.encryption == "age" {
-        majutsu_crypto::ensure_age_keyring(&recipients_path(paths))?;
+        crate::majutsu_crypto::ensure_age_keyring(&recipients_path(paths))?;
     }
     let conn = open_db(paths)?;
     migrate(&conn)?;
@@ -1017,7 +1040,7 @@ pub(crate) fn validate_clone_remote_chunk_index(
             .with_context(|| {
                 format!("parse remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}")
             })?;
-    if shard.version != 1 || shard.shard != majutsu_store::DEFAULT_CHUNK_INDEX_SHARD {
+    if shard.version != 1 || shard.shard != crate::majutsu_store::DEFAULT_CHUNK_INDEX_SHARD {
         bail!("remote chunk index shard metadata does not match export");
     }
     if shard.chunks.len() != export.chunks.len() {
@@ -1145,12 +1168,15 @@ pub(crate) fn validate_clone_remote_oplog(
         .next()
     {
         match issue {
-            majutsu_core::OperationLogComparisonIssue::CountMismatch { expected, actual } => {
+            crate::majutsu_core::OperationLogComparisonIssue::CountMismatch {
+                expected,
+                actual,
+            } => {
                 bail!(
                     "remote operation log count mismatch {key} expected={expected} actual={actual}"
                 );
             }
-            majutsu_core::OperationLogComparisonIssue::EntryMismatch { index, id } => {
+            crate::majutsu_core::OperationLogComparisonIssue::EntryMismatch { index, id } => {
                 bail!(
                     "remote operation log entry does not match metadata {key} {id} index={index}"
                 );
@@ -1408,7 +1434,7 @@ fn validate_clone_remote_lifecycle_policy(remote: &RemoteStore, key: &str) -> Re
     let policy: serde_json::Value = serde_json::from_slice(&remote.get(key)?)
         .with_context(|| format!("parse lifecycle policy {key}"))?;
     if key == "lifecycle/policy-s3.json" {
-        majutsu_policy::s3_lifecycle_configuration_xml(&policy)
+        crate::majutsu_policy::s3_lifecycle_configuration_xml(&policy)
             .with_context(|| format!("validate S3 lifecycle policy {key}"))?;
     } else if !policy.get("rule").is_some_and(|rule| rule.is_array()) {
         bail!("invalid GCS lifecycle policy {key}: missing rule array");
@@ -1429,7 +1455,7 @@ pub(crate) fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
         .iter()
         .map(|snapshot| snapshot.id.clone())
         .collect::<BTreeSet<_>>();
-    for issue in majutsu_db::local_ref_issues(
+    for issue in crate::majutsu_db::local_ref_issues(
         export
             .refs
             .iter()
@@ -2451,7 +2477,7 @@ fn scan_root(
                 size: bytes.len() as u64,
                 object_key: object_key.clone(),
             });
-            if bytes.len() as u64 <= majutsu_pack::SMALL_BLOB_MAX_SIZE {
+            if bytes.len() as u64 <= crate::majutsu_pack::SMALL_BLOB_MAX_SIZE {
                 Payload::InlineSmall { oid, object_key }
             } else {
                 Payload::NormalBlob { oid, object_key }
@@ -2551,8 +2577,11 @@ fn store_large_file_buffered(
         return Ok((oid, manifest_key, chunk_count));
     }
     let mut chunks = Vec::new();
-    let ranges =
-        majutsu_large::chunk_ranges_for_bytes(&config.default_chunking, config.chunk_size, &bytes);
+    let ranges = crate::majutsu_large::chunk_ranges_for_bytes(
+        &config.default_chunking,
+        config.chunk_size,
+        &bytes,
+    );
     for (index, (start, end)) in ranges.into_iter().enumerate() {
         let chunk = &bytes[start..end];
         let chunk_oid = blake3_hex(chunk);
@@ -2789,9 +2818,9 @@ fn compress_large_chunk(
     config: &LargeConfig,
     rel: &Path,
     bytes: &[u8],
-) -> Result<majutsu_large::StoredLargeChunk> {
+) -> Result<crate::majutsu_large::StoredLargeChunk> {
     let name = rel.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    majutsu_large::compress_chunk_if_useful(majutsu_large::CompressionInput {
+    crate::majutsu_large::compress_chunk_if_useful(crate::majutsu_large::CompressionInput {
         bytes,
         enabled: config.compression.enabled,
         algorithm: &config.compression.algorithm,
@@ -2884,8 +2913,8 @@ fn open_db(paths: &Paths) -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(majutsu_db::schema_sql())?;
-    for migration in majutsu_db::compat_migrations() {
+    conn.execute_batch(crate::majutsu_db::schema_sql())?;
+    for migration in crate::majutsu_db::compat_migrations() {
         let _ = conn.execute(migration, []);
     }
     Ok(())
@@ -3455,7 +3484,12 @@ pub(crate) fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
             .map(|config| encryption_mode(&config.security))
             .transpose()?
             .unwrap_or(EncryptionMode::None);
-        majutsu_crypto::encode_object(bytes, mode, &paths.master_key, &recipients_path(paths))
+        crate::majutsu_crypto::encode_object(
+            bytes,
+            mode,
+            &paths.master_key,
+            &recipients_path(paths),
+        )
     } else {
         Ok(bytes.to_vec())
     }
@@ -3546,7 +3580,7 @@ pub(crate) fn read_blob_payload(
 }
 
 pub(crate) fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
-    majutsu_crypto::decode_object(bytes, &paths.master_key, &recipients_path(paths))
+    crate::majutsu_crypto::decode_object(bytes, &paths.master_key, &recipients_path(paths))
 }
 
 pub(crate) fn recipients_path(paths: &Paths) -> PathBuf {
@@ -3554,19 +3588,19 @@ pub(crate) fn recipients_path(paths: &Paths) -> PathBuf {
 }
 
 pub(crate) fn random_key_hex() -> Result<String> {
-    majutsu_crypto::random_key_hex()
+    crate::majutsu_crypto::random_key_hex()
 }
 
 pub(crate) fn validate_key_hex(hex_key: &str) -> Result<()> {
-    majutsu_crypto::validate_key_hex(hex_key)
+    crate::majutsu_crypto::validate_key_hex(hex_key)
 }
 
 pub(crate) fn read_master_key(paths: &Paths) -> Result<String> {
-    majutsu_crypto::read_master_key(&paths.master_key)
+    crate::majutsu_crypto::read_master_key(&paths.master_key)
 }
 
 pub(crate) fn write_master_key(paths: &Paths, hex_key: &str) -> Result<()> {
-    majutsu_crypto::write_master_key(&paths.master_key, hex_key)
+    crate::majutsu_crypto::write_master_key(&paths.master_key, hex_key)
 }
 
 fn hostname_from_env() -> Result<String> {
@@ -4000,7 +4034,7 @@ tier = "Bulk"
         .unwrap();
         let root = tmp.path().join("root");
         fs::create_dir_all(&root).unwrap();
-        let payload = vec![b'x'; (majutsu_pack::SMALL_BLOB_MAX_SIZE as usize) + 1024];
+        let payload = vec![b'x'; (crate::majutsu_pack::SMALL_BLOB_MAX_SIZE as usize) + 1024];
         fs::write(root.join("payload.bin"), &payload).unwrap();
         root_cmd(
             &paths,

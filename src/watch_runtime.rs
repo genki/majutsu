@@ -22,13 +22,13 @@ use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
 use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
 
 pub fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
-    majutsu_watch::WatchBackend::normalize(backend)
+    crate::majutsu_watch::WatchBackend::normalize(backend)
         .map(|backend| backend.as_cli())
         .map_err(anyhow::Error::msg)
 }
 
 pub fn default_daemon_backend() -> &'static str {
-    majutsu_watch::default_backend()
+    crate::majutsu_watch::default_backend()
 }
 
 pub fn default_watch_backend() -> String {

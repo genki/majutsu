@@ -1,12 +1,12 @@
+use crate::majutsu_cli::{parse_byte_size, parse_duration_millis};
+use crate::majutsu_core::{OperationLogEntry as OperationExport, SnapshotExport, SnapshotMode};
+use crate::majutsu_crypto::EncryptionMode;
+use crate::majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
+use crate::majutsu_pack::PackExport;
+use crate::majutsu_store::BlobExport;
+use crate::majutsu_watch::WatchMode;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use majutsu_cli::{parse_byte_size, parse_duration_millis};
-use majutsu_core::{OperationLogEntry as OperationExport, SnapshotExport, SnapshotMode};
-use majutsu_crypto::EncryptionMode;
-use majutsu_large::{ChunkExport, LargeObjectExport, LargePinExport};
-use majutsu_pack::PackExport;
-use majutsu_store::BlobExport;
-use majutsu_watch::WatchMode;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::env;
@@ -557,13 +557,13 @@ fn configured_state_home_from(
     Ok(Some(PathBuf::from(home)))
 }
 
-pub(crate) fn policy_config(tiering: &TieringConfig) -> majutsu_policy::PolicyConfig {
-    majutsu_policy::PolicyConfig {
+pub(crate) fn policy_config(tiering: &TieringConfig) -> crate::majutsu_policy::PolicyConfig {
+    crate::majutsu_policy::PolicyConfig {
         enabled: tiering.enabled,
         rules: tiering
             .rules
             .iter()
-            .map(|rule| majutsu_policy::PolicyRule {
+            .map(|rule| crate::majutsu_policy::PolicyRule {
                 name: rule.name.clone(),
                 prefix: rule.prefix.clone(),
                 after: rule.after.clone(),
@@ -607,7 +607,7 @@ pub(crate) fn validate_watch_mode(mode: &str) -> Result<()> {
 
 fn validate_security_config(security: &SecurityConfig) -> Result<()> {
     encryption_enabled(security)?;
-    majutsu_crypto::validate_security_hash(&security.hash)
+    crate::majutsu_crypto::validate_security_hash(&security.hash)
 }
 
 fn validate_large_config(large: &LargeConfig) -> Result<()> {
@@ -638,11 +638,11 @@ fn validate_pack_config(pack: &PackConfig) -> Result<()> {
 }
 
 fn validate_tiering_config(tiering: &TieringConfig) -> Result<()> {
-    majutsu_policy::s3_lifecycle_policy(&policy_config(tiering)).map(|_| ())
+    crate::majutsu_policy::s3_lifecycle_policy(&policy_config(tiering)).map(|_| ())
 }
 
 pub(crate) fn encryption_enabled(security: &SecurityConfig) -> Result<bool> {
-    majutsu_crypto::encryption_enabled(&security.encryption)
+    crate::majutsu_crypto::encryption_enabled(&security.encryption)
 }
 
 pub(crate) fn encryption_mode(security: &SecurityConfig) -> Result<EncryptionMode> {
@@ -650,7 +650,7 @@ pub(crate) fn encryption_mode(security: &SecurityConfig) -> Result<EncryptionMod
 }
 
 pub(crate) fn validate_large_chunking(chunking: &str) -> Result<()> {
-    majutsu_large::validate_chunking(chunking)
+    crate::majutsu_large::validate_chunking(chunking)
 }
 
 pub(crate) fn validate_restore_archive_config(config: &RestoreArchiveConfig) -> Result<()> {
@@ -771,7 +771,7 @@ pub(crate) fn default_snapshot_mode() -> String {
 }
 
 pub(crate) fn default_large_chunking() -> String {
-    majutsu_large::default_chunking().into()
+    crate::majutsu_large::default_chunking().into()
 }
 
 fn default_true() -> bool {
@@ -779,91 +779,91 @@ fn default_true() -> bool {
 }
 
 pub(crate) fn default_large_min_size() -> u64 {
-    majutsu_large::default_large_min_size()
+    crate::majutsu_large::default_large_min_size()
 }
 
 pub(crate) fn default_large_max_parallel_uploads() -> usize {
-    majutsu_large::default_max_parallel_uploads()
+    crate::majutsu_large::default_max_parallel_uploads()
 }
 
 pub(crate) fn default_large_binary_min_size() -> u64 {
-    majutsu_large::default_large_binary_min_size()
+    crate::majutsu_large::default_large_binary_min_size()
 }
 
 pub(crate) fn default_large_chunked_min_size() -> u64 {
-    majutsu_large::default_chunked_min_size()
+    crate::majutsu_large::default_chunked_min_size()
 }
 
 pub(crate) fn default_large_chunked_chunk_size() -> usize {
-    majutsu_large::default_chunked_chunk_size()
+    crate::majutsu_large::default_chunked_chunk_size()
 }
 
 pub(crate) fn default_chunk_size() -> usize {
-    majutsu_large::default_chunk_size()
+    crate::majutsu_large::default_chunk_size()
 }
 
 fn default_large_compression_algorithm() -> String {
-    majutsu_large::default_compression_algorithm().into()
+    crate::majutsu_large::default_compression_algorithm().into()
 }
 
 fn default_large_compression_level() -> i32 {
-    majutsu_large::default_compression_level()
+    crate::majutsu_large::default_compression_level()
 }
 
 fn default_large_compression_sample_bytes() -> usize {
-    majutsu_large::default_compression_sample_bytes()
+    crate::majutsu_large::default_compression_sample_bytes()
 }
 
 fn default_large_compression_min_gain_ratio() -> f64 {
-    majutsu_large::default_compression_min_gain_ratio()
+    crate::majutsu_large::default_compression_min_gain_ratio()
 }
 
 fn default_large_compression_skip_extensions() -> Vec<String> {
-    majutsu_large::default_compression_skip_extensions()
+    crate::majutsu_large::default_compression_skip_extensions()
 }
 
 fn default_small_pack_target() -> u64 {
-    majutsu_pack::default_small_pack_target()
+    crate::majutsu_pack::default_small_pack_target()
 }
 
 fn default_normal_pack_target() -> u64 {
-    majutsu_pack::default_normal_pack_target()
+    crate::majutsu_pack::default_normal_pack_target()
 }
 
 fn default_watch_mode() -> String {
-    majutsu_watch::default_mode().into()
+    crate::majutsu_watch::default_mode().into()
 }
 
 fn default_watch_debounce_ms() -> u64 {
-    majutsu_watch::default_debounce().as_millis() as u64
+    crate::majutsu_watch::default_debounce().as_millis() as u64
 }
 
 fn default_watch_settle_ms() -> u64 {
-    majutsu_watch::default_settle().as_millis() as u64
+    crate::majutsu_watch::default_settle().as_millis() as u64
 }
 
 fn default_watch_buffer_max_ms() -> u64 {
-    majutsu_watch::default_buffer_max().as_millis() as u64
+    crate::majutsu_watch::default_buffer_max().as_millis() as u64
 }
 
 fn default_watch_buffer_max_events() -> usize {
-    majutsu_watch::default_buffer_max_events()
+    crate::majutsu_watch::default_buffer_max_events()
 }
 
 fn default_watch_periodic_rescan_secs() -> u64 {
-    majutsu_watch::default_periodic_rescan().as_secs()
+    crate::majutsu_watch::default_periodic_rescan().as_secs()
 }
 
 fn default_watch_interval_secs() -> u64 {
-    majutsu_watch::default_poll_interval().as_secs()
+    crate::majutsu_watch::default_poll_interval().as_secs()
 }
 
 pub(crate) fn default_security_key_id() -> String {
-    majutsu_crypto::default_security_key_id().into()
+    crate::majutsu_crypto::default_security_key_id().into()
 }
 
 pub(crate) fn default_security_hash() -> String {
-    majutsu_crypto::default_security_hash().into()
+    crate::majutsu_crypto::default_security_hash().into()
 }
 
 fn default_restore_archive_days() -> u32 {
@@ -875,7 +875,7 @@ fn default_restore_archive_tier() -> String {
 }
 
 fn default_tiering_rules() -> Vec<TieringRule> {
-    majutsu_policy::default_tiering_rules()
+    crate::majutsu_policy::default_tiering_rules()
         .into_iter()
         .map(|rule| TieringRule {
             name: rule.name,

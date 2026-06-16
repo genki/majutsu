@@ -1,9 +1,9 @@
-use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
-use majutsu_core::OperationLogEntry as OperationExport;
-use majutsu_store::{
+use crate::majutsu_core::OperationLogEntry as OperationExport;
+use crate::majutsu_store::{
     host_current_ref_key, host_last_synced_ref_key, host_root_ack_ref_key, host_root_ack_ref_prefix,
 };
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -702,8 +702,8 @@ struct HealthInputs<'a> {
     daemon: &'a DaemonHealth,
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
-    current_manifest: Option<&'a majutsu_core::SnapshotManifest>,
-    remote_manifest: Option<&'a majutsu_core::SnapshotManifest>,
+    current_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
+    remote_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     conn: &'a Connection,
 }
 
@@ -1711,7 +1711,7 @@ struct StateQueues {
     restore_jobs: u64,
 }
 
-fn pending_journal_event_count(records: &[majutsu_db::EventJournalRecord]) -> usize {
+fn pending_journal_event_count(records: &[crate::majutsu_db::EventJournalRecord]) -> usize {
     let last_snapshot_finish = records
         .iter()
         .filter(|event| event.is_snapshot_finish())
@@ -2140,7 +2140,7 @@ fn compact_timestamp(value: &str) -> String {
 
 fn root_remote_sync_label(
     remote_ack: Option<&RemoteRootAck>,
-    remote_manifest: Option<&majutsu_core::SnapshotManifest>,
+    remote_manifest: Option<&crate::majutsu_core::SnapshotManifest>,
     root_id: &str,
     current_tree_id: &str,
     remote_last_synced: Option<&str>,
@@ -3097,8 +3097,8 @@ fn operation_file_changes(
 
 fn snapshot_file_changes(
     paths: &Paths,
-    from: Option<&majutsu_core::SnapshotManifest>,
-    to: &majutsu_core::SnapshotManifest,
+    from: Option<&crate::majutsu_core::SnapshotManifest>,
+    to: &crate::majutsu_core::SnapshotManifest,
     root: Option<&str>,
     full: bool,
 ) -> Result<Vec<FileChange>> {
@@ -3145,8 +3145,8 @@ fn snapshot_file_changes(
 
 fn snapshot_file_changes_from_root_trees(
     paths: &Paths,
-    from: Option<&majutsu_core::SnapshotManifest>,
-    to: &majutsu_core::SnapshotManifest,
+    from: Option<&crate::majutsu_core::SnapshotManifest>,
+    to: &crate::majutsu_core::SnapshotManifest,
     root: Option<&str>,
     full: bool,
 ) -> Result<Vec<FileChange>> {
@@ -3215,8 +3215,8 @@ fn snapshot_file_changes_from_root_trees(
 
 fn large_tree_fold_required(
     paths: &Paths,
-    from_tree: Option<&majutsu_core::RootSnapshot>,
-    to_tree: Option<&majutsu_core::RootSnapshot>,
+    from_tree: Option<&crate::majutsu_core::RootSnapshot>,
+    to_tree: Option<&crate::majutsu_core::RootSnapshot>,
     limit: usize,
 ) -> bool {
     const DEFAULT_TREE_OBJECT_DETAIL_LIMIT: u64 = 128 * 1024;
@@ -3250,8 +3250,8 @@ fn tree_object_bytes(paths: &Paths, key: &str) -> u64 {
 }
 
 fn folded_root_status(
-    from_tree: Option<&majutsu_core::RootSnapshot>,
-    to_tree: Option<&majutsu_core::RootSnapshot>,
+    from_tree: Option<&crate::majutsu_core::RootSnapshot>,
+    to_tree: Option<&crate::majutsu_core::RootSnapshot>,
 ) -> &'static str {
     match (from_tree, to_tree) {
         (None, Some(_)) => "A",
@@ -3262,9 +3262,9 @@ fn folded_root_status(
 
 fn root_file_map(
     paths: &Paths,
-    snapshot: Option<&majutsu_core::SnapshotManifest>,
+    snapshot: Option<&crate::majutsu_core::SnapshotManifest>,
     root_id: &str,
-) -> Result<BTreeMap<String, majutsu_core::FileRecord>> {
+) -> Result<BTreeMap<String, crate::majutsu_core::FileRecord>> {
     let Some(snapshot) = snapshot else {
         return Ok(BTreeMap::new());
     };
@@ -3481,8 +3481,8 @@ pub(crate) fn diff_cmd(paths: &Paths, args: DiffArgs) -> Result<()> {
 
 fn print_snapshot_diff(
     paths: &Paths,
-    from: Option<&majutsu_core::SnapshotManifest>,
-    to: &majutsu_core::SnapshotManifest,
+    from: Option<&crate::majutsu_core::SnapshotManifest>,
+    to: &crate::majutsu_core::SnapshotManifest,
     root: Option<&str>,
 ) -> Result<()> {
     for change in snapshot_file_changes(paths, from, to, root, true)? {

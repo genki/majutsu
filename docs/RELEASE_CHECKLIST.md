@@ -40,8 +40,8 @@
 6. release tag を作成する。
 
    ```sh
-   git tag v0.4.0
-   git push origin v0.4.0
+   git tag v0.4.2
+   git push origin v0.4.2
    ```
 
 7. release artifact をローカルで展開して smoke test を実行する。
@@ -70,8 +70,8 @@
 
 10. ローカル生成した release artifact で `mj --version` と `mj --help` が動作することを release note に記録する。
 
-11. crates.io へ公開する場合は、workspace crate の依存順を守って dry-run
-    してから実 publish する。
+11. crates.io へ公開する場合は、公開対象が root `majutsu` crate のみである
+    ことを確認し、dry-run してから実 publish する。
 
     ```sh
     scripts/publish-crates-io.sh

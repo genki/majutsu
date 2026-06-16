@@ -1,10 +1,8 @@
-use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
-use majutsu_core::{
+use crate::majutsu_core::{
     LargeManifest, OperationLogEntry as OperationExport, SnapshotManifest, TreeManifest,
 };
-use majutsu_pack::PackIndex;
-use majutsu_store::{
+use crate::majutsu_pack::PackIndex;
+use crate::majutsu_store::{
     REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY, RemoteChunkIndexEntry as ChunkIndexEntry,
     RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
     RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostSummary,
@@ -15,6 +13,8 @@ use majutsu_store::{
     host_snapshots_prefix, is_content_addressed_remote_key, remote_gc_mark_key,
     remote_gc_tombstone_key,
 };
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -621,7 +621,7 @@ fn enqueue_and_drain_sync(
         enqueue_inline_upload(
             paths,
             &host_oplog_key(&config.host.id),
-            majutsu_core::encode_operation_log(&remote_export.operations)?,
+            crate::majutsu_core::encode_operation_log(&remote_export.operations)?,
         )?;
     }
     if should_upload_full_remote_oplog(remote) {
@@ -877,7 +877,7 @@ fn sync_content_local_object_keys(
                 if let Ok(tree) = tree_manifest_for_object_keys(paths, &root_tree.tree_key) {
                     for record in tree.entries.values() {
                         if let Some((_, manifest_key, _)) =
-                            majutsu_core::payload_large_ref(&record.payload)
+                            crate::majutsu_core::payload_large_ref(&record.payload)
                         {
                             keys.push(manifest_key.to_string());
                         }
@@ -908,7 +908,7 @@ fn sync_content_local_object_keys(
 
 fn current_snapshot_manifest_for_object_keys(
     paths: &Paths,
-    snapshot: &majutsu_core::SnapshotExport,
+    snapshot: &crate::majutsu_core::SnapshotExport,
 ) -> Result<SnapshotManifest> {
     if !snapshot.manifest_json.trim().is_empty() {
         return Ok(serde_json::from_str(&snapshot.manifest_json)?);
@@ -1162,7 +1162,7 @@ fn enqueue_snapshot_uploads_if_needed(
     remote: &RemoteStore,
     cache: &RemoteSyncCache,
     host_id: &str,
-    snapshot: &majutsu_core::SnapshotExport,
+    snapshot: &crate::majutsu_core::SnapshotExport,
 ) -> Result<()> {
     let canonical_key = host_snapshot_canonical_key(host_id, &snapshot.id);
     let fingerprint = payload_fingerprint(&serde_json::to_vec(snapshot)?);
@@ -1660,7 +1660,7 @@ fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Res
 }
 
 fn encode_canonical_remote_oplog(paths: &Paths, operations: &[OperationExport]) -> Result<Vec<u8>> {
-    let cborl = majutsu_core::encode_operation_log(operations)?;
+    let cborl = crate::majutsu_core::encode_operation_log(operations)?;
     let compressed = zstd::stream::encode_all(cborl.as_slice(), 3)?;
     encode_object(paths, &compressed)
 }

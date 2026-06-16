@@ -1,7 +1,7 @@
+use crate::majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
+use crate::majutsu_store::BlobExport;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use majutsu_pack::{PackEntry, PackExport, PackIndex, PackTier};
-use majutsu_store::BlobExport;
 use rusqlite::{Connection, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -67,7 +67,7 @@ where
 {
     let target_size = target_size.max(1);
     let mut indexes = Vec::new();
-    let prefixes = majutsu_pack::date_prefixes(tier, Utc::now());
+    let prefixes = crate::majutsu_pack::date_prefixes(tier, Utc::now());
     let mut pack = open_pack(paths, &prefixes.pack_prefix, &prefixes.index_prefix)?;
     for blob in blobs {
         let payload = payload_for(blob)?;
@@ -106,7 +106,7 @@ where
     let (small_blobs, normal_blobs): (Vec<_>, Vec<_>) = blobs
         .iter()
         .cloned()
-        .partition(|blob| majutsu_pack::tier_for_blob(blob.size) == PackTier::Small);
+        .partition(|blob| crate::majutsu_pack::tier_for_blob(blob.size) == PackTier::Small);
     let mut indexes = Vec::new();
     indexes.extend(write_blob_packs(
         paths,
@@ -142,8 +142,8 @@ struct OpenPack {
 
 fn open_pack(paths: &Paths, pack_prefix: &str, index_prefix: &str) -> Result<OpenPack> {
     let pack_id = new_id("pack");
-    let pack_key = majutsu_pack::pack_key(pack_prefix, &pack_id);
-    let index_key = majutsu_pack::index_key(index_prefix, &pack_id);
+    let pack_key = crate::majutsu_pack::pack_key(pack_prefix, &pack_id);
+    let index_key = crate::majutsu_pack::index_key(index_prefix, &pack_id);
     let pack_path = paths.home.join(&pack_key);
     if let Some(parent) = pack_path.parent() {
         fs::create_dir_all(parent)?;

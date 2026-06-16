@@ -1442,11 +1442,13 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "majutsu"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "age",
  "anyhow",
  "base64 0.22.1",
  "blake3",
+ "chacha20poly1305",
  "chrono",
  "clap",
  "filetime",
@@ -1455,19 +1457,9 @@ dependencies = [
  "hmac",
  "ignore",
  "libc",
- "majutsu-cli",
- "majutsu-core",
- "majutsu-crypto",
- "majutsu-daemon",
- "majutsu-db",
- "majutsu-large",
- "majutsu-pack",
- "majutsu-policy",
- "majutsu-restore",
- "majutsu-store",
- "majutsu-watch",
  "notify",
  "quick-xml",
+ "rand",
  "reqwest",
  "rusqlite",
  "serde",

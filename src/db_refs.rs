@@ -1,6 +1,6 @@
+use crate::majutsu_store::{host_current_ref_key, host_last_synced_ref_key};
 use anyhow::Result;
 use chrono::Utc;
-use majutsu_store::{host_current_ref_key, host_last_synced_ref_key};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 

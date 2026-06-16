@@ -6,6 +6,7 @@ description = "Database schema and queue models for majutsu"
 license = "MIT"
 repository = "https://github.com/genki/majutsu"
 homepage = "https://github.com/genki/majutsu"
+publish = false
 
 [dependencies]
 blake3 = "1"

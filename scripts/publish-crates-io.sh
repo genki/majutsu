@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/publish-crates-io.sh [--execute] [--allow-dirty] [--no-skip-existing]
 
-Publish majutsu workspace crates to crates.io in dependency order.
+Publish the public majutsu crate to crates.io.
 
 Default mode is dry-run. Use --execute only after local release checks pass.
 Set CARGO_REGISTRY_TOKEN in the environment before --execute.
@@ -45,20 +45,7 @@ if [ "$execute" -eq 1 ] && [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
   exit 2
 fi
 
-packages=(
-  majutsu-core
-  majutsu-cli
-  majutsu-crypto
-  majutsu-daemon
-  majutsu-db
-  majutsu-policy
-  majutsu-watch
-  majutsu-large
-  majutsu-pack
-  majutsu-restore
-  majutsu-store
-  majutsu
-)
+packages=(majutsu)
 
 package_version() {
   local pkg="$1"

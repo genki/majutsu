@@ -1,5 +1,5 @@
+use crate::majutsu_core::FileRecord;
 use anyhow::{Context, Result, bail};
-use majutsu_core::FileRecord;
 use std::fs;
 use std::path::Path;
 

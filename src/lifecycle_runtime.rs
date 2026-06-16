@@ -100,8 +100,8 @@ pub(crate) fn lifecycle_cmd(paths: &Paths, command: LifecycleCommand) -> Result<
 
 fn lifecycle_policy_for_provider(config: &Config, provider: &str) -> Result<serde_json::Value> {
     match normalize_lifecycle_provider(provider)?.as_str() {
-        "gcs" => majutsu_policy::gcs_lifecycle_policy(&policy_config(&config.tiering)),
-        "s3" => majutsu_policy::s3_lifecycle_policy(&policy_config(&config.tiering)),
+        "gcs" => crate::majutsu_policy::gcs_lifecycle_policy(&policy_config(&config.tiering)),
+        "s3" => crate::majutsu_policy::s3_lifecycle_policy(&policy_config(&config.tiering)),
         other => bail!("unsupported lifecycle provider: {other}"),
     }
 }

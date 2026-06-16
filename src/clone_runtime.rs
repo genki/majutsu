@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
-use majutsu_store::{
+use crate::majutsu_store::{
     LEGACY_METADATA_EXPORT_KEY, RemoteHostIndex, RemoteHostSummary, select_remote_host,
 };
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -169,11 +169,11 @@ impl CloneTrace {
     }
 }
 
-fn snapshot_metadata_is_compact(snapshot: &majutsu_core::SnapshotExport) -> bool {
+fn snapshot_metadata_is_compact(snapshot: &crate::majutsu_core::SnapshotExport) -> bool {
     if snapshot.manifest_json.trim().is_empty() {
         return true;
     }
-    serde_json::from_str::<majutsu_core::SnapshotManifest>(&snapshot.manifest_json)
+    serde_json::from_str::<crate::majutsu_core::SnapshotManifest>(&snapshot.manifest_json)
         .map(|manifest| manifest.roots.is_empty() && !manifest.root_trees.is_empty())
         .unwrap_or(false)
 }

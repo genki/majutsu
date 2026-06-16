@@ -1,7 +1,7 @@
 # crates.io release
 
-`majutsu` is published as a Cargo workspace. The user-facing install target is
-the root `majutsu` crate, which provides the `mj` binary:
+`majutsu` is published as a single public crate. The install target is the root
+`majutsu` crate, which provides the `mj` binary:
 
 ```sh
 cargo install majutsu
@@ -9,8 +9,9 @@ cargo install majutsu
 
 ## Current package shape
 
-The 0.4.0 release publishes these crates because the root binary crate depends
-on the internal workspace crates:
+Only the root `majutsu` package is publishable. The support crates under
+`crates/` are repository-local workspace boundaries and are marked
+`publish = false`:
 
 ```text
 majutsu-core
@@ -24,12 +25,12 @@ majutsu-large
 majutsu-pack
 majutsu-restore
 majutsu-store
-majutsu
 ```
 
-The dependency order matters. Crates that depend on `majutsu-core` must be
-published after `majutsu-core`, and the root `majutsu` crate must be published
-last.
+The published root crate embeds the support source under `src/internal/`, so
+the crates.io package has no dependency on private `majutsu-*` crates. This
+avoids publishing unstable internal API crates and keeps `cargo install
+majutsu` self-contained.
 
 ## Recommended process
 
@@ -39,16 +40,16 @@ last.
    scripts/check-completion.sh
    ```
 
-2. Verify package metadata and dependency order with dry-run publishing.
+2. Verify package metadata with dry-run publishing.
 
    ```sh
    scripts/publish-crates-io.sh
    ```
 
-   The helper requires `jq` because it reads package versions from
-   `cargo metadata`. It skips package versions that already exist on crates.io
-   by default. Use `--no-skip-existing` only when checking the exact package
-   command output for an unpublished version.
+   The helper publishes only the public `majutsu` crate. It skips a package
+   version that already exists on crates.io by default. Use
+   `--no-skip-existing` only when checking the exact package command output for
+   an unpublished version.
 
 3. Publish only after the dry-run passes and the release commit is pushed.
 
@@ -91,25 +92,17 @@ used as the crates.io or GitHub release identifier.
 
 ## Rate limits
 
-crates.io applies a strict rate limit to publishing many new crates in a short
-period. The publish helper retries `Too Many Requests` responses in execute
-mode, sleeping for `PUBLISH_RETRY_SECS` seconds, defaulting to 610 seconds.
+crates.io can apply rate limits to publish requests. The publish helper retries
+`Too Many Requests` responses in execute mode, sleeping for
+`PUBLISH_RETRY_SECS` seconds, defaulting to 610 seconds.
 
 The helper also skips already-published versions before calling
 `cargo publish`, which avoids unnecessary registry requests during reruns.
 
-For future releases of already-created crates, this limit should be less
-painful than the first 0.4.0 publish.
-
 ## Future cleanup
 
 The current split is useful inside the repository, but not every internal crate
-is necessarily a public API. For a cleaner long-term publishing model, prefer
-one of these directions:
-
-- Keep publishing the workspace crates as a coordinated set and use
-  `scripts/publish-crates-io.sh` or a release manager such as `cargo-release`.
-- Collapse purely internal crates back into the root package before publishing.
-- Keep only stable public library crates publishable and mark private internal
-  crates with `publish = false`; this requires the root published crate not to
-  depend on unpublished path-only packages.
+is a public API. Keep support crates private until a stable library API is
+intentionally designed. If a public library crate is added later, release it as
+a separate compatibility commitment instead of exposing the current internal
+workspace crates by accident.

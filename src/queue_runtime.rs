@@ -1,7 +1,7 @@
+use crate::majutsu_db::{EventJournalRecord, UploadQueueItem, expected_upload_queue_item_id};
+use crate::majutsu_store::{canonical_remote_aliases, is_content_addressed_remote_key};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
-use majutsu_db::{EventJournalRecord, UploadQueueItem, expected_upload_queue_item_id};
-use majutsu_store::{canonical_remote_aliases, is_content_addressed_remote_key};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
@@ -457,7 +457,7 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
 
 pub(crate) fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
     let records = event_journal_records(paths)?;
-    Ok(majutsu_db::has_pending_journal_events(&records))
+    Ok(crate::majutsu_db::has_pending_journal_events(&records))
 }
 
 pub(crate) fn compact_event_journal_force(paths: &Paths) -> Result<usize> {

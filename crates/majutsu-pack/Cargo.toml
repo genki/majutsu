@@ -6,6 +6,11 @@ description = "Pack file metadata and validation for majutsu"
 license = "MIT"
 repository = "https://github.com/genki/majutsu"
 homepage = "https://github.com/genki/majutsu"
+publish = false
+
+[features]
+default = ["standalone-crate"]
+standalone-crate = []
 
 [dependencies]
 chrono = "0.4"

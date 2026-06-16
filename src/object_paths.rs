@@ -1,11 +1,11 @@
+use crate::majutsu_core::{TreeManifest, payload_large_ref};
 use anyhow::Result;
-use majutsu_core::{TreeManifest, payload_large_ref};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use crate::config::{MetadataExport, Paths};
+use crate::majutsu_store::{canonical_remote_alias, canonical_remote_aliases};
 use crate::util::path_to_slash;
-use majutsu_store::{canonical_remote_alias, canonical_remote_aliases};
 use std::fs;
 
 pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<String>> {
@@ -73,8 +73,8 @@ fn local_object_keys_inner(
 
 fn snapshot_manifest_for_object_keys(
     paths: &Paths,
-    snapshot: &majutsu_core::SnapshotExport,
-) -> Result<majutsu_core::SnapshotManifest> {
+    snapshot: &crate::majutsu_core::SnapshotExport,
+) -> Result<crate::majutsu_core::SnapshotManifest> {
     if !snapshot.manifest_json.trim().is_empty() {
         return Ok(serde_json::from_str(&snapshot.manifest_json)?);
     }
@@ -167,7 +167,7 @@ pub(crate) fn local_object_keys_from_metadata(export: &MetadataExport) -> Vec<St
     for snapshot in &export.snapshots {
         keys.push(snapshot.manifest_key.clone());
         if let Ok(manifest) =
-            serde_json::from_str::<majutsu_core::SnapshotManifest>(&snapshot.manifest_json)
+            serde_json::from_str::<crate::majutsu_core::SnapshotManifest>(&snapshot.manifest_json)
         {
             for root_tree in manifest.root_trees.values() {
                 keys.push(root_tree.tree_key.clone());
@@ -238,8 +238,8 @@ mod tests {
         default_large_chunked_min_size, default_large_chunking, default_large_max_parallel_uploads,
         default_large_min_size,
     };
+    use crate::majutsu_store::BlobExport;
     use chrono::Utc;
-    use majutsu_store::BlobExport;
     use std::collections::BTreeMap;
 
     fn empty_export() -> MetadataExport {

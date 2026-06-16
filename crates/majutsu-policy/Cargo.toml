@@ -6,6 +6,7 @@ description = "Lifecycle and prune policy helpers for majutsu"
 license = "MIT"
 repository = "https://github.com/genki/majutsu"
 homepage = "https://github.com/genki/majutsu"
+publish = false
 
 [dependencies]
 anyhow = "1"

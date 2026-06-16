@@ -1,5 +1,4 @@
-use anyhow::{Context, Result, bail};
-use majutsu_core::{
+use crate::majutsu_core::{
     ConfigRootIssue, HistoryGraphIssue, HostFileIssue, LargeManifest, LiveMetadataReferences,
     MetadataReferenceIssue, OperationLogComparisonIssue, OperationLogEntry as OperationExport,
     OperationLogEntryIssue, SnapshotExport, SnapshotManifest, TreeManifest,
@@ -8,19 +7,19 @@ use majutsu_core::{
     payload_blob_ref, payload_large_ref, snapshot_export_matches, snapshot_manifest_matches,
     tree_manifest_issues,
 };
-use majutsu_db::{
+use crate::majutsu_db::{
     EventJournalRecord, EventJournalRecordIssue, RemoteObjectKeyIssue, UploadQueueItem,
     UploadQueueItemIssue, local_ref_issues, remote_ref_issues,
 };
-use majutsu_large::{
+use crate::majutsu_large::{
     LargePinIssue, large_chunk_hash_matches, large_manifest_issues, large_pin_issues,
 };
-use majutsu_pack::{
+use crate::majutsu_pack::{
     PackIndex, PackIndexIssue, PackObjectIssue, missing_pack_metadata_ids, pack_index_issues,
     pack_object_issues,
 };
-use majutsu_restore::{RestoreQueueItem, validate_relative_filter_path};
-use majutsu_store::{
+use crate::majutsu_restore::{RestoreQueueItem, validate_relative_filter_path};
+use crate::majutsu_store::{
     BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
     RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
     RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
@@ -31,6 +30,7 @@ use majutsu_store::{
     host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
     remote_gc_mark_key, remote_gc_tombstone_prefix, remote_object_availability_issues,
 };
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2222,7 +2222,7 @@ pub(crate) fn validate_remote_large_manifest_objects(
 fn validate_remote_large_chunk_object(
     paths: &Paths,
     remote: &RemoteStore,
-    chunk: &majutsu_core::LargeChunk,
+    chunk: &crate::majutsu_core::LargeChunk,
     budget: &mut RemotePayloadFsckBudget,
     missing: &mut usize,
 ) -> Result<()> {
@@ -3398,7 +3398,7 @@ fn validate_remote_lifecycle_policy(
         }
     };
     if key == "lifecycle/policy-s3.json" {
-        if let Err(err) = majutsu_policy::s3_lifecycle_configuration_xml(&policy) {
+        if let Err(err) = crate::majutsu_policy::s3_lifecycle_configuration_xml(&policy) {
             *missing += 1;
             eprintln!("invalid S3 lifecycle policy {key}: {err}");
         }

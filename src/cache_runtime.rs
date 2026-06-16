@@ -1,5 +1,5 @@
+use crate::majutsu_store::canonical_remote_alias;
 use anyhow::{Context, Result, anyhow};
-use majutsu_store::canonical_remote_alias;
 use std::collections::BTreeSet;
 use std::fs;
 
@@ -380,11 +380,11 @@ fn metadata_cache_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<Str
                 continue;
             }
             let bytes = fs::read(path)?;
-            serde_json::from_slice::<majutsu_core::SnapshotManifest>(&crate::decode_object(
+            serde_json::from_slice::<crate::majutsu_core::SnapshotManifest>(&crate::decode_object(
                 paths, &bytes,
             )?)?
         } else {
-            serde_json::from_str::<majutsu_core::SnapshotManifest>(&snapshot.manifest_json)?
+            serde_json::from_str::<crate::majutsu_core::SnapshotManifest>(&snapshot.manifest_json)?
         };
         {
             keys.extend(

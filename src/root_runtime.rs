@@ -1,6 +1,8 @@
+use crate::majutsu_core::{
+    LargeManifest, Payload, SnapshotManifest, TreeManifest, payload_blob_ref,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use majutsu_core::{LargeManifest, Payload, SnapshotManifest, TreeManifest, payload_blob_ref};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -545,7 +547,8 @@ fn read_metadata_manifest<T: for<'de> serde::Deserialize<'de>>(
         }
     }
     let remote = remote.ok_or_else(|| anyhow!("metadata object is not cached locally: {key}"))?;
-    let remote_key = majutsu_store::canonical_remote_alias(key).unwrap_or_else(|| key.to_string());
+    let remote_key =
+        crate::majutsu_store::canonical_remote_alias(key).unwrap_or_else(|| key.to_string());
     let bytes = remote.get(&remote_key)?;
     crate::decode_canonical_remote_export(paths, &bytes)
 }
@@ -577,7 +580,7 @@ fn resolve_remote_keys(
 }
 
 fn remote_key_candidates(key: &str, is_s3_remote: bool) -> Vec<String> {
-    let alias = majutsu_store::canonical_remote_alias(key).filter(|alias| alias != key);
+    let alias = crate::majutsu_store::canonical_remote_alias(key).filter(|alias| alias != key);
     match (is_s3_remote, alias) {
         (true, Some(alias)) => vec![alias, key.to_string()],
         (_, Some(alias)) => vec![key.to_string(), alias],

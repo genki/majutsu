@@ -6,5 +6,6 @@ description = "Filesystem watch policy helpers for majutsu"
 license = "MIT"
 repository = "https://github.com/genki/majutsu"
 homepage = "https://github.com/genki/majutsu"
+publish = false
 
 [dependencies]
