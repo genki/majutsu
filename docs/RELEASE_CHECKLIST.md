@@ -47,9 +47,9 @@
 7. release artifact をローカルで展開して smoke test を実行する。
 
    ```sh
-   tar -tf dist/majutsu-*.tar.gz
+   tar -tf target/dist/majutsu-*.tar.gz
    tmp=$(mktemp -d)
-   tar -xzf dist/majutsu-*.tar.gz -C "$tmp"
+   tar -xzf target/dist/majutsu-*.tar.gz -C "$tmp"
    "$tmp"/majutsu-*/mj --version
    "$tmp"/majutsu-*/mj --help
    ```

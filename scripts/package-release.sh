@@ -3,7 +3,8 @@ set -euo pipefail
 
 mode="${1:-release}"
 target_dir="${CARGO_TARGET_DIR:-target}"
-mkdir -p dist
+dist_dir="${MAJUTSU_DIST_DIR:-${target_dir}/dist}"
+mkdir -p "$dist_dir"
 
 if [[ "$mode" == "dev" ]]; then
   MAJUTSU_DEV_BUILD=1 cargo build --locked
@@ -24,7 +25,7 @@ fi
 version="$($bin --version | awk '{print $2}')"
 package_version="${version/+/-}"
 platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
-stage="dist/majutsu-${package_version}-${platform}"
+stage="${dist_dir}/majutsu-${package_version}-${platform}"
 rm -rf "$stage"
 mkdir -p "$stage"
 cp "$bin" "$stage/mj"
@@ -33,10 +34,10 @@ if [[ -f LICENSE ]]; then cp LICENSE "$stage/LICENSE"; fi
 if [[ -d docs ]]; then cp -R docs "$stage/docs"; fi
 
 if command -v tar >/dev/null 2>&1; then
-  tar -C dist -czf "${stage}.tar.gz" "$(basename "$stage")"
+  tar -C "$dist_dir" -czf "${stage}.tar.gz" "$(basename "$stage")"
 fi
 if command -v zip >/dev/null 2>&1; then
-  (cd dist && zip -qr "$(basename "$stage").zip" "$(basename "$stage")")
+  (cd "$dist_dir" && zip -qr "$(basename "$stage").zip" "$(basename "$stage")")
 fi
 
-echo "release artifact を dist/ に出力しました"
+echo "release artifact を ${dist_dir}/ に出力しました"

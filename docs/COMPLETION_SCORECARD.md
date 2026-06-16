@@ -43,7 +43,7 @@ MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh
 - [x] release artifact はローカルで生成し、展開後の smoke test まで completion gate で確認する。検証: `scripts/check-completion.sh`
 - [x] provider matrix で supported とした provider がすべて検証済みである。対象: File remote, MinIO via Podman, GCS S3-compatible endpoint。詳細: `docs/PROVIDER_MATRIX.md`
 - [x] archive / cold tier restore は、実 provider drill が通った provider だけ supported とし、未検証 provider は experimental として扱う。検証: `docs/PROVIDER_MATRIX.md`
-- [x] `scripts/package-release.sh` が `mj`、README、docs を含む自己完結 archive を生成する。検証: `scripts/check-completion.sh`
+- [x] `scripts/package-release.sh` が `target/dist/` に `mj`、README、docs を含む自己完結 archive を生成する。検証: `scripts/check-completion.sh`
 
 ## 完成宣言
 

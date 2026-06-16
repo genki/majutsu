@@ -23,7 +23,7 @@ MAJUTSU_RUN_MINIO_E2E=1 scripts/check-completion.sh
 
 ```sh
 scripts/package-release.sh
-tar -tf dist/majutsu-*.tar.gz
+tar -tf target/dist/majutsu-*.tar.gz
 ```
 
 - artifact:

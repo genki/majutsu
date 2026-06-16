@@ -62,6 +62,10 @@ scripts/sync-internal-crates.sh
    `--no-skip-existing` only when checking the exact package command output for
    an unpublished version.
 
+   Release archives are generated under `target/dist/` by default so they do
+   not make the repository dirty for `cargo publish`. Set `MAJUTSU_DIST_DIR`
+   only when an explicit artifact destination is needed.
+
 3. Publish only after the dry-run passes and the release commit is pushed.
 
    ```sh
