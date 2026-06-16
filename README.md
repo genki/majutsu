@@ -230,7 +230,9 @@ target_chunk_size = "8 MiB"
 ```
 
 Large size settings accept either byte integers or strings such as `"64 MiB"`,
-`"16 MiB"`, and `"8 MiB"`.
+`"16 MiB"`, and `"8 MiB"`. By default, non-large files at or above 512 KiB are
+stored as 64 KiB chunked blobs so repeated medium-file edits can reuse unchanged
+chunks instead of re-uploading the whole blob.
 
 Root-specific large-file policy can override the global thresholds and
 patterns:

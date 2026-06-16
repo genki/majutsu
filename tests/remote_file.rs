@@ -316,7 +316,7 @@ fn file_remote_clone_restores_normal_and_large_files() {
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("binary_min_size = 16777216", "binary_min_size = 131072")
-        .replace("chunked_min_size = 1048576", "chunked_min_size = 131072")
+        .replace("chunked_min_size = 524288", "chunked_min_size = 131072")
         .replace("chunk_size = 8388608", "chunk_size = 65536");
     fs::write(&config_path, config).unwrap();
     run({
@@ -6717,7 +6717,7 @@ fn snapshot_manifest_uses_spec_payload_variants() {
     let config = fs::read_to_string(&config_path)
         .unwrap()
         .replace("binary_min_size = 16777216", "binary_min_size = 131072")
-        .replace("chunked_min_size = 1048576", "chunked_min_size = 131072")
+        .replace("chunked_min_size = 524288", "chunked_min_size = 131072")
         .replace("chunk_size = 8388608", "chunk_size = 65536");
     fs::write(&config_path, config).unwrap();
     run({
@@ -12376,13 +12376,13 @@ fn root_large_policy_override_can_route_small_files_to_large_pipeline() {
 }
 
 #[test]
-fn default_chunked_min_size_routes_medium_text_to_chunked_blob() {
+fn default_chunked_min_size_routes_half_mib_text_to_chunked_blob() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
     fs::create_dir_all(&source).unwrap();
-    let mut medium = Vec::with_capacity(1024 * 1024 + 128);
-    for i in 0..1024 * 1024 + 128 {
+    let mut medium = Vec::with_capacity(512 * 1024 + 128);
+    for i in 0..512 * 1024 + 128 {
         medium.push(b'a' + (i % 26) as u8);
     }
     fs::write(source.join("medium.log"), &medium).unwrap();
@@ -12415,8 +12415,82 @@ fn default_chunked_min_size_routes_medium_text_to_chunked_blob() {
     );
     assert_eq!(
         tree["entries"]["medium.log"]["payload"]["chunk_count"],
-        serde_json::Value::from(17)
+        serde_json::Value::from(9)
     );
+}
+
+#[test]
+fn default_chunked_blob_reuses_unchanged_chunks_after_medium_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    let mut medium = Vec::with_capacity(512 * 1024 + 128);
+    for i in 0..512 * 1024 + 128 {
+        medium.push(b'a' + (i % 26) as u8);
+    }
+    fs::write(source.join("medium.log"), &medium).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let first_chunks = latest_payload_chunk_oids(&state, "sample", "medium.log");
+
+    medium[300 * 1024] = b'Z';
+    fs::write(source.join("medium.log"), &medium).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let second_chunks = latest_payload_chunk_oids(&state, "sample", "medium.log");
+
+    assert_eq!(first_chunks.len(), 9);
+    assert_eq!(second_chunks.len(), 9);
+    let reused = first_chunks
+        .iter()
+        .zip(second_chunks.iter())
+        .filter(|(left, right)| left == right)
+        .count();
+    assert_eq!(reused, 8);
+}
+
+fn latest_payload_chunk_oids(state: &std::path::Path, root: &str, path: &str) -> Vec<String> {
+    let manifest = local_snapshot_manifest(state, "desc");
+    let payload = manifest["roots"][root]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["path"] == path)
+        .unwrap()["payload"]
+        .clone();
+    assert_eq!(payload["type"], "chunked-blob");
+    let manifest_key = payload["manifest_key"].as_str().unwrap();
+    let large_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join(manifest_key)).unwrap()).unwrap();
+    large_manifest["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|chunk| chunk["oid"].as_str().unwrap().to_string())
+        .collect()
 }
 
 #[test]
