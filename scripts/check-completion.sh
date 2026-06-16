@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+scripts/sync-internal-crates.sh --check
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked
 RUST_TEST_THREADS=1 cargo test --workspace --all-targets --locked -- --nocapture

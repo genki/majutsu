@@ -32,6 +32,13 @@ the crates.io package has no dependency on private `majutsu-*` crates. This
 avoids publishing unstable internal API crates and keeps `cargo install
 majutsu` self-contained.
 
+When changing a private support crate, refresh the embedded source before
+running release checks:
+
+```sh
+scripts/sync-internal-crates.sh
+```
+
 ## Recommended process
 
 1. Run the local release gate.
@@ -39,6 +46,10 @@ majutsu` self-contained.
    ```sh
    scripts/check-completion.sh
    ```
+
+   The gate includes `scripts/sync-internal-crates.sh --check` so the
+   publish-facing `src/internal/` mirror cannot drift from the private
+   workspace support crates.
 
 2. Verify package metadata with dry-run publishing.
 

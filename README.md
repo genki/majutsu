@@ -93,6 +93,13 @@ CLI continues to preserve compatibility. These support crates are not published
 to crates.io; the public package is the root `majutsu` crate, and its publish
 tarball embeds the same support source under `src/internal/`.
 
+After changing a support crate, refresh and verify the embedded publish mirror:
+
+```sh
+scripts/sync-internal-crates.sh
+scripts/sync-internal-crates.sh --check
+```
+
 ## State Home
 
 State home resolution order:
