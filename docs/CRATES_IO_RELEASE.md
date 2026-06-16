@@ -60,8 +60,34 @@ last.
 4. Verify installation from crates.io.
 
    ```sh
-   cargo install majutsu --version 0.4.0 --root "$(mktemp -d)"
+   cargo install majutsu --version 0.4.2 --locked --root "$(mktemp -d)"
    ```
+
+## Version display policy
+
+Published crates.io and GitHub release versions use clean SemVer package
+versions, such as `0.4.2`. The released `mj --version` output should match the
+package version:
+
+```text
+mj 0.4.2
+```
+
+Build metadata such as `+build.N` is reserved for local development builds and
+other non-published diagnostics. To include it explicitly, build with:
+
+```sh
+MAJUTSU_DEV_BUILD=1 cargo build
+```
+
+That produces version output such as:
+
+```text
+mj 0.4.2+build.3
+```
+
+`BUILD_NUMBER` can still be incremented for local batches, but it must not be
+used as the crates.io or GitHub release identifier.
 
 ## Rate limits
 

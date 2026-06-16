@@ -26,11 +26,15 @@
    scripts/package-release.sh
    ```
 
-5. `BUILD_NUMBER` を確認し、ある程度まとまった実装単位・検証単位ごとにインクリメントする。
+5. version 表示方針を確認する。crates.io / GitHub Release に出す正式版は
+   `0.4.2` のような clean SemVer とし、`mj --version` も同じ値を返す。
+   `+build.N` は `MAJUTSU_DEV_BUILD=1` で作る開発版だけに使う。
 
    ```sh
    cat BUILD_NUMBER
    mj --version
+   MAJUTSU_DEV_BUILD=1 cargo build --locked
+   target/debug/mj --version
    ```
 
 6. release tag を作成する。
@@ -73,7 +77,7 @@
     scripts/publish-crates-io.sh
     export CARGO_REGISTRY_TOKEN=...
     scripts/publish-crates-io.sh --execute
-    cargo install majutsu --version 0.4.0 --root "$(mktemp -d)"
+    cargo install majutsu --version 0.4.2 --locked --root "$(mktemp -d)"
     ```
 
     詳細は `docs/CRATES_IO_RELEASE.md` を参照する。

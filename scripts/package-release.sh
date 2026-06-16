@@ -2,14 +2,18 @@
 set -euo pipefail
 
 mode="${1:-release}"
+target_dir="${CARGO_TARGET_DIR:-target}"
 mkdir -p dist
 
-if [[ "$mode" == "smoke" ]]; then
+if [[ "$mode" == "dev" ]]; then
+  MAJUTSU_DEV_BUILD=1 cargo build --locked
+  bin="$target_dir/debug/mj"
+elif [[ "$mode" == "smoke" ]]; then
   cargo build --locked
-  bin="target/debug/mj"
+  bin="$target_dir/debug/mj"
 else
   cargo build --release --locked
-  bin="target/release/mj"
+  bin="$target_dir/release/mj"
 fi
 
 if [[ ! -x "$bin" ]]; then

@@ -30,6 +30,9 @@ tar -tf dist/majutsu-*.tar.gz
 - `mj --version`:
 - `mj --help` 確認: yes/no
 
+正式releaseの `mj --version` は package version と一致させ、`+build.N` を
+含めない。`+build.N` は `MAJUTSU_DEV_BUILD=1` で作る開発buildだけに使う。
+
 ## provider validation
 
 | Provider | Status | Evidence |
