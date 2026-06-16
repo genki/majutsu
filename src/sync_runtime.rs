@@ -669,15 +669,18 @@ fn enqueue_and_drain_sync(
             )?;
         }
     }
-    let host_index = update_remote_host_index(remote, config, &remote_export, &host_metadata)?;
+    let (host_index, host_index_changed) =
+        update_remote_host_index(remote, config, &remote_export, &host_metadata)?;
     trace.mark("host index");
-    enqueue_inline_upload(
-        paths,
-        REMOTE_HOST_INDEX_KEY,
-        serde_json::to_vec_pretty(&host_index)?,
-    )?;
+    if host_index_changed {
+        enqueue_inline_upload(
+            paths,
+            REMOTE_HOST_INDEX_KEY,
+            serde_json::to_vec_pretty(&host_index)?,
+        )?;
+    }
     enqueue_remote_head_if_supported(paths, remote, config, &remote_export, &host_metadata)?;
-    enqueue_clone_bootstrap_if_supported(paths, remote, host_index)?;
+    enqueue_clone_bootstrap_if_supported(paths, remote, host_index, host_index_changed)?;
     trace.mark("clone bootstrap");
     let recipients = paths.home.join("keys/recipients.toml");
     if recipients.exists() {
@@ -1119,6 +1122,7 @@ fn enqueue_clone_bootstrap_if_supported(
     paths: &Paths,
     remote: &RemoteStore,
     host_index: RemoteHostIndex,
+    force: bool,
 ) -> Result<()> {
     if !matches!(remote, RemoteStore::S3(_)) {
         return Ok(());
@@ -1127,7 +1131,7 @@ fn enqueue_clone_bootstrap_if_supported(
         version: CLONE_BOOTSTRAP_VERSION,
         host_index,
     };
-    if !should_upload_s3_clone_bootstrap(remote)? {
+    if !force && !should_upload_s3_clone_bootstrap(remote)? {
         return Ok(());
     }
     let json = serde_json::to_vec(&bootstrap)?;
@@ -1760,7 +1764,7 @@ fn update_remote_host_index(
     config: &Config,
     export: &MetadataExport,
     metadata_key: &str,
-) -> Result<RemoteHostIndex> {
+) -> Result<(RemoteHostIndex, bool)> {
     let mut index = read_remote_host_index(remote)?;
     let last_synced_at = export
         .refs
@@ -1775,8 +1779,45 @@ fn update_remote_host_index(
         current_snapshot: export.refs.get("current").cloned(),
         metadata_key: metadata_key.to_string(),
     };
+    if matches!(remote, RemoteStore::S3(_)) && !sync_s3_host_index_every_time() {
+        let (summary, changed) = compact_s3_host_index_summary(
+            index.hosts.iter().find(|host| host.id == config.host.id),
+            summary,
+        );
+        if changed {
+            index.upsert_host(summary, Utc::now());
+        }
+        return Ok((index, changed));
+    }
     index.upsert_host(summary, Utc::now());
-    Ok(index)
+    Ok((index, true))
+}
+
+fn sync_s3_host_index_every_time() -> bool {
+    env::var("MAJUTSU_SYNC_S3_HOST_INDEX_EVERY_TIME")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn compact_s3_host_index_summary(
+    existing: Option<&RemoteHostSummary>,
+    desired: RemoteHostSummary,
+) -> (RemoteHostSummary, bool) {
+    let Some(existing) = existing else {
+        return (desired, true);
+    };
+    let changed = existing.name != desired.name || existing.metadata_key != desired.metadata_key;
+    if changed {
+        return (desired, true);
+    }
+    let summary = RemoteHostSummary {
+        id: desired.id,
+        name: desired.name,
+        last_synced_at: existing.last_synced_at,
+        current_snapshot: existing.current_snapshot.clone(),
+        metadata_key: desired.metadata_key,
+    };
+    (summary, false)
 }
 
 fn prune_remote_host_exports(
@@ -2015,4 +2056,64 @@ fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> 
         &remote_gc_tombstone_key(host_id, &new_id("tombstone")),
         &serde_json::to_vec_pretty(&tombstone)?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RemoteHostSummary, compact_s3_host_index_summary};
+    use chrono::{DateTime, Utc};
+
+    fn host_summary(name: &str, current: Option<&str>, metadata_key: &str) -> RemoteHostSummary {
+        RemoteHostSummary {
+            id: "host-a".into(),
+            name: name.into(),
+            last_synced_at: DateTime::<Utc>::UNIX_EPOCH,
+            current_snapshot: current.map(str::to_string),
+            metadata_key: metadata_key.into(),
+        }
+    }
+
+    #[test]
+    fn compact_s3_host_index_keeps_identity_stable_across_snapshot_changes() {
+        let existing = host_summary(
+            "workstation",
+            Some("snap-old"),
+            "hosts/host-a/metadata/export.json.zst",
+        );
+        let desired = RemoteHostSummary {
+            last_synced_at: Utc::now(),
+            current_snapshot: Some("snap-new".into()),
+            ..host_summary(
+                "workstation",
+                Some("snap-new"),
+                "hosts/host-a/metadata/export.json.zst",
+            )
+        };
+
+        let (summary, changed) = compact_s3_host_index_summary(Some(&existing), desired);
+
+        assert!(!changed);
+        assert_eq!(summary.current_snapshot.as_deref(), Some("snap-old"));
+        assert_eq!(summary.last_synced_at, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn compact_s3_host_index_updates_when_discovery_identity_changes() {
+        let existing = host_summary(
+            "old-name",
+            Some("snap-old"),
+            "hosts/host-a/metadata/export.json.zst",
+        );
+        let desired = host_summary(
+            "new-name",
+            Some("snap-new"),
+            "hosts/host-a/metadata/export.json.zst",
+        );
+
+        let (summary, changed) = compact_s3_host_index_summary(Some(&existing), desired);
+
+        assert!(changed);
+        assert_eq!(summary.name, "new-name");
+        assert_eq!(summary.current_snapshot.as_deref(), Some("snap-new"));
+    }
 }

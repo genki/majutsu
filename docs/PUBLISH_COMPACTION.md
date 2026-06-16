@@ -41,6 +41,18 @@ MAJUTSU_SYNC_REMOTE_REF_OBJECTS=1 mj sync
 MAJUTSU_SYNC_LEGACY_CURRENT_REFS=1 mj sync
 ```
 
+## host index
+
+`hosts/index.json` は host discovery 用の identity index として扱う。S3/GCS 互換 backend では
+同じ host id / name / metadata key のままなら、current snapshot や last-synced だけが進んでも
+index は毎回 publish しない。最新 current、last-synced、root ack は compact head を正とする。
+
+互換確認や手動調査で従来通り毎回更新したい場合は次を使う。
+
+```sh
+MAJUTSU_SYNC_S3_HOST_INDEX_EVERY_TIME=1 mj sync
+```
+
 ## GC mark
 
 S3/GCS 互換 backend では compact head を通常復旧の正とするため、GC mark は初回だけ seed し、

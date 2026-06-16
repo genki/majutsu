@@ -331,15 +331,16 @@ fn validate_quick_host_metadata(
             host.name, export.config.host.name
         );
     }
+    let head = read_remote_head(paths, remote, &host.id)?;
+    let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
     let current = export.refs.get("current");
-    if host.current_snapshot.as_ref() != current {
+    if host.current_snapshot.as_ref() != current && !compact_head_authoritative {
         *missing += 1;
         eprintln!(
             "host index current snapshot does not match metadata for {}",
             host.id
         );
     }
-    let head = read_remote_head(paths, remote, &host.id)?;
     if let Some(head) = head.as_ref() {
         if head.version != 1 {
             *missing += 1;
@@ -398,7 +399,7 @@ fn validate_quick_host_metadata(
     }
     if let Some(last_synced) = export.refs.get("last-synced") {
         match parse_db_time(last_synced) {
-            Ok(value) if host.last_synced_at == value => {}
+            Ok(value) if host.last_synced_at == value || compact_head_authoritative => {}
             Ok(value) => {
                 *missing += 1;
                 eprintln!(
