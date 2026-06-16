@@ -8,6 +8,10 @@ Usage: scripts/sync-internal-crates.sh [--check]
 Synchronize the publish-facing src/internal/*.rs files from the private
 workspace support crates under crates/majutsu-*/src/lib.rs.
 
+Private support crates are discovered from cargo metadata. A workspace package
+whose name starts with majutsu- and whose Cargo manifest has publish = false is
+mirrored to src/internal/<crate_name_with_underscores>.rs.
+
 Default mode updates src/internal and removes stale generated files. Use
 --check in release gates to fail when the generated files are stale or when
 unexpected mirror files remain.
@@ -36,28 +40,35 @@ done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-modules=(
-  "majutsu-cli:majutsu_cli"
-  "majutsu-core:majutsu_core"
-  "majutsu-crypto:majutsu_crypto"
-  "majutsu-daemon:majutsu_daemon"
-  "majutsu-db:majutsu_db"
-  "majutsu-large:majutsu_large"
-  "majutsu-pack:majutsu_pack"
-  "majutsu-policy:majutsu_policy"
-  "majutsu-restore:majutsu_restore"
-  "majutsu-store:majutsu_store"
-  "majutsu-watch:majutsu_watch"
-)
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required to read cargo metadata" >&2
+  exit 2
+fi
 
 mkdir -p src/internal
 
 stale=0
 expected_files=()
-for module in "${modules[@]}"; do
-  crate="${module%%:*}"
-  target="${module##*:}"
-  src="crates/${crate}/src/lib.rs"
+metadata="$(cargo metadata --no-deps --format-version 1)"
+mapfile -t support_crates < <(
+  jq -r '
+    .packages[]
+    | select(.name | startswith("majutsu-"))
+    | select(.publish == [])
+    | [.name, .manifest_path]
+    | @tsv
+  ' <<<"$metadata" | sort
+)
+
+if [ "${#support_crates[@]}" -eq 0 ]; then
+  echo "no private majutsu support crates found in cargo metadata" >&2
+  exit 1
+fi
+
+for support_crate in "${support_crates[@]}"; do
+  IFS=$'\t' read -r crate manifest_path <<<"$support_crate"
+  target="${crate//-/_}"
+  src="$(dirname "$manifest_path")/src/lib.rs"
   dst="src/internal/${target}.rs"
   expected_files+=("$dst")
 

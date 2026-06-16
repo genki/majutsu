@@ -39,6 +39,10 @@ running release checks:
 scripts/sync-internal-crates.sh
 ```
 
+The sync helper discovers private support crates from `cargo metadata`; any
+workspace package named `majutsu-*` with `publish = false` is expected to have a
+matching `src/internal/*.rs` mirror.
+
 ## Recommended process
 
 1. Run the local release gate.
