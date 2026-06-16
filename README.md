@@ -58,10 +58,16 @@ FUSE mounts run in the foreground and hydrate large-file chunks on read.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install majutsu
 ```
 
 This installs `mj`.
+
+For local development builds, use:
+
+```sh
+cargo install --path .
+```
 
 ## Workspace
 

@@ -65,3 +65,15 @@
    ```
 
 10. ローカル生成した release artifact で `mj --version` と `mj --help` が動作することを release note に記録する。
+
+11. crates.io へ公開する場合は、workspace crate の依存順を守って dry-run
+    してから実 publish する。
+
+    ```sh
+    scripts/publish-crates-io.sh
+    export CARGO_REGISTRY_TOKEN=...
+    scripts/publish-crates-io.sh --execute
+    cargo install majutsu --version 0.4.0 --root "$(mktemp -d)"
+    ```
+
+    詳細は `docs/CRATES_IO_RELEASE.md` を参照する。
