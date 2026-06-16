@@ -49,7 +49,8 @@ scripts/sync-internal-crates.sh
 
    The gate includes `scripts/sync-internal-crates.sh --check` so the
    publish-facing `src/internal/` mirror cannot drift from the private
-   workspace support crates.
+   workspace support crates. The check also rejects unexpected stale mirror
+   files.
 
 2. Verify package metadata with dry-run publishing.
 
