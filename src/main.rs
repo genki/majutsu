@@ -1,23 +1,34 @@
+#[allow(dead_code)]
 #[path = "internal/majutsu_cli.rs"]
 mod majutsu_cli;
+#[allow(dead_code)]
 #[path = "internal/majutsu_core.rs"]
 mod majutsu_core;
+#[allow(dead_code)]
 #[path = "internal/majutsu_crypto.rs"]
 mod majutsu_crypto;
+#[allow(dead_code)]
 #[path = "internal/majutsu_daemon.rs"]
 mod majutsu_daemon;
+#[allow(dead_code)]
 #[path = "internal/majutsu_db.rs"]
 mod majutsu_db;
+#[allow(dead_code)]
 #[path = "internal/majutsu_large.rs"]
 mod majutsu_large;
+#[allow(dead_code)]
 #[path = "internal/majutsu_pack.rs"]
 mod majutsu_pack;
+#[allow(dead_code)]
 #[path = "internal/majutsu_policy.rs"]
 mod majutsu_policy;
+#[allow(dead_code)]
 #[path = "internal/majutsu_restore.rs"]
 mod majutsu_restore;
+#[allow(dead_code)]
 #[path = "internal/majutsu_store.rs"]
 mod majutsu_store;
+#[allow(dead_code)]
 #[path = "internal/majutsu_watch.rs"]
 mod majutsu_watch;
 
