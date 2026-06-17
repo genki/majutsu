@@ -151,6 +151,7 @@ mod remote_store;
 mod restore_apply;
 mod restore_runtime;
 mod root_runtime;
+mod root_size_summary;
 mod root_state;
 mod snapshot_rules;
 mod snapshot_state;

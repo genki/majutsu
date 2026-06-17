@@ -169,6 +169,7 @@ pub fn history_graph_issues(
     issues
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataReferenceIssue {
     DanglingBlob { oid: String },
@@ -843,6 +844,7 @@ pub fn snapshot_manifest_matches(actual: &SnapshotManifest, expected: &SnapshotM
     serde_json::to_value(actual).ok() == serde_json::to_value(expected).ok()
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeManifestIssue {
     RootIdMismatch { expected: String, actual: String },

@@ -3,6 +3,7 @@ use crate::majutsu_core;
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 #[cfg(feature = "standalone-crate")]
+#[allow(clippy::single_component_path_imports)]
 use majutsu_core;
 use majutsu_core::{ObjectKey, RootId, SnapshotId};
 use serde::{Deserialize, Serialize};

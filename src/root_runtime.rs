@@ -18,6 +18,7 @@ use crate::config::{
 use crate::daemon_runtime::ensure_daemon_running;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteObjectStat, RemoteStore, open_remote};
+use crate::root_size_summary::{print_root_size_summary, read_root_size_summary};
 use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
 };
@@ -319,6 +320,13 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         .with_context(|| format!("read snapshot manifest key for {current}"))?;
     let config = read_config(paths)?;
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
+    if env::var("MAJUTSU_ROOT_SIZE_FORCE_SCAN").as_deref() != Ok("1")
+        && let Some(summary) =
+            read_root_size_summary(paths, remote.as_ref(), &config.host.id, &current)?
+    {
+        print_root_size_summary(&summary, args.json)?;
+        return Ok(());
+    }
     let remote_sizes = remote
         .as_ref()
         .map(|remote| root_size_remote_objects(paths, remote))

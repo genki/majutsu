@@ -12824,7 +12824,8 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(!sizes.contains("| root |"));
     assert!(sizes.contains("全体:"));
     assert!(sizes.contains("- current snapshotのユニークbackend復元単位:"));
-    assert!(sizes.contains("- GCS backend prefix全体:"));
+    assert!(sizes.contains("- GCS backend prefix全体: not scanned"));
+    assert!(sizes.contains("MAJUTSU_ROOT_SIZE_FORCE_SCAN=1 mj root size"));
 
     let json = output({
         let mut c = mj();
@@ -12850,8 +12851,10 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(report["totals"]["payload_bytes"].as_u64().unwrap() > 0);
     assert!(report["totals"]["metadata_bytes"].as_u64().unwrap() > 0);
     assert!(report["totals"]["objects"].as_u64().unwrap() > 0);
-    assert!(report["totals"]["backend_prefix_bytes"].as_u64().unwrap() > 0);
-    assert!(report["totals"]["backend_prefix_objects"].as_u64().unwrap() > 0);
+    assert_eq!(report["totals"]["backend_prefix_bytes"], 0);
+    assert_eq!(report["totals"]["backend_prefix_objects"], 0);
+    assert_eq!(report["totals"]["backend_prefix_exact"], false);
+    assert_eq!(report["totals"]["backend_prefix_scope"], "not-scanned");
 }
 
 #[test]

@@ -3,6 +3,7 @@ use crate::majutsu_core;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "standalone-crate")]
+#[allow(clippy::single_component_path_imports)]
 use majutsu_core;
 use majutsu_core::ObjectKey;
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,7 @@ pub struct LargeObjectExport {
     pub manifest_key: String,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LargeManifestIssue {
     OidMismatch { expected: String, actual: String },

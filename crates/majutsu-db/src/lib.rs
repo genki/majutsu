@@ -236,6 +236,7 @@ pub struct EventJournalRecord {
     pub raw_backend: Option<String>,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventJournalRecordIssue {
     EmptyEventId,

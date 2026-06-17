@@ -44,6 +44,9 @@ use crate::queue_runtime::{
 };
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
+use crate::root_size_summary::{
+    build_root_size_summary, encode_root_size_summary, root_size_summary_key,
+};
 use crate::snapshot_state::current_snapshot;
 use crate::util::{blake3_hex, new_id, parse_db_time};
 use crate::{
@@ -51,7 +54,7 @@ use crate::{
     remote_object_available, remote_ref,
 };
 
-const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v7";
+const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v8";
 const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
 const CLONE_BOOTSTRAP_VERSION: u32 = 2;
 const REMOTE_HEAD_VERSION: u32 = 1;
@@ -778,6 +781,22 @@ fn enqueue_and_drain_sync(
     trace.mark("content queue");
     enqueue_gc_mark_if_needed(paths, remote, config, &content_export)?;
     trace.mark("gc mark");
+    match build_root_size_summary(paths, config, &remote_export) {
+        Ok(Some(summary)) => {
+            let key = root_size_summary_key(&config.host.id);
+            let fingerprint = payload_fingerprint(&serde_json::to_vec(&summary)?);
+            sync_fingerprints.insert(key.clone(), fingerprint.clone());
+            if !cache_matches(&sync_cache, &key, &fingerprint) {
+                let bytes = encode_root_size_summary(paths, &summary)?;
+                enqueue_inline_upload_overwrite(paths, &key, bytes)?;
+            }
+            trace.mark("root size summary");
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("warning: skipped root size summary publish: {err:#}");
+        }
+    }
     let upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     trace.mark("drain queue");
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
