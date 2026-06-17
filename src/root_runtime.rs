@@ -320,12 +320,17 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         .with_context(|| format!("read snapshot manifest key for {current}"))?;
     let config = read_config(paths)?;
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
-    if env::var("MAJUTSU_ROOT_SIZE_FORCE_SCAN").as_deref() != Ok("1")
-        && let Some(summary) =
-            read_root_size_summary(paths, remote.as_ref(), &config.host.id, &current)?
-    {
-        print_root_size_summary(&summary, args.json)?;
-        return Ok(());
+    if env::var("MAJUTSU_ROOT_SIZE_FORCE_SCAN").as_deref() != Ok("1") {
+        match read_root_size_summary(paths, remote.as_ref(), &config.host.id, &current) {
+            Ok(Some(summary)) => {
+                print_root_size_summary(&summary, args.json)?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("warning: ignoring invalid root size summary: {err:#}");
+            }
+        }
     }
     let remote_sizes = remote
         .as_ref()
