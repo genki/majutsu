@@ -43,3 +43,23 @@ scripts/traffic-regression.sh
 traffic benchmark script は小さな root を作成し、root add / noop / add / edit / delete の各経路について、`synced`、`synced_bytes`、elapsed time を表示する。
 
 S3/GCS では `MAJUTSU_TRACE_REMOTE=1` を付けると、request count は従来通り stderr に表示される。
+
+`scripts/traffic-regression.sh` は、既定では object 数と転送 bytes の上限を超えた場合に非ゼロ終了する。elapsed は実行環境差が大きいため既定では判定に使わない。必要な場合は `MAJUTSU_TRAFFIC_MAX_ELAPSED_MS` を指定する。
+
+主な調整用環境変数:
+
+```sh
+MAJUTSU_TRAFFIC_MAX_ROOT_ADD_SYNCED=400
+MAJUTSU_TRAFFIC_MAX_ROOT_ADD_BYTES=500000
+MAJUTSU_TRAFFIC_MAX_NOOP_SYNCED=0
+MAJUTSU_TRAFFIC_MAX_NOOP_BYTES=0
+MAJUTSU_TRAFFIC_MAX_SMALL_SYNCED=80
+MAJUTSU_TRAFFIC_MAX_SMALL_BYTES=300000
+MAJUTSU_TRAFFIC_MAX_ELAPSED_MS=0
+```
+
+履歴を残す場合は TSV 出力先を指定する。
+
+```sh
+MAJUTSU_TRAFFIC_REPORT=target/traffic-regression.tsv scripts/traffic-regression.sh
+```
