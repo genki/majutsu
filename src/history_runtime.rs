@@ -18,7 +18,7 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use walkdir::WalkDir;
 
 use crate::atomic_io::write_atomic;
@@ -2377,6 +2377,102 @@ fn write_to_pager(output: &str) -> Result<()> {
     Ok(())
 }
 
+struct StreamingOutput {
+    buffer: String,
+    buffered_lines: usize,
+    page_height: usize,
+    pager: Option<Child>,
+    pager_stdin: Option<ChildStdin>,
+    direct: bool,
+}
+
+impl StreamingOutput {
+    fn new(page_height: usize) -> Self {
+        Self {
+            buffer: String::new(),
+            buffered_lines: 0,
+            page_height,
+            pager: None,
+            pager_stdin: None,
+            direct: !io::stdout().is_terminal(),
+        }
+    }
+
+    fn write_chunk(&mut self, chunk: &str) -> Result<()> {
+        if self.direct {
+            print!("{chunk}");
+            return Ok(());
+        }
+        if let Some(stdin) = self.pager_stdin.as_mut() {
+            io::Write::write_all(stdin, chunk.as_bytes()).context("write pager chunk")?;
+            return Ok(());
+        }
+
+        self.buffer.push_str(chunk);
+        self.buffered_lines += chunk.lines().count();
+        if self.buffered_lines > self.page_height {
+            self.start_pager()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        if self.direct {
+            return Ok(());
+        }
+        if let Some(pager) = self.pager.as_mut() {
+            self.pager_stdin.take();
+            let status = pager.wait().context("wait for pager")?;
+            if !status.success() {
+                bail!("pager exited with {status}");
+            }
+            return Ok(());
+        }
+        print!("{}", self.buffer);
+        Ok(())
+    }
+
+    fn start_pager(&mut self) -> Result<()> {
+        let pager = std::env::var("MJ_PAGER")
+            .or_else(|_| std::env::var("PAGER"))
+            .unwrap_or_else(|_| "less -R".into());
+        let mut parts = pager.split_whitespace();
+        let Some(program) = parts.next() else {
+            self.direct = true;
+            print!("{}", self.buffer);
+            self.buffer.clear();
+            return Ok(());
+        };
+        let Ok(mut child) = Command::new(program)
+            .args(parts)
+            .env(
+                "LESS",
+                std::env::var("LESS").unwrap_or_else(|_| "-R".into()),
+            )
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            self.direct = true;
+            print!("{}", self.buffer);
+            self.buffer.clear();
+            io::Write::flush(&mut io::stdout()).context("flush stdout")?;
+            return Ok(());
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            self.direct = true;
+            print!("{}", self.buffer);
+            self.buffer.clear();
+            io::Write::flush(&mut io::stdout()).context("flush stdout")?;
+            return Ok(());
+        };
+        io::Write::write_all(&mut stdin, self.buffer.as_bytes()).context("write pager buffer")?;
+        self.buffer.clear();
+        self.pager = Some(child);
+        self.pager_stdin = Some(stdin);
+        Ok(())
+    }
+}
+
 struct TerminalSize {
     cols: usize,
     rows: usize,
@@ -2951,7 +3047,7 @@ pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
 
 fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {
     let mut printed = 0usize;
-    let mut output = String::new();
+    let mut output = StreamingOutput::new(terminal_height());
     let ui = StatusUi::new();
     let file_limit = if args.full { usize::MAX } else { 120 };
     let batch_size = args.limit.max(20).saturating_mul(4).min(500);
@@ -2972,8 +3068,9 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
                 continue;
             }
             let summary = summarize_changes(&changes);
+            let mut chunk = String::new();
             writeln!(
-                output,
+                chunk,
                 "{}\t{}\t{}\t{}\t{}\t{}",
                 ui.paint(&op.created_at, "1;34"),
                 op.id,
@@ -2985,7 +3082,7 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
             let change_count = changes.len();
             for change in changes.into_iter().take(file_limit) {
                 writeln!(
-                    output,
+                    chunk,
                     "{}\t{}",
                     color_change_status(&ui, change.status),
                     change.path
@@ -2993,7 +3090,7 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
             }
             if change_count > file_limit {
                 writeln!(
-                    output,
+                    chunk,
                     "{}",
                     ui.paint(
                         &format!(
@@ -3004,10 +3101,11 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
                     )
                 )?;
             }
+            output.write_chunk(&chunk)?;
             printed += 1;
         }
     }
-    emit_status_output_auto(&output, terminal_height())
+    output.finish()
 }
 
 fn recent_change_operations(
