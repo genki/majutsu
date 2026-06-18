@@ -794,6 +794,7 @@ pub struct TreeManifest {
     pub root_node: Option<TreeNodeRef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub subtree_nodes: BTreeMap<String, TreeNodeRef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entries: BTreeMap<String, FileRecord>,
 }
 
@@ -894,10 +895,19 @@ pub fn tree_manifest_issues(
             actual: actual.tree_id.clone(),
         });
     }
-    if actual.entries.len() != expected.file_count {
+    let actual_file_count = if actual.entries.is_empty() {
+        actual
+            .root_node
+            .as_ref()
+            .map(|node| node.file_count)
+            .unwrap_or(0)
+    } else {
+        actual.entries.len()
+    };
+    if actual_file_count != expected.file_count {
         issues.push(TreeManifestIssue::FileCountMismatch {
             expected: expected.file_count,
-            actual: actual.entries.len(),
+            actual: actual_file_count,
         });
     }
     issues

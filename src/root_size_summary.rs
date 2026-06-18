@@ -5,7 +5,8 @@ use std::fs;
 
 use crate::config::{Config, MetadataExport, Paths};
 use crate::majutsu_core::{
-    LargeManifest, Payload, SnapshotExport, SnapshotManifest, TreeManifest, payload_blob_ref,
+    FileRecord, LargeManifest, Payload, SnapshotExport, SnapshotManifest, TreeManifest,
+    TreeNodeManifest, payload_blob_ref,
 };
 use crate::remote_store::RemoteStore;
 
@@ -101,7 +102,8 @@ pub(crate) fn build_root_size_summary(
         for node in tree.subtree_nodes.values() {
             stat.metadata_keys.insert(node.node_key.clone());
         }
-        for record in tree.entries.values() {
+        let entries = local_tree_entries(paths, tree)?;
+        for record in entries.values() {
             match record.kind.as_str() {
                 "directory" => stat.dirs += 1,
                 _ => {
@@ -299,6 +301,16 @@ fn read_local_metadata_object<T: for<'de> serde::Deserialize<'de>>(
         return Ok(value);
     }
     Err(anyhow!("unsupported metadata object encoding: {key}"))
+}
+
+fn local_tree_entries(paths: &Paths, tree: TreeManifest) -> Result<BTreeMap<String, FileRecord>> {
+    if !tree.entries.is_empty() || tree.root_node.is_none() {
+        return Ok(tree.entries);
+    }
+    let root_node = tree.root_node.expect("checked above");
+    let node: TreeNodeManifest = read_local_metadata_object(paths, &root_node.node_key)
+        .with_context(|| format!("read root tree node {}", root_node.node_key))?;
+    Ok(node.entries)
 }
 
 fn add_payload_keys(

@@ -714,7 +714,8 @@ fn build_fsck_scope(
         for root_tree in manifest.root_trees.values() {
             let tree: TreeManifest = read_object(paths, &root_tree.tree_key)
                 .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?;
-            for record in tree.entries.values() {
+            let entries = crate::snapshot_state::tree_entries_from_manifest(paths, tree)?;
+            for record in entries.values() {
                 if let Some((oid, _)) = payload_blob_ref(&record.payload) {
                     scope.blob_oids.insert(oid.to_string());
                 }
@@ -1362,7 +1363,10 @@ fn validate_local_metadata_references(
             let Ok(tree) = serde_json::from_slice::<TreeManifest>(&bytes) else {
                 continue;
             };
-            for record in tree.entries.values() {
+            let Ok(entries) = crate::snapshot_state::tree_entries_from_manifest(paths, tree) else {
+                continue;
+            };
+            for record in entries.values() {
                 if let Some((oid, _)) = payload_blob_ref(&record.payload) {
                     live.blobs.insert(oid.to_string());
                 } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {

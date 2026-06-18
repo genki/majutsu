@@ -58,9 +58,23 @@ quick fsck は root node の到達性と基本 metadata を確認する。deep f
 残る大きな変更:
 
 - node をトップレベルだけでなく階層全体の Merkle directory tree にする。
-- root tree から flat `entries` を省略できる format version を導入する。
 - restore / diff / fsck を node traversal で動作させる。
 - old flat tree と new node tree の混在 timeline を明示的に検証する。
+
+## 2026-06-18 v2 opt-in 実装
+
+`MAJUTSU_TREE_FORMAT=v2` を指定した snapshot / key rotation では、root tree manifest の `version` を 2 にし、flat `entries` を省略する。
+entries は `root_node.node_key` が指す `TreeNodeManifest` から展開する。
+
+対応済み:
+
+- v1 の flat `entries` は引き続き読める。
+- v2 tree は `entries` なしで local restore / clone restore できる。
+- `snapshot_state` / compact snapshot hydrate / fsck payload scope / `root size` / root size summary / sync live key 計算は root node から entries を展開する。
+- canonical remote encode-decode は tree node manifest を tree manifest と区別して扱う。
+- clone 時の GC mark 検証では `objects/trees/nodes/` と `trees/nodes/` を tree metadata として扱う。
+
+まだ v2 は opt-in のままにする。現時点の node は root node が flat entries 全体を保持するため、root tree object は小さくなるが、metadata 全体の根本削減は階層 Merkle node 化まで完了してから得られる。
 
 ## restore bundle 案
 

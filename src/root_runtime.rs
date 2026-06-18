@@ -1,5 +1,6 @@
 use crate::majutsu_core::{
-    LargeManifest, Payload, SnapshotManifest, TreeManifest, payload_blob_ref,
+    FileRecord, LargeManifest, Payload, SnapshotManifest, TreeManifest, TreeNodeManifest,
+    payload_blob_ref,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -358,7 +359,8 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         for node in tree.subtree_nodes.values() {
             stat.metadata_keys.insert(node.node_key.clone());
         }
-        for record in tree.entries.values() {
+        let entries = root_size_tree_entries(paths, remote.as_ref(), tree)?;
+        for record in entries.values() {
             match record.kind.as_str() {
                 "directory" => stat.dirs += 1,
                 _ => {
@@ -597,6 +599,20 @@ fn read_metadata_manifest<T: for<'de> serde::Deserialize<'de>>(
         crate::majutsu_store::canonical_remote_alias(key).unwrap_or_else(|| key.to_string());
     let bytes = remote.get(&remote_key)?;
     crate::decode_canonical_remote_export(paths, &bytes)
+}
+
+fn root_size_tree_entries(
+    paths: &Paths,
+    remote: Option<&RemoteStore>,
+    tree: TreeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    if !tree.entries.is_empty() || tree.root_node.is_none() {
+        return Ok(tree.entries);
+    }
+    let root_node = tree.root_node.expect("checked above");
+    let node: TreeNodeManifest = read_metadata_manifest(paths, remote, &root_node.node_key)
+        .with_context(|| format!("read root tree node {}", root_node.node_key))?;
+    Ok(node.entries)
 }
 
 struct ResolvedRemoteKeys {

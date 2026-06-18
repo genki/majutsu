@@ -127,17 +127,20 @@ fn local_snapshot_manifest(state: &std::path::Path, order: &str) -> serde_json::
             let tree_key = root_tree["tree_key"].as_str().unwrap();
             let tree: serde_json::Value =
                 serde_json::from_slice(&fs::read(state.join(tree_key)).unwrap()).unwrap();
-            roots.insert(
-                root_id.clone(),
-                serde_json::Value::Array(
-                    tree["entries"]
-                        .as_object()
-                        .unwrap()
-                        .values()
-                        .cloned()
-                        .collect(),
-                ),
-            );
+            let entries = if let Some(entries) = tree["entries"].as_object() {
+                entries.values().cloned().collect()
+            } else {
+                let node_key = tree["root_node"]["node_key"].as_str().unwrap();
+                let node: serde_json::Value =
+                    serde_json::from_slice(&fs::read(state.join(node_key)).unwrap()).unwrap();
+                node["entries"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect()
+            };
+            roots.insert(root_id.clone(), serde_json::Value::Array(entries));
         }
         manifest["roots"] = serde_json::Value::Object(roots);
     }
@@ -4829,6 +4832,95 @@ fn tree_manifests_are_stored_as_compact_json() {
     assert!(!tree_text.contains('\n'), "{tree_text}");
     assert!(tree_bytes.len() < pretty.len());
     assert_eq!(tree["entries"].as_object().unwrap().len(), 3);
+}
+
+#[test]
+fn tree_format_v2_omits_flat_entries_and_restores_from_root_node() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("nested/beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_TREE_FORMAT", "v2")
+            .arg("--home")
+            .arg(&state)
+            .arg("snapshot");
+        c
+    });
+
+    let manifest = local_snapshot_manifest(&state, "asc");
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap();
+    let tree_bytes = fs::read(state.join(tree_key)).unwrap();
+    let tree: serde_json::Value = serde_json::from_slice(&tree_bytes).unwrap();
+    assert_eq!(tree["version"], 2);
+    assert!(tree.get("entries").is_none(), "{tree}");
+    let node_key = tree["root_node"]["node_key"].as_str().unwrap();
+    let node_bytes = fs::read(state.join(node_key)).unwrap();
+    let node: serde_json::Value = serde_json::from_slice(&node_bytes).unwrap();
+    assert_eq!(node["entries"].as_object().unwrap().len(), 3);
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("--wait");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
+        "alpha\n"
+    );
+    assert_eq!(
+        fs::read_to_string(restore.join("sample/nested/beta.txt")).unwrap(),
+        "beta\n"
+    );
 }
 
 #[test]

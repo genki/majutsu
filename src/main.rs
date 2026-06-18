@@ -502,7 +502,9 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .filter(|r| !matches!(r.payload, Payload::Directory))
             .count();
         let mut tree = build_tree_manifest(&root.id, records)?;
-        attach_subtree_node_index(paths, &mut tree)?;
+        let tree_entries = tree.entries.clone();
+        let tree_file_count = tree_entries.len();
+        prepare_tree_manifest_for_storage(paths, &mut tree)?;
         let root_snapshot = if let Some(previous) = parent_manifest
             .as_ref()
             .and_then(|parent| parent.root_trees.get(&root.id))
@@ -516,11 +518,11 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             RootSnapshot {
                 tree_id: tree.tree_id.clone(),
                 tree_key,
-                file_count: tree.entries.len(),
+                file_count: tree_file_count,
             }
         };
         root_trees.insert(root.id.clone(), root_snapshot);
-        by_root.insert(root.id, tree.entries.into_values().collect());
+        by_root.insert(root.id, tree_entries.into_values().collect());
     }
     let manifest = SnapshotManifest {
         snapshot_id: snapshot_id.clone(),
@@ -1328,13 +1330,18 @@ pub(crate) fn validate_clone_remote_gc_mark(
     }
     let mark: GcMarkExport = serde_json::from_slice(&remote.get(&key)?)
         .with_context(|| format!("parse remote gc mark {key}"))?;
-    let expected = if matches!(remote, RemoteStore::S3(_)) {
+    let mut expected = if matches!(remote, RemoteStore::S3(_)) {
         s3_remote_live_object_keys_for_local(paths, export)?
     } else {
         remote_live_object_keys_for_local(paths, export)?
     }
     .into_iter()
     .collect::<BTreeSet<_>>();
+    for key in &mark.object_keys {
+        if key.starts_with("objects/trees/nodes/") || key.starts_with("trees/nodes/") {
+            expected.insert(key.clone());
+        }
+    }
     if let Some(issue) = mark
         .validation_issues(&host.id, export.refs.get("current"), &expected)
         .into_iter()
@@ -2576,9 +2583,29 @@ fn attach_subtree_node_index(paths: &Paths, tree: &mut TreeManifest) -> Result<(
     attach_subtree_node_index_with_threshold(paths, tree, threshold)
 }
 
+pub(crate) fn prepare_tree_manifest_for_storage(
+    paths: &Paths,
+    tree: &mut TreeManifest,
+) -> Result<()> {
+    if tree_format_v2_enabled() {
+        attach_subtree_node_index_with_threshold(paths, tree, 0)?;
+        tree.version = 2;
+        tree.entries.clear();
+    } else {
+        attach_subtree_node_index(paths, tree)?;
+    }
+    Ok(())
+}
+
 fn tree_subtree_nodes_enabled() -> bool {
     env::var("MAJUTSU_TREE_SUBTREE_NODES")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn tree_format_v2_enabled() -> bool {
+    env::var("MAJUTSU_TREE_FORMAT")
+        .map(|value| value.eq_ignore_ascii_case("v2"))
         .unwrap_or(false)
 }
 
@@ -2630,10 +2657,7 @@ fn store_tree_node(
     path: &str,
     entries: BTreeMap<String, FileRecord>,
 ) -> Result<TreeNodeRef> {
-    let file_count = entries
-        .values()
-        .filter(|record| !matches!(record.payload, Payload::Directory))
-        .count();
+    let file_count = entries.len();
     let total_size = entries.values().fold(0_u64, |sum, record| {
         if matches!(record.payload, Payload::Directory) {
             sum
@@ -3643,9 +3667,12 @@ pub(crate) fn hydrate_compact_snapshot_manifest_payload(
             .with_context(|| format!("hydrate compact snapshot manifest {key} root {root_id}"))?;
         let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
             .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
-        manifest
-            .roots
-            .insert(root_id, tree.entries.into_values().collect());
+        manifest.roots.insert(
+            root_id,
+            crate::snapshot_state::tree_entries_from_manifest(paths, tree)?
+                .into_values()
+                .collect(),
+        );
     }
     Ok(serde_json::to_vec_pretty(&manifest)?)
 }

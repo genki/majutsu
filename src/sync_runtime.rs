@@ -1,6 +1,6 @@
 use crate::majutsu_core::{
-    LargeManifest, OperationLogEntry as OperationExport, SnapshotManifest, TreeManifest,
-    TreeNodeManifest,
+    FileRecord, LargeManifest, OperationLogEntry as OperationExport, SnapshotManifest,
+    TreeManifest, TreeNodeManifest,
 };
 use crate::majutsu_pack::PackIndex;
 use crate::majutsu_store::{
@@ -915,7 +915,7 @@ fn sync_content_local_object_keys(
                     for node in tree.subtree_nodes.values() {
                         keys.push(node.node_key.clone());
                     }
-                    for record in tree.entries.values() {
+                    for record in tree_entries_for_object_keys(paths, &tree)?.values() {
                         if let Some((_, manifest_key, _)) =
                             crate::majutsu_core::payload_large_ref(&record.payload)
                         {
@@ -964,6 +964,19 @@ fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeMa
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
     )?)?)
+}
+
+fn tree_entries_for_object_keys(
+    paths: &Paths,
+    tree: &TreeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    if !tree.entries.is_empty() || tree.root_node.is_none() {
+        return Ok(tree.entries.clone());
+    }
+    let root_node = tree.root_node.as_ref().expect("checked above");
+    let bytes = fs::read(paths.home.join(&root_node.node_key))?;
+    let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
+    Ok(node.entries)
 }
 
 fn sync_verify_cached_remote_aliases() -> bool {

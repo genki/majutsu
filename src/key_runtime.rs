@@ -12,9 +12,9 @@ use crate::operation_log::record_op;
 use crate::snapshot_state::{current_snapshot, snapshot_manifest_from_parts};
 use crate::util::blake3_hex;
 use crate::{
-    build_tree_manifest, create_layout, open_db, query_blobs, query_chunks, query_large_objects,
-    random_key_hex, read_blob_payload, read_master_key, read_object, store_bytes, validate_key_hex,
-    write_master_key,
+    build_tree_manifest, create_layout, open_db, prepare_tree_manifest_for_storage, query_blobs,
+    query_chunks, query_large_objects, random_key_hex, read_blob_payload, read_master_key,
+    read_object, store_bytes, validate_key_hex, write_master_key,
 };
 
 pub(crate) fn key_cmd(paths: &Paths, command: KeyCommand) -> Result<()> {
@@ -152,7 +152,9 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
         rewrite_manifest_payload_keys(&mut manifest, &blob_keys, &large_manifest_keys)?;
         manifest.root_trees.clear();
         for (root_id, records) in &manifest.roots {
-            let tree = build_tree_manifest(root_id, records.clone())?;
+            let mut tree = build_tree_manifest(root_id, records.clone())?;
+            let file_count = records.len();
+            prepare_tree_manifest_for_storage(paths, &mut tree)?;
             let tree_json = serde_json::to_vec(&tree)?;
             let tree_oid = blake3_hex(&tree_json);
             let tree_key = store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
@@ -161,7 +163,7 @@ fn rotate_master_key(paths: &Paths, new_key: Option<String>) -> Result<KeyRotati
                 RootSnapshot {
                     tree_id: tree.tree_id,
                     tree_key,
-                    file_count: tree.entries.len(),
+                    file_count,
                 },
             );
             objects += 1;

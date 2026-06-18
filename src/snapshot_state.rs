@@ -1,4 +1,6 @@
-use crate::majutsu_core::{FileRecord, RootSnapshot, SnapshotManifest, TreeManifest};
+use crate::majutsu_core::{
+    FileRecord, RootSnapshot, SnapshotManifest, TreeManifest, TreeNodeManifest,
+};
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -138,9 +140,12 @@ fn snapshot_manifest_from_parts_for_root(
         })?;
         let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
             .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
-        manifest
-            .roots
-            .insert(root.to_string(), tree.entries.into_values().collect());
+        manifest.roots.insert(
+            root.to_string(),
+            tree_entries_from_manifest(paths, tree)?
+                .into_values()
+                .collect(),
+        );
     }
     Ok(manifest)
 }
@@ -174,7 +179,22 @@ pub(crate) fn load_root_tree_entries(
         .with_context(|| format!("read root tree {}", root_tree.tree_key))?;
     let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
         .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
-    Ok(tree.entries)
+    tree_entries_from_manifest(paths, tree)
+}
+
+pub(crate) fn tree_entries_from_manifest(
+    paths: &Paths,
+    tree: TreeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    if !tree.entries.is_empty() || tree.root_node.is_none() {
+        return Ok(tree.entries);
+    }
+    let root_node = tree.root_node.expect("checked above");
+    let node_bytes = crate::read_object(paths, &root_node.node_key)
+        .with_context(|| format!("read root tree node {}", root_node.node_key))?;
+    let node: TreeNodeManifest = serde_json::from_slice(&node_bytes)
+        .with_context(|| format!("parse root tree node {}", root_node.node_key))?;
+    Ok(node.entries)
 }
 
 fn hydrate_snapshot_manifest_from_remote(paths: &Paths, manifest_key: &str) -> Result<()> {

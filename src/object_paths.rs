@@ -1,5 +1,6 @@
-use crate::majutsu_core::{TreeManifest, payload_large_ref};
+use crate::majutsu_core::{FileRecord, TreeManifest, TreeNodeManifest, payload_large_ref};
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -39,7 +40,7 @@ fn local_object_keys_inner(
                     for node in tree.subtree_nodes.values() {
                         keys.push(node.node_key.clone());
                     }
-                    for record in tree.entries.values() {
+                    for record in tree_entries_for_object_keys(paths, &tree)?.values() {
                         if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
                             keys.push(manifest_key.to_string());
                         }
@@ -95,6 +96,19 @@ fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeMa
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
     )?)?)
+}
+
+fn tree_entries_for_object_keys(
+    paths: &Paths,
+    tree: &TreeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    if !tree.entries.is_empty() || tree.root_node.is_none() {
+        return Ok(tree.entries.clone());
+    }
+    let root_node = tree.root_node.as_ref().expect("checked above");
+    let bytes = fs::read(paths.home.join(&root_node.node_key))?;
+    let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
+    Ok(node.entries)
 }
 
 pub(crate) fn prefer_canonical_remote_only(key: &str) -> bool {
