@@ -546,7 +546,7 @@ pub(crate) struct SnapshotArgs {
     pub(crate) message: Option<String>,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct LogArgs {
     #[arg(
         long,

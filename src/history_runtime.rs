@@ -7,6 +7,10 @@ use crate::majutsu_store::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use crossterm::cursor;
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::execute;
+use crossterm::terminal::{self, ClearType};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +22,10 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration as StdDuration;
 use walkdir::WalkDir;
 
 use crate::atomic_io::write_atomic;
@@ -2377,110 +2384,6 @@ fn write_to_pager(output: &str) -> Result<()> {
     Ok(())
 }
 
-struct StreamingOutput {
-    buffer: String,
-    buffered_lines: usize,
-    page_height: usize,
-    pager: Option<Child>,
-    pager_stdin: Option<ChildStdin>,
-    direct: bool,
-}
-
-impl StreamingOutput {
-    fn new(page_height: usize) -> Self {
-        Self {
-            buffer: String::new(),
-            buffered_lines: 0,
-            page_height,
-            pager: None,
-            pager_stdin: None,
-            direct: !io::stdout().is_terminal(),
-        }
-    }
-
-    fn new_immediate_pager(page_height: usize) -> Self {
-        let mut output = Self::new(page_height);
-        if !output.direct {
-            let _ = output.start_pager();
-        }
-        output
-    }
-
-    fn write_chunk(&mut self, chunk: &str) -> Result<()> {
-        if self.direct {
-            print!("{chunk}");
-            return Ok(());
-        }
-        if let Some(stdin) = self.pager_stdin.as_mut() {
-            io::Write::write_all(stdin, chunk.as_bytes()).context("write pager chunk")?;
-            return Ok(());
-        }
-
-        self.buffer.push_str(chunk);
-        self.buffered_lines += chunk.lines().count();
-        if self.buffered_lines > self.page_height {
-            self.start_pager()?;
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<()> {
-        if self.direct {
-            return Ok(());
-        }
-        if let Some(pager) = self.pager.as_mut() {
-            self.pager_stdin.take();
-            let status = pager.wait().context("wait for pager")?;
-            if !status.success() {
-                bail!("pager exited with {status}");
-            }
-            return Ok(());
-        }
-        print!("{}", self.buffer);
-        Ok(())
-    }
-
-    fn start_pager(&mut self) -> Result<()> {
-        let pager = std::env::var("MJ_PAGER")
-            .or_else(|_| std::env::var("PAGER"))
-            .unwrap_or_else(|_| "less -R".into());
-        let mut parts = pager.split_whitespace();
-        let Some(program) = parts.next() else {
-            self.direct = true;
-            print!("{}", self.buffer);
-            self.buffer.clear();
-            return Ok(());
-        };
-        let Ok(mut child) = Command::new(program)
-            .args(parts)
-            .env(
-                "LESS",
-                std::env::var("LESS").unwrap_or_else(|_| "-R".into()),
-            )
-            .stdin(Stdio::piped())
-            .spawn()
-        else {
-            self.direct = true;
-            print!("{}", self.buffer);
-            self.buffer.clear();
-            io::Write::flush(&mut io::stdout()).context("flush stdout")?;
-            return Ok(());
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            self.direct = true;
-            print!("{}", self.buffer);
-            self.buffer.clear();
-            io::Write::flush(&mut io::stdout()).context("flush stdout")?;
-            return Ok(());
-        };
-        io::Write::write_all(&mut stdin, self.buffer.as_bytes()).context("write pager buffer")?;
-        self.buffer.clear();
-        self.pager = Some(child);
-        self.pager_stdin = Some(stdin);
-        Ok(())
-    }
-}
-
 struct TerminalSize {
     cols: usize,
     rows: usize,
@@ -3045,6 +2948,9 @@ fn display_option_bool(value: Option<bool>) -> String {
 
 pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
+    if !args.operations && should_use_log_viewer() {
+        return print_change_log_viewer(paths, args);
+    }
     let conn = crate::open_db(paths)?;
     if args.operations {
         print_op_log(paths, &conn, &args)
@@ -3053,9 +2959,31 @@ pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
     }
 }
 
+fn should_use_log_viewer() -> bool {
+    io::stdout().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb")
+}
+
 fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {
+    let mut output = String::new();
+    write_change_log_lines(paths, conn, args, |line| {
+        output.push_str(line);
+        output.push('\n');
+        Ok(())
+    })?;
+    print!("{output}");
+    Ok(())
+}
+
+fn write_change_log_lines<F>(
+    paths: &Paths,
+    conn: &Connection,
+    args: &LogArgs,
+    mut write_line: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let mut printed = 0usize;
-    let mut output = StreamingOutput::new_immediate_pager(terminal_height());
     let ui = StatusUi::new();
     let file_limit = if args.full { usize::MAX } else { 120 };
     let batch_size = args.limit.max(20).saturating_mul(4).min(500);
@@ -3076,9 +3004,7 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
                 continue;
             }
             let summary = summarize_changes(&changes);
-            let mut chunk = String::new();
-            writeln!(
-                chunk,
+            write_line(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}",
                 ui.paint(&op.created_at, "1;34"),
                 op.id,
@@ -3086,43 +3012,225 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
                 operation_session_label(&op),
                 summary,
                 op.message.as_deref().unwrap_or_default()
-            )?;
+            ))?;
             let change_count = changes.len();
             for change in changes.into_iter().take(file_limit) {
-                writeln!(
-                    chunk,
+                write_line(&format!(
                     "{}\t{}",
                     color_change_status(&ui, change.status),
                     change.path
-                )?;
+                ))?;
             }
             if change_count > file_limit {
-                writeln!(
-                    chunk,
-                    "{}",
-                    ui.paint(
-                        &format!(
-                            "... {} more changed files hidden; use --full to show all",
-                            change_count - file_limit
-                        ),
-                        "2"
-                    )
-                )?;
+                write_line(&ui.paint(
+                    &format!(
+                        "... {} more changed files hidden; use --full to show all",
+                        change_count - file_limit
+                    ),
+                    "2",
+                ))?;
             }
-            output.write_chunk(&chunk)?;
             printed += 1;
         }
     }
     if args.root.is_none() && printed >= args.limit {
-        let note = StatusUi::new().paint(
+        write_line(&StatusUi::new().paint(
             &format!(
-                "... showing {printed} change operations; use `mj log --limit N` for more or `mj log --operations` for internal operation records\n"
+                "... showing {printed} change operations; use `mj log --limit N` for more or `mj log --operations` for internal operation records"
             ),
             "2",
-        );
-        output.write_chunk(&note)?;
+        ))?;
     }
-    output.finish()
+    Ok(())
+}
+
+fn print_change_log_viewer(paths: &Paths, args: LogArgs) -> Result<()> {
+    let height = terminal_height();
+    let (tx, rx) = mpsc::channel::<LogProducerMessage>();
+    let producer_paths = paths.clone();
+    let producer_args = args.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let conn = crate::open_db(&producer_paths)?;
+            write_change_log_lines(&producer_paths, &conn, &producer_args, |line| {
+                tx.send(LogProducerMessage::Line(line.to_string()))
+                    .map_err(|err| anyhow!("send log line: {err}"))?;
+                Ok(())
+            })?;
+            Ok(())
+        })();
+        let _ = tx.send(match result {
+            Ok(()) => LogProducerMessage::Done,
+            Err(err) => LogProducerMessage::Error(format!("{err:#}")),
+        });
+    });
+
+    let mut lines = Vec::new();
+    let mut done = false;
+    while lines.len() <= height {
+        match rx.recv() {
+            Ok(LogProducerMessage::Line(line)) => lines.push(line),
+            Ok(LogProducerMessage::Done) => {
+                done = true;
+                break;
+            }
+            Ok(LogProducerMessage::Error(err)) => bail!("{err}"),
+            Err(_) => {
+                done = true;
+                break;
+            }
+        }
+    }
+
+    if done && lines.len() <= height {
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
+    run_log_viewer(lines, rx)
+}
+
+enum LogProducerMessage {
+    Line(String),
+    Done,
+    Error(String),
+}
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode().context("enable raw mode")?;
+        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)
+            .context("enter log viewer")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn run_log_viewer(
+    initial_lines: Vec<String>,
+    rx: mpsc::Receiver<LogProducerMessage>,
+) -> Result<()> {
+    let _guard = TerminalGuard::enter()?;
+    let mut lines = initial_lines;
+    let mut done = false;
+    let mut offset = 0usize;
+    loop {
+        drain_log_messages(&rx, &mut lines, &mut done)?;
+        draw_log_viewer(&lines, offset, done)?;
+        if event::poll(StdDuration::from_millis(80)).context("poll log viewer input")?
+            && let Event::Key(key) = event::read().context("read log viewer input")?
+        {
+            let page = terminal_height().saturating_sub(1).max(1);
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    offset = offset.saturating_add(1).min(lines.len().saturating_sub(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    offset = offset.saturating_sub(1);
+                }
+                KeyCode::Char(' ') | KeyCode::PageDown => {
+                    offset = offset
+                        .saturating_add(page)
+                        .min(lines.len().saturating_sub(1));
+                }
+                KeyCode::Char('b') | KeyCode::PageUp => {
+                    offset = offset.saturating_sub(page);
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    offset = 0;
+                }
+                KeyCode::Char('G') | KeyCode::End if done => {
+                    offset = lines.len().saturating_sub(page);
+                }
+                _ => {}
+            }
+        }
+        if done && lines.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn drain_log_messages(
+    rx: &mpsc::Receiver<LogProducerMessage>,
+    lines: &mut Vec<String>,
+    done: &mut bool,
+) -> Result<()> {
+    while let Ok(message) = rx.try_recv() {
+        match message {
+            LogProducerMessage::Line(line) => lines.push(line),
+            LogProducerMessage::Done => *done = true,
+            LogProducerMessage::Error(err) => bail!("{err}"),
+        }
+    }
+    Ok(())
+}
+
+fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
+    let size = terminal::size().context("read terminal size")?;
+    let width = usize::from(size.0).max(1);
+    let height = usize::from(size.1).max(1);
+    let body_height = height.saturating_sub(1);
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(ClearType::All)
+    )
+    .context("clear log viewer")?;
+    for row in 0..body_height {
+        let Some(line) = lines.get(offset + row) else {
+            break;
+        };
+        let rendered = truncate_for_terminal(line, width);
+        println!("{rendered}");
+    }
+    let status = if done {
+        format!(
+            "mj log {}/{}  j/k scroll  space/b page  g/G top/bottom  q quit",
+            lines.len().min(offset + body_height),
+            lines.len()
+        )
+    } else {
+        format!(
+            "mj log {}/{}+  loading...  j/k scroll  space/b page  q quit",
+            lines.len().min(offset + body_height),
+            lines.len()
+        )
+    };
+    execute!(
+        io::stdout(),
+        cursor::MoveTo(0, size.1.saturating_sub(1)),
+        terminal::Clear(ClearType::CurrentLine)
+    )
+    .context("draw log viewer status")?;
+    print!("{}", truncate_for_terminal(&status, width));
+    io::Write::flush(&mut io::stdout()).context("flush log viewer")?;
+    Ok(())
+}
+
+fn truncate_for_terminal(line: &str, width: usize) -> String {
+    let mut out = String::new();
+    for ch in line.chars() {
+        let next = out.len() + ch.len_utf8();
+        if next > width {
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn recent_change_operations(
