@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
+use crossterm::queue;
 use crossterm::terminal::{self, ClearType};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -3142,15 +3143,26 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode().context("enable raw mode")?;
-        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)
-            .context("enter log viewer")?;
+        execute!(
+            io::stdout(),
+            terminal::EnterAlternateScreen,
+            terminal::DisableLineWrap,
+            terminal::Clear(ClearType::All),
+            cursor::Hide
+        )
+        .context("enter log viewer")?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            cursor::Show,
+            terminal::EnableLineWrap,
+            terminal::LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -3169,6 +3181,7 @@ fn run_log_viewer(
             draw_log_viewer(&lines, offset, done)?;
             needs_redraw = false;
         }
+        let old_offset = offset;
         if event::poll(StdDuration::from_millis(30)).context("poll log viewer input")?
             && let Event::Key(key) = event::read().context("read log viewer input")?
         {
@@ -3204,8 +3217,14 @@ fn run_log_viewer(
                 _ => {}
             }
         }
-        if drain_log_messages(&rx, &mut lines, &mut done, 256)? {
+        let changed = drain_log_messages(&rx, &mut lines, &mut done, 256)?;
+        if changed {
             needs_redraw = true;
+        } else if needs_redraw
+            && offset.abs_diff(old_offset) == 1
+            && draw_log_viewer_single_scroll(&lines, old_offset, offset, done).is_ok()
+        {
+            needs_redraw = false;
         }
         if done && lines.is_empty() {
             break;
@@ -3247,25 +3266,87 @@ fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
     let body_height = height.saturating_sub(1);
     let text_width = width.saturating_sub(1).max(1);
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        cursor::MoveTo(0, 0),
-        terminal::Clear(ClearType::All)
-    )
-    .context("clear log viewer")?;
     for row in 0..body_height {
-        let Some(line) = lines.get(offset + row) else {
-            break;
-        };
-        let rendered = truncate_for_terminal(line, text_width);
-        execute!(
+        queue_log_viewer_line(&mut stdout, lines, offset + row, row, text_width)?;
+    }
+    queue_log_viewer_status(&mut stdout, lines, offset, body_height, done, size.1)?;
+    io::Write::flush(&mut stdout).context("flush log viewer")?;
+    Ok(())
+}
+
+fn draw_log_viewer_single_scroll(
+    lines: &[String],
+    old_offset: usize,
+    offset: usize,
+    done: bool,
+) -> Result<()> {
+    let size = log_viewer_terminal_size();
+    let width = usize::from(size.0).max(1);
+    let height = usize::from(size.1).max(1);
+    let body_height = height.saturating_sub(1);
+    if body_height == 0 {
+        return draw_log_viewer(lines, offset, done);
+    }
+    let text_width = width.saturating_sub(1).max(1);
+    let mut stdout = io::stdout();
+
+    write!(stdout, "\x1b[1;{}r", body_height).context("set log viewer scroll region")?;
+    if offset > old_offset {
+        queue!(
             stdout,
-            cursor::MoveTo(0, row as u16),
-            terminal::Clear(ClearType::CurrentLine)
+            cursor::MoveTo(0, body_height.saturating_sub(1) as u16)
         )
-        .context("draw log viewer line")?;
+        .context("move to log viewer scroll bottom")?;
+        write!(stdout, "\x1bD").context("scroll log viewer body up")?;
+        write!(stdout, "\x1b[r").context("reset log viewer scroll region")?;
+        queue_log_viewer_line(
+            &mut stdout,
+            lines,
+            offset + body_height.saturating_sub(1),
+            body_height.saturating_sub(1),
+            text_width,
+        )?;
+    } else {
+        queue!(stdout, cursor::MoveTo(0, 0)).context("move to log viewer scroll top")?;
+        write!(stdout, "\x1bM").context("scroll log viewer body down")?;
+        write!(stdout, "\x1b[r").context("reset log viewer scroll region")?;
+        queue_log_viewer_line(&mut stdout, lines, offset, 0, text_width)?;
+    }
+    queue_log_viewer_status(&mut stdout, lines, offset, body_height, done, size.1)?;
+    io::Write::flush(&mut stdout).context("flush log viewer scroll")?;
+    Ok(())
+}
+
+fn queue_log_viewer_line(
+    stdout: &mut io::Stdout,
+    lines: &[String],
+    line_index: usize,
+    row: usize,
+    text_width: usize,
+) -> Result<()> {
+    queue!(
+        stdout,
+        cursor::MoveTo(0, row as u16),
+        terminal::Clear(ClearType::CurrentLine)
+    )
+    .context("draw log viewer line")?;
+    if let Some(line) = lines.get(line_index) {
+        let rendered = truncate_for_terminal(line, text_width);
         write!(stdout, "{rendered}").context("write log viewer line")?;
     }
+    Ok(())
+}
+
+fn queue_log_viewer_status(
+    stdout: &mut io::Stdout,
+    lines: &[String],
+    offset: usize,
+    body_height: usize,
+    done: bool,
+    terminal_rows: u16,
+) -> Result<()> {
+    let width = usize::from(log_viewer_terminal_size().0).max(1);
+    let text_width = width.saturating_sub(1).max(1);
     let status = if done {
         format!(
             "mj log {}/{}  j/k scroll  space/b page  g/G top/bottom  q quit",
@@ -3279,15 +3360,14 @@ fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
             lines.len()
         )
     };
-    execute!(
+    queue!(
         stdout,
-        cursor::MoveTo(0, size.1.saturating_sub(1)),
+        cursor::MoveTo(0, terminal_rows.saturating_sub(1)),
         terminal::Clear(ClearType::CurrentLine)
     )
     .context("draw log viewer status")?;
     write!(stdout, "{}", truncate_for_terminal(&status, text_width))
         .context("write log viewer status")?;
-    io::Write::flush(&mut stdout).context("flush log viewer")?;
     Ok(())
 }
 
