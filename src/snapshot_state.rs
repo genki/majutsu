@@ -18,7 +18,7 @@ pub(crate) fn current_snapshot(conn: &Connection) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
-pub(crate) fn load_snapshot(
+pub(crate) fn load_snapshot_header(
     paths: &Paths,
     conn: &Connection,
     args: &RestoreArgs,
@@ -30,10 +30,7 @@ pub(crate) fn load_snapshot(
     } else {
         current_snapshot(conn)?.ok_or_else(|| anyhow!("no current snapshot"))?
     };
-    if args.root.is_some() {
-        return load_snapshot_by_id_for_root(paths, conn, &id, args.root.as_deref());
-    }
-    load_snapshot_by_id(paths, conn, &id)
+    load_snapshot_header_by_id(paths, conn, &id)
 }
 
 pub(crate) fn snapshot_id_at(conn: &Connection, at: &str) -> Result<String> {
@@ -100,56 +97,6 @@ pub(crate) fn snapshot_manifest_from_parts(
         .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
 }
 
-pub(crate) fn load_snapshot_by_id_for_root(
-    paths: &Paths,
-    conn: &Connection,
-    id: &str,
-    root: Option<&str>,
-) -> Result<SnapshotManifest> {
-    let (manifest_key, manifest_json): (String, String) = conn.query_row(
-        "select manifest_key, manifest_json from snapshots where id=?1",
-        params![id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    snapshot_manifest_from_parts_for_root(paths, id, &manifest_key, &manifest_json, root)
-}
-
-fn snapshot_manifest_from_parts_for_root(
-    paths: &Paths,
-    id: &str,
-    manifest_key: &str,
-    manifest_json: &str,
-    root: Option<&str>,
-) -> Result<SnapshotManifest> {
-    if !manifest_json.trim().is_empty() {
-        return serde_json::from_str(manifest_json)
-            .with_context(|| format!("parse snapshot manifest metadata {id}"));
-    }
-    let bytes = read_snapshot_manifest_object_raw(paths, id, manifest_key)?;
-    let mut manifest: SnapshotManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))?;
-    if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
-        return Ok(manifest);
-    }
-    let Some(root) = root else {
-        return Ok(manifest);
-    };
-    if let Some(root_tree) = manifest.root_trees.get(root) {
-        let tree_bytes = crate::read_object(paths, &root_tree.tree_key).with_context(|| {
-            format!("hydrate compact snapshot manifest {manifest_key} root {root}")
-        })?;
-        let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
-            .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
-        manifest.roots.insert(
-            root.to_string(),
-            tree_entries_from_manifest(paths, tree)?
-                .into_values()
-                .collect(),
-        );
-    }
-    Ok(manifest)
-}
-
 fn read_snapshot_manifest_object_raw(
     paths: &Paths,
     id: &str,
@@ -195,6 +142,49 @@ pub(crate) fn tree_entries_from_manifest(
     let node: TreeNodeManifest = serde_json::from_slice(&node_bytes)
         .with_context(|| format!("parse root tree node {}", root_node.node_key))?;
     tree_entries_from_node(paths, node)
+}
+
+pub(crate) fn visit_tree_records<F>(
+    paths: &Paths,
+    root_tree: &RootSnapshot,
+    mut visitor: F,
+) -> Result<()>
+where
+    F: FnMut(&FileRecord) -> Result<()>,
+{
+    let tree_bytes = crate::read_object(paths, &root_tree.tree_key)
+        .with_context(|| format!("read root tree {}", root_tree.tree_key))?;
+    let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
+        .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
+    if !tree.entries.is_empty() || tree.root_node.is_none() {
+        for record in tree.entries.values() {
+            visitor(record)?;
+        }
+        return Ok(());
+    }
+    let root_node = tree.root_node.expect("checked above");
+    visit_tree_node_records(paths, &root_node.node_key, &mut visitor)
+}
+
+pub(crate) fn visit_tree_node_records<F>(
+    paths: &Paths,
+    node_key: &str,
+    visitor: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&FileRecord) -> Result<()>,
+{
+    let node_bytes = crate::read_object(paths, node_key)
+        .with_context(|| format!("read tree node {node_key}"))?;
+    let node: TreeNodeManifest = serde_json::from_slice(&node_bytes)
+        .with_context(|| format!("parse tree node {node_key}"))?;
+    for record in node.entries.values() {
+        visitor(record)?;
+    }
+    for child in node.child_nodes.values() {
+        visit_tree_node_records(paths, &child.node_key, visitor)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn tree_entries_from_node(

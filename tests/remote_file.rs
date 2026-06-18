@@ -4937,6 +4937,23 @@ fn tree_format_v2_omits_flat_entries_and_restores_from_root_node() {
         fs::read_to_string(restore.join("sample/nested/beta.txt")).unwrap(),
         "beta\n"
     );
+
+    fs::write(source.join("nested/beta.txt"), b"changed\n").unwrap();
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_TREE_FORMAT", "v2")
+            .arg("--home")
+            .arg(&state)
+            .arg("snapshot");
+        c
+    });
+    let diff = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("diff");
+        c
+    });
+    assert!(diff.contains("M\tsample/nested/beta.txt"), "{diff}");
+    assert!(!diff.contains("sample/alpha.txt"), "{diff}");
 }
 
 #[test]

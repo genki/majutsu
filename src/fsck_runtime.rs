@@ -712,17 +712,15 @@ fn build_fsck_scope(
         )?;
         persist_snapshot_payload_index(conn, &manifest)?;
         for root_tree in manifest.root_trees.values() {
-            let tree: TreeManifest = read_object(paths, &root_tree.tree_key)
-                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))?;
-            let entries = crate::snapshot_state::tree_entries_from_manifest(paths, tree)?;
-            for record in entries.values() {
+            crate::snapshot_state::visit_tree_records(paths, root_tree, |record| {
                 if let Some((oid, _)) = payload_blob_ref(&record.payload) {
                     scope.blob_oids.insert(oid.to_string());
                 }
                 if let Some((oid, _, _)) = payload_large_ref(&record.payload) {
                     scope.large_oids.insert(oid.to_string());
                 }
-            }
+                Ok(())
+            })?;
         }
     }
     for blob in &export.blobs {
@@ -1357,23 +1355,17 @@ fn validate_local_metadata_references(
         };
         let mut large_manifest_keys = live.add_snapshot_manifest(&manifest);
         for root_tree in manifest.root_trees.values() {
-            let Ok(bytes) = read_object(paths, &root_tree.tree_key) else {
-                continue;
-            };
-            let Ok(tree) = serde_json::from_slice::<TreeManifest>(&bytes) else {
-                continue;
-            };
-            let Ok(entries) = crate::snapshot_state::tree_entries_from_manifest(paths, tree) else {
-                continue;
-            };
-            for record in entries.values() {
+            let Ok(()) = crate::snapshot_state::visit_tree_records(paths, root_tree, |record| {
                 if let Some((oid, _)) = payload_blob_ref(&record.payload) {
                     live.blobs.insert(oid.to_string());
                 } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
                     live.large_objects.insert(oid.to_string());
                     large_manifest_keys.push(manifest_key.to_string());
                 }
-            }
+                Ok(())
+            }) else {
+                continue;
+            };
         }
         for manifest_key in large_manifest_keys {
             let Ok(bytes) = read_object(paths, &manifest_key) else {

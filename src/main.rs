@@ -216,7 +216,7 @@ use snapshot_rules::{
     large_pointer_compression, looks_binary,
 };
 use snapshot_state::{
-    carry_forward_root_snapshot, current_snapshot, load_snapshot, load_snapshot_by_id,
+    carry_forward_root_snapshot, current_snapshot, load_snapshot_by_id, load_snapshot_header,
 };
 use sync_runtime::sync_cmd;
 use util::{
@@ -2000,7 +2000,7 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
         validate_relative_filter_path(path, "restore --path")?;
     }
     restore_trace_mark(trace_start, "build_plan validate args");
-    let snapshot = load_snapshot(paths, conn, args)?;
+    let snapshot = load_snapshot_header(paths, conn, args)?;
     restore_trace_mark(trace_start, "build_plan load snapshot");
     let root_paths = roots(conn)?
         .into_iter()
@@ -2009,93 +2009,14 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
     restore_trace_mark(trace_start, "build_plan load roots");
     let mut files = Vec::new();
     let mut plan_roots = Vec::new();
-    for (root_id, records) in &snapshot.roots {
+    for root_id in restore_plan_root_ids(&snapshot) {
         if let Some(filter_root) = &args.root
-            && filter_root != root_id
+            && filter_root != &root_id
         {
             continue;
         }
         plan_roots.push(root_id.clone());
-        for record in records {
-            if let Some(path_filter) = &args.path
-                && !Path::new(&record.path).starts_with(path_filter)
-            {
-                continue;
-            }
-            files.push(FileRecord {
-                root_id: record.root_id.clone(),
-                path: record.path.clone(),
-                kind: record.kind.clone(),
-                size: record.size,
-                mode: record.mode,
-                modified: record.modified,
-                uid: record.uid,
-                gid: record.gid,
-                xattrs: record.xattrs.clone(),
-                payload: match &record.payload {
-                    Payload::Directory => Payload::Directory,
-                    Payload::InlineSmall { oid, object_key } => Payload::InlineSmall {
-                        oid: oid.clone(),
-                        object_key: object_key.clone(),
-                    },
-                    Payload::NormalBlob { oid, object_key } => Payload::NormalBlob {
-                        oid: oid.clone(),
-                        object_key: object_key.clone(),
-                    },
-                    Payload::ChunkedBlob {
-                        oid,
-                        manifest_key,
-                        chunk_count,
-                    } => Payload::ChunkedBlob {
-                        oid: oid.clone(),
-                        manifest_key: manifest_key.clone(),
-                        chunk_count: *chunk_count,
-                    },
-                    Payload::LargeObject {
-                        oid,
-                        manifest_key,
-                        chunk_count,
-                        media_type,
-                        binary,
-                        chunking,
-                        compression,
-                        encryption,
-                        storage_tier_hint,
-                        hydrate_policy,
-                    } => Payload::LargeObject {
-                        oid: oid.clone(),
-                        manifest_key: manifest_key.clone(),
-                        chunk_count: *chunk_count,
-                        media_type: media_type.clone(),
-                        binary: *binary,
-                        chunking: chunking.clone(),
-                        compression: compression.clone(),
-                        encryption: encryption.clone(),
-                        storage_tier_hint: storage_tier_hint.clone(),
-                        hydrate_policy: hydrate_policy.clone(),
-                    },
-                    Payload::Blob { oid, object_key } => Payload::Blob {
-                        oid: oid.clone(),
-                        object_key: object_key.clone(),
-                    },
-                    Payload::Large {
-                        oid,
-                        manifest_key,
-                        chunk_count,
-                    } => Payload::Large {
-                        oid: oid.clone(),
-                        manifest_key: manifest_key.clone(),
-                        chunk_count: *chunk_count,
-                    },
-                    Payload::Symlink { target } => Payload::Symlink {
-                        target: target.clone(),
-                    },
-                    Payload::Special { special_kind } => Payload::Special {
-                        special_kind: special_kind.clone(),
-                    },
-                },
-            });
-        }
+        collect_restore_plan_records(paths, &snapshot, &root_id, args.path.as_deref(), &mut files)?;
     }
     restore_trace_mark(trace_start, "build_plan filter files");
     let deletes = build_restore_deletes(args, &root_paths, &plan_roots, &files)?;
@@ -2107,6 +2028,45 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
         files,
         deletes,
     })
+}
+
+fn restore_plan_root_ids(snapshot: &SnapshotManifest) -> Vec<String> {
+    let mut roots = snapshot
+        .root_trees
+        .keys()
+        .cloned()
+        .chain(snapshot.roots.keys().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots
+}
+
+fn collect_restore_plan_records(
+    paths: &Paths,
+    snapshot: &SnapshotManifest,
+    root_id: &str,
+    path_filter: Option<&Path>,
+    files: &mut Vec<FileRecord>,
+) -> Result<()> {
+    let mut push_record = |record: &FileRecord| -> Result<()> {
+        if path_filter.is_some_and(|filter| !Path::new(&record.path).starts_with(filter)) {
+            return Ok(());
+        }
+        files.push(record.clone());
+        Ok(())
+    };
+    if let Some(records) = snapshot.roots.get(root_id) {
+        for record in records {
+            push_record(record)?;
+        }
+        return Ok(());
+    }
+    if let Some(root_tree) = snapshot.root_trees.get(root_id) {
+        crate::snapshot_state::visit_tree_records(paths, root_tree, push_record)?;
+    }
+    Ok(())
 }
 
 fn restore_trace_mark(start: std::time::Instant, label: &str) {
@@ -2619,14 +2579,8 @@ fn attach_subtree_node_index_with_threshold(
     }
 
     let nodes_dir = paths.home.join("objects/trees/nodes");
-    let root_node = store_tree_node(
-        paths,
-        &nodes_dir,
-        &tree.root_id,
-        "",
-        &tree.entries,
-        threshold,
-    )?;
+    let trie = TreeNodeBuild::from_entries(&tree.entries);
+    let root_node = store_tree_node(paths, &nodes_dir, &tree.root_id, "", &trie, threshold)?;
     tree.root_node = Some(root_node);
     tree.subtree_nodes.clear();
     if let Some(root_node) = &tree.root_node {
@@ -2646,32 +2600,31 @@ fn store_tree_node(
     nodes_dir: &Path,
     root_id: &str,
     path: &str,
-    all_entries: &BTreeMap<String, FileRecord>,
+    node: &TreeNodeBuild,
     threshold: usize,
 ) -> Result<TreeNodeRef> {
-    let entries = direct_tree_node_entries(path, all_entries);
-    let child_paths = direct_child_directory_paths(path, all_entries);
     let mut child_nodes = BTreeMap::new();
-    for child_path in child_paths {
-        if subtree_entry_count(&child_path, all_entries) < threshold {
+    for (child_name, child_node) in &node.children {
+        if child_node.file_count < threshold {
             continue;
         }
+        let child_path = join_tree_path(path, child_name);
         let child = store_tree_node(
             paths,
             nodes_dir,
             root_id,
             &child_path,
-            all_entries,
+            child_node,
             threshold,
         )?;
         child_nodes.insert(child_path, child);
     }
-    let file_count = entries.len()
+    let file_count = node.entries.len()
         + child_nodes
             .values()
             .map(|child| child.file_count)
             .sum::<usize>();
-    let total_size = entries.values().fold(0_u64, |sum, record| {
+    let total_size = node.entries.values().fold(0_u64, |sum, record| {
         if matches!(record.payload, Payload::Directory) {
             sum
         } else {
@@ -2681,7 +2634,7 @@ fn store_tree_node(
         .values()
         .map(|child| child.total_size)
         .sum::<u64>();
-    let identity = serde_json::to_vec(&(root_id, path, &entries, &child_nodes))?;
+    let identity = serde_json::to_vec(&(root_id, path, &node.entries, &child_nodes))?;
     let node_id = format!("node-{}", blake3_hex(&identity));
     let manifest = TreeNodeManifest {
         version: 2,
@@ -2692,7 +2645,7 @@ fn store_tree_node(
         file_count,
         total_size,
         child_nodes,
-        entries,
+        entries: node.entries.clone(),
     };
     let node_json = serde_json::to_vec(&manifest)?;
     let node_oid = blake3_hex(&node_json);
@@ -2705,55 +2658,56 @@ fn store_tree_node(
     })
 }
 
-fn direct_tree_node_entries(
-    node_path: &str,
-    all_entries: &BTreeMap<String, FileRecord>,
-) -> BTreeMap<String, FileRecord> {
-    all_entries
-        .iter()
-        .filter(|(path, _)| parent_path(path) == node_path)
-        .map(|(path, record)| (path.clone(), record.clone()))
-        .collect()
+#[derive(Default)]
+struct TreeNodeBuild {
+    entries: BTreeMap<String, FileRecord>,
+    children: BTreeMap<String, TreeNodeBuild>,
+    file_count: usize,
 }
 
-fn direct_child_directory_paths(
-    node_path: &str,
-    all_entries: &BTreeMap<String, FileRecord>,
-) -> Vec<String> {
-    all_entries
-        .keys()
-        .filter_map(|path| direct_child_directory_path(node_path, path))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn direct_child_directory_path(node_path: &str, entry_path: &str) -> Option<String> {
-    let rest = if node_path.is_empty() {
-        entry_path
-    } else {
-        entry_path.strip_prefix(&format!("{node_path}/"))?
-    };
-    let (child, _) = rest.split_once('/')?;
-    if node_path.is_empty() {
-        Some(child.to_string())
-    } else {
-        Some(format!("{node_path}/{child}"))
+impl TreeNodeBuild {
+    fn from_entries(entries: &BTreeMap<String, FileRecord>) -> Self {
+        let mut root = Self::default();
+        for (path, record) in entries {
+            root.insert(path, record.clone());
+        }
+        root.recount();
+        root
     }
-}
 
-fn subtree_entry_count(node_path: &str, all_entries: &BTreeMap<String, FileRecord>) -> usize {
-    let prefix = format!("{node_path}/");
-    all_entries
-        .keys()
-        .filter(|path| *path == node_path || path.starts_with(&prefix))
-        .count()
+    fn insert(&mut self, path: &str, record: FileRecord) {
+        let parent = parent_path(path);
+        let mut node = self;
+        if !parent.is_empty() {
+            for component in parent.split('/') {
+                node = node.children.entry(component.to_string()).or_default();
+            }
+        }
+        node.entries.insert(path.to_string(), record);
+    }
+
+    fn recount(&mut self) -> usize {
+        let mut count = self.entries.len();
+        for child in self.children.values_mut() {
+            count += child.recount();
+        }
+        self.file_count = count;
+        count
+    }
 }
 
 fn parent_path(path: &str) -> &str {
     path.rsplit_once('/')
         .map(|(parent, _)| parent)
         .unwrap_or("")
+}
+
+fn join_tree_path(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
+    }
 }
 
 fn store_large_file(

@@ -1,4 +1,7 @@
-use crate::majutsu_core::OperationLogEntry as OperationExport;
+use crate::majutsu_core::{
+    FileRecord, OperationLogEntry as OperationExport, RootSnapshot, SnapshotManifest, TreeManifest,
+    TreeNodeManifest, TreeNodeRef,
+};
 use crate::majutsu_store::{
     host_current_ref_key, host_last_synced_ref_key, host_root_ack_ref_key, host_root_ack_ref_prefix,
 };
@@ -6,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -3179,38 +3182,214 @@ fn snapshot_file_changes_from_root_trees(
             });
             continue;
         }
-        let from_files = root_file_map(paths, from, &root_id)?;
-        let to_files = root_file_map(paths, Some(to), &root_id)?;
-        let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
-        paths_all.extend(
-            to_files
-                .keys()
-                .filter(|key| !from_files.contains_key(*key))
-                .cloned(),
-        );
-        paths_all.sort();
-        for path in paths_all {
-            let full_path = format!("{root_id}/{path}");
-            match (from_files.get(&path), to_files.get(&path)) {
-                (None, Some(_)) => changes.push(FileChange {
-                    status: "A",
-                    path: full_path,
-                }),
-                (Some(_), None) => changes.push(FileChange {
-                    status: "D",
-                    path: full_path,
-                }),
-                (Some(a), Some(b)) if a != b => {
-                    changes.push(FileChange {
-                        status: "M",
-                        path: full_path,
-                    });
-                }
-                _ => {}
-            }
-        }
+        append_root_file_changes(paths, from, to, &root_id, &mut changes)?;
     }
     Ok(changes)
+}
+
+fn append_root_file_changes(
+    paths: &Paths,
+    from: Option<&SnapshotManifest>,
+    to: &SnapshotManifest,
+    root_id: &str,
+    changes: &mut Vec<FileChange>,
+) -> Result<()> {
+    let from_tree = from.and_then(|snapshot| snapshot.root_trees.get(root_id));
+    let to_tree = to.root_trees.get(root_id);
+    match (from_tree, to_tree) {
+        (None, Some(tree)) if !snapshot_root_has_flat_records(to, root_id) => {
+            append_tree_records_with_status(paths, root_id, tree, "A", changes)?;
+            return Ok(());
+        }
+        (Some(tree), None)
+            if from.is_some_and(|snapshot| !snapshot_root_has_flat_records(snapshot, root_id)) =>
+        {
+            append_tree_records_with_status(paths, root_id, tree, "D", changes)?;
+            return Ok(());
+        }
+        (Some(from_tree), Some(to_tree))
+            if from.is_some_and(|snapshot| !snapshot_root_has_flat_records(snapshot, root_id))
+                && !snapshot_root_has_flat_records(to, root_id)
+                && append_v2_tree_diff(paths, root_id, from_tree, to_tree, changes)? =>
+        {
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let from_files = root_file_map(paths, from, root_id)?;
+    let to_files = root_file_map(paths, Some(to), root_id)?;
+    let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
+    paths_all.extend(
+        to_files
+            .keys()
+            .filter(|key| !from_files.contains_key(*key))
+            .cloned(),
+    );
+    paths_all.sort();
+    for path in paths_all {
+        let full_path = format!("{root_id}/{path}");
+        match (from_files.get(&path), to_files.get(&path)) {
+            (None, Some(_)) => changes.push(FileChange {
+                status: "A",
+                path: full_path,
+            }),
+            (Some(_), None) => changes.push(FileChange {
+                status: "D",
+                path: full_path,
+            }),
+            (Some(a), Some(b)) if a != b => {
+                changes.push(FileChange {
+                    status: "M",
+                    path: full_path,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_root_has_flat_records(snapshot: &SnapshotManifest, root_id: &str) -> bool {
+    snapshot.roots.contains_key(root_id)
+}
+
+fn append_tree_records_with_status(
+    paths: &Paths,
+    root_id: &str,
+    root_tree: &RootSnapshot,
+    status: &'static str,
+    changes: &mut Vec<FileChange>,
+) -> Result<()> {
+    crate::snapshot_state::visit_tree_records(paths, root_tree, |record| {
+        changes.push(FileChange {
+            status,
+            path: format!("{root_id}/{}", record.path),
+        });
+        Ok(())
+    })
+}
+
+fn append_v2_tree_diff(
+    paths: &Paths,
+    root_id: &str,
+    from_tree: &RootSnapshot,
+    to_tree: &RootSnapshot,
+    changes: &mut Vec<FileChange>,
+) -> Result<bool> {
+    let from = read_tree_manifest(paths, from_tree)?;
+    let to = read_tree_manifest(paths, to_tree)?;
+    let (Some(from_node), Some(to_node)) = (from.root_node.as_ref(), to.root_node.as_ref()) else {
+        return Ok(false);
+    };
+    if !from.entries.is_empty() || !to.entries.is_empty() {
+        return Ok(false);
+    }
+    append_node_diff(paths, root_id, Some(from_node), Some(to_node), changes)?;
+    Ok(true)
+}
+
+fn read_tree_manifest(paths: &Paths, root_tree: &RootSnapshot) -> Result<TreeManifest> {
+    let bytes = crate::read_object(paths, &root_tree.tree_key)
+        .with_context(|| format!("read root tree {}", root_tree.tree_key))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse root tree {}", root_tree.tree_key))
+}
+
+fn append_node_diff(
+    paths: &Paths,
+    root_id: &str,
+    from: Option<&TreeNodeRef>,
+    to: Option<&TreeNodeRef>,
+    changes: &mut Vec<FileChange>,
+) -> Result<()> {
+    match (from, to) {
+        (Some(a), Some(b)) if a.node_key == b.node_key => return Ok(()),
+        (None, Some(node)) => {
+            return append_node_records_with_status(paths, root_id, node, "A", changes);
+        }
+        (Some(node), None) => {
+            return append_node_records_with_status(paths, root_id, node, "D", changes);
+        }
+        (None, None) => return Ok(()),
+        _ => {}
+    }
+    let from_node = read_tree_node(paths, &from.expect("matched above").node_key)?;
+    let to_node = read_tree_node(paths, &to.expect("matched above").node_key)?;
+    append_entry_map_diff(root_id, &from_node.entries, &to_node.entries, changes);
+    let child_paths = from_node
+        .child_nodes
+        .keys()
+        .chain(to_node.child_nodes.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path in child_paths {
+        append_node_diff(
+            paths,
+            root_id,
+            from_node.child_nodes.get(&path),
+            to_node.child_nodes.get(&path),
+            changes,
+        )?;
+    }
+    Ok(())
+}
+
+fn append_entry_map_diff(
+    root_id: &str,
+    from: &BTreeMap<String, FileRecord>,
+    to: &BTreeMap<String, FileRecord>,
+    changes: &mut Vec<FileChange>,
+) {
+    let paths = from
+        .keys()
+        .chain(to.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path in paths {
+        let full_path = format!("{root_id}/{path}");
+        match (from.get(&path), to.get(&path)) {
+            (None, Some(_)) => changes.push(FileChange {
+                status: "A",
+                path: full_path,
+            }),
+            (Some(_), None) => changes.push(FileChange {
+                status: "D",
+                path: full_path,
+            }),
+            (Some(a), Some(b)) if a != b => changes.push(FileChange {
+                status: "M",
+                path: full_path,
+            }),
+            _ => {}
+        }
+    }
+}
+
+fn append_node_records_with_status(
+    paths: &Paths,
+    root_id: &str,
+    node: &TreeNodeRef,
+    status: &'static str,
+    changes: &mut Vec<FileChange>,
+) -> Result<()> {
+    let node = read_tree_node(paths, &node.node_key)?;
+    for record in node.entries.values() {
+        changes.push(FileChange {
+            status,
+            path: format!("{root_id}/{}", record.path),
+        });
+    }
+    for child in node.child_nodes.values() {
+        append_node_records_with_status(paths, root_id, child, status, changes)?;
+    }
+    Ok(())
+}
+
+fn read_tree_node(paths: &Paths, node_key: &str) -> Result<TreeNodeManifest> {
+    let bytes = crate::read_object(paths, node_key)
+        .with_context(|| format!("read tree node {node_key}"))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse tree node {node_key}"))
 }
 
 fn large_tree_fold_required(

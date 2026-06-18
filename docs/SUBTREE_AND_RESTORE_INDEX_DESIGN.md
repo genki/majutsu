@@ -91,9 +91,21 @@ entries は `root_node.node_key` が指す `TreeNodeManifest` から展開する
 
 残る課題:
 
-- node 生成はまだ全 entries を複数回走査するため、大規模 root では directory trie を先に構築する実装へ置き換える余地がある。
-- restore / diff / fsck はまだ node traversal ではなく再帰展開後の flat map に寄せている。
+- root size / root size summary / sync live key 計算はまだ再帰展開後の flat map に寄せている。
 - `MAJUTSU_TREE_FORMAT=v2` を既定化する前に、GCS 実データで node 数、metadata bytes、GET 数、restore latency を測定する必要がある。
+
+## 2026-06-18 traversal / trie 化
+
+node 生成は directory trie を先に構築し、各 path の parent を一度辿るだけで direct entries と child nodes を得る実装にした。
+これにより階層 node 保存時の全 entries 複数走査を避ける。
+
+restore / diff / fsck は次のように node traversal を直接使う。
+
+- restore plan は snapshot header を読み、対象 root の `root_trees` から `visit_tree_records` で files を集める。
+- diff は v2 tree 同士なら node key が同じ subtree を展開せずに skip し、変化した node だけ direct entries と child refs を比較する。
+- fsck payload scope / live metadata collection は `visit_tree_records` で record を逐次処理する。
+
+まだ root size / sync live key の一部は caller 側都合で flat map を作るが、復元・差分・検査の主要経路は node traversal へ移行済み。
 
 ## restore bundle 案
 
