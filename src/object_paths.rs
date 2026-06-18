@@ -33,6 +33,12 @@ fn local_object_keys_inner(
             for root_tree in manifest.root_trees.values() {
                 keys.push(root_tree.tree_key.clone());
                 if let Ok(tree) = tree_manifest_for_object_keys(paths, &root_tree.tree_key) {
+                    if let Some(root_node) = &tree.root_node {
+                        keys.push(root_node.node_key.clone());
+                    }
+                    for node in tree.subtree_nodes.values() {
+                        keys.push(node.node_key.clone());
+                    }
                     for record in tree.entries.values() {
                         if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
                             keys.push(manifest_key.to_string());

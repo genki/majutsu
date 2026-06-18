@@ -1,5 +1,6 @@
 use crate::majutsu_core::{
     LargeManifest, OperationLogEntry as OperationExport, SnapshotManifest, TreeManifest,
+    TreeNodeManifest,
 };
 use crate::majutsu_pack::PackIndex;
 use crate::majutsu_store::{
@@ -908,6 +909,12 @@ fn sync_content_local_object_keys(
             for root_tree in manifest.root_trees.values() {
                 keys.push(root_tree.tree_key.clone());
                 if let Ok(tree) = tree_manifest_for_object_keys(paths, &root_tree.tree_key) {
+                    if let Some(root_node) = &tree.root_node {
+                        keys.push(root_node.node_key.clone());
+                    }
+                    for node in tree.subtree_nodes.values() {
+                        keys.push(node.node_key.clone());
+                    }
                     for record in tree.entries.values() {
                         if let Some((_, manifest_key, _)) =
                             crate::majutsu_core::payload_large_ref(&record.payload)
@@ -1789,7 +1796,11 @@ fn encode_canonical_local_object(
             .with_context(|| format!("decode snapshot manifest {key}"))?;
         return crate::encode_compact_snapshot_manifest_for_remote(paths, &manifest);
     }
-    if key.starts_with("objects/trees/") {
+    if key.starts_with("objects/trees/nodes/") {
+        let manifest: TreeNodeManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode tree node manifest {key}"))?;
+        encode_canonical_remote_export(paths, &manifest)
+    } else if key.starts_with("objects/trees/") {
         let manifest: TreeManifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode tree manifest {key}"))?;
         encode_canonical_remote_export(paths, &manifest)

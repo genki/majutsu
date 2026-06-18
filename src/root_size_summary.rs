@@ -95,6 +95,12 @@ pub(crate) fn build_root_size_summary(
             .with_context(|| format!("read root tree {}", root_snapshot.tree_key))?;
         let stat = stats.entry(root_id.clone()).or_default();
         stat.metadata_keys.insert(root_snapshot.tree_key.clone());
+        if let Some(root_node) = &tree.root_node {
+            stat.metadata_keys.insert(root_node.node_key.clone());
+        }
+        for node in tree.subtree_nodes.values() {
+            stat.metadata_keys.insert(node.node_key.clone());
+        }
         for record in tree.entries.values() {
             match record.kind.as_str() {
                 "directory" => stat.dirs += 1,

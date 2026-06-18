@@ -46,6 +46,22 @@ quick fsck は root node の到達性と基本 metadata を確認する。deep f
 - v2 の書き込みは `MAJUTSU_TREE_FORMAT=v2` または明示 migration command の後に限定する。
 - metadata export には tree format と root node key の両方を含める。
 
+## 2026-06-18 実装済みの移行準備
+
+現行の `TreeManifest` に `root_node` と `subtree_nodes` を追加し、`MAJUTSU_TREE_SUBTREE_NODES=1` を指定した場合は一定数以上の entry を持つ root で
+`objects/trees/nodes/` に content-addressed な `TreeNodeManifest` sidecar を書けるようにした。
+未変更のトップレベルサブツリーは snapshot 間で同じ node key を再利用する。
+
+この段階では復元互換性を優先し、flat `entries` はまだ root tree に残している。sidecar を既定有効にすると metadata が増えるため、既定では書き込まない。
+次の変更で `entries` を optional / omitted にして node tree を source of truth に移すための remote encoding、sync、gc、root size の参照経路は通してある。
+
+残る大きな変更:
+
+- node をトップレベルだけでなく階層全体の Merkle directory tree にする。
+- root tree から flat `entries` を省略できる format version を導入する。
+- restore / diff / fsck を node traversal で動作させる。
+- old flat tree と new node tree の混在 timeline を明示的に検証する。
+
 ## restore bundle 案
 
 path 指定 restore 向けに、任意の restore index を書く案がある。

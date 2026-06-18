@@ -35,10 +35,10 @@ mod majutsu_watch;
 use crate::majutsu_core::{
     FileRecord, HistoryGraphIssue, LargeChunk, LargeManifest, LiveMetadataReferences,
     MetadataReferenceIssue, OperationLogEntry as OperationExport, OperationLogEntryIssue, Payload,
-    RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, decode_operation_log,
-    history_graph_issues, metadata_reference_issues, operation_log_comparison_issues,
-    operation_log_entry_matches, payload_blob_ref, payload_large_ref, snapshot_export_matches,
-    snapshot_manifest_matches, tree_manifest_issues,
+    RootSnapshot, SnapshotExport, SnapshotManifest, TreeManifest, TreeNodeManifest, TreeNodeRef,
+    decode_operation_log, history_graph_issues, metadata_reference_issues,
+    operation_log_comparison_issues, operation_log_entry_matches, payload_blob_ref,
+    payload_large_ref, snapshot_export_matches, snapshot_manifest_matches, tree_manifest_issues,
 };
 use crate::majutsu_crypto::EncryptionMode;
 use crate::majutsu_large::{
@@ -501,7 +501,8 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .iter()
             .filter(|r| !matches!(r.payload, Payload::Directory))
             .count();
-        let tree = build_tree_manifest(&root.id, records)?;
+        let mut tree = build_tree_manifest(&root.id, records)?;
+        attach_subtree_node_index(paths, &mut tree)?;
         let root_snapshot = if let Some(previous) = parent_manifest
             .as_ref()
             .and_then(|parent| parent.root_trees.get(&root.id))
@@ -1856,6 +1857,10 @@ fn canonical_remote_object_to_local_bytes(
     {
         return Ok(bytes);
     }
+    if key.starts_with("objects/trees/nodes/") {
+        let manifest: TreeNodeManifest = decode_canonical_remote_export(paths, bytes)?;
+        return encode_object(paths, &serde_json::to_vec(&manifest)?);
+    }
     if key.starts_with("objects/trees/") {
         let manifest: TreeManifest = decode_canonical_remote_export(paths, bytes)?;
         return encode_object(paths, &serde_json::to_vec(&manifest)?);
@@ -2554,7 +2559,108 @@ pub(crate) fn build_tree_manifest(root_id: &str, records: Vec<FileRecord>) -> Re
         tree_id: format!("tree-{}", blake3_hex(&identity)),
         root_id: root_id.to_string(),
         created_at: Utc::now(),
+        root_node: None,
+        subtree_nodes: BTreeMap::new(),
         entries,
+    })
+}
+
+fn attach_subtree_node_index(paths: &Paths, tree: &mut TreeManifest) -> Result<()> {
+    if !tree_subtree_nodes_enabled() {
+        return Ok(());
+    }
+    let threshold = env::var("MAJUTSU_TREE_SUBTREE_NODE_MIN_ENTRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(128);
+    attach_subtree_node_index_with_threshold(paths, tree, threshold)
+}
+
+fn tree_subtree_nodes_enabled() -> bool {
+    env::var("MAJUTSU_TREE_SUBTREE_NODES")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn attach_subtree_node_index_with_threshold(
+    paths: &Paths,
+    tree: &mut TreeManifest,
+    threshold: usize,
+) -> Result<()> {
+    if tree.entries.len() < threshold {
+        return Ok(());
+    }
+
+    let mut root_entries = BTreeMap::new();
+    let mut by_top_dir = BTreeMap::<String, BTreeMap<String, FileRecord>>::new();
+    for (path, record) in &tree.entries {
+        root_entries.insert(path.clone(), record.clone());
+        let Some((top_dir, _)) = path.split_once('/') else {
+            continue;
+        };
+        by_top_dir
+            .entry(top_dir.to_string())
+            .or_default()
+            .insert(path.clone(), record.clone());
+    }
+
+    let nodes_dir = paths.home.join("objects/trees/nodes");
+    tree.root_node = Some(store_tree_node(
+        paths,
+        &nodes_dir,
+        &tree.root_id,
+        "",
+        root_entries,
+    )?);
+    tree.subtree_nodes.clear();
+    for (top_dir, entries) in by_top_dir {
+        if entries.len() < threshold {
+            continue;
+        }
+        let node = store_tree_node(paths, &nodes_dir, &tree.root_id, &top_dir, entries)?;
+        tree.subtree_nodes.insert(top_dir, node);
+    }
+    Ok(())
+}
+
+fn store_tree_node(
+    paths: &Paths,
+    nodes_dir: &Path,
+    root_id: &str,
+    path: &str,
+    entries: BTreeMap<String, FileRecord>,
+) -> Result<TreeNodeRef> {
+    let file_count = entries
+        .values()
+        .filter(|record| !matches!(record.payload, Payload::Directory))
+        .count();
+    let total_size = entries.values().fold(0_u64, |sum, record| {
+        if matches!(record.payload, Payload::Directory) {
+            sum
+        } else {
+            sum.saturating_add(record.size)
+        }
+    });
+    let identity = serde_json::to_vec(&(root_id, path, &entries))?;
+    let node_id = format!("node-{}", blake3_hex(&identity));
+    let manifest = TreeNodeManifest {
+        version: 1,
+        node_id: node_id.clone(),
+        root_id: root_id.to_string(),
+        path: path.to_string(),
+        created_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
+        file_count,
+        total_size,
+        entries,
+    };
+    let node_json = serde_json::to_vec(&manifest)?;
+    let node_oid = blake3_hex(&node_json);
+    let node_key = store_bytes(paths, nodes_dir, &node_oid, &node_json)?;
+    Ok(TreeNodeRef {
+        node_id,
+        node_key,
+        file_count,
+        total_size,
     })
 }
 
@@ -3929,6 +4035,78 @@ mod tests {
         assert!(remote.put_if_absent("objects/test", b"first").unwrap());
         assert!(!remote.put_if_absent("objects/test", b"second").unwrap());
         assert_eq!(remote.get("objects/test").unwrap(), b"first");
+    }
+
+    #[test]
+    fn subtree_node_index_reuses_unchanged_top_level_subtrees() {
+        fn file_record(root_id: &str, path: String, oid: String, size: u64) -> FileRecord {
+            FileRecord {
+                root_id: root_id.to_string(),
+                path,
+                kind: "file".to_string(),
+                size,
+                mode: 0o100644,
+                modified: None,
+                uid: None,
+                gid: None,
+                xattrs: BTreeMap::new(),
+                payload: Payload::InlineSmall {
+                    oid: oid.clone(),
+                    object_key: format!("objects/blobs/{oid}"),
+                },
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        create_layout(&paths).unwrap();
+
+        let mut records = Vec::new();
+        for dir in ["alpha", "beta"] {
+            for index in 0..130 {
+                let path = format!("{dir}/file-{index:03}.txt");
+                let oid = format!("{dir}-{index:03}");
+                records.push(file_record("sample", path, oid, 1));
+            }
+        }
+
+        let mut first = build_tree_manifest("sample", records.clone()).unwrap();
+        attach_subtree_node_index(&paths, &mut first).unwrap();
+        assert!(first.root_node.is_none());
+        attach_subtree_node_index_with_threshold(&paths, &mut first, 128).unwrap();
+        let first_root_node = first.root_node.clone().expect("root node");
+        let first_alpha = first
+            .subtree_nodes
+            .get("alpha")
+            .cloned()
+            .expect("alpha node");
+        let first_beta = first.subtree_nodes.get("beta").cloned().expect("beta node");
+        assert!(paths.home.join(&first_root_node.node_key).exists());
+        assert!(paths.home.join(&first_alpha.node_key).exists());
+        assert!(paths.home.join(&first_beta.node_key).exists());
+
+        records.retain(|record| record.path != "beta/file-129.txt");
+        records.push(file_record(
+            "sample",
+            "beta/file-129.txt".to_string(),
+            "beta-edited".to_string(),
+            2,
+        ));
+        let mut second = build_tree_manifest("sample", records).unwrap();
+        attach_subtree_node_index_with_threshold(&paths, &mut second, 128).unwrap();
+
+        assert_eq!(
+            first_alpha.node_key,
+            second.subtree_nodes.get("alpha").unwrap().node_key
+        );
+        assert_ne!(
+            first_beta.node_key,
+            second.subtree_nodes.get("beta").unwrap().node_key
+        );
+        assert_ne!(
+            first_root_node.node_key,
+            second.root_node.as_ref().unwrap().node_key
+        );
     }
 
     #[test]

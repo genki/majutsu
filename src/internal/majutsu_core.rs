@@ -790,6 +790,30 @@ pub struct TreeManifest {
     pub tree_id: String,
     pub root_id: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_node: Option<TreeNodeRef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subtree_nodes: BTreeMap<String, TreeNodeRef>,
+    pub entries: BTreeMap<String, FileRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeNodeRef {
+    pub node_id: String,
+    pub node_key: ObjectKey,
+    pub file_count: usize,
+    pub total_size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TreeNodeManifest {
+    pub version: u32,
+    pub node_id: String,
+    pub root_id: String,
+    pub path: String,
+    pub created_at: DateTime<Utc>,
+    pub file_count: usize,
+    pub total_size: u64,
     pub entries: BTreeMap<String, FileRecord>,
 }
 
@@ -1184,6 +1208,8 @@ mod tests {
             tree_id: "tree-actual".into(),
             root_id: "root-actual".into(),
             created_at: DateTime::<Utc>::UNIX_EPOCH,
+            root_node: None,
+            subtree_nodes: BTreeMap::new(),
             entries: BTreeMap::new(),
         };
         let expected = RootSnapshot {
