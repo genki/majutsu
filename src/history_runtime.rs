@@ -6,7 +6,7 @@ use crate::majutsu_store::{
     host_current_ref_key, host_last_synced_ref_key, host_root_ack_ref_key, host_root_ack_ref_prefix,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
@@ -3014,8 +3014,8 @@ where
             let summary = summarize_changes(&changes);
             write_line(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}",
-                ui.paint(&op.created_at, "1;34"),
-                op.id,
+                ui.paint(&display_log_timestamp(&op.created_at), "1;34"),
+                display_op_id(&op.id),
                 ui.paint(&op.kind, "36"),
                 operation_session_label(&op),
                 summary,
@@ -3186,35 +3186,31 @@ fn run_log_viewer(
             && let Event::Key(key) = event::read().context("read log viewer input")?
         {
             let page = terminal_height().saturating_sub(1).max(1);
+            let max_offset = max_log_viewer_offset(lines.len(), page);
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('j') | KeyCode::Down => {
-                    offset = offset.saturating_add(1).min(lines.len().saturating_sub(1));
-                    needs_redraw = true;
+                    offset = offset.saturating_add(1).min(max_offset);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     offset = offset.saturating_sub(1);
-                    needs_redraw = true;
                 }
                 KeyCode::Char(' ') | KeyCode::PageDown => {
-                    offset = offset
-                        .saturating_add(page)
-                        .min(lines.len().saturating_sub(1));
-                    needs_redraw = true;
+                    offset = offset.saturating_add(page).min(max_offset);
                 }
                 KeyCode::Char('b') | KeyCode::PageUp => {
                     offset = offset.saturating_sub(page);
-                    needs_redraw = true;
                 }
                 KeyCode::Char('g') | KeyCode::Home => {
                     offset = 0;
-                    needs_redraw = true;
                 }
                 KeyCode::Char('G') | KeyCode::End if done => {
-                    offset = lines.len().saturating_sub(page);
-                    needs_redraw = true;
+                    offset = max_offset;
                 }
                 _ => {}
+            }
+            if offset != old_offset {
+                needs_redraw = true;
             }
         }
         let changed = drain_log_messages(&rx, &mut lines, &mut done, 256)?;
@@ -3231,6 +3227,10 @@ fn run_log_viewer(
         }
     }
     Ok(())
+}
+
+fn max_log_viewer_offset(line_count: usize, page_height: usize) -> usize {
+    line_count.saturating_sub(page_height.max(1))
 }
 
 fn drain_log_messages(
@@ -3940,6 +3940,27 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
         writeln!(output, "{note}")?;
     }
     emit_status_output_auto(&output, terminal_height())
+}
+
+fn display_log_timestamp(value: &str) -> String {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn display_op_id(value: &str) -> String {
+    value
+        .strip_prefix("op-")
+        .map(|suffix| {
+            let short = suffix.chars().take(8).collect::<String>();
+            format!("op-{short}")
+        })
+        .unwrap_or_else(|| value.chars().take(12).collect())
 }
 
 fn operation_session_label(op: &OperationExport) -> String {
