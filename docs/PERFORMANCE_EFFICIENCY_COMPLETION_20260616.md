@@ -22,17 +22,20 @@ summary には root 別の client bytes、payload / metadata bytes、object coun
 
 ## P2 pack / sync RSS
 
-pack と upload の streaming 化は既に実装済み。今後の regression 検出には次を使う。
+pack と upload の streaming 化は既に実装済み。traffic regression 検出には次を使う。
 
 ```sh
 scripts/traffic-regression.sh
 ```
 
-高メモリ条件の確認には platform の `time` を使う。
+高メモリ条件の確認には `scripts/measure-pack-rss.sh` を使う。`pack` と `sync --wait` を個別phaseとして実行し、`/usr/bin/time -v` の elapsed と maximum RSS を表示する。
 
 ```sh
-/usr/bin/time -v mj sync --wait
+MAJUTSU_HOME=$HOME/.majutsu scripts/measure-pack-rss.sh
+MAJUTSU_MEASURE_RSS_REPORT=target/measure-rss.tsv MAJUTSU_HOME=$HOME/.majutsu scripts/measure-pack-rss.sh
 ```
+
+`MAJUTSU_MEASURE_MAX_RSS_KB` を指定すると、phaseごとの最大RSSが上限を超えた場合に非ゼロ終了する。
 
 ## P2 subtree / delta tree design
 
