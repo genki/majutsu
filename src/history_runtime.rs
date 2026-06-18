@@ -2952,12 +2952,18 @@ pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
         return print_change_log_viewer(paths, args);
     }
     let conn = crate::open_db(paths)?;
+    let mut args = args;
+    if args.limit.is_none() {
+        args.limit = Some(DEFAULT_LOG_LIMIT);
+    }
     if args.operations {
         print_op_log(paths, &conn, &args)
     } else {
         print_change_log(paths, &conn, &args)
     }
 }
+
+const DEFAULT_LOG_LIMIT: usize = 20;
 
 fn should_use_log_viewer() -> bool {
     io::stdout().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb")
@@ -2986,16 +2992,17 @@ where
     let mut printed = 0usize;
     let ui = StatusUi::new();
     let file_limit = if args.full { usize::MAX } else { 120 };
-    let batch_size = args.limit.max(20).saturating_mul(4).min(500);
+    let limit = args.limit.unwrap_or(usize::MAX);
+    let batch_size = limit.max(20).saturating_mul(4).min(500);
     let mut offset = 0usize;
-    while printed < args.limit {
+    while printed < limit {
         let operations = recent_change_operations(conn, batch_size, offset)?;
         if operations.is_empty() {
             break;
         }
         offset += operations.len();
         for op in operations {
-            if printed >= args.limit {
+            if printed >= limit {
                 break;
             }
             let changes =
@@ -3033,7 +3040,7 @@ where
             printed += 1;
         }
     }
-    if args.root.is_none() && printed >= args.limit {
+    if args.root.is_none() && args.limit.is_some() && printed >= limit {
         write_line(&StatusUi::new().paint(
             &format!(
                 "... showing {printed} change operations; use `mj log --limit N` for more or `mj log --operations` for internal operation records"
@@ -3046,6 +3053,7 @@ where
 
 fn print_change_log_viewer(paths: &Paths, args: LogArgs) -> Result<()> {
     let height = terminal_height();
+    let likely_needs_viewer = log_viewer_likely_needed(paths, &args, height).unwrap_or(true);
     let (tx, rx) = mpsc::channel::<LogProducerMessage>();
     let producer_paths = paths.clone();
     let producer_args = args.clone();
@@ -3067,15 +3075,28 @@ fn print_change_log_viewer(paths: &Paths, args: LogArgs) -> Result<()> {
 
     let mut lines = Vec::new();
     let mut done = false;
+    let prefetch_timeout = if likely_needs_viewer {
+        StdDuration::from_millis(120)
+    } else {
+        StdDuration::from_millis(250)
+    };
+    let prefetch_started = std::time::Instant::now();
     while lines.len() <= height {
-        match rx.recv() {
+        let elapsed = prefetch_started.elapsed();
+        if elapsed >= prefetch_timeout {
+            break;
+        }
+        match rx.recv_timeout(prefetch_timeout - elapsed) {
             Ok(LogProducerMessage::Line(line)) => lines.push(line),
             Ok(LogProducerMessage::Done) => {
                 done = true;
                 break;
             }
             Ok(LogProducerMessage::Error(err)) => bail!("{err}"),
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 done = true;
                 break;
             }
@@ -3090,6 +3111,24 @@ fn print_change_log_viewer(paths: &Paths, args: LogArgs) -> Result<()> {
     }
 
     run_log_viewer(lines, rx)
+}
+
+fn log_viewer_likely_needed(paths: &Paths, args: &LogArgs, height: usize) -> Result<bool> {
+    if args.limit.is_none() {
+        return Ok(true);
+    }
+    let Some(limit) = args.limit else {
+        return Ok(true);
+    };
+    if limit == 0 {
+        return Ok(false);
+    }
+    if args.root.is_some() {
+        return Ok(limit.saturating_mul(2) > height);
+    }
+    let conn = crate::open_db(paths)?;
+    let count = count_recent_change_operations(&conn)?;
+    Ok(count.min(limit).saturating_mul(2) > height)
 }
 
 enum LogProducerMessage {
@@ -3124,10 +3163,13 @@ fn run_log_viewer(
     let mut lines = initial_lines;
     let mut done = false;
     let mut offset = 0usize;
+    let mut needs_redraw = true;
     loop {
-        drain_log_messages(&rx, &mut lines, &mut done)?;
-        draw_log_viewer(&lines, offset, done)?;
-        if event::poll(StdDuration::from_millis(80)).context("poll log viewer input")?
+        if needs_redraw {
+            draw_log_viewer(&lines, offset, done)?;
+            needs_redraw = false;
+        }
+        if event::poll(StdDuration::from_millis(30)).context("poll log viewer input")?
             && let Event::Key(key) = event::read().context("read log viewer input")?
         {
             let page = terminal_height().saturating_sub(1).max(1);
@@ -3135,26 +3177,35 @@ fn run_log_viewer(
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('j') | KeyCode::Down => {
                     offset = offset.saturating_add(1).min(lines.len().saturating_sub(1));
+                    needs_redraw = true;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     offset = offset.saturating_sub(1);
+                    needs_redraw = true;
                 }
                 KeyCode::Char(' ') | KeyCode::PageDown => {
                     offset = offset
                         .saturating_add(page)
                         .min(lines.len().saturating_sub(1));
+                    needs_redraw = true;
                 }
                 KeyCode::Char('b') | KeyCode::PageUp => {
                     offset = offset.saturating_sub(page);
+                    needs_redraw = true;
                 }
                 KeyCode::Char('g') | KeyCode::Home => {
                     offset = 0;
+                    needs_redraw = true;
                 }
                 KeyCode::Char('G') | KeyCode::End if done => {
                     offset = lines.len().saturating_sub(page);
+                    needs_redraw = true;
                 }
                 _ => {}
             }
+        }
+        if drain_log_messages(&rx, &mut lines, &mut done, 256)? {
+            needs_redraw = true;
         }
         if done && lines.is_empty() {
             break;
@@ -3167,19 +3218,30 @@ fn drain_log_messages(
     rx: &mpsc::Receiver<LogProducerMessage>,
     lines: &mut Vec<String>,
     done: &mut bool,
-) -> Result<()> {
-    while let Ok(message) = rx.try_recv() {
+    max_messages: usize,
+) -> Result<bool> {
+    let mut changed = false;
+    for _ in 0..max_messages {
+        let Ok(message) = rx.try_recv() else {
+            break;
+        };
         match message {
-            LogProducerMessage::Line(line) => lines.push(line),
-            LogProducerMessage::Done => *done = true,
+            LogProducerMessage::Line(line) => {
+                lines.push(line);
+                changed = true;
+            }
+            LogProducerMessage::Done => {
+                *done = true;
+                changed = true;
+            }
             LogProducerMessage::Error(err) => bail!("{err}"),
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
-    let size = terminal::size().context("read terminal size")?;
+    let size = log_viewer_terminal_size();
     let width = usize::from(size.0).max(1);
     let height = usize::from(size.1).max(1);
     let body_height = height.saturating_sub(1);
@@ -3221,6 +3283,13 @@ fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
     Ok(())
 }
 
+fn log_viewer_terminal_size() -> (u16, u16) {
+    terminal::size()
+        .ok()
+        .filter(|(cols, rows)| *cols >= 20 && *rows >= 5)
+        .unwrap_or((100, 24))
+}
+
 fn truncate_for_terminal(line: &str, width: usize) -> String {
     let mut out = String::new();
     for ch in line.chars() {
@@ -3231,6 +3300,20 @@ fn truncate_for_terminal(line: &str, width: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn count_recent_change_operations(conn: &Connection) -> Result<usize> {
+    conn.query_row(
+        "select count(*)
+         from operations
+         where after_snapshot is not null
+           and (before_snapshot is null or before_snapshot != after_snapshot)
+           and kind in ('initial-scan', 'manual-snapshot', 'file-events-batch')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as usize)
+    .context("count recent change operations")
 }
 
 fn recent_change_operations(
@@ -3700,6 +3783,7 @@ fn color_change_status(ui: &StatusUi, status: &str) -> String {
 fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {
     let rows = recent_operations(conn)?;
     let mut printed = 0usize;
+    let limit = args.limit.unwrap_or(DEFAULT_LOG_LIMIT);
     let mut output = String::new();
     let ui = StatusUi::new();
     for row in rows {
@@ -3726,7 +3810,7 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
                 continue;
             }
         }
-        if printed >= args.limit {
+        if printed >= limit {
             break;
         }
         let created = ui.paint(&created, "1;34");
@@ -3741,7 +3825,7 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
         )?;
         printed += 1;
     }
-    if args.root.is_none() && printed >= args.limit {
+    if args.root.is_none() && printed >= limit {
         let note = ui.paint(
             &format!("... showing {printed} operation records; use `mj log --operations --limit N` for more\n"),
             "2",

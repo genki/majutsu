@@ -550,10 +550,10 @@ pub(crate) struct SnapshotArgs {
 pub(crate) struct LogArgs {
     #[arg(
         long,
-        default_value_t = 20,
+        value_name = "N",
         help = "Maximum number of operations to show; file detail lines do not count toward this limit"
     )]
-    pub(crate) limit: usize,
+    pub(crate) limit: Option<usize>,
     #[arg(long)]
     pub(crate) root: Option<String>,
     #[arg(
