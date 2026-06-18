@@ -2398,6 +2398,14 @@ impl StreamingOutput {
         }
     }
 
+    fn new_immediate_pager(page_height: usize) -> Self {
+        let mut output = Self::new(page_height);
+        if !output.direct {
+            let _ = output.start_pager();
+        }
+        output
+    }
+
     fn write_chunk(&mut self, chunk: &str) -> Result<()> {
         if self.direct {
             print!("{chunk}");
@@ -3047,7 +3055,7 @@ pub(crate) fn log_cmd(paths: &Paths, args: LogArgs) -> Result<()> {
 
 fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {
     let mut printed = 0usize;
-    let mut output = StreamingOutput::new(terminal_height());
+    let mut output = StreamingOutput::new_immediate_pager(terminal_height());
     let ui = StatusUi::new();
     let file_limit = if args.full { usize::MAX } else { 120 };
     let batch_size = args.limit.max(20).saturating_mul(4).min(500);
