@@ -482,13 +482,18 @@ pub(crate) fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
 }
 
 pub(crate) fn resolve_paths_with_scope(home_arg: Option<PathBuf>, system: bool) -> Result<Paths> {
+    #[cfg(windows)]
+    if system && home_arg.is_none() {
+        return resolve_paths(Some(crate::platform_runtime::configured_system_state_home()));
+    }
+
     let home = if let Some(home) = home_arg {
         home
     } else if let Ok(home) = env::var("MAJUTSU_HOME") {
         PathBuf::from(home)
     } else if system {
-        configured_state_home_from(PathBuf::from("/etc/majutsu/config.toml"), None)?
-            .unwrap_or_else(|| PathBuf::from("/var/lib/majutsu"))
+        configured_state_home_from(crate::platform_runtime::system_config_path(), None)?
+            .unwrap_or_else(crate::platform_runtime::system_state_home)
     } else if let Some(home) = configured_state_home()? {
         home
     } else {

@@ -114,7 +114,13 @@ fn stable_file_id(meta: &fs::Metadata) -> Option<u64> {
     Some(meta.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn stable_file_id(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::MetadataExt;
+    Some(meta.creation_time() ^ ((meta.file_attributes() as u64) << 32))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn stable_file_id(_: &fs::Metadata) -> Option<u64> {
     None
 }

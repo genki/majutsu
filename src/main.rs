@@ -74,7 +74,6 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex, mpsc};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -143,6 +142,7 @@ mod mount_runtime;
 mod object_paths;
 mod operation_log;
 mod pack_runtime;
+mod platform_runtime;
 mod process_runtime;
 mod prune_runtime;
 mod queue_runtime;
@@ -226,6 +226,7 @@ use util::{
 use watch_runtime::watch_cmd;
 
 fn main() -> Result<()> {
+    platform_runtime::initialize_process_environment();
     let cli = Cli::parse();
     let paths = resolve_paths_with_scope(cli.home, cli.system)?;
     apply_env_files(&paths)?;
@@ -3361,10 +3362,8 @@ fn run_application_plugin(paths: &Paths, root: &RootConfig, phase: &str) -> Resu
         &format!("application-plugin-{phase}"),
         &format!("{} {}", root.id, command),
     )?;
-    let mut process = ProcessCommand::new("sh");
+    let mut process = crate::platform_runtime::shell_command(command);
     process
-        .arg("-c")
-        .arg(command)
         .current_dir(&root.path)
         .env("MAJUTSU_HOME", &paths.home)
         .env("MAJUTSU_PLUGIN_PHASE", phase)
@@ -3416,9 +3415,7 @@ fn snapshot_scan_root(paths: &Paths, root: &RootConfig) -> Result<RootConfig> {
 }
 
 fn run_hook(command: &str, cwd: &Path) -> Result<()> {
-    let status = ProcessCommand::new("sh")
-        .arg("-c")
-        .arg(command)
+    let status = crate::platform_runtime::shell_command(command)
         .current_dir(cwd)
         .status()?;
     if !status.success() {

@@ -13,6 +13,9 @@ include = [
     "/BUILD_NUMBER",
     "/LICENSE",
     "/README.md",
+    "/docs/WINDOWS_EXTENDED_ATTRIBUTES.md",
+    "/docs/PLATFORM_SUPPORT.md",
+    "/THIRD_PARTY_NOTICES.md",
     "/build.rs",
     "/src/**",
     "/tests/**",
@@ -66,7 +69,15 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 zstd = "0.13"
+[target.'cfg(unix)'.dependencies]
 xattr = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.15", default-features = false }

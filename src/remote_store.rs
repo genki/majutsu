@@ -1495,22 +1495,22 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn advise_sequential(file: &File) {
     use std::os::fd::AsRawFd;
     let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 fn advise_sequential(_file: &File) {}
 
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn advise_dontneed(file: &File) {
     use std::os::fd::AsRawFd;
     let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 fn advise_dontneed(_file: &File) {}
 
 fn advise_path_dontneed(path: &Path) {

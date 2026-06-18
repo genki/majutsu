@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+#[cfg(windows)]
+mod windows_ea;
+
 #[cfg(unix)]
 pub(crate) fn file_mode(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -59,6 +62,7 @@ pub(crate) fn special_file_kind(_: &fs::Metadata) -> Option<String> {
     None
 }
 
+#[cfg(unix)]
 pub(crate) fn read_xattrs(path: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Ok(names) = xattr::list(path) else {
@@ -77,6 +81,30 @@ pub(crate) fn read_xattrs(path: &Path) -> BTreeMap<String, String> {
     out
 }
 
+#[cfg(windows)]
+pub(crate) fn read_xattrs(path: &Path) -> BTreeMap<String, String> {
+    let Ok(entries) = windows_ea::list(path) else {
+        // FAT/exFAT, some network filesystems, and policy-restricted paths do
+        // not support native EAs. Match the existing Unix best-effort policy.
+        return BTreeMap::new();
+    };
+    entries
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                name,
+                base64::engine::general_purpose::STANDARD.encode(value),
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn read_xattrs(_path: &Path) -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
+
+#[cfg(unix)]
 pub(crate) fn apply_xattrs(path: &Path, xattrs: &BTreeMap<String, String>) -> Result<()> {
     for (name, encoded) in xattrs {
         let value = base64::engine::general_purpose::STANDARD
@@ -85,6 +113,33 @@ pub(crate) fn apply_xattrs(path: &Path, xattrs: &BTreeMap<String, String>) -> Re
         if xattr::set(path, name, &value).is_err() {
             continue;
         }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn apply_xattrs(path: &Path, xattrs: &BTreeMap<String, String>) -> Result<()> {
+    for (name, encoded) in xattrs {
+        let value = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| format!("decode Windows EA {name}"))?;
+        // Cross-platform snapshots may contain macOS/Linux names or values
+        // that Windows cannot represent. Preserve restore progress and apply
+        // every native-compatible EA that can be written.
+        if windows_ea::set(path, name, &value).is_err() {
+            continue;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn apply_xattrs(_path: &Path, xattrs: &BTreeMap<String, String>) -> Result<()> {
+    // Validate the serialized values even on a platform without an EA API.
+    for (name, encoded) in xattrs {
+        let _ = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| format!("decode xattr {name}"))?;
     }
     Ok(())
 }
@@ -112,7 +167,32 @@ pub(crate) fn is_mount_point(path: &Path) -> bool {
         }
         false
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(target) = fs::canonicalize(path) else {
+            return false;
+        };
+        let Ok(metadata) = fs::metadata(&target) else {
+            return false;
+        };
+        let parent = target.parent().unwrap_or(&target);
+        let Ok(parent_metadata) = fs::metadata(parent) else {
+            return false;
+        };
+
+        // A Unix mount root either crosses a device boundary or is the root
+        // directory itself (same inode as its parent). This covers macOS
+        // volumes mounted below /Volumes as well as Unix root.
+        metadata.dev() != parent_metadata.dev()
+            || (metadata.dev() == parent_metadata.dev() && metadata.ino() == parent_metadata.ino())
+    }
+    #[cfg(windows)]
+    {
+        crate::platform_runtime::is_windows_mount_point(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         false

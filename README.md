@@ -55,6 +55,11 @@ large object handling.
 
 FUSE mounts run in the foreground and hydrate large-file chunks on read.
 
+
+## Platform support
+
+Majutsu supports Linux, macOS, and Windows for snapshot, history, remote sync, clone, and materialized restore workflows. Linux additionally supports the kernel FUSE view. Windows uses native NT EAs and an authenticated loopback daemon endpoint. See `docs/PLATFORM_SUPPORT.md`.
+
 ## Install
 
 ```sh

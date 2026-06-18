@@ -16,6 +16,7 @@ fn mj() -> Command {
     command
 }
 
+#[allow(dead_code)]
 fn mj_auto() -> Command {
     Command::new(env!("CARGO_BIN_EXE_mj"))
 }

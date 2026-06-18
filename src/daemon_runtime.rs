@@ -8,18 +8,30 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command as ProcessCommand, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::process::Command as ProcessCommand;
+#[cfg(not(windows))]
+use std::process::Stdio;
 
 use crate::cli::DaemonCommand;
 use crate::config::{Paths, read_config, validate_watch_mode};
+#[cfg(not(windows))]
+use crate::platform_runtime::configure_background_command;
 use crate::process_runtime::{pid_alive, read_pid};
 use crate::queue_runtime::{event_journal_records, upload_queue_stats};
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
 use crate::watch_runtime::normalize_watch_backend;
 use crate::{open_db, resolve_paths};
+
+const DAEMON_ATTRIBUTION_ENV_KEYS: &[&str] = &[
+    "MAJUTSU_SESSION_ID",
+    "MAJUTSU_SESSION_LABEL",
+    "MAJUTSU_AGENT_NAME",
+    "CODEX_THREAD_ID",
+    "CLAUDE_SESSION_ID",
+    "CURSOR_SESSION_ID",
+    "TERM_SESSION_ID",
+];
 
 struct DaemonStats {
     pid: u32,
@@ -438,42 +450,65 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
     }
     fs::create_dir_all(&paths.runtime)?;
     fs::create_dir_all(&paths.logs)?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(daemon_log_path(paths))?;
-    let mut command = ProcessCommand::new(env::current_exe()?);
-    command
-        .arg("--home")
-        .arg(&paths.home)
-        .arg("watch")
-        .arg("--foreground")
-        .arg("true")
-        .arg("--backend")
-        .arg(config.backend)
-        .arg("--mode")
-        .arg(&config.mode)
-        .arg("--interval-secs")
-        .arg(config.interval_secs.to_string())
-        .arg("--debounce-ms")
-        .arg(config.debounce_ms.to_string())
-        .arg("--settle-ms")
-        .arg(config.settle_ms.to_string())
-        .arg("--buffer-max-ms")
-        .arg(config.buffer_max_ms.to_string())
-        .arg("--buffer-max-events")
-        .arg(config.buffer_max_events.to_string())
-        .arg("--periodic-rescan-secs")
-        .arg(config.periodic_rescan_secs.to_string())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log));
-    for (key, value) in daemon_env(paths)? {
-        command.env(key, value);
+
+    #[cfg(windows)]
+    {
+        let pid = start_watch_daemon_windows(paths, &config)?;
+        write_daemon_pid_and_log(paths, pid, &config)?;
+        Ok(pid)
     }
-    configure_daemon_operation_attribution(&mut command);
-    detach_daemon_process(&mut command);
-    let child = command.spawn()?;
-    let pid = child.id();
+
+    #[cfg(not(windows))]
+    {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(daemon_log_path(paths))?;
+        let mut command = ProcessCommand::new(env::current_exe()?);
+        command
+            .arg("--home")
+            .arg(&paths.home)
+            .arg("watch")
+            .arg("--foreground")
+            .arg("true")
+            .arg("--backend")
+            .arg(config.backend)
+            .arg("--mode")
+            .arg(&config.mode)
+            .arg("--interval-secs")
+            .arg(config.interval_secs.to_string())
+            .arg("--debounce-ms")
+            .arg(config.debounce_ms.to_string())
+            .arg("--settle-ms")
+            .arg(config.settle_ms.to_string())
+            .arg("--buffer-max-ms")
+            .arg(config.buffer_max_ms.to_string())
+            .arg("--buffer-max-events")
+            .arg(config.buffer_max_events.to_string())
+            .arg("--periodic-rescan-secs")
+            .arg(config.periodic_rescan_secs.to_string())
+            .stdin(Stdio::null());
+        command
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log));
+        for (key, value) in daemon_env(paths)? {
+            command.env(key, value);
+        }
+        configure_daemon_operation_attribution(&mut command);
+        configure_background_command(&mut command);
+        detach_daemon_process(&mut command);
+        let child = command.spawn()?;
+        let pid = child.id();
+        write_daemon_pid_and_log(paths, pid, &config)?;
+        Ok(pid)
+    }
+}
+
+fn write_daemon_pid_and_log(
+    paths: &Paths,
+    pid: u32,
+    config: &WatchDaemonLaunchConfig,
+) -> Result<()> {
     fs::write(&paths.daemon_pid, pid.to_string())?;
     append_daemon_log(
         paths,
@@ -488,7 +523,81 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
             config.periodic_rescan_secs
         ),
     );
-    Ok(pid)
+    Ok(())
+}
+
+#[cfg(windows)]
+fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -> Result<u32> {
+    let exe = env::current_exe()?;
+    let args = vec![
+        "--home".to_string(),
+        paths.home.display().to_string(),
+        "watch".to_string(),
+        "--foreground".to_string(),
+        "true".to_string(),
+        "--backend".to_string(),
+        config.backend.to_string(),
+        "--mode".to_string(),
+        config.mode.clone(),
+        "--interval-secs".to_string(),
+        config.interval_secs.to_string(),
+        "--debounce-ms".to_string(),
+        config.debounce_ms.to_string(),
+        "--settle-ms".to_string(),
+        config.settle_ms.to_string(),
+        "--buffer-max-ms".to_string(),
+        config.buffer_max_ms.to_string(),
+        "--buffer-max-events".to_string(),
+        config.buffer_max_events.to_string(),
+        "--periodic-rescan-secs".to_string(),
+        config.periodic_rescan_secs.to_string(),
+    ];
+    let quoted_args = args
+        .iter()
+        .map(|arg| format!("'{}'", powershell_single_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut script = String::from("$ErrorActionPreference = 'Stop'\n");
+    for key in DAEMON_ATTRIBUTION_ENV_KEYS {
+        let _ = writeln!(script, "$env:{key} = $null");
+    }
+    script.push_str("$env:MAJUTSU_DAEMON = '1'\n");
+    for (key, value) in daemon_env(paths)? {
+        let _ = writeln!(script, "$env:{key} = '{}'", powershell_single_quote(&value));
+    }
+    let _ = writeln!(
+        script,
+        "$p = Start-Process -FilePath '{}' -ArgumentList @({quoted_args}) -WindowStyle Hidden -PassThru",
+        powershell_single_quote(&exe.display().to_string())
+    );
+    script.push_str("[Console]::Out.WriteLine($p.Id)\n");
+
+    let script_path = paths.runtime.join("launch-daemon.ps1");
+    fs::write(&script_path, script)?;
+    let output = ProcessCommand::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&script_path)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "failed to launch Windows daemon\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|err| anyhow!("failed to parse Windows daemon pid: {err}"))
+}
+
+#[cfg(windows)]
+fn powershell_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn daemon_doctor(paths: &Paths) -> Result<()> {
@@ -552,16 +661,9 @@ fn daemon_log_tail(paths: &Paths, lines: usize) -> Result<String> {
     }
 }
 
+#[cfg(not(windows))]
 fn configure_daemon_operation_attribution(command: &mut ProcessCommand) {
-    for key in [
-        "MAJUTSU_SESSION_ID",
-        "MAJUTSU_SESSION_LABEL",
-        "MAJUTSU_AGENT_NAME",
-        "CODEX_THREAD_ID",
-        "CLAUDE_SESSION_ID",
-        "CURSOR_SESSION_ID",
-        "TERM_SESSION_ID",
-    ] {
+    for key in DAEMON_ATTRIBUTION_ENV_KEYS {
         command.env_remove(key);
     }
     command.env("MAJUTSU_DAEMON", "1");
@@ -582,7 +684,7 @@ fn detach_daemon_process(command: &mut ProcessCommand) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn detach_daemon_process(_: &mut ProcessCommand) {}
 
 fn daemon_env(paths: &Paths) -> Result<BTreeMap<String, String>> {
@@ -649,40 +751,7 @@ fn unquote_env_value(value: &str) -> String {
 }
 
 fn stop_daemon_process(pid: u32) -> Result<()> {
-    if !pid_alive(pid) {
-        return Ok(());
-    }
-    let status = ProcessCommand::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()?;
-    if !status.success() {
-        bail!("failed to stop daemon pid {pid}");
-    }
-    if wait_for_pid_exit(pid, 50, Duration::from_millis(100)) {
-        return Ok(());
-    }
-    let status = ProcessCommand::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .status()?;
-    if !status.success() {
-        bail!("failed to force stop daemon pid {pid}");
-    }
-    if !wait_for_pid_exit(pid, 50, Duration::from_millis(100)) {
-        bail!("daemon pid {pid} did not exit after stop signal");
-    }
-    Ok(())
-}
-
-fn wait_for_pid_exit(pid: u32, attempts: usize, delay: Duration) -> bool {
-    for _ in 0..attempts {
-        if !pid_alive(pid) {
-            return true;
-        }
-        thread::sleep(delay);
-    }
-    !pid_alive(pid)
+    crate::platform_runtime::terminate_process(pid, std::time::Duration::from_secs(5))
 }
 
 fn cleanup_daemon_runtime(paths: &Paths) {
@@ -690,9 +759,9 @@ fn cleanup_daemon_runtime(paths: &Paths) {
     let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn start_daemon_ipc(paths: &Paths) -> Result<()> {
-    use std::os::unix::net::UnixListener;
+    use crate::platform_runtime::UnixListener;
 
     fs::create_dir_all(&paths.runtime)?;
     let sock = paths.runtime.join("daemon.sock");
@@ -712,13 +781,13 @@ pub(crate) fn start_daemon_ipc(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn start_daemon_ipc(_: &Paths) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn handle_daemon_ipc(home: &Path, stream: &mut std::os::unix::net::UnixStream) -> Result<()> {
+#[cfg(any(unix, windows))]
+fn handle_daemon_ipc(home: &Path, stream: &mut crate::platform_runtime::UnixStream) -> Result<()> {
     let mut command = String::new();
     stream.read_to_string(&mut command)?;
     let paths = resolve_paths(Some(home.to_path_buf()))?;
@@ -1020,9 +1089,9 @@ fn restore_queue_status_counts(paths: &Paths) -> Result<BTreeMap<String, usize>>
     Ok(counts)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn daemon_ipc_request(paths: &Paths, command: &str) -> Result<String> {
-    use std::os::unix::net::UnixStream;
+    use crate::platform_runtime::UnixStream;
 
     let mut stream = UnixStream::connect(paths.runtime.join("daemon.sock"))?;
     stream.write_all(command.as_bytes())?;
@@ -1063,7 +1132,7 @@ BAD-NAME=ignored
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn daemon_ipc_request(_: &Paths, _: &str) -> Result<String> {
     bail!("daemon IPC is not supported on this platform")
 }

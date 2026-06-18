@@ -1017,9 +1017,7 @@ fn maybe_send_health_notice(paths: &Paths, record: &RuntimeHealthRecord) -> Resu
     if health_notice_recently_sent(paths, record.report.state, &issue_codes) {
         return Ok(());
     }
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(&command)
+    let status = crate::platform_runtime::shell_command(&command)
         .env("MAJUTSU_HOME", &paths.home)
         .env("MAJUTSU_HEALTH_STATE", record.report.state.as_str())
         .env(

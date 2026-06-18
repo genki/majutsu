@@ -8,7 +8,6 @@ use crate::majutsu_restore::{
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -35,6 +34,9 @@ use crate::{
     read_large_chunk, read_object, remote_available_key, remote_object_available,
     request_archive_restore_for_job, write_large_chunks_atomic,
 };
+
+#[cfg(unix)]
+use std::ffi::OsStr;
 
 #[derive(Debug)]
 pub(crate) struct RestorePlan {

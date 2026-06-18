@@ -36,15 +36,21 @@ pub enum DaemonServiceScope {
 
 pub fn render_daemon_service(config: DaemonServiceConfig<'_>) -> Result<String, String> {
     let args = daemon_watch_args(&config);
-    match config.provider {
-        "systemd" => Ok(render_systemd_service(&config, args)),
-        "launchd" => {
-            if config.scope == DaemonServiceScope::System {
-                Err("launchd system scope is not supported; use systemd or render a user launchd plist".into())
-            } else {
-                Ok(render_launchd_plist(&config, args))
-            }
+    let provider = if config.provider == "auto" {
+        if cfg!(target_os = "windows") {
+            "windows-task"
+        } else if cfg!(target_os = "macos") {
+            "launchd"
+        } else {
+            "systemd"
         }
+    } else {
+        config.provider
+    };
+    match provider {
+        "systemd" => Ok(render_systemd_service(&config, args)),
+        "launchd" => Ok(render_launchd_plist(&config, args)),
+        "windows-task" | "schtasks" => Ok(render_windows_task_script(&config, args)),
         other => Err(format!("unsupported daemon service provider: {other}")),
     }
 }
@@ -167,6 +173,71 @@ fn xml_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn render_windows_task_script(config: &DaemonServiceConfig<'_>, args: Vec<String>) -> String {
+    let execute = powershell_quote(&args[0]);
+    let argument_line = args[1..]
+        .iter()
+        .map(|value| windows_command_line_quote(value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let task_name = match config.scope {
+        DaemonServiceScope::User => "Majutsu Watch",
+        DaemonServiceScope::System => "Majutsu Watch (System)",
+    };
+    let principal = match config.scope {
+        DaemonServiceScope::User => {
+            "$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited"
+        }
+        DaemonServiceScope::System => {
+            "$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest"
+        }
+    };
+    let trigger = match config.scope {
+        DaemonServiceScope::User => "$trigger = New-ScheduledTaskTrigger -AtLogOn",
+        DaemonServiceScope::System => "$trigger = New-ScheduledTaskTrigger -AtStartup",
+    };
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $action = New-ScheduledTaskAction -Execute {execute} -Argument {arguments}\n\
+         {trigger}\n\
+         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)\n\
+         {principal}\n\
+         Register-ScheduledTask -TaskName {task_name} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force\n",
+        arguments = powershell_quote(&argument_line),
+        task_name = powershell_quote(task_name),
+    )
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn windows_command_line_quote(value: &str) -> String {
+    if !value.is_empty() && value.chars().all(|ch| !ch.is_whitespace() && ch != '"') {
+        return value.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => slashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(slashes));
+                slashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
 }
 
 #[cfg(test)]

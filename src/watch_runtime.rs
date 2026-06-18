@@ -3,7 +3,6 @@ use chrono::Utc;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
@@ -311,9 +310,7 @@ fn notify_stalled_pending_journal(paths: &Paths) -> Result<()> {
     if oldest_age_secs < threshold_secs || notice_recently_sent(paths, rate_limit_secs) {
         return Ok(());
     }
-    let status = ProcessCommand::new("sh")
-        .arg("-c")
-        .arg(&command)
+    let status = crate::platform_runtime::shell_command(&command)
         .env("MAJUTSU_HOME", &paths.home)
         .env("MAJUTSU_PENDING_JOURNAL_COUNT", pending.to_string())
         .env(

@@ -62,10 +62,7 @@ pub(crate) fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
                 restore_special_file(&dest, record, special_kind, true)?;
             }
             Payload::Symlink { target } => {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(target, &dest)?;
-                #[cfg(not(unix))]
-                fs::write(&dest, target)?;
+                crate::platform_runtime::create_symlink(target, &dest)?;
             }
             payload => {
                 if let Some((oid, object_key)) = payload_blob_ref(payload) {

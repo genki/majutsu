@@ -27,7 +27,7 @@ where
         write_contents(&mut file)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&tmp, dest)?;
+        crate::platform_runtime::replace_file_atomic(&tmp, dest)?;
         fsync_parent_dir(dest)?;
         Ok(())
     })();
@@ -72,13 +72,5 @@ fn atomic_temp_path(dest: &Path) -> PathBuf {
 }
 
 pub(crate) fn fsync_parent_dir(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-    let dir = File::open(parent)?;
-    dir.sync_all()?;
-    Ok(())
+    crate::platform_runtime::sync_parent_dir(path)
 }

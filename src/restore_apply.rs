@@ -15,11 +15,7 @@ pub(crate) fn restore_symlink(dest: &Path, target: &str, force: bool) -> Result<
         }
         fs::remove_file(dest)?;
     }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, dest)?;
-    #[cfg(not(unix))]
-    fs::write(dest, target)?;
-    Ok(())
+    crate::platform_runtime::create_symlink(target, dest)
 }
 
 pub(crate) fn prepare_file_restore_destination(dest: &Path, force: bool) -> Result<()> {
