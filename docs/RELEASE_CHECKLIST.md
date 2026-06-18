@@ -27,7 +27,7 @@
    ```
 
 5. version 表示方針を確認する。crates.io / GitHub Release に出す正式版は
-   `0.4.2` のような clean SemVer とし、`mj --version` も同じ値を返す。
+   `0.5.0` のような clean SemVer とし、`mj --version` も同じ値を返す。
    `+build.N` は `MAJUTSU_DEV_BUILD=1` で作る開発版だけに使う。
 
    ```sh
@@ -40,8 +40,8 @@
 6. release tag を作成する。
 
    ```sh
-   git tag v0.4.2
-   git push origin v0.4.2
+   git tag v0.5.0
+   git push origin v0.5.0
    ```
 
 7. release artifact をローカルで展開して smoke test を実行する。
@@ -77,7 +77,7 @@
     scripts/publish-crates-io.sh
     export CARGO_REGISTRY_TOKEN=...
     scripts/publish-crates-io.sh --execute
-    cargo install majutsu --version 0.4.2 --locked --root "$(mktemp -d)"
+    cargo install majutsu --version 0.5.0 --locked --root "$(mktemp -d)"
     ```
 
     詳細は `docs/CRATES_IO_RELEASE.md` を参照する。
