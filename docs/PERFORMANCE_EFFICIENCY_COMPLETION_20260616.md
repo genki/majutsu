@@ -63,3 +63,21 @@ MAJUTSU_TRAFFIC_MAX_ELAPSED_MS=0
 ```sh
 MAJUTSU_TRAFFIC_REPORT=target/traffic-regression.tsv scripts/traffic-regression.sh
 ```
+
+`scripts/root-size-regression.sh` は `mj root size --json` を使い、current snapshot の復元単位と client data の比率、正確な scan を使った場合の backend prefix 全体と current backend の比率を確認する。
+
+既定では remote summary 高速パスを使うため、prefix 全体が未scanの場合は prefix ratio を判定しない。履歴や stale object まで含む厳密な prefix 全体値を判定する場合は `MAJUTSU_ROOT_SIZE_EXACT=1` を指定する。
+
+```sh
+scripts/root-size-regression.sh
+MAJUTSU_ROOT_SIZE_EXACT=1 scripts/root-size-regression.sh
+MAJUTSU_ROOT_SIZE_REPORT=target/root-size-regression.tsv scripts/root-size-regression.sh
+```
+
+主な調整用環境変数:
+
+```sh
+MAJUTSU_ROOT_SIZE_MAX_CURRENT_CLIENT_RATIO=5.0
+MAJUTSU_ROOT_SIZE_MAX_PREFIX_CURRENT_RATIO=10.0
+MAJUTSU_ROOT_SIZE_MIN_CLIENT_BYTES=16777216
+```
