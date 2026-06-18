@@ -2618,34 +2618,25 @@ fn attach_subtree_node_index_with_threshold(
         return Ok(());
     }
 
-    let mut root_entries = BTreeMap::new();
-    let mut by_top_dir = BTreeMap::<String, BTreeMap<String, FileRecord>>::new();
-    for (path, record) in &tree.entries {
-        root_entries.insert(path.clone(), record.clone());
-        let Some((top_dir, _)) = path.split_once('/') else {
-            continue;
-        };
-        by_top_dir
-            .entry(top_dir.to_string())
-            .or_default()
-            .insert(path.clone(), record.clone());
-    }
-
     let nodes_dir = paths.home.join("objects/trees/nodes");
-    tree.root_node = Some(store_tree_node(
+    let root_node = store_tree_node(
         paths,
         &nodes_dir,
         &tree.root_id,
         "",
-        root_entries,
-    )?);
+        &tree.entries,
+        threshold,
+    )?;
+    tree.root_node = Some(root_node);
     tree.subtree_nodes.clear();
-    for (top_dir, entries) in by_top_dir {
-        if entries.len() < threshold {
-            continue;
+    if let Some(root_node) = &tree.root_node {
+        let node_bytes = read_object(paths, &root_node.node_key)?;
+        let node: TreeNodeManifest = serde_json::from_slice(&node_bytes)?;
+        for (child_path, child) in node.child_nodes {
+            if child.file_count >= threshold {
+                tree.subtree_nodes.insert(child_path, child);
+            }
         }
-        let node = store_tree_node(paths, &nodes_dir, &tree.root_id, &top_dir, entries)?;
-        tree.subtree_nodes.insert(top_dir, node);
     }
     Ok(())
 }
@@ -2655,26 +2646,52 @@ fn store_tree_node(
     nodes_dir: &Path,
     root_id: &str,
     path: &str,
-    entries: BTreeMap<String, FileRecord>,
+    all_entries: &BTreeMap<String, FileRecord>,
+    threshold: usize,
 ) -> Result<TreeNodeRef> {
-    let file_count = entries.len();
+    let entries = direct_tree_node_entries(path, all_entries);
+    let child_paths = direct_child_directory_paths(path, all_entries);
+    let mut child_nodes = BTreeMap::new();
+    for child_path in child_paths {
+        if subtree_entry_count(&child_path, all_entries) < threshold {
+            continue;
+        }
+        let child = store_tree_node(
+            paths,
+            nodes_dir,
+            root_id,
+            &child_path,
+            all_entries,
+            threshold,
+        )?;
+        child_nodes.insert(child_path, child);
+    }
+    let file_count = entries.len()
+        + child_nodes
+            .values()
+            .map(|child| child.file_count)
+            .sum::<usize>();
     let total_size = entries.values().fold(0_u64, |sum, record| {
         if matches!(record.payload, Payload::Directory) {
             sum
         } else {
             sum.saturating_add(record.size)
         }
-    });
-    let identity = serde_json::to_vec(&(root_id, path, &entries))?;
+    }) + child_nodes
+        .values()
+        .map(|child| child.total_size)
+        .sum::<u64>();
+    let identity = serde_json::to_vec(&(root_id, path, &entries, &child_nodes))?;
     let node_id = format!("node-{}", blake3_hex(&identity));
     let manifest = TreeNodeManifest {
-        version: 1,
+        version: 2,
         node_id: node_id.clone(),
         root_id: root_id.to_string(),
         path: path.to_string(),
         created_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
         file_count,
         total_size,
+        child_nodes,
         entries,
     };
     let node_json = serde_json::to_vec(&manifest)?;
@@ -2686,6 +2703,57 @@ fn store_tree_node(
         file_count,
         total_size,
     })
+}
+
+fn direct_tree_node_entries(
+    node_path: &str,
+    all_entries: &BTreeMap<String, FileRecord>,
+) -> BTreeMap<String, FileRecord> {
+    all_entries
+        .iter()
+        .filter(|(path, _)| parent_path(path) == node_path)
+        .map(|(path, record)| (path.clone(), record.clone()))
+        .collect()
+}
+
+fn direct_child_directory_paths(
+    node_path: &str,
+    all_entries: &BTreeMap<String, FileRecord>,
+) -> Vec<String> {
+    all_entries
+        .keys()
+        .filter_map(|path| direct_child_directory_path(node_path, path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn direct_child_directory_path(node_path: &str, entry_path: &str) -> Option<String> {
+    let rest = if node_path.is_empty() {
+        entry_path
+    } else {
+        entry_path.strip_prefix(&format!("{node_path}/"))?
+    };
+    let (child, _) = rest.split_once('/')?;
+    if node_path.is_empty() {
+        Some(child.to_string())
+    } else {
+        Some(format!("{node_path}/{child}"))
+    }
+}
+
+fn subtree_entry_count(node_path: &str, all_entries: &BTreeMap<String, FileRecord>) -> usize {
+    let prefix = format!("{node_path}/");
+    all_entries
+        .keys()
+        .filter(|path| *path == node_path || path.starts_with(&prefix))
+        .count()
+}
+
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("")
 }
 
 fn store_large_file(

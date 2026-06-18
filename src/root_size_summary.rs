@@ -310,7 +310,20 @@ fn local_tree_entries(paths: &Paths, tree: TreeManifest) -> Result<BTreeMap<Stri
     let root_node = tree.root_node.expect("checked above");
     let node: TreeNodeManifest = read_local_metadata_object(paths, &root_node.node_key)
         .with_context(|| format!("read root tree node {}", root_node.node_key))?;
-    Ok(node.entries)
+    local_tree_entries_from_node(paths, node)
+}
+
+fn local_tree_entries_from_node(
+    paths: &Paths,
+    node: TreeNodeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    let mut entries = node.entries;
+    for child in node.child_nodes.values() {
+        let child_node: TreeNodeManifest = read_local_metadata_object(paths, &child.node_key)
+            .with_context(|| format!("read child tree node {}", child.node_key))?;
+        entries.extend(local_tree_entries_from_node(paths, child_node)?);
+    }
+    Ok(entries)
 }
 
 fn add_payload_keys(

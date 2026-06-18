@@ -815,6 +815,9 @@ pub struct TreeNodeManifest {
     pub created_at: DateTime<Utc>,
     pub file_count: usize,
     pub total_size: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub child_nodes: BTreeMap<String, TreeNodeRef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entries: BTreeMap<String, FileRecord>,
 }
 

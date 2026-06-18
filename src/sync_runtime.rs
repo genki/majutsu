@@ -911,9 +911,11 @@ fn sync_content_local_object_keys(
                 if let Ok(tree) = tree_manifest_for_object_keys(paths, &root_tree.tree_key) {
                     if let Some(root_node) = &tree.root_node {
                         keys.push(root_node.node_key.clone());
+                        push_child_tree_node_keys(paths, &mut keys, &root_node.node_key)?;
                     }
                     for node in tree.subtree_nodes.values() {
                         keys.push(node.node_key.clone());
+                        push_child_tree_node_keys(paths, &mut keys, &node.node_key)?;
                     }
                     for record in tree_entries_for_object_keys(paths, &tree)?.values() {
                         if let Some((_, manifest_key, _)) =
@@ -976,7 +978,31 @@ fn tree_entries_for_object_keys(
     let root_node = tree.root_node.as_ref().expect("checked above");
     let bytes = fs::read(paths.home.join(&root_node.node_key))?;
     let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
-    Ok(node.entries)
+    tree_entries_from_node_for_object_keys(paths, node)
+}
+
+fn tree_entries_from_node_for_object_keys(
+    paths: &Paths,
+    node: TreeNodeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    let mut entries = node.entries;
+    for child in node.child_nodes.values() {
+        let bytes = fs::read(paths.home.join(&child.node_key))?;
+        let child_node: TreeNodeManifest =
+            serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
+        entries.extend(tree_entries_from_node_for_object_keys(paths, child_node)?);
+    }
+    Ok(entries)
+}
+
+fn push_child_tree_node_keys(paths: &Paths, keys: &mut Vec<String>, node_key: &str) -> Result<()> {
+    let bytes = fs::read(paths.home.join(node_key))?;
+    let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
+    for child in node.child_nodes.values() {
+        keys.push(child.node_key.clone());
+        push_child_tree_node_keys(paths, keys, &child.node_key)?;
+    }
+    Ok(())
 }
 
 fn sync_verify_cached_remote_aliases() -> bool {

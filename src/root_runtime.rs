@@ -612,7 +612,22 @@ fn root_size_tree_entries(
     let root_node = tree.root_node.expect("checked above");
     let node: TreeNodeManifest = read_metadata_manifest(paths, remote, &root_node.node_key)
         .with_context(|| format!("read root tree node {}", root_node.node_key))?;
-    Ok(node.entries)
+    root_size_tree_entries_from_node(paths, remote, node)
+}
+
+fn root_size_tree_entries_from_node(
+    paths: &Paths,
+    remote: Option<&RemoteStore>,
+    node: TreeNodeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    let mut entries = node.entries;
+    for child in node.child_nodes.values() {
+        let child_node: TreeNodeManifest =
+            read_metadata_manifest(paths, remote, &child.node_key)
+                .with_context(|| format!("read child tree node {}", child.node_key))?;
+        entries.extend(root_size_tree_entries_from_node(paths, remote, child_node)?);
+    }
+    Ok(entries)
 }
 
 struct ResolvedRemoteKeys {

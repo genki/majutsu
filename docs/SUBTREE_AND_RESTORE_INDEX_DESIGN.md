@@ -74,7 +74,26 @@ entries は `root_node.node_key` が指す `TreeNodeManifest` から展開する
 - canonical remote encode-decode は tree node manifest を tree manifest と区別して扱う。
 - clone 時の GC mark 検証では `objects/trees/nodes/` と `trees/nodes/` を tree metadata として扱う。
 
-まだ v2 は opt-in のままにする。現時点の node は root node が flat entries 全体を保持するため、root tree object は小さくなるが、metadata 全体の根本削減は階層 Merkle node 化まで完了してから得られる。
+まだ v2 は opt-in のままにする。2026-06-18時点で node は階層 Merkle 化済みで、root node は直下 entries と child node 参照だけを保持する。
+これにより未変更 subtree の node key は再利用可能になった。次の段階では diff / restore / fsck が展開済み flat entries ではなく node traversal を直接使うようにして、不要な child node GET と展開コストを削る。
+
+## 2026-06-18 階層 Merkle node 実装
+
+`TreeNodeManifest` に `child_nodes` を追加した。node の identity は direct entries と child node refs から決まり、単一ファイル変更ではその leaf directory と ancestor directory だけが変わる。
+
+対応済み:
+
+- v2 root tree は flat `entries` を持たず、root node から再帰展開できる。
+- legacy flat node は `child_nodes` なしとして引き続き読める。
+- node live key 計算は child node を再帰的に含める。
+- root size / root size summary / fsck payload scope / sync live key / compact snapshot hydrate は階層 node を再帰展開する。
+- directory record がない synthetic/test data でも path 構造から child directory を推定する。
+
+残る課題:
+
+- node 生成はまだ全 entries を複数回走査するため、大規模 root では directory trie を先に構築する実装へ置き換える余地がある。
+- restore / diff / fsck はまだ node traversal ではなく再帰展開後の flat map に寄せている。
+- `MAJUTSU_TREE_FORMAT=v2` を既定化する前に、GCS 実データで node 数、metadata bytes、GET 数、restore latency を測定する必要がある。
 
 ## restore bundle 案
 

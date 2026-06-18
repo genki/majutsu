@@ -133,18 +133,32 @@ fn local_snapshot_manifest(state: &std::path::Path, order: &str) -> serde_json::
                 let node_key = tree["root_node"]["node_key"].as_str().unwrap();
                 let node: serde_json::Value =
                     serde_json::from_slice(&fs::read(state.join(node_key)).unwrap()).unwrap();
-                node["entries"]
-                    .as_object()
-                    .unwrap()
-                    .values()
-                    .cloned()
-                    .collect()
+                local_tree_node_entries(state, &node)
             };
             roots.insert(root_id.clone(), serde_json::Value::Array(entries));
         }
         manifest["roots"] = serde_json::Value::Object(roots);
     }
     manifest
+}
+
+fn local_tree_node_entries(
+    state: &std::path::Path,
+    node: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut entries = node["entries"]
+        .as_object()
+        .map(|entries| entries.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(children) = node["child_nodes"].as_object() {
+        for child in children.values() {
+            let node_key = child["node_key"].as_str().unwrap();
+            let child_node: serde_json::Value =
+                serde_json::from_slice(&fs::read(state.join(node_key)).unwrap()).unwrap();
+            entries.extend(local_tree_node_entries(state, &child_node));
+        }
+    }
+    entries
 }
 
 fn remote_snapshot_manifest(
@@ -4885,7 +4899,9 @@ fn tree_format_v2_omits_flat_entries_and_restores_from_root_node() {
     let node_key = tree["root_node"]["node_key"].as_str().unwrap();
     let node_bytes = fs::read(state.join(node_key)).unwrap();
     let node: serde_json::Value = serde_json::from_slice(&node_bytes).unwrap();
-    assert_eq!(node["entries"].as_object().unwrap().len(), 3);
+    assert_eq!(node["entries"].as_object().unwrap().len(), 2);
+    assert_eq!(node["child_nodes"].as_object().unwrap().len(), 1);
+    assert_eq!(local_tree_node_entries(&state, &node).len(), 3);
 
     run({
         let mut c = mj();

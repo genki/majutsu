@@ -194,7 +194,22 @@ pub(crate) fn tree_entries_from_manifest(
         .with_context(|| format!("read root tree node {}", root_node.node_key))?;
     let node: TreeNodeManifest = serde_json::from_slice(&node_bytes)
         .with_context(|| format!("parse root tree node {}", root_node.node_key))?;
-    Ok(node.entries)
+    tree_entries_from_node(paths, node)
+}
+
+pub(crate) fn tree_entries_from_node(
+    paths: &Paths,
+    node: TreeNodeManifest,
+) -> Result<BTreeMap<String, FileRecord>> {
+    let mut entries = node.entries;
+    for child in node.child_nodes.values() {
+        let child_bytes = crate::read_object(paths, &child.node_key)
+            .with_context(|| format!("read child tree node {}", child.node_key))?;
+        let child_node: TreeNodeManifest = serde_json::from_slice(&child_bytes)
+            .with_context(|| format!("parse child tree node {}", child.node_key))?;
+        entries.extend(tree_entries_from_node(paths, child_node)?);
+    }
+    Ok(entries)
 }
 
 fn hydrate_snapshot_manifest_from_remote(paths: &Paths, manifest_key: &str) -> Result<()> {
