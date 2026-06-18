@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write as _};
 #[cfg(unix)]
 use std::mem;
 #[cfg(unix)]
@@ -3245,6 +3245,7 @@ fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
     let width = usize::from(size.0).max(1);
     let height = usize::from(size.1).max(1);
     let body_height = height.saturating_sub(1);
+    let text_width = width.saturating_sub(1).max(1);
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -3256,8 +3257,14 @@ fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
         let Some(line) = lines.get(offset + row) else {
             break;
         };
-        let rendered = truncate_for_terminal(line, width);
-        println!("{rendered}");
+        let rendered = truncate_for_terminal(line, text_width);
+        execute!(
+            stdout,
+            cursor::MoveTo(0, row as u16),
+            terminal::Clear(ClearType::CurrentLine)
+        )
+        .context("draw log viewer line")?;
+        write!(stdout, "{rendered}").context("write log viewer line")?;
     }
     let status = if done {
         format!(
@@ -3273,13 +3280,14 @@ fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
         )
     };
     execute!(
-        io::stdout(),
+        stdout,
         cursor::MoveTo(0, size.1.saturating_sub(1)),
         terminal::Clear(ClearType::CurrentLine)
     )
     .context("draw log viewer status")?;
-    print!("{}", truncate_for_terminal(&status, width));
-    io::Write::flush(&mut io::stdout()).context("flush log viewer")?;
+    write!(stdout, "{}", truncate_for_terminal(&status, text_width))
+        .context("write log viewer status")?;
+    io::Write::flush(&mut stdout).context("flush log viewer")?;
     Ok(())
 }
 
@@ -3292,12 +3300,31 @@ fn log_viewer_terminal_size() -> (u16, u16) {
 
 fn truncate_for_terminal(line: &str, width: usize) -> String {
     let mut out = String::new();
-    for ch in line.chars() {
-        let next = out.len() + ch.len_utf8();
-        if next > width {
+    let mut columns = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            out.push(ch);
+            for next in chars.by_ref() {
+                out.push(next);
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        let char_width = if ch == '\t' {
+            8 - (columns % 8)
+        } else if ch.is_control() {
+            0
+        } else {
+            1
+        };
+        if columns + char_width > width {
             break;
         }
         out.push(ch);
+        columns += char_width;
     }
     out
 }
