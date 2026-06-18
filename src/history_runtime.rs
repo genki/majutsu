@@ -3113,6 +3113,15 @@ fn print_change_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<
             printed += 1;
         }
     }
+    if args.root.is_none() && printed >= args.limit {
+        let note = StatusUi::new().paint(
+            &format!(
+                "... showing {printed} change operations; use `mj log --limit N` for more or `mj log --operations` for internal operation records\n"
+            ),
+            "2",
+        );
+        output.write_chunk(&note)?;
+    }
     output.finish()
 }
 
@@ -3623,6 +3632,13 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
             message.unwrap_or_default()
         )?;
         printed += 1;
+    }
+    if args.root.is_none() && printed >= args.limit {
+        let note = ui.paint(
+            &format!("... showing {printed} operation records; use `mj log --operations --limit N` for more\n"),
+            "2",
+        );
+        writeln!(output, "{note}")?;
     }
     emit_status_output_auto(&output, terminal_height())
 }
