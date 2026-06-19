@@ -13045,6 +13045,62 @@ fn root_size_falls_back_when_remote_summary_is_corrupt() {
 }
 
 #[test]
+fn root_size_uses_local_summary_cache_when_remote_summary_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("--wait");
+        c
+    });
+
+    let hosts_dir = remote.join("hosts");
+    let summary_path = fs::read_dir(hosts_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("root-size-summary.cbor.zst.enc"))
+        .find(|path| path.exists())
+        .expect("root size summary");
+    fs::remove_file(summary_path).unwrap();
+
+    let sizes = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("root").arg("size");
+        c
+    });
+    assert!(sizes.contains("sample"));
+    assert!(sizes.contains("- GCS backend prefix全体: not scanned"));
+}
+
+#[test]
 fn root_add_rejects_duplicate_id_without_overwriting_existing_root() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

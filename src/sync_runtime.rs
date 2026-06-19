@@ -46,7 +46,8 @@ use crate::queue_runtime::{
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
 use crate::root_size_summary::{
-    build_root_size_summary, encode_root_size_summary, root_size_summary_key,
+    RootSizeSummary, build_root_size_summary, encode_root_size_summary, root_size_summary_key,
+    write_cached_root_size_summary,
 };
 use crate::snapshot_state::current_snapshot;
 use crate::util::{blake3_hex, new_id, parse_db_time};
@@ -782,6 +783,7 @@ fn enqueue_and_drain_sync(
     trace.mark("content queue");
     enqueue_gc_mark_if_needed(paths, remote, config, &content_export)?;
     trace.mark("gc mark");
+    let mut root_size_summary_cache = None::<RootSizeSummary>;
     match build_root_size_summary(paths, config, &remote_export) {
         Ok(Some(summary)) => {
             let key = root_size_summary_key(&config.host.id);
@@ -791,6 +793,7 @@ fn enqueue_and_drain_sync(
                 let bytes = encode_root_size_summary(paths, &summary)?;
                 enqueue_inline_upload_overwrite(paths, &key, bytes)?;
             }
+            root_size_summary_cache = Some(summary);
             trace.mark("root size summary");
         }
         Ok(None) => {}
@@ -799,6 +802,11 @@ fn enqueue_and_drain_sync(
         }
     }
     let upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    if let Some(summary) = &root_size_summary_cache
+        && let Err(err) = write_cached_root_size_summary(paths, summary)
+    {
+        eprintln!("warning: failed to update local root size summary cache: {err:#}");
+    }
     trace.mark("drain queue");
     write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
     trace.mark("write sync cache");

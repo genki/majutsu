@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
+use crate::atomic_io::write_atomic;
 use crate::config::{Config, MetadataExport, Paths};
 use crate::majutsu_core::{
     FileRecord, LargeManifest, Payload, SnapshotExport, SnapshotManifest, TreeManifest,
@@ -216,7 +217,59 @@ pub(crate) fn read_root_size_summary(
     {
         return Ok(None);
     }
+    let _ = write_cached_root_size_summary(paths, &summary);
     Ok(Some(summary))
+}
+
+pub(crate) fn read_cached_root_size_summary(
+    paths: &Paths,
+    host_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<RootSizeSummary>> {
+    let path = cached_root_size_summary_path(paths, host_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let summary: RootSizeSummary = match serde_json::from_slice(&fs::read(path)?) {
+        Ok(summary) => summary,
+        Err(_) => return Ok(None),
+    };
+    if summary.version != ROOT_SIZE_SUMMARY_VERSION
+        || summary.host_id != host_id
+        || summary.snapshot_id != snapshot_id
+    {
+        return Ok(None);
+    }
+    Ok(Some(summary))
+}
+
+pub(crate) fn write_cached_root_size_summary(
+    paths: &Paths,
+    summary: &RootSizeSummary,
+) -> Result<()> {
+    let path = cached_root_size_summary_path(paths, &summary.host_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_atomic(&path, &serde_json::to_vec(summary)?)?;
+    Ok(())
+}
+
+fn cached_root_size_summary_path(paths: &Paths, host_id: &str) -> std::path::PathBuf {
+    let safe_host_id = host_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    paths
+        .home
+        .join("cache")
+        .join(format!("root-size-summary-{safe_host_id}.json"))
 }
 
 pub(crate) fn print_root_size_summary(summary: &RootSizeSummary, json: bool) -> Result<()> {
@@ -257,9 +310,13 @@ pub(crate) fn print_root_size_summary(summary: &RootSizeSummary, json: bool) -> 
     println!(
         "注: `|` より左はclient側、右はremote側。backend は復元に必要なremote object全体、used はpack内slice換算の実利用量。"
     );
-    println!(
-        "注: remote summary高速パスを使用しています。backend prefix全体はscanしていません。厳密値は `MAJUTSU_ROOT_SIZE_FORCE_SCAN=1 mj root size` で確認できます。"
-    );
+    if summary.totals.backend_prefix_exact {
+        println!("注: summary高速パスを使用しています。backend prefix全体は直近scanの厳密値です。");
+    } else {
+        println!(
+            "注: summary高速パスを使用しています。backend prefix全体の厳密値は `MAJUTSU_ROOT_SIZE_FORCE_SCAN=1 mj root size` で確認できます。"
+        );
+    }
     println!();
     println!("全体:");
     println!(
@@ -272,8 +329,19 @@ pub(crate) fn print_root_size_summary(summary: &RootSizeSummary, json: bool) -> 
         format_mib(summary.totals.metadata_bytes)
     );
     println!("  - objects: {}", format_count(summary.totals.objects));
-    println!("- GCS backend prefix全体: not scanned");
-    println!("  - exact: false");
+    if summary.totals.backend_prefix_exact {
+        println!(
+            "- GCS backend prefix全体: {}",
+            format_mib(summary.totals.backend_prefix_bytes)
+        );
+        println!(
+            "  - objects: {}",
+            format_count(summary.totals.backend_prefix_objects)
+        );
+    } else {
+        println!("- GCS backend prefix全体: not scanned");
+        println!("  - exact: false");
+    }
     Ok(())
 }
 

@@ -19,7 +19,10 @@ use crate::config::{
 use crate::daemon_runtime::ensure_daemon_running;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteObjectStat, RemoteStore, open_remote};
-use crate::root_size_summary::{print_root_size_summary, read_root_size_summary};
+use crate::root_size_summary::{
+    RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, print_root_size_summary,
+    read_cached_root_size_summary, read_root_size_summary, write_cached_root_size_summary,
+};
 use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
 };
@@ -319,9 +322,17 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
             |row| row.get(0),
         )
         .with_context(|| format!("read snapshot manifest key for {current}"))?;
+    let snapshot_created_at: String = conn
+        .query_row(
+            "select created_at from snapshots where id=?1",
+            params![current],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("read snapshot timestamp for {current}"))?;
     let config = read_config(paths)?;
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
     if env::var("MAJUTSU_ROOT_SIZE_FORCE_SCAN").as_deref() != Ok("1") {
+        let mut remote_summary_error = false;
         match read_root_size_summary(paths, remote.as_ref(), &config.host.id, &current) {
             Ok(Some(summary)) => {
                 print_root_size_summary(&summary, args.json)?;
@@ -329,7 +340,20 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
             }
             Ok(None) => {}
             Err(err) => {
+                remote_summary_error = true;
                 eprintln!("warning: ignoring invalid root size summary: {err:#}");
+            }
+        }
+        if !remote_summary_error {
+            match read_cached_root_size_summary(paths, &config.host.id, &current) {
+                Ok(Some(summary)) => {
+                    print_root_size_summary(&summary, args.json)?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("warning: ignoring invalid local root size summary cache: {err:#}");
+                }
             }
         }
     }
@@ -417,6 +441,16 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         &unique_payload_keys,
         &unique_metadata_keys,
     );
+    let summary = root_size_summary_from_scan(
+        &config.host.id,
+        &current,
+        &snapshot_created_at,
+        &rows,
+        totals,
+    );
+    if let Err(err) = write_cached_root_size_summary(paths, &summary) {
+        eprintln!("warning: failed to update local root size summary cache: {err:#}");
+    }
     if args.json {
         println!(
             "{}",
@@ -429,6 +463,46 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         print_root_size_table(&rows, &totals);
     }
     Ok(())
+}
+
+fn root_size_summary_from_scan(
+    host_id: &str,
+    snapshot_id: &str,
+    generated_at: &str,
+    rows: &[RootSizeRow],
+    totals: RootSizeTotals,
+) -> RootSizeSummary {
+    RootSizeSummary {
+        version: 1,
+        host_id: host_id.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        generated_at: generated_at.to_string(),
+        roots: rows
+            .iter()
+            .map(|row| RootSizeSummaryRow {
+                root: row.root.clone(),
+                files: row.files,
+                dirs: row.dirs,
+                client_bytes: row.client_bytes,
+                used_bytes: row.used_bytes,
+                backend_bytes: row.backend_bytes,
+                payload_bytes: row.payload_bytes,
+                metadata_bytes: row.metadata_bytes,
+                backend_objects: row.backend_objects,
+                missing_objects: row.missing_objects,
+            })
+            .collect(),
+        totals: RootSizeSummaryTotals {
+            current_backend_bytes: totals.current_backend_bytes,
+            payload_bytes: totals.payload_bytes,
+            metadata_bytes: totals.metadata_bytes,
+            objects: totals.objects,
+            backend_prefix_bytes: totals.backend_prefix_bytes,
+            backend_prefix_objects: totals.backend_prefix_objects,
+            backend_prefix_exact: true,
+            backend_prefix_scope: "full-prefix-scan".into(),
+        },
+    }
 }
 
 fn root_size_remote_objects(paths: &Paths, remote: &RemoteStore) -> Result<Vec<RemoteObjectStat>> {
