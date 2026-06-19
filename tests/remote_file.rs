@@ -12950,8 +12950,8 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(!sizes.contains("| root |"));
     assert!(sizes.contains("全体:"));
     assert!(sizes.contains("- current snapshotのユニークbackend復元単位:"));
-    assert!(sizes.contains("- GCS backend prefix全体: not scanned"));
-    assert!(sizes.contains("MAJUTSU_ROOT_SIZE_FORCE_SCAN=1 mj root size"));
+    assert!(sizes.contains("- GCS backend prefix全体:"));
+    assert!(!sizes.contains("not scanned"));
 
     let json = output({
         let mut c = mj();
@@ -12977,10 +12977,10 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(report["totals"]["payload_bytes"].as_u64().unwrap() > 0);
     assert!(report["totals"]["metadata_bytes"].as_u64().unwrap() > 0);
     assert!(report["totals"]["objects"].as_u64().unwrap() > 0);
-    assert_eq!(report["totals"]["backend_prefix_bytes"], 0);
-    assert_eq!(report["totals"]["backend_prefix_objects"], 0);
-    assert_eq!(report["totals"]["backend_prefix_exact"], false);
-    assert_eq!(report["totals"]["backend_prefix_scope"], "not-scanned");
+    assert!(report["totals"]["backend_prefix_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["backend_prefix_objects"].as_u64().unwrap() > 0);
+    assert_eq!(report["totals"]["backend_prefix_exact"], true);
+    assert_eq!(report["totals"]["backend_prefix_scope"], "full-prefix-scan");
 }
 
 #[test]
@@ -13045,7 +13045,7 @@ fn root_size_falls_back_when_remote_summary_is_corrupt() {
 }
 
 #[test]
-fn root_size_uses_local_summary_cache_when_remote_summary_is_missing() {
+fn root_size_reports_full_totals_when_remote_summary_is_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
@@ -13097,7 +13097,8 @@ fn root_size_uses_local_summary_cache_when_remote_summary_is_missing() {
         c
     });
     assert!(sizes.contains("sample"));
-    assert!(sizes.contains("- GCS backend prefix全体: not scanned"));
+    assert!(sizes.contains("- GCS backend prefix全体:"));
+    assert!(!sizes.contains("not scanned"));
 }
 
 #[test]

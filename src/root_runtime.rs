@@ -20,8 +20,7 @@ use crate::daemon_runtime::ensure_daemon_running;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteObjectStat, RemoteStore, open_remote};
 use crate::root_size_summary::{
-    RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, print_root_size_summary,
-    read_cached_root_size_summary, read_root_size_summary, write_cached_root_size_summary,
+    RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, write_cached_root_size_summary,
 };
 use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
@@ -284,7 +283,7 @@ struct RootSizeReport<'a> {
     totals: RootSizeTotals,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Serialize)]
 struct RootSizeTotals {
     current_backend_bytes: u64,
     payload_bytes: u64,
@@ -292,6 +291,8 @@ struct RootSizeTotals {
     objects: usize,
     backend_prefix_bytes: u64,
     backend_prefix_objects: usize,
+    backend_prefix_exact: bool,
+    backend_prefix_scope: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -331,32 +332,6 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         .with_context(|| format!("read snapshot timestamp for {current}"))?;
     let config = read_config(paths)?;
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
-    if env::var("MAJUTSU_ROOT_SIZE_FORCE_SCAN").as_deref() != Ok("1") {
-        let mut remote_summary_error = false;
-        match read_root_size_summary(paths, remote.as_ref(), &config.host.id, &current) {
-            Ok(Some(summary)) => {
-                print_root_size_summary(&summary, args.json)?;
-                return Ok(());
-            }
-            Ok(None) => {}
-            Err(err) => {
-                remote_summary_error = true;
-                eprintln!("warning: ignoring invalid root size summary: {err:#}");
-            }
-        }
-        if !remote_summary_error {
-            match read_cached_root_size_summary(paths, &config.host.id, &current) {
-                Ok(Some(summary)) => {
-                    print_root_size_summary(&summary, args.json)?;
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    eprintln!("warning: ignoring invalid local root size summary cache: {err:#}");
-                }
-            }
-        }
-    }
     let remote_sizes = remote
         .as_ref()
         .map(|remote| root_size_remote_objects(paths, remote))
@@ -446,7 +421,7 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         &current,
         &snapshot_created_at,
         &rows,
-        totals,
+        &totals,
     );
     if let Err(err) = write_cached_root_size_summary(paths, &summary) {
         eprintln!("warning: failed to update local root size summary cache: {err:#}");
@@ -470,7 +445,7 @@ fn root_size_summary_from_scan(
     snapshot_id: &str,
     generated_at: &str,
     rows: &[RootSizeRow],
-    totals: RootSizeTotals,
+    totals: &RootSizeTotals,
 ) -> RootSizeSummary {
     RootSizeSummary {
         version: 1,
@@ -499,8 +474,8 @@ fn root_size_summary_from_scan(
             objects: totals.objects,
             backend_prefix_bytes: totals.backend_prefix_bytes,
             backend_prefix_objects: totals.backend_prefix_objects,
-            backend_prefix_exact: true,
-            backend_prefix_scope: "full-prefix-scan".into(),
+            backend_prefix_exact: totals.backend_prefix_exact,
+            backend_prefix_scope: totals.backend_prefix_scope.clone(),
         },
     }
 }
@@ -759,6 +734,8 @@ fn root_size_totals(
         objects: unique_keys.len(),
         backend_prefix_bytes: remote_sizes.iter().map(|object| object.size).sum(),
         backend_prefix_objects: remote_sizes.len(),
+        backend_prefix_exact: true,
+        backend_prefix_scope: "full-prefix-scan".into(),
     }
 }
 

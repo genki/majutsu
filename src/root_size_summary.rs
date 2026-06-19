@@ -9,7 +9,6 @@ use crate::majutsu_core::{
     FileRecord, LargeManifest, Payload, SnapshotExport, SnapshotManifest, TreeManifest,
     TreeNodeManifest, payload_blob_ref,
 };
-use crate::remote_store::RemoteStore;
 
 const ROOT_SIZE_SUMMARY_VERSION: u32 = 1;
 
@@ -195,54 +194,6 @@ pub(crate) fn encode_root_size_summary(
     crate::encode_object(paths, &compressed)
 }
 
-pub(crate) fn read_root_size_summary(
-    paths: &Paths,
-    remote: Option<&RemoteStore>,
-    host_id: &str,
-    snapshot_id: &str,
-) -> Result<Option<RootSizeSummary>> {
-    let Some(remote) = remote else {
-        return Ok(None);
-    };
-    let key = root_size_summary_key(host_id);
-    let Some(bytes) = remote.get_optional(&key)? else {
-        return Ok(None);
-    };
-    let decoded = crate::decode_object(paths, &bytes)?;
-    let decompressed = zstd::stream::decode_all(decoded.as_slice())?;
-    let summary: RootSizeSummary = serde_cbor::from_slice(&decompressed)?;
-    if summary.version != ROOT_SIZE_SUMMARY_VERSION
-        || summary.host_id != host_id
-        || summary.snapshot_id != snapshot_id
-    {
-        return Ok(None);
-    }
-    let _ = write_cached_root_size_summary(paths, &summary);
-    Ok(Some(summary))
-}
-
-pub(crate) fn read_cached_root_size_summary(
-    paths: &Paths,
-    host_id: &str,
-    snapshot_id: &str,
-) -> Result<Option<RootSizeSummary>> {
-    let path = cached_root_size_summary_path(paths, host_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let summary: RootSizeSummary = match serde_json::from_slice(&fs::read(path)?) {
-        Ok(summary) => summary,
-        Err(_) => return Ok(None),
-    };
-    if summary.version != ROOT_SIZE_SUMMARY_VERSION
-        || summary.host_id != host_id
-        || summary.snapshot_id != snapshot_id
-    {
-        return Ok(None);
-    }
-    Ok(Some(summary))
-}
-
 pub(crate) fn write_cached_root_size_summary(
     paths: &Paths,
     summary: &RootSizeSummary,
@@ -270,79 +221,6 @@ fn cached_root_size_summary_path(paths: &Paths, host_id: &str) -> std::path::Pat
         .home
         .join("cache")
         .join(format!("root-size-summary-{safe_host_id}.json"))
-}
-
-pub(crate) fn print_root_size_summary(summary: &RootSizeSummary, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(summary)?);
-        return Ok(());
-    }
-    let table_rows = summary
-        .roots
-        .iter()
-        .map(|row| {
-            vec![
-                row.root.clone(),
-                format_count(row.files),
-                format_count(row.dirs),
-                format_mib(row.client_bytes),
-                "|".into(),
-                format_mib(row.backend_bytes),
-                format_mib(row.used_bytes),
-                format_mib(row.payload_bytes),
-                format_mib(row.metadata_bytes),
-                format_count(row.backend_objects),
-                format_count(row.missing_objects),
-            ]
-        })
-        .collect::<Vec<_>>();
-    print_aligned_table(
-        &[
-            "root", "files", "dirs", "client", "|", "backend", "used", "payload", "metadata",
-            "objects", "missing",
-        ],
-        &[
-            false, true, true, true, false, true, true, true, true, true, true,
-        ],
-        &table_rows,
-    );
-    println!();
-    println!(
-        "注: `|` より左はclient側、右はremote側。backend は復元に必要なremote object全体、used はpack内slice換算の実利用量。"
-    );
-    if summary.totals.backend_prefix_exact {
-        println!("注: summary高速パスを使用しています。backend prefix全体は直近scanの厳密値です。");
-    } else {
-        println!(
-            "注: summary高速パスを使用しています。backend prefix全体の厳密値は `MAJUTSU_ROOT_SIZE_FORCE_SCAN=1 mj root size` で確認できます。"
-        );
-    }
-    println!();
-    println!("全体:");
-    println!(
-        "- current snapshotのユニークbackend復元単位: {}",
-        format_mib(summary.totals.current_backend_bytes)
-    );
-    println!("  - payload: {}", format_mib(summary.totals.payload_bytes));
-    println!(
-        "  - metadata: {}",
-        format_mib(summary.totals.metadata_bytes)
-    );
-    println!("  - objects: {}", format_count(summary.totals.objects));
-    if summary.totals.backend_prefix_exact {
-        println!(
-            "- GCS backend prefix全体: {}",
-            format_mib(summary.totals.backend_prefix_bytes)
-        );
-        println!(
-            "  - objects: {}",
-            format_count(summary.totals.backend_prefix_objects)
-        );
-    } else {
-        println!("- GCS backend prefix全体: not scanned");
-        println!("  - exact: false");
-    }
-    Ok(())
 }
 
 fn read_snapshot_manifest(paths: &Paths, snapshot: &SnapshotExport) -> Result<SnapshotManifest> {
@@ -485,62 +363,4 @@ fn missing_local_objects(paths: &Paths, keys: &BTreeSet<String>) -> usize {
     keys.iter()
         .filter(|key| fs::metadata(paths.home.join(key)).is_err())
         .count()
-}
-
-fn print_aligned_table(headers: &[&str], right_align: &[bool], rows: &[Vec<String>]) {
-    let widths = headers
-        .iter()
-        .enumerate()
-        .map(|(index, header)| {
-            rows.iter()
-                .filter_map(|row| row.get(index))
-                .map(|value| value.len())
-                .max()
-                .unwrap_or(0)
-                .max(header.len())
-        })
-        .collect::<Vec<_>>();
-    print_table_line(headers, &widths, right_align);
-    let separator = widths
-        .iter()
-        .map(|width| "-".repeat(*width))
-        .collect::<Vec<_>>()
-        .join("  ");
-    println!("{separator}");
-    for row in rows {
-        let cells = row.iter().map(String::as_str).collect::<Vec<_>>();
-        print_table_line(&cells, &widths, right_align);
-    }
-}
-
-fn print_table_line(cells: &[&str], widths: &[usize], right_align: &[bool]) {
-    let line = cells
-        .iter()
-        .enumerate()
-        .map(|(index, cell)| {
-            if right_align.get(index).copied().unwrap_or(false) {
-                format!("{:>width$}", cell, width = widths[index])
-            } else {
-                format!("{:<width$}", cell, width = widths[index])
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("  ");
-    println!("{line}");
-}
-
-fn format_mib(bytes: u64) -> String {
-    format!("{:.2} MiB", bytes as f64 / 1024.0 / 1024.0)
-}
-
-fn format_count(value: usize) -> String {
-    let text = value.to_string();
-    let mut out = String::new();
-    for (index, ch) in text.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
 }
