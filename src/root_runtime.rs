@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, IsTerminal};
+use std::thread;
 
 use crate::cli::{RootCommand, RootSizeArgs};
 use crate::config::{
@@ -260,6 +262,7 @@ struct RootSizeStat {
     payload_keys: BTreeSet<String>,
     metadata_keys: BTreeSet<String>,
     packed_payload_keys: BTreeSet<String>,
+    packed_payload_oids: BTreeSet<String>,
     packed_slice_bytes: u64,
 }
 
@@ -285,6 +288,10 @@ struct RootSizeReport<'a> {
 
 #[derive(Clone, Serialize)]
 struct RootSizeTotals {
+    billed_bytes: u64,
+    billed_objects: usize,
+    row_used_bytes: u64,
+    unique_used_bytes: u64,
     current_backend_bytes: u64,
     payload_bytes: u64,
     metadata_bytes: u64,
@@ -301,6 +308,17 @@ struct RootSizeRemoteObjectCache {
     remote: String,
     fetched_at: DateTime<Utc>,
     objects: Vec<RemoteObjectStat>,
+}
+
+struct RootSizeTotalsInput<'a> {
+    remote_sizes: &'a [RemoteObjectStat],
+    remote_size_map: &'a BTreeMap<String, u64>,
+    unique_keys: &'a BTreeSet<String>,
+    unique_payload_keys: &'a BTreeSet<String>,
+    unique_metadata_keys: &'a BTreeSet<String>,
+    unique_packed_payload_keys: &'a BTreeSet<String>,
+    unique_packed_slice_bytes: u64,
+    rows: &'a [RootSizeRow],
 }
 
 #[derive(Clone)]
@@ -332,16 +350,12 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         .with_context(|| format!("read snapshot timestamp for {current}"))?;
     let config = read_config(paths)?;
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
-    let remote_sizes = remote
-        .as_ref()
-        .map(|remote| root_size_remote_objects(paths, remote))
-        .transpose()?
-        .unwrap_or_default();
-    let remote_size_map = remote_sizes
-        .iter()
-        .map(|object| (object.key.clone(), object.size))
-        .collect::<BTreeMap<_, _>>();
     let is_s3_remote = matches!(remote, Some(RemoteStore::S3(_)));
+    let remote_sizes_task = remote.as_ref().map(|remote| {
+        let paths = paths.clone();
+        let remote = remote.clone();
+        thread::spawn(move || root_size_remote_objects(&paths, &remote))
+    });
     let packed_blobs = packed_blob_size_refs(conn)?;
     let manifest: SnapshotManifest = read_metadata_manifest(paths, remote.as_ref(), &manifest_key)
         .with_context(|| format!("read snapshot manifest {manifest_key}"))?;
@@ -371,10 +385,32 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         }
     }
 
+    let remote_sizes = match remote_sizes_task {
+        Some(task) => {
+            if !args.json
+                && !task.is_finished()
+                && io::stderr().is_terminal()
+                && env::var("TERM").as_deref() != Ok("dumb")
+            {
+                eprintln!("root size: local root scan completed; waiting for S3 object listing...");
+            }
+            task.join()
+                .map_err(|err| anyhow!("root size remote listing worker panicked: {err:?}"))??
+        }
+        None => Vec::new(),
+    };
+    let remote_size_map = remote_sizes
+        .iter()
+        .map(|object| (object.key.clone(), object.size))
+        .collect::<BTreeMap<_, _>>();
+
     let mut rows = Vec::new();
     let mut unique_keys = BTreeSet::new();
     let mut unique_payload_keys = BTreeSet::new();
     let mut unique_metadata_keys = BTreeSet::new();
+    let mut unique_packed_payload_keys = BTreeSet::new();
+    let mut unique_packed_payload_oids = BTreeSet::new();
+    let mut unique_packed_slice_bytes = 0u64;
     for (root, stat) in stats {
         let payload_keys = resolve_remote_keys(&stat.payload_keys, &remote_size_map, is_s3_remote);
         let metadata_keys =
@@ -391,6 +427,15 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         let metadata_bytes = sum_remote_keys(&remote_size_map, &metadata_keys.found);
         let packed_payload_keys =
             resolve_remote_keys(&stat.packed_payload_keys, &remote_size_map, is_s3_remote);
+        unique_packed_payload_keys.extend(packed_payload_keys.found.iter().cloned());
+        for oid in &stat.packed_payload_oids {
+            if unique_packed_payload_oids.insert(oid.clone())
+                && let Some(packed) = packed_blobs.get(oid)
+            {
+                unique_packed_slice_bytes =
+                    unique_packed_slice_bytes.saturating_add(packed.pack_len);
+            }
+        }
         let packed_payload_bytes = sum_remote_keys(&remote_size_map, &packed_payload_keys.found);
         let backend_bytes = sum_remote_keys(&remote_size_map, &all_keys);
         let used_bytes = backend_bytes
@@ -409,13 +454,16 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
             missing_objects: payload_keys.missing + metadata_keys.missing,
         });
     }
-    let totals = root_size_totals(
-        &remote_sizes,
-        &remote_size_map,
-        &unique_keys,
-        &unique_payload_keys,
-        &unique_metadata_keys,
-    );
+    let totals = root_size_totals(RootSizeTotalsInput {
+        remote_sizes: &remote_sizes,
+        remote_size_map: &remote_size_map,
+        unique_keys: &unique_keys,
+        unique_payload_keys: &unique_payload_keys,
+        unique_metadata_keys: &unique_metadata_keys,
+        unique_packed_payload_keys: &unique_packed_payload_keys,
+        unique_packed_slice_bytes,
+        rows: &rows,
+    });
     let summary = root_size_summary_from_scan(
         &config.host.id,
         &current,
@@ -468,6 +516,10 @@ fn root_size_summary_from_scan(
             })
             .collect(),
         totals: RootSizeSummaryTotals {
+            billed_bytes: totals.billed_bytes,
+            billed_objects: totals.billed_objects,
+            row_used_bytes: totals.row_used_bytes,
+            unique_used_bytes: totals.unique_used_bytes,
             current_backend_bytes: totals.current_backend_bytes,
             payload_bytes: totals.payload_bytes,
             metadata_bytes: totals.metadata_bytes,
@@ -556,6 +608,7 @@ fn add_payload_remote_keys(
 ) -> Result<()> {
     if let Some((oid, object_key)) = payload_blob_ref(payload) {
         if let Some(packed) = packed_blobs.get(oid) {
+            stat.packed_payload_oids.insert(oid.to_string());
             stat.packed_payload_keys.insert(packed.pack_key.clone());
             stat.payload_keys.insert(packed.pack_key.clone());
             stat.metadata_keys.insert(packed.index_key.clone());
@@ -720,20 +773,29 @@ fn sum_remote_keys(remote_size_map: &BTreeMap<String, u64>, keys: &BTreeSet<Stri
         .sum()
 }
 
-fn root_size_totals(
-    remote_sizes: &[RemoteObjectStat],
-    remote_size_map: &BTreeMap<String, u64>,
-    unique_keys: &BTreeSet<String>,
-    unique_payload_keys: &BTreeSet<String>,
-    unique_metadata_keys: &BTreeSet<String>,
-) -> RootSizeTotals {
+fn root_size_totals(input: RootSizeTotalsInput<'_>) -> RootSizeTotals {
+    let billed_bytes = input.remote_sizes.iter().map(|object| object.size).sum();
+    let billed_objects = input.remote_sizes.len();
+    let current_backend_bytes = sum_remote_keys(input.remote_size_map, input.unique_keys);
+    let payload_bytes = sum_remote_keys(input.remote_size_map, input.unique_payload_keys);
+    let metadata_bytes = sum_remote_keys(input.remote_size_map, input.unique_metadata_keys);
+    let packed_payload_bytes =
+        sum_remote_keys(input.remote_size_map, input.unique_packed_payload_keys);
+    let row_used_bytes = input.rows.iter().map(|row| row.used_bytes).sum();
+    let unique_used_bytes = current_backend_bytes
+        .saturating_sub(packed_payload_bytes)
+        .saturating_add(input.unique_packed_slice_bytes);
     RootSizeTotals {
-        current_backend_bytes: sum_remote_keys(remote_size_map, unique_keys),
-        payload_bytes: sum_remote_keys(remote_size_map, unique_payload_keys),
-        metadata_bytes: sum_remote_keys(remote_size_map, unique_metadata_keys),
-        objects: unique_keys.len(),
-        backend_prefix_bytes: remote_sizes.iter().map(|object| object.size).sum(),
-        backend_prefix_objects: remote_sizes.len(),
+        billed_bytes,
+        billed_objects,
+        row_used_bytes,
+        unique_used_bytes,
+        current_backend_bytes,
+        payload_bytes,
+        metadata_bytes,
+        objects: input.unique_keys.len(),
+        backend_prefix_bytes: billed_bytes,
+        backend_prefix_objects: billed_objects,
         backend_prefix_exact: true,
         backend_prefix_scope: "full-prefix-scan".into(),
     }
@@ -775,20 +837,29 @@ fn print_root_size_table(rows: &[RootSizeRow], totals: &RootSizeTotals) {
     println!();
     println!("全体:");
     println!(
-        "- current snapshotのユニークbackend復元単位: {}",
+        "- root別used集計合計: {}",
+        format_mib(totals.row_used_bytes)
+    );
+    println!("  - 注: root間共有payloadは重複計上されます。");
+    println!(
+        "- current snapshotのユニークused推定: {}",
+        format_mib(totals.unique_used_bytes)
+    );
+    println!("  - 注: pack内slice換算。S3課金対象サイズではありません。");
+    println!(
+        "- current snapshotが参照するremote object全体: {}",
         format_mib(totals.current_backend_bytes)
     );
+    println!("  - 注: pack object全体サイズ。root別backend列は共有objectを含むため合計不可。");
     println!("  - payload: {}", format_mib(totals.payload_bytes));
     println!("  - metadata: {}", format_mib(totals.metadata_bytes));
     println!("  - objects: {}", format_count(totals.objects));
     println!(
-        "- GCS backend prefix全体: {}",
-        format_mib(totals.backend_prefix_bytes)
+        "- S3上の実サイズbackend prefix全体: {}",
+        format_mib(totals.billed_bytes)
     );
-    println!(
-        "  - objects: {}",
-        format_count(totals.backend_prefix_objects)
-    );
+    println!("  - objects: {}", format_count(totals.billed_objects));
+    println!("  - exact: {}", totals.backend_prefix_exact);
 }
 
 fn terminal_width() -> usize {

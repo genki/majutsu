@@ -12949,8 +12949,10 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(sizes.contains("0.00 MiB"));
     assert!(!sizes.contains("| root |"));
     assert!(sizes.contains("全体:"));
-    assert!(sizes.contains("- current snapshotのユニークbackend復元単位:"));
-    assert!(sizes.contains("- GCS backend prefix全体:"));
+    assert!(sizes.contains("- root別used集計合計:"));
+    assert!(sizes.contains("- current snapshotのユニークused推定:"));
+    assert!(sizes.contains("- current snapshotが参照するremote object全体:"));
+    assert!(sizes.contains("- S3上の実サイズbackend prefix全体:"));
     assert!(!sizes.contains("not scanned"));
 
     let json = output({
@@ -12974,6 +12976,10 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(report["roots"][0]["backend_objects"].as_u64().unwrap() > 0);
     assert_eq!(report["roots"][0]["missing_objects"], 0);
     assert!(report["totals"]["current_backend_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["row_used_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["unique_used_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["billed_bytes"].as_u64().unwrap() > 0);
+    assert!(report["totals"]["billed_objects"].as_u64().unwrap() > 0);
     assert!(report["totals"]["payload_bytes"].as_u64().unwrap() > 0);
     assert!(report["totals"]["metadata_bytes"].as_u64().unwrap() > 0);
     assert!(report["totals"]["objects"].as_u64().unwrap() > 0);
@@ -13040,7 +13046,7 @@ fn root_size_falls_back_when_remote_summary_is_corrupt() {
         c
     });
     assert!(sizes.contains("sample"));
-    assert!(sizes.contains("- GCS backend prefix全体:"));
+    assert!(sizes.contains("- S3上の実サイズbackend prefix全体:"));
     assert!(!sizes.contains("not scanned"));
 }
 
@@ -13097,7 +13103,7 @@ fn root_size_reports_full_totals_when_remote_summary_is_missing() {
         c
     });
     assert!(sizes.contains("sample"));
-    assert!(sizes.contains("- GCS backend prefix全体:"));
+    assert!(sizes.contains("- S3上の実サイズbackend prefix全体:"));
     assert!(!sizes.contains("not scanned"));
 }
 

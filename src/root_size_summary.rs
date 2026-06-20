@@ -38,6 +38,14 @@ pub(crate) struct RootSizeSummaryRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RootSizeSummaryTotals {
+    #[serde(default)]
+    pub(crate) billed_bytes: u64,
+    #[serde(default)]
+    pub(crate) billed_objects: usize,
+    #[serde(default)]
+    pub(crate) row_used_bytes: u64,
+    #[serde(default)]
+    pub(crate) unique_used_bytes: u64,
     pub(crate) current_backend_bytes: u64,
     pub(crate) payload_bytes: u64,
     pub(crate) metadata_bytes: u64,
@@ -164,10 +172,18 @@ pub(crate) fn build_root_size_summary(
     }
     rows.sort_by(|left, right| left.root.cmp(&right.root));
 
+    let current_backend_bytes = sum_local_sizes(paths, &unique_keys);
+    let payload_bytes = sum_local_sizes(paths, &unique_payload_keys);
+    let metadata_bytes = sum_local_sizes(paths, &unique_metadata_keys);
+    let row_used_bytes = rows.iter().map(|row| row.used_bytes).sum();
     let totals = RootSizeSummaryTotals {
-        current_backend_bytes: sum_local_sizes(paths, &unique_keys),
-        payload_bytes: sum_local_sizes(paths, &unique_payload_keys),
-        metadata_bytes: sum_local_sizes(paths, &unique_metadata_keys),
+        billed_bytes: 0,
+        billed_objects: 0,
+        row_used_bytes,
+        unique_used_bytes: row_used_bytes,
+        current_backend_bytes,
+        payload_bytes,
+        metadata_bytes,
         objects: unique_keys.len(),
         backend_prefix_bytes: 0,
         backend_prefix_objects: 0,
