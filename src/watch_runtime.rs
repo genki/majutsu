@@ -9,7 +9,9 @@ use walkdir::WalkDir;
 
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
-use crate::daemon_runtime::{WatchDaemonLaunchConfig, start_daemon_ipc, start_watch_daemon};
+use crate::daemon_runtime::{
+    WatchDaemonLaunchConfig, child_process_exe, start_daemon_ipc, start_watch_daemon,
+};
 use crate::history_runtime::refresh_runtime_health;
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{
@@ -428,6 +430,7 @@ fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
 }
 
 fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
+    sync_current_external(paths)?;
     if std::env::var("MAJUTSU_WATCH_INLINE_SNAPSHOT").as_deref() == Ok("1") {
         snapshot(paths, args)?;
         match sync_current_if_remote(paths) {
@@ -453,7 +456,7 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     }
 
     let message = args.message.unwrap_or_else(|| "watch snapshot".into());
-    let exe = std::env::current_exe()?;
+    let exe = child_process_exe()?;
     let output = std::process::Command::new(&exe)
         .arg("--home")
         .arg(&paths.home)
@@ -498,7 +501,7 @@ fn sync_current_external(paths: &Paths) -> Result<()> {
         )?;
         return Ok(());
     }
-    let exe = std::env::current_exe()?;
+    let exe = child_process_exe()?;
     let status = std::process::Command::new(&exe)
         .arg("--home")
         .arg(&paths.home)

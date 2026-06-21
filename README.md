@@ -685,6 +685,17 @@ without parsing terminal tables. The JSON report contains per-root
 `metadata_bytes`, object, and missing counts plus the same overall totals shown
 in the text output.
 
+The overall section shows both logical restore accounting and the billed remote
+prefix size. If the billed S3/GCS prefix is much larger than the current
+snapshot's unique `used` estimate, run `mj sync --wait`; sync prunes remote
+content objects that are no longer reachable from retained snapshots by
+default. Set `MAJUTSU_SYNC_REMOTE_PRUNE=0` only when remote deletion must be
+temporarily disabled. A successful remote prune records a local state cache so
+unchanged no-op syncs do not repeatedly list the whole backend prefix. Use
+`MAJUTSU_SYNC_REMOTE_PRUNE_FORCE=1` to force a prune pass, or adjust
+`MAJUTSU_SYNC_REMOTE_PRUNE_INTERVAL_SECS` when periodic cleanup should run more
+or less often.
+
 ```sh
 mj root size --json
 ```
@@ -728,6 +739,13 @@ mj prune --dry-run=false --keep-daily 90 --keep-monthly 36
 The current snapshot is always kept. Non-dry-run prune removes unkept snapshot
 metadata and drops blob/large/chunk metadata no longer referenced by remaining
 snapshots.
+
+Files removed from the working tree remain part of history until retention
+prunes the snapshots that reference them. Files removed from majutsu management
+by a root configuration change are different: `mj root set --exclude ...`,
+`--include ...`, or `--clear-include` rewrites retained snapshot metadata for
+that root so newly unmanaged paths are forgotten from history. After that,
+metadata prune and remote cleanup can delete the related payloads and objects.
 
 `mj gc` removes unreferenced local loose objects under `$MAJUTSU_HOME/objects`.
 It does not delete referenced history or remote objects.

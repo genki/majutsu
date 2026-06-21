@@ -234,6 +234,36 @@ pub struct EventJournalRecord {
     pub event_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_journal_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_journal_synced_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_tombstone: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_entry_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_payload_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_payload_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_payload_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_large_manifest_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_large_chunk_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_symlink_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_special_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_modified: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_gid: Option<u32>,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -255,6 +285,21 @@ impl EventJournalRecord {
             path: None,
             event_kind: None,
             raw_backend: None,
+            remote_journal_key: None,
+            remote_journal_synced_at: None,
+            durable_tombstone: None,
+            durable_entry_kind: None,
+            durable_payload_oid: None,
+            durable_payload_key: None,
+            durable_payload_size: None,
+            durable_large_manifest_key: None,
+            durable_large_chunk_count: None,
+            durable_symlink_target: None,
+            durable_special_kind: None,
+            durable_mode: None,
+            durable_modified: None,
+            durable_uid: None,
+            durable_gid: None,
         }
     }
 
@@ -276,6 +321,21 @@ impl EventJournalRecord {
             path: Some(path),
             event_kind: Some(event_kind),
             raw_backend: Some(raw_backend),
+            remote_journal_key: None,
+            remote_journal_synced_at: None,
+            durable_tombstone: None,
+            durable_entry_kind: None,
+            durable_payload_oid: None,
+            durable_payload_key: None,
+            durable_payload_size: None,
+            durable_large_manifest_key: None,
+            durable_large_chunk_count: None,
+            durable_symlink_target: None,
+            durable_special_kind: None,
+            durable_mode: None,
+            durable_modified: None,
+            durable_uid: None,
+            durable_gid: None,
         }
     }
 
@@ -285,6 +345,10 @@ impl EventJournalRecord {
 
     pub fn is_pending_trigger(&self) -> bool {
         matches!(self.kind.as_str(), "fs-event" | "periodic-rescan")
+    }
+
+    pub fn is_remote_journal_pending(&self) -> bool {
+        self.is_pending_trigger() && self.remote_journal_synced_at.is_none()
     }
 
     pub fn validation_issues(&self) -> Vec<EventJournalRecordIssue> {

@@ -1,18 +1,25 @@
+use crate::majutsu_core::{FileRecord, LargeManifest, Payload, SnapshotManifest};
 use crate::majutsu_db::{EventJournalRecord, UploadQueueItem, expected_upload_queue_item_id};
 use crate::majutsu_store::{canonical_remote_aliases, is_content_addressed_remote_key};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
+use walkdir::WalkDir;
 
 use crate::cli::EventCommand;
-use crate::config::Paths;
+use crate::config::{Config, Paths, RootConfig};
 use crate::object_paths::prefer_canonical_remote_only;
 use crate::remote_store::RemoteStore;
-use crate::util::{new_id, path_to_slash};
+use crate::snapshot_rules::{
+    build_ignore, classify_large, effective_large_config, is_ignored, is_included, looks_binary,
+};
+use crate::snapshot_state::{current_snapshot, load_root_tree_entries, load_snapshot_by_id};
+use crate::util::{blake3_hex, new_id, path_to_slash, stable_read};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UploadQueueStats {
@@ -426,11 +433,100 @@ pub(crate) fn record_file_event(
     )
 }
 
+pub(crate) fn enqueue_live_diff_event_journals(
+    paths: &Paths,
+    current: Option<&SnapshotManifest>,
+    roots: &[RootConfig],
+) -> Result<usize> {
+    let Some(current) = current else {
+        return Ok(0);
+    };
+    let existing = event_journal_records(paths)?;
+    let mut enqueued = 0usize;
+    for root in roots
+        .iter()
+        .filter(|root| root.status == "active" && root.path.exists())
+    {
+        let snapshot_files = snapshot_root_file_map(paths, current, &root.id)?;
+        let live_files = scan_live_root_for_journal(root, &snapshot_files)?;
+        let mut paths_all = snapshot_files.keys().cloned().collect::<Vec<_>>();
+        paths_all.extend(
+            live_files
+                .keys()
+                .filter(|key| !snapshot_files.contains_key(*key))
+                .cloned(),
+        );
+        paths_all.sort();
+        paths_all.dedup();
+        for rel_path in paths_all {
+            let snapshot_record = snapshot_files.get(&rel_path);
+            let live_record = live_files.get(&rel_path);
+            let Some(event_kind) = live_diff_event_kind(snapshot_record, live_record) else {
+                continue;
+            };
+            if live_diff_event_already_covered(
+                &existing,
+                &root.id,
+                &rel_path,
+                current.timestamp,
+                live_record,
+            ) {
+                continue;
+            }
+            write_event_record(
+                paths,
+                EventJournalRecord::new_file_event(
+                    new_id("event"),
+                    Utc::now(),
+                    format!(
+                        "live-diff root={} path={} kind={event_kind}",
+                        root.id, rel_path
+                    ),
+                    root.id.clone(),
+                    rel_path,
+                    event_kind.to_string(),
+                    "live-diff".into(),
+                ),
+            )?;
+            enqueued += 1;
+        }
+    }
+    Ok(enqueued)
+}
+
 fn write_event_record(paths: &Paths, event: EventJournalRecord) -> Result<()> {
     fs::create_dir_all(&paths.event_queue)?;
     let path = paths.event_queue.join(format!("{}.json", event.event_id));
     fs::write(path, serde_json::to_vec_pretty(&event)?)?;
     Ok(())
+}
+
+pub(crate) fn import_remote_event_journals(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<usize> {
+    let prefix = remote_event_journal_prefix(host_id);
+    let mut imported = 0usize;
+    let mut keys = remote.list(&prefix)?;
+    keys.sort();
+    for key in keys {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let bytes = remote
+            .get(&key)
+            .with_context(|| format!("read remote durable journal {key}"))?;
+        let mut record: EventJournalRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse remote durable journal {key}"))?;
+        record.remote_journal_key = Some(key);
+        if record.remote_journal_synced_at.is_none() {
+            record.remote_journal_synced_at = Some(Utc::now());
+        }
+        write_event_record(paths, record)?;
+        imported += 1;
+    }
+    Ok(imported)
 }
 
 pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRecord>> {
@@ -453,6 +549,418 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
     }
     records.sort_by_key(|a| a.observed_at);
     Ok(records)
+}
+
+fn snapshot_root_file_map(
+    paths: &Paths,
+    snapshot: &SnapshotManifest,
+    root_id: &str,
+) -> Result<BTreeMap<String, FileRecord>> {
+    if let Some(records) = snapshot.roots.get(root_id) {
+        return Ok(records
+            .iter()
+            .filter(|record| record.kind != "directory")
+            .map(|record| (record.path.clone(), record.clone()))
+            .collect());
+    }
+    let Some(root_tree) = snapshot.root_trees.get(root_id) else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(load_root_tree_entries(paths, root_tree)?
+        .into_iter()
+        .filter(|(_, record)| record.kind != "directory")
+        .collect())
+}
+
+fn scan_live_root_for_journal(
+    root: &RootConfig,
+    snapshot_files: &BTreeMap<String, FileRecord>,
+) -> Result<BTreeMap<String, FileRecord>> {
+    let ignore = build_ignore(root)?;
+    let mut records = BTreeMap::new();
+    let scan_base = journal_source_base(root);
+    let walker = WalkDir::new(scan_base)
+        .follow_links(root.follow_symlinks)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == scan_base {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(scan_base) else {
+                return true;
+            };
+            !is_ignored(&ignore, rel, entry.file_type().is_dir())
+        });
+    for entry in walker {
+        let entry = entry?;
+        if entry.path() == scan_base {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(scan_base)?.to_path_buf();
+        if !is_included(&root.include, &rel) {
+            continue;
+        }
+        if is_ignored(&ignore, &rel, entry.file_type().is_dir()) {
+            continue;
+        }
+        let rel_s = path_to_slash(&rel);
+        let link_meta = fs::symlink_metadata(entry.path())?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let record = if link_meta.file_type().is_symlink() && !root.follow_symlinks {
+            FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s.clone(),
+                kind: "symlink".into(),
+                size: 0,
+                mode: crate::fs_meta::file_mode(&link_meta),
+                modified: crate::util::modified_secs(&link_meta),
+                uid: crate::fs_meta::file_uid(&link_meta),
+                gid: crate::fs_meta::file_gid(&link_meta),
+                xattrs: BTreeMap::new(),
+                payload: Payload::Symlink {
+                    target: fs::read_link(entry.path())?.to_string_lossy().to_string(),
+                },
+            }
+        } else if let Some(special_kind) = crate::fs_meta::special_file_kind(&link_meta) {
+            FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s.clone(),
+                kind: "special".into(),
+                size: 0,
+                mode: crate::fs_meta::file_mode(&link_meta),
+                modified: crate::util::modified_secs(&link_meta),
+                uid: crate::fs_meta::file_uid(&link_meta),
+                gid: crate::fs_meta::file_gid(&link_meta),
+                xattrs: crate::fs_meta::read_xattrs(entry.path()),
+                payload: Payload::Special { special_kind },
+            }
+        } else {
+            let meta = if link_meta.file_type().is_symlink() {
+                fs::metadata(entry.path())?
+            } else {
+                link_meta
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mode = crate::fs_meta::file_mode(&meta);
+            let modified = crate::util::modified_secs(&meta);
+            let uid = crate::fs_meta::file_uid(&meta);
+            let gid = crate::fs_meta::file_gid(&meta);
+            if let Some(snapshot_record) = snapshot_files.get(&rel_s)
+                && snapshot_record.kind == "file"
+                && snapshot_record.size == meta.len()
+                && snapshot_record.mode == mode
+                && snapshot_record.modified == modified
+                && snapshot_record.uid == uid
+                && snapshot_record.gid == gid
+                && journal_payload_oid(&snapshot_record.payload).is_some()
+            {
+                let xattrs = crate::fs_meta::read_xattrs(entry.path());
+                if snapshot_record.xattrs == xattrs {
+                    records.insert(rel_s, snapshot_record.clone());
+                    continue;
+                }
+            }
+            let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
+            let oid = blake3_hex(&bytes);
+            FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s.clone(),
+                kind: "file".into(),
+                size: meta.len(),
+                mode,
+                modified,
+                uid,
+                gid,
+                xattrs: crate::fs_meta::read_xattrs(entry.path()),
+                payload: Payload::NormalBlob {
+                    oid,
+                    object_key: String::new(),
+                },
+            }
+        };
+        records.insert(rel_s, record);
+    }
+    Ok(records)
+}
+
+fn journal_source_base(root: &RootConfig) -> &Path {
+    if root.snapshot_mode == "transactional"
+        && let Some(source) = root.snapshot_source.as_deref()
+        && source.exists()
+    {
+        return source;
+    }
+    &root.path
+}
+
+fn live_diff_event_kind(
+    snapshot: Option<&FileRecord>,
+    live: Option<&FileRecord>,
+) -> Option<&'static str> {
+    match (snapshot, live) {
+        (None, Some(_)) => Some("create"),
+        (Some(_), None) => Some("delete"),
+        (Some(snapshot), Some(live)) if !journal_records_match(snapshot, live) => Some("modify"),
+        _ => None,
+    }
+}
+
+fn journal_records_match(a: &FileRecord, b: &FileRecord) -> bool {
+    a.kind == b.kind
+        && a.size == b.size
+        && a.mode == b.mode
+        && a.modified == b.modified
+        && a.uid == b.uid
+        && a.gid == b.gid
+        && a.xattrs == b.xattrs
+        && journal_payloads_match(&a.payload, &b.payload)
+}
+
+fn journal_payloads_match(a: &Payload, b: &Payload) -> bool {
+    match (a, b) {
+        (Payload::Directory, Payload::Directory) => true,
+        (Payload::Symlink { target: a }, Payload::Symlink { target: b }) => a == b,
+        (Payload::Special { special_kind: a }, Payload::Special { special_kind: b }) => a == b,
+        _ => journal_payload_oid(a).is_some_and(|a| journal_payload_oid(b) == Some(a)),
+    }
+}
+
+fn journal_payload_oid(payload: &Payload) -> Option<&str> {
+    match payload {
+        Payload::InlineSmall { oid, .. }
+        | Payload::NormalBlob { oid, .. }
+        | Payload::ChunkedBlob { oid, .. }
+        | Payload::LargeObject { oid, .. }
+        | Payload::Blob { oid, .. }
+        | Payload::Large { oid, .. } => Some(oid),
+        Payload::Directory | Payload::Symlink { .. } | Payload::Special { .. } => None,
+    }
+}
+
+fn live_diff_event_already_covered(
+    records: &[EventJournalRecord],
+    root_id: &str,
+    rel_path: &str,
+    snapshot_timestamp: DateTime<Utc>,
+    live_record: Option<&FileRecord>,
+) -> bool {
+    records
+        .iter()
+        .filter(|record| {
+            record.root_id.as_deref() == Some(root_id)
+                && record.path.as_deref() == Some(rel_path)
+                && record.observed_at > snapshot_timestamp
+        })
+        .any(|record| {
+            if record.remote_journal_synced_at.is_none() {
+                return true;
+            }
+            match live_record {
+                None => record.durable_tombstone == Some(true),
+                Some(record_live) => durable_payload_matches(record, record_live),
+            }
+        })
+}
+
+fn durable_payload_matches(event: &EventJournalRecord, live: &FileRecord) -> bool {
+    match &live.payload {
+        Payload::Symlink { target } => {
+            event.durable_entry_kind.as_deref() == Some("symlink")
+                && event.durable_symlink_target.as_deref() == Some(target.as_str())
+        }
+        Payload::Special { special_kind } => {
+            event.durable_entry_kind.as_deref() == Some("special")
+                && event.durable_special_kind.as_deref() == Some(special_kind.as_str())
+        }
+        _ => {
+            let Some(live_oid) = journal_payload_oid(&live.payload) else {
+                return false;
+            };
+            event.durable_payload_oid.as_deref() == Some(live_oid)
+        }
+    }
+}
+
+pub(crate) fn enqueue_remote_event_journal_uploads(
+    paths: &Paths,
+    config: &Config,
+    host_id: &str,
+    roots: &[RootConfig],
+) -> Result<usize> {
+    let mut enqueued = 0usize;
+    for mut record in event_journal_records(paths)?
+        .into_iter()
+        .filter(EventJournalRecord::is_remote_journal_pending)
+    {
+        let key = remote_event_journal_key(host_id, &record.event_id);
+        record.remote_journal_key = Some(key.clone());
+        enrich_remote_event_journal_payload(paths, config, roots, &mut record)?;
+        let bytes = serde_json::to_vec_pretty(&record)?;
+        enqueue_inline_upload_overwrite(paths, &key, bytes)?;
+        write_event_record(paths, record)?;
+        enqueued += 1;
+    }
+    Ok(enqueued)
+}
+
+fn enrich_remote_event_journal_payload(
+    paths: &Paths,
+    config: &Config,
+    roots: &[RootConfig],
+    record: &mut EventJournalRecord,
+) -> Result<()> {
+    if record.durable_entry_kind.is_some()
+        || record.durable_payload_key.is_some()
+        || record.durable_tombstone == Some(true)
+    {
+        return Ok(());
+    }
+    let (Some(root_id), Some(rel_path)) = (record.root_id.as_deref(), record.path.as_deref())
+    else {
+        return Ok(());
+    };
+    let Some(root) = roots.iter().find(|root| root.id == root_id) else {
+        return Ok(());
+    };
+    let source = journal_source_base(root).join(rel_path);
+    let meta = match fs::symlink_metadata(&source) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            record.durable_tombstone = Some(true);
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    record.durable_mode = Some(crate::fs_meta::file_mode(&meta));
+    record.durable_modified = crate::util::modified_secs(&meta);
+    record.durable_uid = crate::fs_meta::file_uid(&meta);
+    record.durable_gid = crate::fs_meta::file_gid(&meta);
+    if meta.file_type().is_symlink() && !root.follow_symlinks {
+        record.durable_entry_kind = Some("symlink".into());
+        record.durable_symlink_target = Some(fs::read_link(&source)?.to_string_lossy().to_string());
+        return Ok(());
+    }
+    if let Some(special_kind) = crate::fs_meta::special_file_kind(&meta) {
+        record.durable_entry_kind = Some("special".into());
+        record.durable_special_kind = Some(special_kind);
+        return Ok(());
+    }
+    let meta = if meta.file_type().is_symlink() {
+        fs::metadata(&source)?
+    } else {
+        meta
+    };
+    if !meta.is_file() {
+        return Ok(());
+    }
+    record.durable_entry_kind = Some("file".into());
+    record.durable_mode = Some(crate::fs_meta::file_mode(&meta));
+    record.durable_modified = crate::util::modified_secs(&meta);
+    record.durable_uid = crate::fs_meta::file_uid(&meta);
+    record.durable_gid = crate::fs_meta::file_gid(&meta);
+    let large_config = effective_large_config(config, root);
+    let binary = looks_binary(&source).unwrap_or(false);
+    if classify_large(&large_config, Path::new(rel_path), meta.len(), binary) {
+        let (oid, manifest_key, chunk_count) =
+            crate::store_large_file(paths, &source, Path::new(rel_path), &large_config, binary)?;
+        enqueue_large_manifest_uploads(paths, &manifest_key)?;
+        record.durable_payload_oid = Some(oid);
+        record.durable_payload_size = Some(meta.len());
+        record.durable_large_manifest_key = Some(manifest_key);
+        record.durable_large_chunk_count = Some(chunk_count);
+        return Ok(());
+    }
+    if large_config.enabled && meta.len() >= large_config.chunked_min_size {
+        let mut chunked_config = large_config.clone();
+        chunked_config.chunk_size = large_config.chunked_chunk_size;
+        let (oid, manifest_key, chunk_count) =
+            crate::store_large_file(paths, &source, Path::new(rel_path), &chunked_config, binary)?;
+        enqueue_large_manifest_uploads(paths, &manifest_key)?;
+        record.durable_payload_oid = Some(oid);
+        record.durable_payload_size = Some(meta.len());
+        record.durable_large_manifest_key = Some(manifest_key);
+        record.durable_large_chunk_count = Some(chunk_count);
+        return Ok(());
+    }
+    let bytes = stable_read(&source, root.snapshot_mode.as_str())?;
+    let oid = blake3_hex(&bytes);
+    let object_key = crate::store_bytes(paths, &paths.objects, &oid, &bytes)?;
+    let local_object = paths.home.join(&object_key);
+    enqueue_file_upload(paths, &object_key, &local_object)?;
+    record.durable_payload_oid = Some(oid);
+    record.durable_payload_key = Some(object_key);
+    record.durable_payload_size = Some(bytes.len() as u64);
+    Ok(())
+}
+
+fn enqueue_large_manifest_uploads(paths: &Paths, manifest_key: &str) -> Result<()> {
+    let manifest_path = paths.home.join(manifest_key);
+    enqueue_file_upload(paths, manifest_key, &manifest_path)?;
+    let manifest: LargeManifest =
+        serde_json::from_slice(&crate::read_object(paths, manifest_key)?)?;
+    for chunk in manifest.chunks {
+        let chunk_path = paths.home.join(&chunk.object_key);
+        enqueue_file_upload(paths, &chunk.object_key, &chunk_path)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn acknowledge_remote_event_journal_uploads(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<usize> {
+    let mut acknowledged = 0usize;
+    for mut record in event_journal_records(paths)?
+        .into_iter()
+        .filter(EventJournalRecord::is_remote_journal_pending)
+    {
+        let key = record
+            .remote_journal_key
+            .clone()
+            .unwrap_or_else(|| remote_event_journal_key(host_id, &record.event_id));
+        if remote.exists(&key)? {
+            record.remote_journal_key = Some(key);
+            record.remote_journal_synced_at = Some(Utc::now());
+            write_event_record(paths, record)?;
+            acknowledged += 1;
+        }
+    }
+    Ok(acknowledged)
+}
+
+pub(crate) fn remote_event_journal_stats(paths: &Paths) -> Result<RemoteEventJournalStats> {
+    let records = event_journal_records(paths)?;
+    let mut stats = RemoteEventJournalStats::default();
+    for record in records.iter().filter(|record| record.is_pending_trigger()) {
+        stats.total += 1;
+        if record.remote_journal_synced_at.is_some() {
+            stats.durable += 1;
+        } else {
+            stats.pending += 1;
+        }
+    }
+    Ok(stats)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RemoteEventJournalStats {
+    pub(crate) total: usize,
+    pub(crate) durable: usize,
+    pub(crate) pending: usize,
+}
+
+fn remote_event_journal_key(host_id: &str, event_id: &str) -> String {
+    format!("hosts/{host_id}/journal/{event_id}.json")
+}
+
+fn remote_event_journal_prefix(host_id: &str) -> String {
+    format!("hosts/{host_id}/journal/")
 }
 
 pub(crate) fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
@@ -497,7 +1005,12 @@ pub(crate) struct EventJournalStats {
 
 pub(crate) fn event_journal_stats(paths: &Paths) -> Result<EventJournalStats> {
     let records = event_journal_records(paths)?;
-    Ok(event_journal_stats_from_records(&records))
+    let current = current_snapshot_for_event_compact(paths).ok().flatten();
+    Ok(event_journal_stats_from_records(
+        paths,
+        &records,
+        current.as_ref(),
+    ))
 }
 
 fn print_event_journal_stats(stats: &EventJournalStats) {
@@ -535,7 +1048,11 @@ fn print_event_journal_stats(stats: &EventJournalStats) {
     );
 }
 
-fn event_journal_stats_from_records(records: &[EventJournalRecord]) -> EventJournalStats {
+fn event_journal_stats_from_records(
+    paths: &Paths,
+    records: &[EventJournalRecord],
+    current: Option<&SnapshotManifest>,
+) -> EventJournalStats {
     let snapshot_finishes = records
         .iter()
         .filter(|event| event.is_snapshot_finish())
@@ -552,14 +1069,18 @@ fn event_journal_stats_from_records(records: &[EventJournalRecord]) -> EventJour
         })
         .count();
     let compact_before = previous_snapshot_finish(&snapshot_finishes);
-    let removable = compact_before
-        .map(|cutoff| {
-            records
-                .iter()
-                .filter(|event| event.observed_at < cutoff)
-                .count()
+    let removable = records
+        .iter()
+        .filter(|event| {
+            event_removable_after_snapshot(
+                paths,
+                event,
+                compact_before,
+                last_snapshot_finish,
+                current,
+            )
         })
-        .unwrap_or(0);
+        .count();
     EventJournalStats {
         total: records.len(),
         pending,
@@ -596,7 +1117,8 @@ fn compact_event_journal_inner(
         return Ok(EventJournalCompactResult::default());
     }
     let records = event_journal_records(paths)?;
-    let stats = event_journal_stats_from_records(&records);
+    let current = current_snapshot_for_event_compact(paths)?;
+    let stats = event_journal_stats_from_records(paths, &records, current.as_ref());
     let min_records = std::env::var("MAJUTSU_EVENT_COMPACT_MIN_RECORDS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -609,7 +1131,7 @@ fn compact_event_journal_inner(
             removed: 0,
         });
     }
-    let Some(compact_before) = stats.compact_before else {
+    let Some(last_snapshot_finish) = stats.last_snapshot_finish else {
         return Ok(EventJournalCompactResult {
             total: stats.total,
             pending: stats.pending,
@@ -631,7 +1153,13 @@ fn compact_event_journal_inner(
             Err(err) => return Err(err.into()),
         };
         let event: EventJournalRecord = serde_json::from_slice(&bytes)?;
-        if event.observed_at < compact_before {
+        if event_removable_after_snapshot(
+            paths,
+            &event,
+            stats.compact_before,
+            Some(last_snapshot_finish),
+            current.as_ref(),
+        ) {
             if dry_run {
                 removed += 1;
             } else {
@@ -649,6 +1177,79 @@ fn compact_event_journal_inner(
         removable: stats.removable,
         removed,
     })
+}
+
+fn current_snapshot_for_event_compact(paths: &Paths) -> Result<Option<SnapshotManifest>> {
+    let conn = crate::open_db(paths)?;
+    current_snapshot(&conn)?
+        .as_deref()
+        .map(|id| load_snapshot_by_id(paths, &conn, id))
+        .transpose()
+}
+
+fn event_removable_after_snapshot(
+    paths: &Paths,
+    event: &EventJournalRecord,
+    compact_before: Option<DateTime<Utc>>,
+    last_snapshot_finish: Option<DateTime<Utc>>,
+    current: Option<&SnapshotManifest>,
+) -> bool {
+    if event.is_snapshot_finish() || !event.is_pending_trigger() {
+        return compact_before
+            .map(|cutoff| event.observed_at < cutoff)
+            .unwrap_or(false);
+    }
+    let Some(last_snapshot_finish) = last_snapshot_finish else {
+        return false;
+    };
+    if event.observed_at >= last_snapshot_finish {
+        return false;
+    }
+    if event.remote_journal_synced_at.is_none() {
+        return false;
+    }
+    let Some(current) = current else {
+        return false;
+    };
+    durable_event_covered_by_snapshot(paths, event, current).unwrap_or(false)
+}
+
+fn durable_event_covered_by_snapshot(
+    paths: &Paths,
+    event: &EventJournalRecord,
+    snapshot: &SnapshotManifest,
+) -> Result<bool> {
+    let (Some(root_id), Some(rel_path)) = (event.root_id.as_deref(), event.path.as_deref()) else {
+        return Ok(event.observed_at <= snapshot.timestamp);
+    };
+    let snapshot_files = snapshot_root_file_map(paths, snapshot, root_id)?;
+    let snapshot_record = snapshot_files.get(rel_path);
+    if event.durable_tombstone == Some(true) {
+        return Ok(snapshot_record.is_none());
+    }
+    let Some(record) = snapshot_record else {
+        return Ok(false);
+    };
+    Ok(durable_event_matches_snapshot_record(event, record))
+}
+
+fn durable_event_matches_snapshot_record(event: &EventJournalRecord, record: &FileRecord) -> bool {
+    match &record.payload {
+        Payload::Symlink { target } => {
+            event.durable_entry_kind.as_deref() == Some("symlink")
+                && event.durable_symlink_target.as_deref() == Some(target.as_str())
+        }
+        Payload::Special { special_kind } => {
+            event.durable_entry_kind.as_deref() == Some("special")
+                && event.durable_special_kind.as_deref() == Some(special_kind.as_str())
+        }
+        _ => {
+            let Some(record_oid) = journal_payload_oid(&record.payload) else {
+                return false;
+            };
+            event.durable_payload_oid.as_deref() == Some(record_oid)
+        }
+    }
 }
 
 #[cfg(test)]

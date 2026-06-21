@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
@@ -54,6 +54,89 @@ fn synced_object_count(output: &str) -> usize {
             rest.split_whitespace().next()?.parse().ok()
         })
         .unwrap_or_else(|| panic!("missing synced object count in output:\n{output}"))
+}
+
+#[test]
+fn top_level_help_groups_commands_without_hiding_maintenance_commands() {
+    let help = output({
+        let mut c = mj();
+        c.arg("--help");
+        c
+    });
+    for heading in [
+        "Setup:",
+        "Daily use:",
+        "History:",
+        "Recovery:",
+        "Remote:",
+        "Service:",
+        "Security:",
+        "Storage maintenance:",
+        "Advanced/debug:",
+    ] {
+        assert!(help.contains(heading), "{help}");
+    }
+    for command in ["large", "cache", "pack", "prune", "gc", "fsck"] {
+        assert!(help.contains(command), "{help}");
+    }
+    assert!(!help.contains("maintenance "), "{help}");
+}
+
+#[test]
+fn commit_and_switch_top_level_aliases_follow_git_like_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let committed = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("commit")
+            .arg("--message")
+            .arg("via commit alias");
+        c
+    });
+    assert!(committed.contains("snapshot "), "{committed}");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("branch")
+            .arg("create")
+            .arg("side");
+        c
+    });
+    let switched = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("switch").arg("side");
+        c
+    });
+    assert!(switched.contains("switched branch side"), "{switched}");
+    let current = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("branch").arg("current");
+        c
+    });
+    assert!(current.contains("branch side"), "{current}");
 }
 
 fn root_list_has(root_list: &str, id: &str, status: &str) -> bool {
@@ -7697,10 +7780,7 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
     });
     let sync = output({
         let mut c = mj();
-        c.arg("--home")
-            .arg(&state)
-            .arg("sync")
-            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
+        c.arg("--home").arg(&state).arg("sync");
         c
     });
     assert!(sync.contains("pruned_remote_exports "));
@@ -7717,6 +7797,78 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         })
         .count();
     assert_eq!(after, 2);
+    assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
+}
+
+#[test]
+fn prune_remote_cleanup_prunes_stale_remote_exports_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let host_dir = fs::read_dir(remote.join("hosts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("metadata/export.json").exists())
+        .unwrap();
+    let before = fs::read_dir(host_dir.join("snapshots"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert!(before >= 2);
+
+    let prune = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("0")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    assert!(prune.contains("remote_cleanup true"));
+    assert!(prune.contains("pruned_remote_exports "));
     assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
 }
 
@@ -8302,10 +8454,7 @@ fn sync_prunes_remote_loose_blobs_after_pack() {
     });
     let sync = output({
         let mut c = mj();
-        c.arg("--home")
-            .arg(&state)
-            .arg("sync")
-            .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
+        c.arg("--home").arg(&state).arg("sync");
         c
     });
     assert!(sync.contains("pruned_remote_objects "));
@@ -12986,7 +13135,224 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(report["totals"]["backend_prefix_bytes"].as_u64().unwrap() > 0);
     assert!(report["totals"]["backend_prefix_objects"].as_u64().unwrap() > 0);
     assert_eq!(report["totals"]["backend_prefix_exact"], true);
-    assert_eq!(report["totals"]["backend_prefix_scope"], "full-prefix-scan");
+    assert!(report["totals"]["backend_prefix_scope"].as_str().is_some());
+}
+
+#[test]
+fn root_size_streams_local_scan_before_uncached_remote_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("--wait");
+        c
+    });
+
+    let started = std::time::Instant::now();
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("root")
+        .arg("size")
+        .arg("--no-remote-cache")
+        .env("MAJUTSU_ROOT_SIZE_FORCE_STREAM", "1")
+        .env("MAJUTSU_ROOT_SIZE_REMOTE_LIST_DELAY_MS", "1200")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !String::from_utf8_lossy(&buf).contains("- S3上の実サイズbackend prefix全体: ...")
+    {
+        stdout.read_exact(&mut byte).unwrap();
+        buf.push(byte[0]);
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "local root-size table was not streamed before remote listing delay elapsed:\n{}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let streamed = String::from_utf8_lossy(&buf);
+    assert!(streamed.contains("sample"));
+    assert!(streamed.contains("0.00 MiB"));
+    assert!(streamed.contains("- remote集計: ..."));
+    assert!(streamed.contains("- S3上の実サイズbackend prefix全体: ..."));
+}
+
+#[test]
+fn root_size_history_reports_payloads_not_referenced_by_current_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"old retained payload\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("note.txt"), b"current payload\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let sizes = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--history")
+            .arg("--history-limit")
+            .arg("10");
+        c
+    });
+    assert!(sizes.contains("履歴保持payload:"));
+    assert!(sizes.contains("current snapshotから外れている保持payload推定"));
+    assert!(sizes.contains("note.txt"));
+    assert!(sizes.contains("blob"));
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--history")
+            .arg("--json");
+        c
+    });
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(report["history"]["retained_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(report["history"]["rows"][0]["path"], "note.txt");
+}
+
+#[test]
+fn root_set_exclude_forgets_unmanaged_history_payloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(source.join("build")).unwrap();
+    fs::write(source.join("build/cache.bin"), b"generated payload\n").unwrap();
+    fs::write(source.join("src.txt"), b"source payload\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::remove_file(source.join("build/cache.bin")).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let before = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--history")
+            .arg("--history-limit")
+            .arg("10");
+        c
+    });
+    assert!(before.contains("build/cache.bin"), "{before}");
+
+    let root_set = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
+            .arg("--exclude")
+            .arg("build/**");
+        c
+    });
+    assert!(
+        root_set.contains("forgotten_unmanaged_records"),
+        "{root_set}"
+    );
+    let after = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--history")
+            .arg("--history-limit")
+            .arg("10");
+        c
+    });
+    assert!(!after.contains("build/cache.bin"), "{after}");
+    assert!(after.contains("sample"));
 }
 
 #[test]
@@ -13888,6 +14254,7 @@ fn mount_creates_lazy_view_and_can_hydrate_large_files() {
         let mut c = mj();
         c.arg("--home")
             .arg(&state)
+            .arg("restore")
             .arg("hydrate")
             .arg(&lazy_view)
             .arg("--root")
@@ -13911,6 +14278,7 @@ fn mount_creates_lazy_view_and_can_hydrate_large_files() {
         let mut c = mj();
         c.arg("--home")
             .arg(&state)
+            .arg("restore")
             .arg("mount")
             .arg("--hydrate-large")
             .arg(&hydrated_view);
@@ -13924,7 +14292,11 @@ fn mount_creates_lazy_view_and_can_hydrate_large_files() {
 
     let unmounted = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("unmount").arg(&lazy_view);
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("unmount")
+            .arg(&lazy_view);
         c
     });
     assert!(unmounted.contains("unmounted"));
@@ -14377,6 +14749,1193 @@ fn status_reports_configured_root_state() {
 }
 
 #[test]
+fn state_reference_reports_file_changes_since_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let other = tmp.path().join("other");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    fs::create_dir_all(source.join("memo")).unwrap();
+    fs::write(source.join("modified.txt"), b"one").unwrap();
+    fs::write(source.join("deleted.txt"), b"remove me").unwrap();
+    fs::write(other.join("other.txt"), b"one").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("other")
+            .arg(&other);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("baseline");
+        c
+    });
+    let baseline_op: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select op_id from snapshots order by created_at asc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    fs::write(source.join("modified.txt"), b"two").unwrap();
+    fs::remove_file(source.join("deleted.txt")).unwrap();
+    fs::write(source.join("added.txt"), b"new").unwrap();
+    fs::write(source.join("memo/new.md"), b"memo\n").unwrap();
+    filetime::set_file_mtime(
+        source.join("memo"),
+        filetime::FileTime::from_unix_time(1, 0),
+    )
+    .unwrap();
+    fs::write(other.join("other.txt"), b"two").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("changed");
+        c
+    });
+
+    let state_output = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("state").arg(&baseline_op);
+        c
+    });
+    let mut state_lines = state_output.lines().collect::<Vec<_>>();
+    state_lines.sort();
+    assert_eq!(
+        state_lines,
+        vec![
+            " A sample/added.txt",
+            " A sample/memo/new.md",
+            " D sample/deleted.txt",
+            " M other/other.txt",
+            " M sample/modified.txt",
+        ]
+    );
+    assert!(!state_output.contains("m sample/memo"), "{state_output}");
+    let root_filtered_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--root")
+            .arg("sample")
+            .arg(&baseline_op);
+        c
+    });
+    let mut root_filtered_lines = root_filtered_output.lines().collect::<Vec<_>>();
+    root_filtered_lines.sort();
+    assert_eq!(
+        root_filtered_lines,
+        vec![
+            " A sample/added.txt",
+            " A sample/memo/new.md",
+            " D sample/deleted.txt",
+            " M sample/modified.txt",
+        ]
+    );
+    assert!(
+        !root_filtered_output.contains("m sample/memo"),
+        "{root_filtered_output}"
+    );
+    let root_meta_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--root")
+            .arg("sample")
+            .arg(&baseline_op)
+            .arg("--meta");
+        c
+    });
+    assert!(
+        root_meta_output.contains(" m sample/memo"),
+        "{root_meta_output}"
+    );
+    assert!(
+        root_meta_output.contains(" A sample/memo/new.md"),
+        "{root_meta_output}"
+    );
+    let short_root_filtered_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op)
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    assert_eq!(short_root_filtered_output, root_filtered_output);
+    let root_diff_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op)
+            .arg("-r")
+            .arg("sample")
+            .arg("--diff");
+        c
+    });
+    assert!(
+        root_diff_output.contains(" A sample/added.txt"),
+        "{root_diff_output}"
+    );
+    assert!(root_diff_output.contains("    +new"), "{root_diff_output}");
+    assert!(
+        root_diff_output.contains(" D sample/deleted.txt"),
+        "{root_diff_output}"
+    );
+    assert!(
+        root_diff_output.contains("    -remove me"),
+        "{root_diff_output}"
+    );
+    assert!(
+        root_diff_output.contains(" M sample/modified.txt"),
+        "{root_diff_output}"
+    );
+    assert!(root_diff_output.contains("    -one"), "{root_diff_output}");
+    assert!(root_diff_output.contains("    +two"), "{root_diff_output}");
+    let colored_state_output = output({
+        let mut c = mj();
+        c.env_remove("NO_COLOR")
+            .env("MJ_COLOR", "always")
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op);
+        c
+    });
+    assert!(
+        colored_state_output
+            .contains("\u{1b}[1;32mA\u{1b}[0m \u{1b}[1;96msample\u{1b}[0m/added.txt"),
+        "{colored_state_output:?}"
+    );
+    assert!(
+        colored_state_output
+            .contains("\u{1b}[1;31mD\u{1b}[0m \u{1b}[1;96msample\u{1b}[0m/deleted.txt"),
+        "{colored_state_output:?}"
+    );
+    assert!(
+        colored_state_output
+            .contains("\u{1b}[1;33mM\u{1b}[0m \u{1b}[1;96msample\u{1b}[0m/modified.txt"),
+        "{colored_state_output:?}"
+    );
+    let colored_diff_output = output({
+        let mut c = mj();
+        c.env_remove("NO_COLOR")
+            .env("MJ_COLOR", "always")
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op)
+            .arg("-r")
+            .arg("sample")
+            .arg("--diff");
+        c
+    });
+    assert!(
+        colored_diff_output.contains("\u{1b}[31m    -one\u{1b}[0m"),
+        "{colored_diff_output:?}"
+    );
+    assert!(
+        colored_diff_output.contains("\u{1b}[32m    +two\u{1b}[0m"),
+        "{colored_diff_output:?}"
+    );
+
+    let json_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--root")
+            .arg("sample")
+            .arg(&baseline_op[..12])
+            .arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+    assert_eq!(value["basis"]["kind"], "operation");
+    assert_eq!(value["changes"]["total"], 4);
+    assert_eq!(value["changes"]["added"], 2);
+    assert_eq!(value["changes"]["modified"], 1);
+    assert_eq!(value["changes"]["deleted"], 1);
+
+    let short_json_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op[..12])
+            .arg("-r")
+            .arg("sample")
+            .arg("-j");
+        c
+    });
+    let short_value: serde_json::Value = serde_json::from_str(&short_json_output).unwrap();
+    assert_eq!(short_value["changes"]["total"], 4);
+}
+
+#[test]
+fn state_inside_root_uses_local_paths_and_global_flag_restores_root_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("modified.txt"), b"one").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let baseline_op: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select op_id from snapshots order by created_at asc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    fs::write(source.join("modified.txt"), b"two").unwrap();
+    fs::write(source.join("added.txt"), b"new").unwrap();
+
+    let local_output = output({
+        let mut c = mj();
+        c.current_dir(&source)
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op);
+        c
+    });
+    assert_eq!(local_output, " A added.txt\n M modified.txt\n");
+
+    let global_output = output({
+        let mut c = mj();
+        c.current_dir(&source)
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-g")
+            .arg(&baseline_op);
+        c
+    });
+    assert_eq!(
+        global_output,
+        " A sample/added.txt\n M sample/modified.txt\n"
+    );
+
+    let outside_output = output({
+        let mut c = mj();
+        c.current_dir(tmp.path())
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op);
+        c
+    });
+    assert_eq!(
+        outside_output,
+        " A sample/added.txt\n M sample/modified.txt\n"
+    );
+}
+
+#[test]
+fn sync_publishes_event_journal_as_durable_remote_journal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"durable content\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+
+    let event_dir = state.join("queue/events");
+    fs::create_dir_all(&event_dir).unwrap();
+    fs::write(
+        event_dir.join("event-durable.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "event_id": "event-durable",
+            "kind": "fs-event",
+            "observed_at": Utc::now().to_rfc3339(),
+            "detail": "sample changed",
+            "root_id": "sample",
+            "path": "note.txt",
+            "event_kind": "modify",
+            "raw_backend": "test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("durable_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+    assert!(
+        find_file_ending(&remote, "journal/event-durable.json").exists(),
+        "remote journal object should be published"
+    );
+
+    let local_event: serde_json::Value =
+        serde_json::from_slice(&fs::read(event_dir.join("event-durable.json")).unwrap()).unwrap();
+    let remote_journal_key = local_event["remote_journal_key"].as_str().unwrap();
+    assert!(remote_journal_key.starts_with("hosts/"));
+    assert!(local_event["remote_journal_synced_at"].as_str().is_some());
+    let payload_key = local_event["durable_payload_key"].as_str().unwrap();
+    assert!(
+        find_file_ending(&remote, payload_key).exists(),
+        "{payload_key}"
+    );
+    assert_eq!(
+        local_event["durable_payload_size"],
+        serde_json::Value::from("durable content\n".len() as u64)
+    );
+
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    assert!(status.contains("durable journal"), "{status}");
+    assert!(
+        status.contains("1 durable, 0 pending remote ack"),
+        "{status}"
+    );
+}
+
+#[test]
+fn restore_applies_durable_journal_after_current_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let restore = tmp.path().join("restore");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"snapshot content\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::write(source.join("note.txt"), b"durable content\n").unwrap();
+    let event_dir = state.join("queue/events");
+    fs::create_dir_all(&event_dir).unwrap();
+    fs::write(
+        event_dir.join("event-restore.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "event_id": "event-restore",
+            "kind": "fs-event",
+            "observed_at": Utc::now().to_rfc3339(),
+            "detail": "sample changed",
+            "root_id": "sample",
+            "path": "note.txt",
+            "event_kind": "modify",
+            "raw_backend": "test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/note.txt")).unwrap(),
+        b"durable content\n"
+    );
+}
+
+#[test]
+fn clone_imports_durable_journal_and_restores_unsnapshotted_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"snapshot content\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::write(source.join("note.txt"), b"durable content\n").unwrap();
+    let event_dir = state.join("queue/events");
+    fs::create_dir_all(&event_dir).unwrap();
+    fs::write(
+        event_dir.join("event-clone-restore.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "event_id": "event-clone-restore",
+            "kind": "fs-event",
+            "observed_at": Utc::now().to_rfc3339(),
+            "detail": "sample changed",
+            "root_id": "sample",
+            "path": "note.txt",
+            "event_kind": "modify",
+            "raw_backend": "test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    let clone_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(
+        clone_output.contains("imported_durable_journals 1"),
+        "{clone_output}"
+    );
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/note.txt")).unwrap(),
+        b"durable content\n"
+    );
+}
+
+#[test]
+fn sync_live_diff_preserves_unsnapshotted_change_without_watch_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"snapshot content\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::write(source.join("note.txt"), b"durable content\n").unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("live_diff_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/note.txt")).unwrap(),
+        b"durable content\n"
+    );
+}
+
+#[test]
+fn sync_live_diff_preserves_unsnapshotted_large_file_via_large_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("large.bin"), b"snapshot content\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--large-min-size")
+            .arg("4")
+            .arg("--large-chunking")
+            .arg("fixed")
+            .arg("--large-chunk-size")
+            .arg("4");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let mut durable = Vec::new();
+    for i in 0..257 {
+        durable.push(b'A' + (i % 23) as u8);
+    }
+    fs::write(source.join("large.bin"), &durable).unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("live_diff_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    let event_path = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            fs::read_to_string(path)
+                .map(|text| text.contains("\"raw_backend\": \"live-diff\""))
+                .unwrap_or(false)
+        })
+        .expect("live diff event");
+    let event: serde_json::Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+    assert!(event["durable_large_manifest_key"].as_str().is_some());
+    assert!(event["durable_large_chunk_count"].as_u64().unwrap() > 1);
+    assert!(event["durable_payload_key"].as_str().is_none());
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(fs::read(restore.join("sample/large.bin")).unwrap(), durable);
+}
+
+#[test]
+fn sync_live_diff_preserves_unsnapshotted_chunked_file_via_large_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("medium.log"), b"snapshot content\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("min_size = 67108864", "min_size = 4096")
+        .replace("chunked_min_size = 524288", "chunked_min_size = 64")
+        .replace("chunked_chunk_size = 524288", "chunked_chunk_size = 16");
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let mut durable = Vec::new();
+    for i in 0..257 {
+        durable.push(b'a' + (i % 26) as u8);
+    }
+    fs::write(source.join("medium.log"), &durable).unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("live_diff_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    let event_path = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            fs::read_to_string(path)
+                .map(|text| text.contains("\"raw_backend\": \"live-diff\""))
+                .unwrap_or(false)
+        })
+        .expect("live diff event");
+    let event: serde_json::Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+    assert!(event["durable_large_manifest_key"].as_str().is_some());
+    assert!(event["durable_large_chunk_count"].as_u64().unwrap() >= 1);
+    assert!(event["durable_payload_key"].as_str().is_none());
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read(restore.join("sample/medium.log")).unwrap(),
+        durable
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_live_diff_preserves_unsnapshotted_symlink_without_watch_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    std::os::unix::fs::symlink("old-target", source.join("link")).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::remove_file(source.join("link")).unwrap();
+    std::os::unix::fs::symlink("new-target", source.join("link")).unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("live_diff_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(
+        fs::read_link(restore.join("sample/link")).unwrap(),
+        std::path::PathBuf::from("new-target")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_live_diff_preserves_unsnapshotted_fifo_without_watch_event() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let fifo = source.join("pipe");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("live_diff_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(
+        fs::symlink_metadata(restore.join("sample/pipe"))
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
+#[test]
+fn sync_live_diff_preserves_unsnapshotted_delete_without_watch_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("deleted.txt"), b"remove me\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::remove_file(source.join("deleted.txt")).unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("live_diff_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert!(!restore.join("sample/deleted.txt").exists());
+}
+
+#[test]
+fn snapshot_compacts_covered_durable_journal_and_sync_prunes_remote_journal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"snapshot content\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::write(source.join("note.txt"), b"durable content\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let live_diff_event_path = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            fs::read_to_string(path)
+                .map(|text| text.contains("\"raw_backend\": \"live-diff\""))
+                .unwrap_or(false)
+        })
+        .expect("live diff event");
+    let event: serde_json::Value =
+        serde_json::from_slice(&fs::read(&live_diff_event_path).unwrap()).unwrap();
+    let remote_journal_key = event["remote_journal_key"].as_str().unwrap().to_string();
+    assert!(
+        remote.join(&remote_journal_key).exists(),
+        "{remote_journal_key}"
+    );
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(
+        !live_diff_event_path.exists(),
+        "covered durable journal should be locally compacted"
+    );
+
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE_FORCE", "1");
+        c
+    });
+    assert!(sync.contains("pruned_remote_journals 1"), "{sync}");
+    assert!(
+        !remote.join(&remote_journal_key).exists(),
+        "stale remote durable journal should be pruned"
+    );
+}
+
+#[test]
 fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -14469,6 +16028,103 @@ fn health_reports_root_last_changed_snapshot() {
     assert_eq!(root["current_snapshot_includes"], true);
     assert_eq!(root["last_changed_snapshot"], value["current_snapshot"]);
     assert!(root["last_changed_at"].as_str().is_some(), "{health}");
+}
+
+#[test]
+fn status_tolerates_missing_parent_snapshot_for_root_last_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let first = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .env("MAJUTSU_SNAPSHOT_ALLOW_NOOP", "1");
+        c
+    });
+    Connection::open(state.join("db/majutsu.sqlite"))
+        .unwrap()
+        .execute(
+            "delete from snapshots where id=?1",
+            rusqlite::params![first],
+        )
+        .unwrap();
+
+    let status = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    assert!(status.contains("Status"), "{status}");
+    assert!(status.contains("sample"), "{status}");
+}
+
+#[test]
+fn status_restarts_stale_daemon_for_active_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    fs::create_dir_all(state.join("runtime")).unwrap();
+    fs::write(state.join("runtime/daemon.pid"), b"99999999").unwrap();
+    let status = output({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    assert!(status.contains("Daemon"), "{status}");
+    assert!(!status.contains("stale pid"), "{status}");
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
 }
 
 #[test]

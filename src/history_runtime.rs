@@ -1,12 +1,12 @@
 use crate::majutsu_core::{
-    FileRecord, OperationLogEntry as OperationExport, RootSnapshot, SnapshotManifest, TreeManifest,
-    TreeNodeManifest, TreeNodeRef,
+    FileRecord, OperationLogEntry as OperationExport, Payload, RootSnapshot, SnapshotManifest,
+    TreeManifest, TreeNodeManifest, TreeNodeRef, payload_blob_ref, payload_large_ref,
 };
 use crate::majutsu_store::{
     host_current_ref_key, host_last_synced_ref_key, host_root_ack_ref_key, host_root_ack_ref_prefix,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, NaiveTime, TimeZone, Utc};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
@@ -22,7 +22,7 @@ use std::io::{self, IsTerminal, Write as _};
 use std::mem;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -32,44 +32,61 @@ use walkdir::WalkDir;
 use crate::atomic_io::write_atomic;
 use crate::cli::{DiffArgs, HealthArgs, LogArgs, OpCommand, StateArgs, StatusArgs};
 use crate::config::{Config, Paths, RootConfig, read_config};
-use crate::daemon_runtime::{DaemonHealth, DaemonHealthState, daemon_health};
+use crate::daemon_runtime::{
+    DaemonHealth, DaemonHealthState, daemon_health, ensure_daemon_running,
+};
 use crate::operation_log::{query_operation, record_op};
 use crate::process_runtime::process_lock_owner;
 use crate::queue_runtime::{
-    event_journal_records, event_journal_stats, record_event, upload_queue_stats,
+    event_journal_records, event_journal_stats, record_event, remote_event_journal_stats,
+    upload_queue_stats,
 };
 use crate::remote_store::open_remote;
 use crate::root_state::roots;
+use crate::snapshot_rules::{build_ignore, is_ignored, is_included};
 use crate::snapshot_state::{
-    current_snapshot, load_root_tree_entries, load_snapshot_by_id, load_snapshot_header_by_id,
-    snapshot_contains_root, snapshot_file_map, snapshot_id_at,
+    current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id, snapshot_contains_root,
+    snapshot_file_map, snapshot_id_at, visit_tree_records,
 };
+use crate::util::{blake3_hex, parse_duration_ago, parse_time, path_to_slash, stable_read};
 
 pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
     let config = read_config(paths)?;
     let roots = roots(&conn)?;
+    let auto_daemon_result = ensure_daemon_running(paths);
+    let auto_daemon_started = matches!(auto_daemon_result, Ok(Some(_)));
+    let auto_daemon_error = auto_daemon_result.err().map(|err| format!("{err:#}"));
+    let remote = read_remote_status(&config)?;
+    let db_stats = read_status_db_stats(&conn)?;
+    let storage = read_storage_stats(paths)?;
+    let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
+    let daemon = if auto_daemon_started {
+        wait_daemon_healthy(paths, 10, StdDuration::from_millis(100))?
+    } else {
+        daemon_health(paths)?
+    };
+
+    // status の集計中に daemon が journal replay や sync を進めることがあるため、
+    // health 判定と表示に使う揮発的な状態は出力直前に再読込する。
     let current = current_snapshot(&conn)?;
     let current_manifest = current
         .as_deref()
         .map(|id| load_snapshot_by_id(paths, &conn, id))
         .transpose()?;
     let current_label = current.as_deref().unwrap_or("(none)");
-    let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let remote_manifest = remote_head
         .remote_current
         .as_deref()
         .and_then(|id| load_snapshot_by_id(paths, &conn, id).ok());
-    let db_stats = read_status_db_stats(&conn)?;
-    let storage = read_storage_stats(paths)?;
     let upload_stats = upload_queue_stats(paths)?;
     let event_records = event_journal_records(paths)?;
     let event_count = event_records.len();
     let pending_event_count = pending_journal_event_count(&event_records);
-    let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
-    let daemon = daemon_health(paths)?;
+    let remote_journal_stats = remote_event_journal_stats(paths)?;
+
     let health = build_health_report(HealthInputs {
         paths,
         config: &config,
@@ -78,8 +95,10 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         remote: &remote,
         remote_head: &remote_head,
         daemon: &daemon,
+        auto_daemon_error,
         upload_stats: &upload_stats,
         pending_event_count,
+        durable_journal_pending: remote_journal_stats.pending,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
         conn: &conn,
@@ -484,6 +503,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     writeln!(output).expect("write status output");
 
     let event_stats = event_journal_stats(paths)?;
+    let remote_journal_stats = remote_event_journal_stats(paths)?;
     writeln!(output, "{}", ui.heading("Queues")).expect("write status output");
     print_table(
         &mut output,
@@ -512,6 +532,14 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
                 &format!(
                     "{pending_event_count} pending, {} removable, records retained",
                     event_stats.removable
+                ),
+            ],
+            [
+                "durable journal",
+                &remote_journal_stats.total.to_string(),
+                &format!(
+                    "{} durable, {} pending remote ack",
+                    remote_journal_stats.durable, remote_journal_stats.pending
                 ),
             ],
             [
@@ -573,6 +601,7 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
     let upload_stats = upload_queue_stats(paths)?;
     let event_records = event_journal_records(paths)?;
     let pending_event_count = pending_journal_event_count(&event_records);
+    let remote_journal_stats = remote_event_journal_stats(paths)?;
     let daemon = daemon_health(paths)?;
     build_health_report(HealthInputs {
         paths,
@@ -582,8 +611,10 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
         remote: &remote,
         remote_head: &remote_head,
         daemon: &daemon,
+        auto_daemon_error: None,
         upload_stats: &upload_stats,
         pending_event_count,
+        durable_journal_pending: remote_journal_stats.pending,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
         conn: &conn,
@@ -675,6 +706,7 @@ struct HealthReport {
     queued_uploads_retrying: usize,
     queued_uploads_delayed: usize,
     pending_journal_events: usize,
+    durable_journal_pending: usize,
     sync_lock_pid: Option<u32>,
     encryption: String,
     roots: Vec<RootHealth>,
@@ -711,8 +743,10 @@ struct HealthInputs<'a> {
     remote: &'a RemoteStatus,
     remote_head: &'a RemoteHeadStatus,
     daemon: &'a DaemonHealth,
+    auto_daemon_error: Option<String>,
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
+    durable_journal_pending: usize,
     current_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     remote_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     conn: &'a Connection,
@@ -727,8 +761,10 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         remote,
         remote_head,
         daemon,
+        auto_daemon_error,
         upload_stats,
         pending_event_count,
+        durable_journal_pending,
         current_manifest,
         remote_manifest,
         conn,
@@ -847,6 +883,13 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
             message: format!("watch daemon is {}", daemon.label()),
         });
     }
+    if let Some(error) = auto_daemon_error {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "daemon-auto-start-failed".into(),
+            message: format!("daemon auto-start failed: {error}"),
+        });
+    }
 
     if active_roots > 0 && !remote.configured {
         issues.push(HealthIssue {
@@ -895,6 +938,15 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
             severity: HealthSeverity::Warning,
             code: "pending-journal-events".into(),
             message: format!("event journal has {pending_event_count} pending trigger event(s)"),
+        });
+    }
+    if durable_journal_pending > 0 {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "durable-journal-pending".into(),
+            message: format!(
+                "durable remote journal has {durable_journal_pending} pending remote ack event(s)"
+            ),
         });
     }
 
@@ -947,11 +999,24 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         queued_uploads_retrying: upload_stats.retrying,
         queued_uploads_delayed: upload_stats.delayed,
         pending_journal_events: pending_event_count,
+        durable_journal_pending,
         sync_lock_pid,
         encryption: config.security.encryption.clone(),
         roots: root_health,
         issues,
     })
+}
+
+fn wait_daemon_healthy(paths: &Paths, attempts: usize, delay: StdDuration) -> Result<DaemonHealth> {
+    let mut latest = daemon_health(paths)?;
+    for _ in 0..attempts {
+        if latest.is_healthy() {
+            return Ok(latest);
+        }
+        thread::sleep(delay);
+        latest = daemon_health(paths)?;
+    }
+    Ok(latest)
 }
 
 fn root_last_change(
@@ -972,6 +1037,12 @@ fn root_last_change(
                 changed_at: candidate_changed_at,
             });
         };
+        if !snapshot_exists(conn, parent_id)? {
+            return Ok(RootChange {
+                snapshot_id: candidate_id,
+                changed_at: candidate_changed_at,
+            });
+        }
         let parent = load_snapshot_header_by_id(paths, conn, parent_id)?;
         let parent_tree_matches = parent
             .root_trees
@@ -988,6 +1059,17 @@ fn root_last_change(
         candidate_changed_at = snapshot_created_at(conn, parent_id)?;
         cursor_id = parent_id.to_string();
     }
+}
+
+fn snapshot_exists(conn: &Connection, snapshot_id: &str) -> Result<bool> {
+    conn.query_row(
+        "select 1 from snapshots where id=?1",
+        params![snapshot_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .map_err(Into::into)
 }
 
 fn snapshot_created_at(conn: &Connection, snapshot_id: &str) -> Result<String> {
@@ -1122,6 +1204,7 @@ fn print_health_report(report: &HealthReport) {
     println!("queued_uploads_retrying {}", report.queued_uploads_retrying);
     println!("queued_uploads_delayed {}", report.queued_uploads_delayed);
     println!("pending_journal_events {}", report.pending_journal_events);
+    println!("durable_journal_pending {}", report.durable_journal_pending);
     println!(
         "sync_lock_pid {}",
         report
@@ -1223,6 +1306,24 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let conn = crate::open_db(paths)?;
     let config = read_config(paths)?;
     let current = current_snapshot(&conn)?;
+    let configured_roots = roots(&conn)?;
+    let state_scope = resolve_state_scope(&configured_roots, &args)?;
+    let basis = args
+        .reference
+        .as_deref()
+        .map(|reference| resolve_state_basis(paths, &conn, reference))
+        .transpose()?;
+    if basis.is_some() && !args.json {
+        stream_state_short_changes(
+            paths,
+            &conn,
+            basis.as_ref().unwrap(),
+            &state_scope,
+            args.diff,
+            args.meta,
+        )?;
+        return Ok(());
+    }
     let active_branch = ref_value_for_state(&conn, "current-branch")?;
     let latest = latest_snapshot_for_state(&conn)?;
     let refs = state_refs(&conn)?;
@@ -1233,10 +1334,20 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let event_records = event_journal_records(paths)?;
     let event_count = event_records.len();
     let pending_event_count = pending_journal_event_count(&event_records);
+    let remote_journal_stats = remote_event_journal_stats(paths)?;
     let restore_queue_count = count_json_files(&paths.home.join("queue/restores"))?;
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let daemon = daemon_health(paths)?;
+    let changes = if let Some(basis) = basis.as_ref() {
+        let from = load_snapshot_by_id(paths, &conn, &basis.snapshot)?;
+        Some(state_change_report(
+            state_live_file_changes(paths, &from, &state_scope.roots, false, args.meta)?,
+            current.as_deref().unwrap_or("(none)").to_string(),
+        ))
+    } else {
+        None
+    };
 
     let state = StateReport {
         host: StateHost {
@@ -1319,8 +1430,12 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
             upload_backpressure: upload_stats.has_backpressure(),
             event_journal: event_count as u64,
             event_journal_pending: pending_event_count as u64,
+            durable_journal: remote_journal_stats.total as u64,
+            durable_journal_pending: remote_journal_stats.pending as u64,
             restore_jobs: restore_queue_count as u64,
         },
+        basis,
+        changes,
         branches,
         refs,
     };
@@ -1338,6 +1453,12 @@ fn print_state_report(state: &StateReport) -> Result<()> {
     let height = terminal_height();
     let ui = StatusUi::new();
     let mut output = String::new();
+
+    if state.basis.is_some() {
+        print_state_short_changes(&mut output, state, &ui);
+        emit_status_output_auto(&output, height)?;
+        return Ok(());
+    }
 
     writeln!(output, "{}", ui.heading("State")).expect("write state output");
     print_kv(&mut output, width, "Home", &state.paths.home);
@@ -1381,6 +1502,67 @@ fn print_state_report(state: &StateReport) -> Result<()> {
     print_kv(&mut output, width, "Remote head", &state.remote.head_status);
     print_kv(&mut output, width, "Encryption", &state.security.encryption);
     writeln!(output).expect("write state output");
+
+    if let Some(basis) = state.basis.as_ref() {
+        writeln!(output, "{}", ui.heading("Basis")).expect("write state output");
+        print_table(
+            &mut output,
+            width,
+            &["ITEM", "VALUE"],
+            &[
+                ["input", basis.input.as_str()],
+                ["kind", basis.kind.as_str()],
+                ["snapshot", basis.snapshot.as_str()],
+                ["snapshot created", basis.snapshot_created_at.as_str()],
+                ["operation", basis.operation.as_deref().unwrap_or("(none)")],
+                [
+                    "operation created",
+                    basis.operation_created_at.as_deref().unwrap_or("(none)"),
+                ],
+                [
+                    "resolved at",
+                    basis.resolved_at.as_deref().unwrap_or("(none)"),
+                ],
+            ],
+        );
+        writeln!(output).expect("write state output");
+
+        writeln!(output, "{}", ui.heading("Changes Since Basis")).expect("write state output");
+        if let Some(changes) = state.changes.as_ref() {
+            let summary = format!(
+                "total={} A={} M={} D={}",
+                changes.total, changes.added, changes.modified, changes.deleted
+            );
+            print_table(
+                &mut output,
+                width,
+                &["ITEM", "VALUE"],
+                &[
+                    ["current snapshot", changes.current_snapshot.as_str()],
+                    ["summary", summary.as_str()],
+                ],
+            );
+            if changes.files.is_empty() {
+                writeln!(output, "  clean").expect("write state output");
+            } else {
+                let rows = changes
+                    .files
+                    .iter()
+                    .map(|change| {
+                        [
+                            change.status.as_str(),
+                            change.root.as_str(),
+                            change.path.as_str(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(&mut output, width, &["S", "ROOT", "PATH"], &rows);
+            }
+        } else {
+            writeln!(output, "  (not requested)").expect("write state output");
+        }
+        writeln!(output).expect("write state output");
+    }
 
     writeln!(output, "{}", ui.heading("Paths")).expect("write state output");
     print_table(
@@ -1594,6 +1776,14 @@ fn print_state_report(state: &StateReport) -> Result<()> {
                 ),
             ],
             [
+                "durable journal",
+                &state.queues.durable_journal.to_string(),
+                &format!(
+                    "{} pending remote ack",
+                    state.queues.durable_journal_pending
+                ),
+            ],
+            [
                 "restore jobs",
                 &state.queues.restore_jobs.to_string(),
                 "prepared jobs",
@@ -1603,6 +1793,26 @@ fn print_state_report(state: &StateReport) -> Result<()> {
 
     emit_status_output_auto(&output, height)?;
     Ok(())
+}
+
+fn print_state_short_changes(output: &mut String, state: &StateReport, ui: &StatusUi) {
+    let Some(changes) = state.changes.as_ref() else {
+        return;
+    };
+    for change in &changes.files {
+        let path = if change.path.is_empty() {
+            change.root.clone()
+        } else {
+            format!("{}/{}", change.root, change.path)
+        };
+        writeln!(
+            output,
+            " {} {}",
+            color_change_status(ui, &change.status),
+            path
+        )
+        .expect("write state output");
+    }
 }
 
 #[derive(Serialize)]
@@ -1616,6 +1826,10 @@ struct StateReport {
     metadata: StateMetadata,
     storage: StateStorage,
     queues: StateQueues,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    basis: Option<StateBasis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changes: Option<StateChangeReport>,
     branches: Vec<StateBranch>,
     refs: Vec<StateRef>,
 }
@@ -1717,7 +1931,910 @@ struct StateQueues {
     upload_backpressure: bool,
     event_journal: u64,
     event_journal_pending: u64,
+    durable_journal: u64,
+    durable_journal_pending: u64,
     restore_jobs: u64,
+}
+
+#[derive(Serialize)]
+struct StateBasis {
+    input: String,
+    kind: String,
+    snapshot: String,
+    snapshot_created_at: String,
+    operation: Option<String>,
+    operation_created_at: Option<String>,
+    resolved_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StateChangeReport {
+    current_snapshot: String,
+    added: usize,
+    modified: usize,
+    deleted: usize,
+    total: usize,
+    files: Vec<StateFileChange>,
+}
+
+#[derive(Serialize)]
+struct StateFileChange {
+    status: String,
+    root: String,
+    path: String,
+}
+
+fn state_change_report(changes: Vec<FileChange>, current_snapshot: String) -> StateChangeReport {
+    let mut files = Vec::with_capacity(changes.len());
+    let mut added = 0usize;
+    let mut modified = 0usize;
+    let mut deleted = 0usize;
+    for change in changes {
+        match change.status {
+            "A" => added += 1,
+            "M" => modified += 1,
+            "D" => deleted += 1,
+            _ => {}
+        }
+        let (root, path) = split_state_change_path(&change.path);
+        files.push(StateFileChange {
+            status: change.status.to_string(),
+            root,
+            path,
+        });
+    }
+    StateChangeReport {
+        current_snapshot,
+        total: files.len(),
+        added,
+        modified,
+        deleted,
+        files,
+    }
+}
+
+fn stream_state_short_changes(
+    paths: &Paths,
+    conn: &Connection,
+    basis: &StateBasis,
+    scope: &StateScope,
+    show_diff: bool,
+    include_meta: bool,
+) -> Result<()> {
+    let _ = conn;
+    let snapshot_id = basis.snapshot.clone();
+    let roots = scope.roots.clone();
+    let local_paths = scope.local_paths;
+    let paths = paths.clone();
+    let (tx, rx) = mpsc::channel::<LogProducerMessage>();
+    thread::spawn(move || {
+        let mut handles = Vec::with_capacity(roots.len());
+        for root in roots {
+            let tx = tx.clone();
+            let paths = paths.clone();
+            let snapshot_id = snapshot_id.clone();
+            handles.push(thread::spawn(move || {
+                let ui = StatusUi::new();
+                let result = state_stream_live_file_changes_for_root(
+                    &paths,
+                    &snapshot_id,
+                    &root,
+                    local_paths,
+                    show_diff,
+                    include_meta,
+                    |change, diff_lines| {
+                        let line = format!(
+                            " {} {}",
+                            color_change_status(&ui, &change.status),
+                            color_state_path(&ui, &change.path, local_paths)
+                        );
+                        tx.send(LogProducerMessage::Line(line))
+                            .map_err(|err| anyhow!("send state line: {err}"))?;
+                        for diff_line in diff_lines {
+                            let line = color_state_diff_line(&ui, &diff_line);
+                            tx.send(LogProducerMessage::Line(line))
+                                .map_err(|err| anyhow!("send state diff line: {err}"))?;
+                        }
+                        Ok(())
+                    },
+                );
+                if let Err(err) = result {
+                    let _ = tx.send(LogProducerMessage::Error(format!("{err:#}")));
+                }
+            }));
+        }
+        for handle in handles {
+            if handle.join().is_err() {
+                let _ = tx.send(LogProducerMessage::Error(
+                    "state worker thread panicked".into(),
+                ));
+            }
+        }
+        let _ = tx.send(LogProducerMessage::Done);
+    });
+
+    if should_use_log_viewer() {
+        stream_state_lines_viewer(rx)
+    } else {
+        stream_state_lines_direct(rx)
+    }
+}
+
+fn stream_state_lines_direct(rx: mpsc::Receiver<LogProducerMessage>) -> Result<()> {
+    let mut stdout = io::stdout();
+    for message in rx {
+        match message {
+            LogProducerMessage::Line(line) => {
+                if let Err(err) = writeln!(stdout, "{line}") {
+                    if err.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(err.into());
+                }
+                if let Err(err) = stdout.flush() {
+                    if err.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(err.into());
+                }
+            }
+            LogProducerMessage::Done => break,
+            LogProducerMessage::Error(err) => bail!("{err}"),
+        }
+    }
+    Ok(())
+}
+
+fn stream_state_lines_viewer(rx: mpsc::Receiver<LogProducerMessage>) -> Result<()> {
+    let height = terminal_height();
+    let mut lines = Vec::new();
+    let mut done = false;
+    let max_wait = StdDuration::from_millis(2000);
+    let started = std::time::Instant::now();
+    while lines.len() <= height {
+        let elapsed = started.elapsed();
+        if elapsed >= max_wait {
+            break;
+        }
+        let timeout = max_wait - elapsed;
+        match rx.recv_timeout(timeout) {
+            Ok(LogProducerMessage::Line(line)) => {
+                lines.push(line);
+            }
+            Ok(LogProducerMessage::Done) => {
+                done = true;
+                break;
+            }
+            Ok(LogProducerMessage::Error(err)) => bail!("{err}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                done = true;
+                break;
+            }
+        }
+    }
+
+    if done && lines.len() <= height {
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
+    run_log_viewer(lines, rx, "mj state")
+}
+
+fn split_state_change_path(path: &str) -> (String, String) {
+    path.split_once('/')
+        .map(|(root, rest)| (root.to_string(), rest.to_string()))
+        .unwrap_or_else(|| (path.to_string(), String::new()))
+}
+
+#[derive(Clone)]
+struct StateScope {
+    roots: Vec<RootConfig>,
+    local_paths: bool,
+}
+
+fn resolve_state_scope(roots: &[RootConfig], args: &StateArgs) -> Result<StateScope> {
+    if let Some(selected) = args.root.as_deref() {
+        let root = roots
+            .iter()
+            .find(|root| root.id == selected)
+            .ok_or_else(|| anyhow!("unknown root: {selected}"))?;
+        return Ok(StateScope {
+            roots: vec![root.clone()],
+            local_paths: false,
+        });
+    }
+    if !args.global
+        && let Some(root) = infer_current_root(roots)?
+    {
+        return Ok(StateScope {
+            roots: vec![root],
+            local_paths: true,
+        });
+    }
+    Ok(StateScope {
+        roots: roots
+            .iter()
+            .filter(|root| root.status == "active")
+            .cloned()
+            .collect(),
+        local_paths: false,
+    })
+}
+
+fn infer_current_root(roots: &[RootConfig]) -> Result<Option<RootConfig>> {
+    let cwd = std::env::current_dir()?;
+    let mut matches = roots
+        .iter()
+        .filter(|root| root.status == "active")
+        .filter_map(|root| {
+            let root_path = absolutize_existing_path(&root.path).ok()?;
+            if cwd.starts_with(&root_path) {
+                Some((root_path.components().count(), root.clone()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(depth, _)| *depth);
+    Ok(matches.pop().map(|(_, root)| root))
+}
+
+fn absolutize_existing_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return Ok(path.canonicalize()?);
+    }
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn state_live_file_changes(
+    paths: &Paths,
+    from: &SnapshotManifest,
+    roots: &[RootConfig],
+    local_paths: bool,
+    include_meta: bool,
+) -> Result<Vec<FileChange>> {
+    let mut changes = Vec::new();
+    for root in roots {
+        changes.extend(state_live_file_changes_for_root(
+            paths,
+            from,
+            root,
+            local_paths,
+            include_meta,
+        )?);
+    }
+    Ok(changes)
+}
+
+fn state_live_file_changes_for_root(
+    paths: &Paths,
+    from: &SnapshotManifest,
+    root: &RootConfig,
+    local_paths: bool,
+    include_meta: bool,
+) -> Result<Vec<FileChange>> {
+    let from_files = root_file_map(paths, Some(from), &root.id)?;
+    let live_files = scan_live_root_for_state(root)?;
+    let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
+    paths_all.extend(
+        live_files
+            .keys()
+            .filter(|key| !from_files.contains_key(*key))
+            .cloned(),
+    );
+    paths_all.sort();
+    let mut changes = Vec::new();
+    for path in paths_all {
+        let display_path = if local_paths {
+            path.clone()
+        } else {
+            format!("{}/{}", root.id, path)
+        };
+        match (from_files.get(&path), live_files.get(&path)) {
+            (None, Some(_)) => changes.push(FileChange {
+                status: "A",
+                path: display_path,
+            }),
+            (Some(_), None) => changes.push(FileChange {
+                status: "D",
+                path: display_path,
+            }),
+            (Some(a), Some(b)) => match state_record_change_status(a, b) {
+                Some("M") => changes.push(FileChange {
+                    status: "M",
+                    path: display_path,
+                }),
+                Some("m") if include_meta => changes.push(FileChange {
+                    status: "m",
+                    path: display_path,
+                }),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(changes)
+}
+
+fn state_stream_live_file_changes_for_root(
+    paths: &Paths,
+    snapshot_id: &str,
+    root: &RootConfig,
+    local_paths: bool,
+    show_diff: bool,
+    include_meta: bool,
+    mut emit: impl FnMut(FileChange, Vec<String>) -> Result<()>,
+) -> Result<()> {
+    let mut from_files = root_file_map_by_snapshot_id(paths, snapshot_id, &root.id)?;
+    scan_live_root_for_state_each(root, false, |path, live| {
+        let display_path = state_display_path(root, &path, local_paths);
+        match from_files.remove(&path) {
+            None => {
+                let diff =
+                    state_live_change_diff(paths, root, &path, None, Some(&live), show_diff)?;
+                emit(
+                    FileChange {
+                        status: "A",
+                        path: display_path,
+                    },
+                    diff,
+                )?
+            }
+            Some(previous) => {
+                let fast_status = state_stream_record_fast_status(&previous, &live);
+                let content_changed = fast_status == Some("M")
+                    || (fast_status != Some("M")
+                        && state_stream_payload_changed(root, &path, &previous)?);
+                if content_changed {
+                    let diff = state_live_change_diff(
+                        paths,
+                        root,
+                        &path,
+                        Some(&previous),
+                        Some(&live),
+                        show_diff,
+                    )?;
+                    emit(
+                        FileChange {
+                            status: "M",
+                            path: display_path,
+                        },
+                        diff,
+                    )?
+                } else if fast_status == Some("m") && include_meta {
+                    emit(
+                        FileChange {
+                            status: "m",
+                            path: display_path,
+                        },
+                        Vec::new(),
+                    )?
+                }
+            }
+        }
+        Ok(())
+    })?;
+    for (path, previous) in &from_files {
+        let diff = state_live_change_diff(paths, root, path, Some(previous), None, show_diff)?;
+        emit(
+            FileChange {
+                status: "D",
+                path: state_display_path(root, path, local_paths),
+            },
+            diff,
+        )?;
+    }
+    Ok(())
+}
+
+fn state_display_path(root: &RootConfig, path: &str, local_paths: bool) -> String {
+    if local_paths {
+        path.to_string()
+    } else {
+        format!("{}/{}", root.id, path)
+    }
+}
+
+fn state_live_change_diff(
+    paths: &Paths,
+    root: &RootConfig,
+    path: &str,
+    previous: Option<&FileRecord>,
+    live: Option<&FileRecord>,
+    show_diff: bool,
+) -> Result<Vec<String>> {
+    const STATE_DIFF_MAX_BYTES: u64 = 1024 * 1024;
+    if !show_diff {
+        return Ok(Vec::new());
+    }
+    if previous.is_some_and(|record| record.kind != "file")
+        || live.is_some_and(|record| record.kind != "file")
+    {
+        return Ok(Vec::new());
+    }
+    if previous.is_some_and(|record| record.size > STATE_DIFF_MAX_BYTES)
+        || live.is_some_and(|record| record.size > STATE_DIFF_MAX_BYTES)
+    {
+        return Ok(vec!["    (diff omitted: file is larger than 1 MiB)".into()]);
+    }
+    let old_bytes = previous
+        .map(|record| state_record_payload_bytes(paths, record))
+        .transpose()?
+        .unwrap_or_default();
+    let new_bytes = if live.is_some() {
+        stable_read(
+            &root.path.join(Path::new(path)),
+            root.snapshot_mode.as_str(),
+        )?
+    } else {
+        Vec::new()
+    };
+    let Some(old_text) = state_diff_text(old_bytes) else {
+        return Ok(vec!["    (diff omitted: previous file is binary)".into()]);
+    };
+    let Some(new_text) = state_diff_text(new_bytes) else {
+        return Ok(vec!["    (diff omitted: current file is binary)".into()]);
+    };
+    Ok(state_unified_diff_lines(&old_text, &new_text))
+}
+
+fn state_record_payload_bytes(paths: &Paths, record: &FileRecord) -> Result<Vec<u8>> {
+    let conn = crate::open_db(paths)?;
+    if let Some((oid, object_key)) = payload_blob_ref(&record.payload) {
+        return crate::read_blob_payload(paths, &conn, oid, object_key);
+    }
+    if let Some((_, manifest_key, chunk_count)) = payload_large_ref(&record.payload) {
+        let manifest = crate::restore_runtime::read_large_manifest_for_restore(paths, manifest_key)
+            .with_context(|| format!("read large manifest {manifest_key}"))?;
+        if manifest.chunks.len() != chunk_count {
+            bail!(
+                "large manifest chunk count mismatch for {manifest_key}: payload={chunk_count} manifest={}",
+                manifest.chunks.len()
+            );
+        }
+        let mut bytes = Vec::with_capacity(record.size.min(usize::MAX as u64) as usize);
+        for chunk in &manifest.chunks {
+            bytes.extend(crate::read_large_chunk(paths, chunk)?);
+        }
+        return Ok(bytes);
+    }
+    Ok(Vec::new())
+}
+
+fn state_diff_text(bytes: Vec<u8>) -> Option<String> {
+    if bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn state_unified_diff_lines(old: &str, new: &str) -> Vec<String> {
+    if old == new {
+        return Vec::new();
+    }
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let ops = state_diff_ops(&old_lines, &new_lines);
+    let mut out = Vec::new();
+    out.push("    @@".into());
+    for op in ops {
+        match op {
+            StateDiffOp::Context(line) => out.push(format!("     {line}")),
+            StateDiffOp::Delete(line) => out.push(format!("    -{line}")),
+            StateDiffOp::Add(line) => out.push(format!("    +{line}")),
+        }
+    }
+    out
+}
+
+enum StateDiffOp<'a> {
+    Context(&'a str),
+    Delete(&'a str),
+    Add(&'a str),
+}
+
+fn state_diff_ops<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<StateDiffOp<'a>> {
+    let mut table = vec![vec![0usize; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            table[i][j] = if old[i] == new[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    let mut ops = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < old.len() && j < new.len() {
+        if old[i] == new[j] {
+            ops.push(StateDiffOp::Context(old[i]));
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            ops.push(StateDiffOp::Delete(old[i]));
+            i += 1;
+        } else {
+            ops.push(StateDiffOp::Add(new[j]));
+            j += 1;
+        }
+    }
+    while i < old.len() {
+        ops.push(StateDiffOp::Delete(old[i]));
+        i += 1;
+    }
+    while j < new.len() {
+        ops.push(StateDiffOp::Add(new[j]));
+        j += 1;
+    }
+    ops
+}
+
+fn state_stream_payload_changed(
+    root: &RootConfig,
+    path: &str,
+    previous: &FileRecord,
+) -> Result<bool> {
+    let Some(previous_oid) = state_payload_oid(&previous.payload) else {
+        return Ok(false);
+    };
+    let bytes = stable_read(
+        &root.path.join(Path::new(path)),
+        root.snapshot_mode.as_str(),
+    )?;
+    Ok(blake3_hex(&bytes) != previous_oid)
+}
+
+fn scan_live_root_for_state(root: &RootConfig) -> Result<BTreeMap<String, FileRecord>> {
+    let mut records = BTreeMap::new();
+    scan_live_root_for_state_each(root, true, |path, record| {
+        records.insert(path, record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+fn scan_live_root_for_state_each(
+    root: &RootConfig,
+    hash_files: bool,
+    mut visit: impl FnMut(String, FileRecord) -> Result<()>,
+) -> Result<()> {
+    if root.status != "active" {
+        return Ok(());
+    }
+    if !root.path.exists() {
+        return Ok(());
+    }
+    let ignore = build_ignore(root)?;
+    let walker = WalkDir::new(&root.path)
+        .follow_links(root.follow_symlinks)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == root.path {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root.path) else {
+                return true;
+            };
+            !is_ignored(&ignore, rel, entry.file_type().is_dir())
+        });
+    for entry in walker {
+        let entry = entry?;
+        if entry.path() == root.path {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(&root.path)?.to_path_buf();
+        if !is_included(&root.include, &rel) {
+            continue;
+        }
+        if is_ignored(&ignore, &rel, entry.file_type().is_dir()) {
+            continue;
+        }
+        let rel_s = path_to_slash(&rel);
+        let link_meta = fs::symlink_metadata(entry.path())?;
+        let record = if entry.file_type().is_dir() {
+            FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s.clone(),
+                kind: "directory".into(),
+                size: 0,
+                mode: crate::fs_meta::file_mode(&link_meta),
+                modified: crate::util::modified_secs(&link_meta),
+                uid: crate::fs_meta::file_uid(&link_meta),
+                gid: crate::fs_meta::file_gid(&link_meta),
+                xattrs: crate::fs_meta::read_xattrs(entry.path()),
+                payload: Payload::Directory,
+            }
+        } else if link_meta.file_type().is_symlink() && !root.follow_symlinks {
+            FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s.clone(),
+                kind: "symlink".into(),
+                size: 0,
+                mode: crate::fs_meta::file_mode(&link_meta),
+                modified: crate::util::modified_secs(&link_meta),
+                uid: crate::fs_meta::file_uid(&link_meta),
+                gid: crate::fs_meta::file_gid(&link_meta),
+                xattrs: BTreeMap::new(),
+                payload: Payload::Symlink {
+                    target: fs::read_link(entry.path())?.to_string_lossy().to_string(),
+                },
+            }
+        } else if let Some(special_kind) = crate::fs_meta::special_file_kind(&link_meta) {
+            FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s.clone(),
+                kind: "special".into(),
+                size: 0,
+                mode: crate::fs_meta::file_mode(&link_meta),
+                modified: crate::util::modified_secs(&link_meta),
+                uid: crate::fs_meta::file_uid(&link_meta),
+                gid: crate::fs_meta::file_gid(&link_meta),
+                xattrs: crate::fs_meta::read_xattrs(entry.path()),
+                payload: Payload::Special { special_kind },
+            }
+        } else {
+            let meta = if link_meta.file_type().is_symlink() {
+                fs::metadata(entry.path())?
+            } else {
+                link_meta
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let oid = if hash_files {
+                let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
+                blake3_hex(&bytes)
+            } else {
+                String::new()
+            };
+            FileRecord {
+                root_id: root.id.clone(),
+                path: rel_s.clone(),
+                kind: "file".into(),
+                size: meta.len(),
+                mode: crate::fs_meta::file_mode(&meta),
+                modified: crate::util::modified_secs(&meta),
+                uid: crate::fs_meta::file_uid(&meta),
+                gid: crate::fs_meta::file_gid(&meta),
+                xattrs: crate::fs_meta::read_xattrs(entry.path()),
+                payload: Payload::NormalBlob {
+                    oid,
+                    object_key: String::new(),
+                },
+            }
+        };
+        visit(rel_s, record)?;
+    }
+    Ok(())
+}
+
+fn state_record_change_status(a: &FileRecord, b: &FileRecord) -> Option<&'static str> {
+    if a.kind != b.kind || !state_payloads_match(&a.payload, &b.payload) {
+        return Some("M");
+    }
+    if state_metadata_changed(a, b) {
+        return Some("m");
+    }
+    None
+}
+
+fn state_stream_record_fast_status(a: &FileRecord, b: &FileRecord) -> Option<&'static str> {
+    if a.kind != b.kind {
+        return Some("M");
+    }
+    if a.kind == "file" && a.size != b.size {
+        return Some("M");
+    }
+    match (&a.payload, &b.payload) {
+        (Payload::Symlink { target: a }, Payload::Symlink { target: b }) if a != b => {
+            return Some("M");
+        }
+        (Payload::Special { special_kind: a }, Payload::Special { special_kind: b }) if a != b => {
+            return Some("M");
+        }
+        _ => {}
+    }
+    if state_metadata_changed(a, b) {
+        return Some("m");
+    }
+    None
+}
+
+fn state_metadata_changed(a: &FileRecord, b: &FileRecord) -> bool {
+    a.size != b.size
+        || a.mode != b.mode
+        || a.modified != b.modified
+        || a.uid != b.uid
+        || a.gid != b.gid
+        || a.xattrs != b.xattrs
+}
+
+fn state_payloads_match(a: &Payload, b: &Payload) -> bool {
+    match (a, b) {
+        (Payload::Directory, Payload::Directory) => true,
+        (Payload::Symlink { target: a }, Payload::Symlink { target: b }) => a == b,
+        (Payload::Special { special_kind: a }, Payload::Special { special_kind: b }) => a == b,
+        _ => state_payload_oid(a).is_some_and(|a| state_payload_oid(b) == Some(a)),
+    }
+}
+
+fn state_payload_oid(payload: &Payload) -> Option<&str> {
+    match payload {
+        Payload::InlineSmall { oid, .. }
+        | Payload::NormalBlob { oid, .. }
+        | Payload::ChunkedBlob { oid, .. }
+        | Payload::LargeObject { oid, .. }
+        | Payload::Blob { oid, .. }
+        | Payload::Large { oid, .. } => Some(oid),
+        Payload::Directory | Payload::Symlink { .. } | Payload::Special { .. } => None,
+    }
+}
+
+fn resolve_state_basis(paths: &Paths, conn: &Connection, input: &str) -> Result<StateBasis> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("state reference must not be empty");
+    }
+    if trimmed.starts_with("op-") {
+        return resolve_state_operation_basis(paths, conn, trimmed);
+    }
+    if trimmed.starts_with("snap-") {
+        let snapshot = resolve_snapshot_id(conn, trimmed)?;
+        return state_basis_from_snapshot(paths, conn, trimmed, "snapshot", snapshot, None, None);
+    }
+    if let Some(resolved_at) = resolve_state_clock_time(trimmed)? {
+        let snapshot = snapshot_id_at(conn, &resolved_at)?;
+        return state_basis_from_snapshot(
+            paths,
+            conn,
+            trimmed,
+            "local-time",
+            snapshot,
+            None,
+            Some(resolved_at),
+        );
+    }
+    if let Ok(resolved) = parse_duration_ago(trimmed) {
+        let resolved_at = resolved.to_rfc3339();
+        let snapshot = snapshot_id_at(conn, &resolved_at)?;
+        return state_basis_from_snapshot(
+            paths,
+            conn,
+            trimmed,
+            "relative-time",
+            snapshot,
+            None,
+            Some(resolved_at),
+        );
+    }
+    let resolved_at = parse_time(trimmed)?;
+    let snapshot = snapshot_id_at(conn, &resolved_at)?;
+    state_basis_from_snapshot(
+        paths,
+        conn,
+        trimmed,
+        "time",
+        snapshot,
+        None,
+        Some(resolved_at),
+    )
+}
+
+fn resolve_state_operation_basis(
+    paths: &Paths,
+    conn: &Connection,
+    input: &str,
+) -> Result<StateBasis> {
+    let op = resolve_operation(conn, input)?;
+    let snapshot = op
+        .after_snapshot
+        .clone()
+        .or_else(|| op.before_snapshot.clone())
+        .ok_or_else(|| anyhow!("operation has no snapshot: {input}"))?;
+    state_basis_from_snapshot(
+        paths,
+        conn,
+        input,
+        "operation",
+        snapshot,
+        Some(op.id),
+        Some(op.created_at),
+    )
+}
+
+fn state_basis_from_snapshot(
+    paths: &Paths,
+    conn: &Connection,
+    input: &str,
+    kind: &str,
+    snapshot: String,
+    operation: Option<String>,
+    resolved_at: Option<String>,
+) -> Result<StateBasis> {
+    let manifest = load_snapshot_header_by_id(paths, conn, &snapshot)?;
+    Ok(StateBasis {
+        input: input.to_string(),
+        kind: kind.to_string(),
+        snapshot,
+        snapshot_created_at: manifest.timestamp.to_rfc3339(),
+        operation,
+        operation_created_at: if kind == "operation" {
+            resolved_at.clone()
+        } else {
+            None
+        },
+        resolved_at,
+    })
+}
+
+fn resolve_operation(conn: &Connection, input: &str) -> Result<OperationExport> {
+    match query_operation(conn, input) {
+        Ok(op) => Ok(op),
+        Err(_) => {
+            let matches = operation_ids_with_prefix(conn, input)?;
+            match matches.as_slice() {
+                [id] => query_operation(conn, id),
+                [] => bail!("unknown operation: {input}"),
+                _ => bail!("ambiguous operation prefix: {input}"),
+            }
+        }
+    }
+}
+
+fn operation_ids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("select id from operations where id like ?1 order by created_at")?;
+    let rows = stmt.query_map(params![format!("{prefix}%")], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn resolve_snapshot_id(conn: &Connection, input: &str) -> Result<String> {
+    let mut stmt = conn.prepare("select id from snapshots where id like ?1 order by created_at")?;
+    let rows = stmt.query_map(params![format!("{input}%")], |row| row.get(0))?;
+    let matches = rows.collect::<rusqlite::Result<Vec<String>>>()?;
+    match matches.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => bail!("unknown snapshot: {input}"),
+        _ => bail!("ambiguous snapshot prefix: {input}"),
+    }
+}
+
+fn resolve_state_clock_time(input: &str) -> Result<Option<String>> {
+    let time = NaiveTime::parse_from_str(input, "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(input, "%H:%M:%S"));
+    let Ok(time) = time else {
+        return Ok(None);
+    };
+    let now = Local::now();
+    let mut date = now.date_naive();
+    let mut local = local_datetime(date.and_time(time), input)?;
+    if local > now {
+        date = date
+            .pred_opt()
+            .ok_or_else(|| anyhow!("invalid local date for time reference: {input}"))?;
+        local = local_datetime(date.and_time(time), input)?;
+    }
+    Ok(Some(local.with_timezone(&Utc).to_rfc3339()))
+}
+
+fn local_datetime(naive: chrono::NaiveDateTime, input: &str) -> Result<DateTime<Local>> {
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(value) => Ok(value),
+        chrono::LocalResult::Ambiguous(earliest, _) => Ok(earliest),
+        chrono::LocalResult::None => bail!("invalid local time reference: {input}"),
+    }
 }
 
 fn pending_journal_event_count(records: &[crate::majutsu_db::EventJournalRecord]) -> usize {
@@ -3111,7 +4228,7 @@ fn print_change_log_viewer(paths: &Paths, args: LogArgs) -> Result<()> {
         return Ok(());
     }
 
-    run_log_viewer(lines, rx)
+    run_log_viewer(lines, rx, "mj log")
 }
 
 fn log_viewer_likely_needed(paths: &Paths, args: &LogArgs, height: usize) -> Result<bool> {
@@ -3170,6 +4287,7 @@ impl Drop for TerminalGuard {
 fn run_log_viewer(
     initial_lines: Vec<String>,
     rx: mpsc::Receiver<LogProducerMessage>,
+    label: &'static str,
 ) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut lines = initial_lines;
@@ -3178,7 +4296,7 @@ fn run_log_viewer(
     let mut needs_redraw = true;
     loop {
         if needs_redraw {
-            draw_log_viewer(&lines, offset, done)?;
+            draw_log_viewer(&lines, offset, done, label)?;
             needs_redraw = false;
         }
         let old_offset = offset;
@@ -3218,7 +4336,7 @@ fn run_log_viewer(
             needs_redraw = true;
         } else if needs_redraw
             && offset.abs_diff(old_offset) == 1
-            && draw_log_viewer_single_scroll(&lines, old_offset, offset, done).is_ok()
+            && draw_log_viewer_single_scroll(&lines, old_offset, offset, done, label).is_ok()
         {
             needs_redraw = false;
         }
@@ -3259,7 +4377,7 @@ fn drain_log_messages(
     Ok(changed)
 }
 
-fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
+fn draw_log_viewer(lines: &[String], offset: usize, done: bool, label: &str) -> Result<()> {
     let size = log_viewer_terminal_size();
     let width = usize::from(size.0).max(1);
     let height = usize::from(size.1).max(1);
@@ -3269,7 +4387,7 @@ fn draw_log_viewer(lines: &[String], offset: usize, done: bool) -> Result<()> {
     for row in 0..body_height {
         queue_log_viewer_line(&mut stdout, lines, offset + row, row, text_width)?;
     }
-    queue_log_viewer_status(&mut stdout, lines, offset, body_height, done, size.1)?;
+    queue_log_viewer_status(&mut stdout, lines, offset, body_height, done, size.1, label)?;
     io::Write::flush(&mut stdout).context("flush log viewer")?;
     Ok(())
 }
@@ -3279,13 +4397,14 @@ fn draw_log_viewer_single_scroll(
     old_offset: usize,
     offset: usize,
     done: bool,
+    label: &str,
 ) -> Result<()> {
     let size = log_viewer_terminal_size();
     let width = usize::from(size.0).max(1);
     let height = usize::from(size.1).max(1);
     let body_height = height.saturating_sub(1);
     if body_height == 0 {
-        return draw_log_viewer(lines, offset, done);
+        return draw_log_viewer(lines, offset, done, label);
     }
     let text_width = width.saturating_sub(1).max(1);
     let mut stdout = io::stdout();
@@ -3312,7 +4431,7 @@ fn draw_log_viewer_single_scroll(
         write!(stdout, "\x1b[r").context("reset log viewer scroll region")?;
         queue_log_viewer_line(&mut stdout, lines, offset, 0, text_width)?;
     }
-    queue_log_viewer_status(&mut stdout, lines, offset, body_height, done, size.1)?;
+    queue_log_viewer_status(&mut stdout, lines, offset, body_height, done, size.1, label)?;
     io::Write::flush(&mut stdout).context("flush log viewer scroll")?;
     Ok(())
 }
@@ -3344,18 +4463,19 @@ fn queue_log_viewer_status(
     body_height: usize,
     done: bool,
     terminal_rows: u16,
+    label: &str,
 ) -> Result<()> {
     let width = usize::from(log_viewer_terminal_size().0).max(1);
     let text_width = width.saturating_sub(1).max(1);
     let status = if done {
         format!(
-            "mj log {}/{}  j/k scroll  space/b page  g/G top/bottom  q quit",
+            "{label} {}/{}  j/k scroll  space/b page  g/G top/bottom  q quit",
             lines.len().min(offset + body_height),
             lines.len()
         )
     } else {
         format!(
-            "mj log {}/{}+  loading...  j/k scroll  space/b page  q quit",
+            "{label} {}/{}+  loading...  j/k scroll  space/b page  q quit",
             lines.len().min(offset + body_height),
             lines.len()
         )
@@ -3867,7 +4987,36 @@ fn root_file_map(
     let Some(root_tree) = snapshot.root_trees.get(root_id) else {
         return Ok(BTreeMap::new());
     };
-    load_root_tree_entries(paths, root_tree)
+    let mut records = BTreeMap::new();
+    visit_tree_records(paths, root_tree, |record| {
+        records.insert(record.path.clone(), record.clone());
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+fn root_file_map_by_snapshot_id(
+    paths: &Paths,
+    snapshot_id: &str,
+    root_id: &str,
+) -> Result<BTreeMap<String, crate::majutsu_core::FileRecord>> {
+    let conn = crate::open_db(paths)?;
+    let snapshot = load_snapshot_header_by_id(paths, &conn, snapshot_id)?;
+    if let Some(records) = snapshot.roots.get(root_id) {
+        return Ok(records
+            .iter()
+            .map(|record| (record.path.clone(), record.clone()))
+            .collect());
+    }
+    let Some(root_tree) = snapshot.root_trees.get(root_id) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut records = BTreeMap::new();
+    visit_tree_records(paths, root_tree, |record| {
+        records.insert(record.path.clone(), record.clone());
+        Ok(())
+    })?;
+    Ok(records)
 }
 
 fn summarize_changes(changes: &[FileChange]) -> String {
@@ -3881,10 +5030,34 @@ fn color_change_status(ui: &StatusUi, status: &str) -> String {
     let severity = match status {
         "A" => Severity::Good,
         "M" => Severity::Warn,
+        "m" => Severity::Info,
         "D" => Severity::Bad,
         _ => Severity::Info,
     };
     ui.severity(status, severity)
+}
+
+fn color_state_path(ui: &StatusUi, path: &str, local_paths: bool) -> String {
+    if local_paths {
+        return path.to_string();
+    }
+    let Some((root, rest)) = path.split_once('/') else {
+        return path.to_string();
+    };
+    format!("{}/{}", ui.paint(root, "1;96"), rest)
+}
+
+fn color_state_diff_line(ui: &StatusUi, line: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('+') {
+        ui.paint(line, "32")
+    } else if trimmed.starts_with('-') {
+        ui.paint(line, "31")
+    } else if trimmed.starts_with("@@") {
+        ui.paint(line, "36")
+    } else {
+        line.to_string()
+    }
 }
 
 fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> {

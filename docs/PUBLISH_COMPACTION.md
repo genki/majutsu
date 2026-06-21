@@ -68,9 +68,11 @@ compact default では `metadata/export.json.zst` の seed 確認も remote-sync
 
 ## GC mark
 
-S3/GCS 互換 backend では compact head を通常復旧の正とするため、GC mark は初回だけ seed し、
-通常の小変更 sync では毎回 publish しない。GC mark は remote prune の保護集合として使うため、
-remote prune を実行する同期では最新状態を強制 publish してから prune する。
+S3/GCS 互換 backend では compact head を通常復旧の正とするため、remote prune を無効化している場合の
+GC mark は初回だけ seed し、通常の小変更 sync では毎回 publish しない。GC mark は remote prune の
+保護集合として使うため、remote prune を実行する同期では最新状態を強制 publish してから prune する。
+remote prune は通常有効で、旧 retention から残った pack、tree、large chunk などの content object を
+自動的に整理する。
 
 GC mark を互換確認などで毎回更新したい場合は次を使う。
 

@@ -194,7 +194,8 @@ use pack_runtime::pack_cmd;
 use process_runtime::acquire_process_lock;
 use prune_runtime::{gc_cmd, prune_cmd};
 use queue_runtime::{
-    compact_event_journal_force, event_cmd, has_pending_journal_events, record_event,
+    compact_event_journal_force, event_cmd, event_journal_records, has_pending_journal_events,
+    record_event,
 };
 use remote_runtime::remote_cmd;
 #[cfg(test)]
@@ -220,8 +221,8 @@ use snapshot_state::{
 };
 use sync_runtime::sync_cmd;
 use util::{
-    blake3_hex, media_type_for_path, modified_secs, new_id, parse_db_time, path_to_slash,
-    stable_metadata_matches, stable_read,
+    blake3_hex, media_type_for_path, modified_secs, new_id, parse_db_time, parse_time,
+    path_to_slash, stable_metadata_matches, stable_read,
 };
 use watch_runtime::watch_cmd;
 
@@ -234,6 +235,7 @@ fn main() -> Result<()> {
         Command::Init(args) => init(&paths, args),
         Command::Root { command } => root_cmd(&paths, command),
         Command::Branch { command } => branch_cmd(&paths, command),
+        Command::Switch(args) => branch_cmd(&paths, cli::BranchCommand::Switch(args)),
         Command::Snapshot(args) => snapshot(&paths, args),
         Command::Status(args) => status_cmd(&paths, args),
         Command::Health(args) => health_cmd(&paths, args),
@@ -2019,6 +2021,7 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
         plan_roots.push(root_id.clone());
         collect_restore_plan_records(paths, &snapshot, &root_id, args.path.as_deref(), &mut files)?;
     }
+    overlay_durable_journal_records(paths, args, &snapshot, &mut files)?;
     restore_trace_mark(trace_start, "build_plan filter files");
     let deletes = build_restore_deletes(args, &root_paths, &plan_roots, &files)?;
     restore_trace_mark(trace_start, "build_plan deletes");
@@ -2067,6 +2070,160 @@ fn collect_restore_plan_records(
     if let Some(root_tree) = snapshot.root_trees.get(root_id) {
         crate::snapshot_state::visit_tree_records(paths, root_tree, push_record)?;
     }
+    Ok(())
+}
+
+fn overlay_durable_journal_records(
+    paths: &Paths,
+    args: &RestoreArgs,
+    snapshot: &SnapshotManifest,
+    files: &mut Vec<FileRecord>,
+) -> Result<()> {
+    if args.snapshot.is_some() {
+        return Ok(());
+    }
+    let target_time = if let Some(at) = &args.at {
+        parse_db_time(&parse_time(at)?)?
+    } else {
+        Utc::now()
+    };
+    let mut by_path = files
+        .drain(..)
+        .map(|record| ((record.root_id.clone(), record.path.clone()), record))
+        .collect::<BTreeMap<_, _>>();
+    for event in event_journal_records(paths)? {
+        if event.remote_journal_synced_at.is_none() {
+            continue;
+        }
+        if event.observed_at <= snapshot.timestamp || event.observed_at > target_time {
+            continue;
+        }
+        let (Some(root_id), Some(path)) = (event.root_id.as_deref(), event.path.as_deref()) else {
+            continue;
+        };
+        if let Some(filter_root) = &args.root
+            && filter_root != root_id
+        {
+            continue;
+        }
+        if args
+            .path
+            .as_ref()
+            .is_some_and(|filter| !Path::new(path).starts_with(filter))
+        {
+            continue;
+        }
+        let key = (root_id.to_string(), path.to_string());
+        if event.durable_tombstone == Some(true) {
+            by_path.remove(&key);
+            continue;
+        }
+        if event.durable_entry_kind.as_deref() == Some("symlink") {
+            let Some(target) = event.durable_symlink_target.as_deref() else {
+                continue;
+            };
+            by_path.insert(
+                key,
+                FileRecord {
+                    root_id: root_id.to_string(),
+                    path: path.to_string(),
+                    kind: "symlink".into(),
+                    size: 0,
+                    mode: event.durable_mode.unwrap_or(0),
+                    modified: event
+                        .durable_modified
+                        .or_else(|| Some(event.observed_at.timestamp())),
+                    uid: event.durable_uid,
+                    gid: event.durable_gid,
+                    xattrs: BTreeMap::new(),
+                    payload: Payload::Symlink {
+                        target: target.to_string(),
+                    },
+                },
+            );
+            continue;
+        }
+        if event.durable_entry_kind.as_deref() == Some("special") {
+            let Some(special_kind) = event.durable_special_kind.as_deref() else {
+                continue;
+            };
+            by_path.insert(
+                key,
+                FileRecord {
+                    root_id: root_id.to_string(),
+                    path: path.to_string(),
+                    kind: "special".into(),
+                    size: 0,
+                    mode: event.durable_mode.unwrap_or(0),
+                    modified: event
+                        .durable_modified
+                        .or_else(|| Some(event.observed_at.timestamp())),
+                    uid: event.durable_uid,
+                    gid: event.durable_gid,
+                    xattrs: BTreeMap::new(),
+                    payload: Payload::Special {
+                        special_kind: special_kind.to_string(),
+                    },
+                },
+            );
+            continue;
+        }
+        if let (Some(oid), Some(manifest_key), Some(chunk_count)) = (
+            event.durable_payload_oid.as_deref(),
+            event.durable_large_manifest_key.as_deref(),
+            event.durable_large_chunk_count,
+        ) {
+            by_path.insert(
+                key,
+                FileRecord {
+                    root_id: root_id.to_string(),
+                    path: path.to_string(),
+                    kind: "file".into(),
+                    size: event.durable_payload_size.unwrap_or(0),
+                    mode: event.durable_mode.unwrap_or(0),
+                    modified: event
+                        .durable_modified
+                        .or_else(|| Some(event.observed_at.timestamp())),
+                    uid: event.durable_uid,
+                    gid: event.durable_gid,
+                    xattrs: BTreeMap::new(),
+                    payload: Payload::ChunkedBlob {
+                        oid: oid.to_string(),
+                        manifest_key: manifest_key.to_string(),
+                        chunk_count,
+                    },
+                },
+            );
+            continue;
+        }
+        let (Some(oid), Some(object_key)) = (
+            event.durable_payload_oid.as_deref(),
+            event.durable_payload_key.as_deref(),
+        ) else {
+            continue;
+        };
+        by_path.insert(
+            key,
+            FileRecord {
+                root_id: root_id.to_string(),
+                path: path.to_string(),
+                kind: "file".into(),
+                size: event.durable_payload_size.unwrap_or(0),
+                mode: event.durable_mode.unwrap_or(0),
+                modified: event
+                    .durable_modified
+                    .or_else(|| Some(event.observed_at.timestamp())),
+                uid: event.durable_uid,
+                gid: event.durable_gid,
+                xattrs: BTreeMap::new(),
+                payload: Payload::NormalBlob {
+                    oid: oid.to_string(),
+                    object_key: object_key.to_string(),
+                },
+            },
+        );
+    }
+    *files = by_path.into_values().collect();
     Ok(())
 }
 
@@ -2711,7 +2868,7 @@ fn join_tree_path(parent: &str, child: &str) -> String {
     }
 }
 
-fn store_large_file(
+pub(crate) fn store_large_file(
     paths: &Paths,
     path: &Path,
     rel: &Path,
@@ -2954,7 +3111,10 @@ fn insert_large_object_chunk_index(conn: &Connection, manifest: &LargeManifest) 
     Ok(())
 }
 
-fn insert_snapshot_payload_index(conn: &Connection, manifest: &SnapshotManifest) -> Result<()> {
+pub(crate) fn insert_snapshot_payload_index(
+    conn: &Connection,
+    manifest: &SnapshotManifest,
+) -> Result<()> {
     conn.execute(
         "delete from snapshot_payloads where snapshot_id=?1",
         params![manifest.snapshot_id],
@@ -2997,7 +3157,7 @@ fn compress_large_chunk(
     })
 }
 
-fn read_large_chunk(paths: &Paths, chunk: &LargeChunk) -> Result<Vec<u8>> {
+pub(crate) fn read_large_chunk(paths: &Paths, chunk: &LargeChunk) -> Result<Vec<u8>> {
     read_large_chunk_payload(paths, &chunk.object_key, &chunk.compression)
 }
 
@@ -3059,7 +3219,11 @@ pub(crate) fn create_layout(paths: &Paths) -> Result<()> {
 
 fn ensure_ready(paths: &Paths) -> Result<()> {
     if !paths.config.exists() || !paths.db.exists() {
-        bail!("majutsu home is not initialized: run `mj init`");
+        bail!(
+            "majutsu state home is not initialized at {}: run `mj init --home {}` or omit --home to use the default state home",
+            paths.home.display(),
+            paths.home.display()
+        );
     }
     Ok(())
 }
@@ -3702,10 +3866,13 @@ pub(crate) fn read_blob_payload(
     oid: &str,
     fallback_key: &str,
 ) -> Result<Vec<u8>> {
-    let blob = query_blobs(conn)?
-        .into_iter()
-        .find(|blob| blob.oid == oid)
-        .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
+    let Some(blob) = query_blobs(conn)?.into_iter().find(|blob| blob.oid == oid) else {
+        if !fallback_key.trim().is_empty() {
+            return read_object(paths, fallback_key)
+                .with_context(|| format!("read fallback blob object {fallback_key} for {oid}"));
+        }
+        bail!("missing blob metadata for {oid}");
+    };
     if let Some(pack_id) = blob.pack_id {
         let pack: PackExport = conn.query_row(
             "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",

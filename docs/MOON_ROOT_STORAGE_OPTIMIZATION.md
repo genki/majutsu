@@ -26,15 +26,25 @@ MAJUTSU_SYNC_AUTO_PACK=0 mj sync
 MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS=512 mj sync
 ```
 
-pack 済みになった blob については、旧 loose blob object と canonical loose blob alias を remote から削除する。削除対象は remote の `gc/marks/` にある全 host の live object set と照合し、別 host が参照している object は削除しない。
+sync 後は、current retention metadata から参照されない remote content object を削除する。対象には旧 loose blob object、canonical loose blob alias、pack、pack index、tree node、large object manifest / chunk を含める。削除対象は remote の `gc/marks/` にある全 host の live object set と照合し、別 host が参照している object は削除しない。
 
-この remote cleanup は環境変数で無効化できる。
+ファイルを作業treeから削除しただけの場合、そのファイルは履歴上の復元対象として残る。一方で `mj root set --exclude ...` や include 変更によって majutsu の管理対象から外した場合は、保持中snapshotの該当root metadataからも対象外pathを忘却する。これにより、そのpayloadは通常の履歴retentionを待たずに metadata prune / remote cleanup の削除対象になれる。
+
+この remote cleanup は通常有効で、環境変数で無効化できる。
 
 ```sh
+MAJUTSU_SYNC_REMOTE_PRUNE=0 mj sync
 MAJUTSU_SYNC_REMOTE_OBJECT_PRUNE=0 mj sync
 ```
 
-cleanup は remote list で存在する loose blob object を絞り込み、S3 upload 並列度の設定を使って delete を並列化する。削除された旧 loose object は pack から復元できるため、通常の clone / restore には不要。
+remote cleanup の成功後は `~/.majutsu/cache/remote-prune-state.json` に状態を記録し、同じ remote / state fingerprint の no-op sync では backend prefix 全体の list を繰り返さない。強制的に remote cleanup を再実行する場合は次を使う。
+
+```sh
+MAJUTSU_SYNC_REMOTE_PRUNE_FORCE=1 mj sync
+MAJUTSU_SYNC_REMOTE_PRUNE_INTERVAL_SECS=3600 mj sync
+```
+
+cleanup は remote list で存在する content object を絞り込み、S3 upload 並列度の設定を使って delete を並列化する。削除された旧 object は current retention metadata から到達不能なため、通常の clone / restore には不要。
 
 `mj sync` 成功後は、ローカルに pack と pack index が揃っている pack 済み blob の旧 loose file も削除する。これにより auto pack 後の `~/.majutsu` 使用量が blob と pack の二重保持で増え続けることを抑える。pack から読める状態を確認してから削除するため、restore / fsck / remote sync の参照先は維持される。
 

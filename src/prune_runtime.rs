@@ -1,4 +1,4 @@
-use crate::majutsu_core::{LargeManifest, LiveMetadataReferences};
+use crate::majutsu_core::{LargeManifest, LiveMetadataReferences, payload_large_ref};
 use crate::majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -9,9 +9,10 @@ use crate::cli::PruneArgs;
 use crate::config::{Paths, read_config};
 use crate::object_paths::{all_local_object_keys, local_object_keys_with_progress};
 use crate::operation_log::record_op;
+use crate::remote_store::RemoteStore;
 use crate::snapshot_state::current_snapshot;
 use crate::util::parse_db_time;
-use crate::{ensure_ready, export_metadata, open_db, read_object};
+use crate::{ensure_ready, export_metadata, open_db, open_remote, read_object};
 
 pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     ensure_ready(paths)?;
@@ -43,16 +44,41 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
         println!("removed_blob_metadata {}", removed.blobs);
         println!("removed_large_metadata {}", removed.large_objects);
         println!("removed_chunk_metadata {}", removed.chunks);
+        println!("removed_pack_metadata {}", removed.packs);
+        println!(
+            "removed_snapshot_payload_indexes {}",
+            removed.snapshot_payload_indexes
+        );
+        println!(
+            "removed_snapshot_payload_rows {}",
+            removed.snapshot_payload_rows
+        );
         println!("removed_large_pins {}", removed.large_pins);
+        if args.remote_cleanup && read_config(paths)?.remote.is_some() {
+            println!("remote_cleanup true");
+            crate::sync_runtime::sync_cmd(
+                paths,
+                crate::cli::SyncArgs {
+                    wait: false,
+                    timeout_secs: 300,
+                    command: None,
+                },
+            )?;
+        } else {
+            println!("remote_cleanup false");
+        }
     }
     Ok(())
 }
 
-struct PrunedMetadata {
-    blobs: usize,
-    large_objects: usize,
-    chunks: usize,
-    large_pins: usize,
+pub(crate) struct PrunedMetadata {
+    pub(crate) blobs: usize,
+    pub(crate) large_objects: usize,
+    pub(crate) chunks: usize,
+    pub(crate) packs: usize,
+    pub(crate) snapshot_payload_indexes: usize,
+    pub(crate) snapshot_payload_rows: usize,
+    pub(crate) large_pins: usize,
 }
 
 fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrunePlan> {
@@ -112,8 +138,14 @@ fn protected_ref_snapshots(
     Ok(protected)
 }
 
-fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<PrunedMetadata> {
+pub(crate) fn prune_unreferenced_metadata(
+    paths: &Paths,
+    conn: &Connection,
+) -> Result<PrunedMetadata> {
+    let config = read_config(paths)?;
+    let remote = config.remote.as_ref().map(open_remote).transpose()?;
     let mut live = LiveMetadataReferences::default();
+    let mut incomplete_metadata_graph = false;
     let mut stmt = conn.prepare("select id, manifest_key, manifest_json from snapshots")?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -131,21 +163,154 @@ fn prune_unreferenced_metadata(paths: &Paths, conn: &Connection) -> Result<Prune
             &manifest_json,
         )?;
         for manifest_key in live.add_snapshot_manifest(&manifest) {
-            let large_manifest: LargeManifest =
-                serde_json::from_slice(&read_object(paths, &manifest_key)?)?;
-            live.add_large_manifest(large_manifest);
+            match read_large_manifest_for_prune(paths, remote.as_ref(), &manifest_key) {
+                Ok(large_manifest) => live.add_large_manifest(large_manifest),
+                Err(err) => {
+                    incomplete_metadata_graph = true;
+                    eprintln!(
+                        "warning: skipped large manifest during prune: {manifest_key}: {err:#}"
+                    );
+                }
+            }
+        }
+        for root_tree in manifest.root_trees.values() {
+            crate::snapshot_state::visit_tree_records(paths, root_tree, |record| {
+                if let Some((oid, _)) = crate::majutsu_core::payload_blob_ref(&record.payload) {
+                    live.blobs.insert(oid.to_string());
+                } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
+                    live.large_objects.insert(oid.to_string());
+                    match read_large_manifest_for_prune(paths, remote.as_ref(), manifest_key) {
+                        Ok(large_manifest) => live.add_large_manifest(large_manifest),
+                        Err(err) => {
+                            incomplete_metadata_graph = true;
+                            eprintln!(
+                                "warning: skipped large manifest during prune: {manifest_key}: {err:#}"
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })?;
         }
     }
     let blobs = delete_rows_not_in(conn, "blobs", "oid", &live.blobs)?;
     let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live.large_objects)?;
-    let chunks = delete_rows_not_in(conn, "chunks", "oid", &live.chunks)?;
     let large_pins = delete_rows_not_in(conn, "large_pins", "oid", &live.large_objects)?;
+    let chunks = if let Some(live_chunks) =
+        live_chunks_from_remaining_large_objects(paths, conn, remote.as_ref())?
+    {
+        delete_rows_not_in(conn, "chunks", "oid", &live_chunks)?
+    } else if incomplete_metadata_graph {
+        eprintln!(
+            "warning: skipped destructive chunk metadata prune because the metadata graph is incomplete"
+        );
+        0
+    } else {
+        delete_rows_not_in(conn, "chunks", "oid", &live.chunks)?
+    };
+    let packs = delete_packs_without_blobs(conn)?;
+    let (snapshot_payload_indexes, snapshot_payload_rows) =
+        delete_snapshot_payload_indexes_without_snapshots(conn)?;
     Ok(PrunedMetadata {
         blobs,
         large_objects,
         chunks,
+        packs,
+        snapshot_payload_indexes,
+        snapshot_payload_rows,
         large_pins,
     })
+}
+
+fn live_chunks_from_remaining_large_objects(
+    paths: &Paths,
+    conn: &Connection,
+    remote: Option<&RemoteStore>,
+) -> Result<Option<BTreeSet<String>>> {
+    let mut live_chunks = BTreeSet::new();
+    let mut stmt = conn.prepare("select manifest_key from large_objects order by oid")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let manifest_key = row?;
+        match read_large_manifest_for_prune(paths, remote, &manifest_key) {
+            Ok(large_manifest) => {
+                for chunk in large_manifest.chunks {
+                    live_chunks.insert(chunk.oid);
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: skipped chunk metadata prune because remaining large manifest is unavailable: {manifest_key}: {err:#}"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(live_chunks))
+}
+
+fn read_large_manifest_for_prune(
+    paths: &Paths,
+    remote: Option<&RemoteStore>,
+    manifest_key: &str,
+) -> Result<LargeManifest> {
+    if let Ok(bytes) = read_object(paths, manifest_key) {
+        return Ok(serde_json::from_slice(&bytes)?);
+    }
+    let remote = remote
+        .ok_or_else(|| anyhow::anyhow!("large manifest is not cached locally: {manifest_key}"))?;
+    let remote_key = crate::majutsu_store::canonical_remote_alias(manifest_key)
+        .unwrap_or_else(|| manifest_key.to_string());
+    crate::decode_canonical_remote_export(paths, &remote.get(&remote_key)?)
+}
+
+fn delete_snapshot_payload_indexes_without_snapshots(conn: &Connection) -> Result<(usize, usize)> {
+    let mut orphan_payload_stmt = conn.prepare(
+        "select distinct snapshot_id from snapshot_payloads \
+         where snapshot_id not in (select id from snapshots)",
+    )?;
+    let orphan_payload_rows = orphan_payload_stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut snapshot_ids = orphan_payload_rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut stmt = conn.prepare(
+        "select snapshot_id from snapshot_payload_index \
+         where snapshot_id not in (select id from snapshots)",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    snapshot_ids.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+    snapshot_ids.sort();
+    snapshot_ids.dedup();
+    let mut removed_rows = 0usize;
+    for snapshot_id in &snapshot_ids {
+        removed_rows += conn.execute(
+            "delete from snapshot_payloads where snapshot_id=?1",
+            params![snapshot_id],
+        )?;
+        conn.execute(
+            "delete from snapshot_payload_index where snapshot_id=?1",
+            params![snapshot_id],
+        )?;
+    }
+    Ok((snapshot_ids.len(), removed_rows))
+}
+
+fn delete_packs_without_blobs(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare("select pack_id from packs")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut removed = 0usize;
+    for row in rows {
+        let pack_id = row?;
+        let references: i64 = conn.query_row(
+            "select count(*) from blobs where pack_id=?1",
+            params![pack_id],
+            |row| row.get(0),
+        )?;
+        if references == 0 {
+            conn.execute("delete from packs where pack_id=?1", params![pack_id])?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn delete_rows_not_in(

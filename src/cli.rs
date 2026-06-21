@@ -19,6 +19,17 @@ Remote recovery flow:
   mj remote fsck
   mj clone --remote file:///mnt/backup/majutsu --home /tmp/recovered-majutsu
 
+Command groups:
+  Setup: init, root
+  Daily use: status, health, state, log, diff, snapshot, commit
+  History: branch, switch, op
+  Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
+  Remote: sync, remote, lifecycle
+  Service: watch, daemon
+  Security: key
+  Storage maintenance: large, cache, pack, prune, gc, fsck
+  Advanced/debug: event
+
 State home is resolved in this order: `--home`, `MAJUTSU_HOME`, XDG config, then `$HOME/.majutsu`.
 For host-level system protection, use `mj --system ...`; that reads `/etc/majutsu/config.toml` and falls back to `/var/lib/majutsu`."#;
 
@@ -60,12 +71,10 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RootCommand,
     },
-    #[command(about = "Create, list, switch, or delete logical history branches")]
-    Branch {
-        #[command(subcommand)]
-        command: BranchCommand,
-    },
-    #[command(about = "Snapshot the current state of configured roots")]
+    #[command(
+        visible_alias = "commit",
+        about = "Create a commit-like checkpoint of configured roots"
+    )]
     Snapshot(SnapshotArgs),
     #[command(about = "Show roots, current snapshot, queues, and daemon state")]
     Status(StatusArgs),
@@ -75,13 +84,20 @@ pub(crate) enum Command {
     State(StateArgs),
     #[command(about = "Show recent managed file changes")]
     Log(LogArgs),
-    #[command(about = "Inspect or restore operation-log entries")]
+    #[command(about = "Show differences between snapshots or points in time")]
+    Diff(DiffArgs),
+    #[command(about = "Create, list, switch, or delete logical history branches")]
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
+    },
+    #[command(about = "Switch the active branch and optionally restore its files")]
+    Switch(BranchSwitchArgs),
+    #[command(about = "Inspect or restore jj-style operation-log entries")]
     Op {
         #[command(subcommand)]
         command: OpCommand,
     },
-    #[command(about = "Show differences between snapshots or points in time")]
-    Diff(DiffArgs),
     #[command(about = "Plan, apply, prepare, or resume a restore")]
     Restore(RestoreTopArgs),
     #[command(about = "Mount a read-only restore view")]
@@ -90,21 +106,8 @@ pub(crate) enum Command {
     Unmount(UnmountArgs),
     #[command(about = "Hydrate large objects in a materialized restore view")]
     Hydrate(HydrateArgs),
-    #[command(about = "List, verify, and pin large objects")]
-    Large {
-        #[command(subcommand)]
-        command: LargeCommand,
-    },
-    #[command(about = "Inspect or prune synced local payload cache")]
-    Cache {
-        #[command(subcommand)]
-        command: CacheCommand,
-    },
-    #[command(about = "Inspect or compact the local filesystem event journal")]
-    Event {
-        #[command(subcommand)]
-        command: EventCommand,
-    },
+    #[command(about = "Bootstrap an empty state directory from remote metadata")]
+    Clone(CloneArgs),
     #[command(about = "Sync metadata and objects to the configured remote")]
     Sync(SyncArgs),
     #[command(about = "Check remote reachability, integrity, and host timelines")]
@@ -117,8 +120,6 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: LifecycleCommand,
     },
-    #[command(about = "Bootstrap an empty state directory from remote metadata")]
-    Clone(CloneArgs),
     #[command(about = "Watch the filesystem and snapshot detected changes")]
     Watch(WatchArgs),
     #[command(about = "Start, stop, inspect, or export metrics for the watch daemon")]
@@ -131,6 +132,16 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    #[command(about = "List, verify, and pin large objects")]
+    Large {
+        #[command(subcommand)]
+        command: LargeCommand,
+    },
+    #[command(about = "Inspect or prune synced local payload cache")]
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     #[command(about = "Pack or compact normal blob objects")]
     Pack(PackArgs),
     #[command(about = "Prune old history according to retention settings")]
@@ -139,6 +150,11 @@ pub(crate) enum Command {
     Gc,
     #[command(about = "Check local metadata, objects, queues, and refs")]
     Fsck(FsckArgs),
+    #[command(about = "Inspect or compact the local filesystem event journal")]
+    Event {
+        #[command(subcommand)]
+        command: EventCommand,
+    },
 }
 
 #[derive(Args)]
@@ -188,6 +204,24 @@ pub(crate) struct RootSizeArgs {
         help = "Emit machine-readable JSON instead of the aligned table"
     )]
     pub(crate) json: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Show retained historical payloads that are not referenced by the current snapshot"
+    )]
+    pub(crate) history: bool,
+    #[arg(
+        long,
+        default_value_t = 30,
+        help = "Limit rows in the retained historical payload report"
+    )]
+    pub(crate) history_limit: usize,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Ignore the cached remote object listing and scan the backend directly"
+    )]
+    pub(crate) no_remote_cache: bool,
 }
 
 #[derive(Subcommand)]
@@ -350,11 +384,43 @@ pub(crate) struct HealthArgs {
 #[derive(Args)]
 pub(crate) struct StateArgs {
     #[arg(
+        value_name = "REF",
+        help = "Show managed file changes since a reference such as 1h, 03:40, op-..., or snap-..."
+    )]
+    pub(crate) reference: Option<String>,
+    #[arg(
+        short = 'j',
         long,
         default_value_t = false,
         help = "Emit machine-readable JSON instead of the terminal summary"
     )]
     pub(crate) json: bool,
+    #[arg(
+        short = 'r',
+        long,
+        value_name = "ID",
+        help = "Limit reference-based file status to one configured root"
+    )]
+    pub(crate) root: Option<String>,
+    #[arg(
+        short = 'g',
+        long = "global",
+        default_value_t = false,
+        help = "Show reference-based file status for all active roots even when run inside a root"
+    )]
+    pub(crate) global: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Show colored line diffs after changed file lines"
+    )]
+    pub(crate) diff: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Include metadata-only changes such as directory mtime, mode, owner, or xattrs"
+    )]
+    pub(crate) meta: bool,
 }
 
 #[derive(Args)]
@@ -593,6 +659,12 @@ pub(crate) enum RestoreCommand {
         #[arg(help = "Restore job id from `mj restore prepare`")]
         job_id: String,
     },
+    #[command(about = "Mount a read-only restore view")]
+    Mount(MountArgs),
+    #[command(about = "Unmount a restore view")]
+    Unmount(UnmountArgs),
+    #[command(about = "Hydrate large objects in a materialized restore view")]
+    Hydrate(HydrateArgs),
 }
 
 #[derive(Args)]
@@ -1112,6 +1184,16 @@ pub(crate) struct PruneArgs {
     pub(crate) keep_daily: u32,
     #[arg(long, default_value_t = 36)]
     pub(crate) keep_monthly: u32,
+    #[arg(
+        long,
+        default_value_t = true,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+        action = clap::ArgAction::Set,
+        help = "After deleting snapshots, sync metadata and prune remote objects that became unreachable"
+    )]
+    pub(crate) remote_cleanup: bool,
 }
 
 #[derive(Args)]

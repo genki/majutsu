@@ -65,7 +65,16 @@ fn local_object_keys_inner(
             keys.push(blob.object_key.clone());
         }
     }
-    for pack in &export.packs {
+    let live_pack_ids = export
+        .blobs
+        .iter()
+        .filter_map(|blob| blob.pack_id.as_ref())
+        .collect::<std::collections::BTreeSet<_>>();
+    for pack in export
+        .packs
+        .iter()
+        .filter(|pack| live_pack_ids.contains(&pack.pack_id))
+    {
         keys.push(pack.pack_key.clone());
         keys.push(pack.index_key.clone());
     }
@@ -225,7 +234,16 @@ pub(crate) fn local_object_keys_from_metadata(export: &MetadataExport) -> Vec<St
             keys.push(blob.object_key.clone());
         }
     }
-    for pack in &export.packs {
+    let live_pack_ids = export
+        .blobs
+        .iter()
+        .filter_map(|blob| blob.pack_id.as_ref())
+        .collect::<std::collections::BTreeSet<_>>();
+    for pack in export
+        .packs
+        .iter()
+        .filter(|pack| live_pack_ids.contains(&pack.pack_id))
+    {
         keys.push(pack.pack_key.clone());
         keys.push(pack.index_key.clone());
     }

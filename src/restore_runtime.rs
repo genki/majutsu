@@ -163,6 +163,9 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
             println!("resumed {}", job.id);
             println!("restored to {}", restore_target_label(&plan));
         }
+        RestoreCommand::Mount(args) => crate::mount_runtime::mount_cmd(paths, args)?,
+        RestoreCommand::Unmount(args) => crate::mount_runtime::unmount_cmd(paths, args)?,
+        RestoreCommand::Hydrate(args) => crate::mount_runtime::hydrate_cmd(paths, args)?,
     }
     Ok(())
 }
@@ -598,13 +601,14 @@ pub(crate) fn required_object_keys_for_plan(
     plan: &RestorePlan,
 ) -> Result<Vec<String>> {
     let mut keys = Vec::new();
+    let blobs = query_blobs(conn)?;
     for record in &plan.files {
         if let Some((oid, object_key)) = payload_blob_ref(&record.payload) {
-            let blob = query_blobs(conn)?
-                .into_iter()
-                .find(|blob| blob.oid == oid)
-                .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
-            if let Some(pack_id) = blob.pack_id {
+            let Some(blob) = blobs.iter().find(|blob| blob.oid == oid) else {
+                keys.push(object_key.to_string());
+                continue;
+            };
+            if let Some(pack_id) = &blob.pack_id {
                 let pack: PackExport = conn.query_row(
                     "select pack_id, pack_key, index_key, object_count, size from packs where pack_id=?1",
                     params![pack_id],
@@ -779,10 +783,9 @@ fn prefetch_packed_blob_ranges_for_plan(
         let Some((oid, _)) = payload_blob_ref(&record.payload) else {
             continue;
         };
-        let blob = blobs_by_oid
-            .get(oid)
-            .copied()
-            .ok_or_else(|| anyhow!("missing blob metadata for {oid}"))?;
+        let Some(blob) = blobs_by_oid.get(oid).copied() else {
+            continue;
+        };
         let Some(pack_id) = blob.pack_id.as_deref() else {
             continue;
         };

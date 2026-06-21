@@ -40,8 +40,10 @@ use crate::operation_log::{OperationDetails, record_op_with_details, update_oper
 use crate::pack_runtime::pack_cmd;
 use crate::process_runtime::{acquire_process_lock, process_lock_owner};
 use crate::queue_runtime::{
-    drain_upload_queue, enqueue_file_upload, enqueue_file_upload_overwrite, enqueue_inline_upload,
-    enqueue_inline_upload_overwrite, upload_queue_stats,
+    acknowledge_remote_event_journal_uploads, drain_upload_queue, enqueue_file_upload,
+    enqueue_file_upload_overwrite, enqueue_inline_upload, enqueue_inline_upload_overwrite,
+    enqueue_live_diff_event_journals, enqueue_remote_event_journal_uploads, event_journal_records,
+    upload_queue_stats,
 };
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
@@ -49,7 +51,8 @@ use crate::root_size_summary::{
     RootSizeSummary, build_root_size_summary, encode_root_size_summary, root_size_summary_key,
     write_cached_root_size_summary,
 };
-use crate::snapshot_state::current_snapshot;
+use crate::root_state::roots;
+use crate::snapshot_state::{current_snapshot, load_snapshot_by_id};
 use crate::util::{blake3_hex, new_id, parse_db_time};
 use crate::{
     decode_object, encode_object, ensure_ready, export_metadata, open_db, read_object,
@@ -312,6 +315,14 @@ fn sync_configured_remote(
     auto_pack_before_sync(paths, conn)?;
     trace.mark("auto pack");
     let current = current_snapshot(conn)?;
+    let current_manifest = current
+        .as_deref()
+        .map(|id| load_snapshot_by_id(paths, conn, id))
+        .transpose()?;
+    let configured_roots = roots(conn)?;
+    let enqueued_live_diff =
+        enqueue_live_diff_event_journals(paths, current_manifest.as_ref(), &configured_roots)?;
+    trace.mark("enqueue live diff journal");
     let export = export_metadata(paths, conn, config)?;
     trace.mark("export metadata");
     let sync_cache = read_remote_sync_cache(paths, remote)?;
@@ -320,11 +331,16 @@ fn sync_configured_remote(
     trace.mark("prepare remote metadata");
     let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
     trace.mark("state fingerprint");
+    let enqueued_remote_journal =
+        enqueue_remote_event_journal_uploads(paths, config, &config.host.id, &configured_roots)?;
+    trace.mark("enqueue remote journal");
     let upload_stats = upload_queue_stats(paths)?;
     trace.mark("upload queue stats");
+    let should_prune_remote =
+        sync_remote_prune_enabled() && remote_prune_due(paths, remote, &state_fingerprint)?;
     if upload_stats.total == 0
         && sync_cache.state_fingerprint.as_deref() == Some(state_fingerprint.as_str())
-        && !sync_remote_prune_enabled()
+        && !should_prune_remote
     {
         let pruned_local_objects =
             prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff_time())?;
@@ -340,8 +356,12 @@ fn sync_configured_remote(
         };
         trace.mark("local prune");
         println!("synced 0 objects to {}", remote.describe());
+        println!("live_diff_journal_enqueued {}", enqueued_live_diff);
+        println!("durable_journal_enqueued 0");
+        println!("durable_journal_acknowledged 0");
         println!("pruned_remote_exports 0");
         println!("pruned_remote_objects 0");
+        println!("pruned_remote_journals 0");
         println!("pruned_local_objects {}", pruned_local_objects);
         println!(
             "pruned_payload_cache_objects {}",
@@ -380,7 +400,15 @@ fn sync_configured_remote(
         },
     )?;
     trace.mark("record sync op");
-    let result = enqueue_and_drain_sync(paths, conn, config, remote, &trace);
+    let result = enqueue_and_drain_sync(
+        paths,
+        conn,
+        config,
+        remote,
+        &trace,
+        enqueued_live_diff,
+        enqueued_remote_journal,
+    );
     match result {
         Ok(()) => {
             update_operation_result(conn, &sync_op, "done", None, Some("synced"))?;
@@ -588,6 +616,8 @@ fn enqueue_and_drain_sync(
     config: &Config,
     remote: &RemoteStore,
     trace: &SyncTrace,
+    enqueued_live_diff: usize,
+    enqueued_remote_journal: usize,
 ) -> Result<()> {
     let local_prune_cutoff = local_prune_cutoff_time();
     let content_export = export_metadata(paths, conn, config)?;
@@ -601,6 +631,8 @@ fn enqueue_and_drain_sync(
     trace.mark("metadata fingerprints");
     let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
     trace.mark("state fingerprint 2");
+    let should_prune_remote =
+        sync_remote_prune_enabled() && remote_prune_due(paths, remote, &state_fingerprint)?;
     let remote_metadata_json = metadata_export_json_for_remote(remote, &remote_export)?;
     trace.mark("metadata json");
     let legacy_metadata = "metadata/export.json";
@@ -802,28 +834,45 @@ fn enqueue_and_drain_sync(
         }
     }
     let upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    let acknowledged_remote_journal =
+        acknowledge_remote_event_journal_uploads(paths, remote, &config.host.id)?;
     if let Some(summary) = &root_size_summary_cache
         && let Err(err) = write_cached_root_size_summary(paths, summary)
     {
         eprintln!("warning: failed to update local root size summary cache: {err:#}");
     }
     trace.mark("drain queue");
-    write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint)?;
+    write_remote_sync_cache(paths, remote, sync_fingerprints, state_fingerprint.clone())?;
     trace.mark("write sync cache");
-    let (pruned_remote_exports, pruned_remote_objects) = if sync_remote_prune_enabled() {
-        let pruned_remote_exports =
-            prune_remote_host_exports(remote, &config.host.id, &remote_export)?;
-        let pruned_remote_objects =
-            prune_remote_packed_blob_objects(
+    let (pruned_remote_exports, pruned_remote_objects, pruned_remote_journals) =
+        if should_prune_remote {
+            let pruned_remote_exports =
+                prune_remote_host_exports(remote, &config.host.id, &remote_export)?;
+            let pruned_remote_journals = prune_remote_stale_event_journals(
+                paths,
                 remote,
                 &config.host.id,
-                &remote_export,
                 config.large.max_parallel_uploads,
-            )? + prune_remote_legacy_canonical_objects(remote, config.large.max_parallel_uploads)?;
-        (pruned_remote_exports, pruned_remote_objects)
-    } else {
-        (0, 0)
-    };
+            )?;
+            let pruned_remote_objects = prune_remote_unreferenced_content_objects(
+                paths,
+                remote,
+                &config.host.id,
+                &content_export,
+                config.large.max_parallel_uploads,
+            )? + prune_remote_legacy_canonical_objects(
+                remote,
+                config.large.max_parallel_uploads,
+            )?;
+            write_remote_prune_state(paths, remote, &state_fingerprint)?;
+            (
+                pruned_remote_exports,
+                pruned_remote_objects,
+                pruned_remote_journals,
+            )
+        } else {
+            (0, 0, 0)
+        };
     let pruned_local_objects =
         prune_local_packed_blob_objects(paths, &remote_export, local_prune_cutoff)?;
     let pruned_payload_cache = if sync_local_payload_cache_prune_enabled() {
@@ -836,6 +885,9 @@ fn enqueue_and_drain_sync(
     } else {
         Default::default()
     };
+    if pruned_remote_objects > 0 {
+        invalidate_root_size_remote_object_cache(paths)?;
+    }
     trace.mark("local prune");
     persist_export_remote_refs(
         conn,
@@ -859,8 +911,15 @@ fn enqueue_and_drain_sync(
     );
     println!("synced_bytes {}", upload_drain.uploaded_bytes);
     println!("skipped_uploads {}", upload_drain.skipped);
+    println!("live_diff_journal_enqueued {}", enqueued_live_diff);
+    println!("durable_journal_enqueued {}", enqueued_remote_journal);
+    println!(
+        "durable_journal_acknowledged {}",
+        acknowledged_remote_journal
+    );
     println!("pruned_remote_exports {}", pruned_remote_exports);
     println!("pruned_remote_objects {}", pruned_remote_objects);
+    println!("pruned_remote_journals {}", pruned_remote_journals);
     println!("pruned_local_objects {}", pruned_local_objects);
     println!(
         "pruned_payload_cache_objects {}",
@@ -1021,8 +1080,92 @@ fn sync_verify_cached_remote_aliases() -> bool {
 
 fn sync_remote_prune_enabled() -> bool {
     std::env::var("MAJUTSU_SYNC_REMOTE_PRUNE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemotePruneState {
+    version: u32,
+    remote: String,
+    state_fingerprint: String,
+    pruned_at_unix_secs: u64,
+}
+
+fn remote_prune_due(paths: &Paths, remote: &RemoteStore, state_fingerprint: &str) -> Result<bool> {
+    if env::var("MAJUTSU_SYNC_REMOTE_PRUNE_FORCE").as_deref() == Ok("1") {
+        return Ok(true);
+    }
+    let Some(state) = read_remote_prune_state(paths)? else {
+        return Ok(true);
+    };
+    if state.version != 1
+        || state.remote != remote.describe()
+        || state.state_fingerprint != state_fingerprint
+    {
+        return Ok(true);
+    }
+    let elapsed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(state.pruned_at_unix_secs))
+        .unwrap_or(Duration::MAX);
+    Ok(elapsed >= remote_prune_interval())
+}
+
+fn remote_prune_interval() -> Duration {
+    env::var("MAJUTSU_SYNC_REMOTE_PRUNE_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(3600))
+}
+
+fn remote_prune_state_path(paths: &Paths) -> std::path::PathBuf {
+    paths.home.join("cache/remote-prune-state.json")
+}
+
+fn read_remote_prune_state(paths: &Paths) -> Result<Option<RemotePruneState>> {
+    let path = remote_prune_state_path(paths);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let state = match serde_json::from_slice(&fs::read(path)?) {
+        Ok(state) => state,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(state))
+}
+
+fn write_remote_prune_state(
+    paths: &Paths,
+    remote: &RemoteStore,
+    state_fingerprint: &str,
+) -> Result<()> {
+    let path = remote_prune_state_path(paths);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let pruned_at_unix_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let state = RemotePruneState {
+        version: 1,
+        remote: remote.describe(),
+        state_fingerprint: state_fingerprint.to_string(),
+        pruned_at_unix_secs,
+    };
+    fs::write(&tmp, serde_json::to_vec(&state)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn invalidate_root_size_remote_object_cache(paths: &Paths) -> Result<()> {
+    let path = paths.home.join("cache/root-size-remote-objects.json");
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn sync_gc_mark_every_time() -> bool {
@@ -1981,7 +2124,8 @@ fn prune_remote_host_exports(
     Ok(removed)
 }
 
-fn prune_remote_packed_blob_objects(
+fn prune_remote_unreferenced_content_objects(
+    paths: &Paths,
     remote: &RemoteStore,
     _host_id: &str,
     export: &MetadataExport,
@@ -1990,29 +2134,95 @@ fn prune_remote_packed_blob_objects(
     if env::var("MAJUTSU_SYNC_REMOTE_OBJECT_PRUNE").as_deref() == Ok("0") {
         return Ok(0);
     }
-    let protected = remote_gc_mark_live_keys(remote)?;
-    let candidates = export
-        .blobs
-        .iter()
-        .filter(|blob| blob.pack_id.is_some())
-        .flat_map(|blob| {
-            let mut keys = vec![blob.object_key.clone()];
-            keys.extend(canonical_remote_aliases(&blob.object_key));
-            keys
-        })
-        .filter(|key| !protected.contains(key))
-        .collect::<BTreeSet<_>>();
-    let remote_blob_keys = remote
-        .list("objects/blobs/")?
+    let mut live = if matches!(remote, RemoteStore::S3(_)) {
+        s3_remote_live_object_keys_for_local(paths, export)?
+    } else {
+        remote_live_object_keys_for_local(paths, export)?
+    }
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    live.extend(remote_gc_mark_live_keys(remote)?);
+    live.extend(durable_journal_live_keys(paths)?);
+    let delete_keys = remote_content_object_keys(remote)?
         .into_iter()
-        .chain(remote.list("blobs/loose/")?)
-        .collect::<BTreeSet<_>>();
-    let delete_keys = candidates
-        .into_iter()
-        .filter(|key| remote_blob_keys.contains(key))
+        .filter(|key| !live.contains(key))
         .collect::<Vec<_>>();
     delete_remote_keys(remote, &delete_keys, max_parallel_deletes)?;
     Ok(delete_keys.len())
+}
+
+fn prune_remote_stale_event_journals(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+    max_parallel_deletes: usize,
+) -> Result<usize> {
+    if env::var("MAJUTSU_SYNC_REMOTE_JOURNAL_PRUNE").as_deref() == Ok("0") {
+        return Ok(0);
+    }
+    let live = event_journal_records(paths)?
+        .into_iter()
+        .filter_map(|record| record.remote_journal_key)
+        .collect::<BTreeSet<_>>();
+    let prefix = format!("hosts/{host_id}/journal/");
+    let delete_keys = remote
+        .list(&prefix)?
+        .into_iter()
+        .filter(|key| key.ends_with(".json") && !live.contains(key))
+        .collect::<Vec<_>>();
+    delete_remote_keys(remote, &delete_keys, max_parallel_deletes)?;
+    Ok(delete_keys.len())
+}
+
+fn durable_journal_live_keys(paths: &Paths) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for record in event_journal_records(paths)? {
+        if record.remote_journal_synced_at.is_none() {
+            continue;
+        }
+        if let Some(manifest_key) = record.durable_large_manifest_key.as_deref() {
+            keys.insert(manifest_key.to_string());
+            keys.extend(canonical_remote_aliases(manifest_key));
+            if let Ok(manifest) =
+                serde_json::from_slice::<LargeManifest>(&read_object(paths, manifest_key)?)
+            {
+                for chunk in manifest.chunks {
+                    keys.insert(chunk.object_key.clone());
+                    keys.extend(canonical_remote_aliases(&chunk.object_key));
+                }
+            }
+        }
+        let Some(key) = record.durable_payload_key else {
+            continue;
+        };
+        keys.insert(key.clone());
+        keys.extend(canonical_remote_aliases(&key));
+    }
+    Ok(keys)
+}
+
+fn remote_content_object_keys(remote: &RemoteStore) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for prefix in [
+        "blobs/loose/",
+        "trees/",
+        "packs/small/",
+        "packs/normal/",
+        "indexes/pack-index/",
+        "large/manifests/",
+        "large/chunks/fixed-8m/",
+        "large/chunks/fastcdc/",
+        "objects/blobs/",
+        "objects/trees/",
+        "objects/packs/",
+        "objects/indexes/pack/",
+        "objects/large/manifests/",
+        "objects/large/chunks/fixed/",
+        "objects/large/chunks/fastcdc/",
+    ] {
+        keys.extend(remote.list(prefix)?);
+    }
+    Ok(keys)
 }
 
 fn prune_remote_legacy_canonical_objects(

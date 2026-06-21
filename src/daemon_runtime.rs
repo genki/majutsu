@@ -7,7 +7,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 #[cfg(not(windows))]
 use std::process::Stdio;
@@ -32,6 +32,37 @@ const DAEMON_ATTRIBUTION_ENV_KEYS: &[&str] = &[
     "CURSOR_SESSION_ID",
     "TERM_SESSION_ID",
 ];
+
+pub(crate) fn child_process_exe() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("MAJUTSU_CHILD_EXE").map(PathBuf::from)
+        && executable_candidate_exists(&path)
+    {
+        return Ok(path);
+    }
+
+    let current = env::current_exe();
+    if let Ok(path) = &current
+        && executable_candidate_exists(path)
+    {
+        return Ok(path.clone());
+    }
+
+    // daemon 稼働中に cargo install などで実行ファイルが置換されると、
+    // current_exe が古い inode 由来の削除済みパスを返すことがある。
+    // daemon の argv[0] はインストール済み mj の実体パスなので、子プロセス起動では
+    // こちらへフォールバックする。
+    if let Some(path) = env::args_os().next().map(PathBuf::from)
+        && executable_candidate_exists(&path)
+    {
+        return Ok(path);
+    }
+
+    current.map_err(Into::into)
+}
+
+fn executable_candidate_exists(path: &Path) -> bool {
+    path.exists() && !path.as_os_str().to_string_lossy().contains(" (deleted)")
+}
 
 struct DaemonStats {
     pid: u32,

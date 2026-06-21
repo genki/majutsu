@@ -1,6 +1,6 @@
 use crate::majutsu_core::{
     FileRecord, LargeManifest, Payload, SnapshotManifest, TreeManifest, TreeNodeManifest,
-    payload_blob_ref,
+    payload_blob_ref, payload_large_ref,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -10,8 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::thread;
+use std::time::Duration as StdDuration;
 
 use crate::cli::{RootCommand, RootSizeArgs};
 use crate::config::{
@@ -28,8 +30,8 @@ use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
 };
 use crate::snapshot_rules::{
-    apply_root_large_set, apply_root_presets, dedup_patterns, root_large_override,
-    warn_sensitive_root_defaults,
+    apply_root_large_set, apply_root_presets, build_ignore, dedup_patterns, is_ignored,
+    is_included, root_large_override, warn_sensitive_root_defaults,
 };
 
 pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
@@ -175,6 +177,16 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             apply_root_large_set(&mut root, &args)?;
             save_root(&conn, &root)?;
             sync_roots_to_config(paths, &conn)?;
+            let forgotten = forget_unmanaged_root_history(paths, &conn, &root)?;
+            if forgotten.records > 0 {
+                let removed = crate::prune_runtime::prune_unreferenced_metadata(paths, &conn)?;
+                println!("forgotten_unmanaged_records {}", forgotten.records);
+                println!("rewritten_snapshots {}", forgotten.snapshots);
+                println!("removed_blob_metadata {}", removed.blobs);
+                println!("removed_large_metadata {}", removed.large_objects);
+                println!("removed_chunk_metadata {}", removed.chunks);
+                println!("removed_pack_metadata {}", removed.packs);
+            }
             record_op(&conn, "config-change", None, None, Some(&root.id))?;
             println!("updated root {} -> {}", root.id, root.path.display());
         }
@@ -211,6 +223,104 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct ForgetUnmanagedStats {
+    snapshots: usize,
+    records: usize,
+}
+
+fn forget_unmanaged_root_history(
+    paths: &Paths,
+    conn: &Connection,
+    root: &RootConfig,
+) -> Result<ForgetUnmanagedStats> {
+    let ignore = build_ignore(root)?;
+    let config = read_config(paths)?;
+    let remote = config.remote.as_ref().map(open_remote).transpose()?;
+    let mut stmt =
+        conn.prepare("select id, manifest_key, manifest_json from snapshots order by created_at")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut stats = ForgetUnmanagedStats::default();
+    for row in rows {
+        let (snapshot_id, manifest_key, manifest_json) = row?;
+        let mut manifest: SnapshotManifest = if manifest_json.trim().is_empty() {
+            read_metadata_manifest(paths, remote.as_ref(), &manifest_key)
+                .with_context(|| format!("read snapshot manifest {manifest_key}"))?
+        } else {
+            serde_json::from_str(&manifest_json)
+                .with_context(|| format!("decode snapshot manifest {snapshot_id}"))?
+        };
+        let Some(root_snapshot) = manifest.root_trees.get(&root.id).cloned() else {
+            continue;
+        };
+        let tree: TreeManifest =
+            read_metadata_manifest(paths, remote.as_ref(), &root_snapshot.tree_key)
+                .with_context(|| format!("read root tree {}", root_snapshot.tree_key))?;
+        let entries = root_size_tree_entries(paths, remote.as_ref(), tree)?;
+        let before = entries.len();
+        let kept = entries
+            .into_values()
+            .filter(|record| root_record_is_managed(root, &ignore, record))
+            .collect::<Vec<_>>();
+        let removed = before.saturating_sub(kept.len());
+        if removed == 0 {
+            continue;
+        }
+        stats.snapshots += 1;
+        stats.records += removed;
+        let mut tree = crate::build_tree_manifest(&root.id, kept.clone())?;
+        let tree_entries = tree.entries.clone();
+        let tree_file_count = tree_entries.len();
+        crate::prepare_tree_manifest_for_storage(paths, &mut tree)?;
+        let tree_json = serde_json::to_vec(&tree)?;
+        let tree_oid = crate::util::blake3_hex(&tree_json);
+        let tree_key = crate::store_bytes(paths, &paths.trees, &tree_oid, &tree_json)?;
+        manifest.root_trees.insert(
+            root.id.clone(),
+            crate::majutsu_core::RootSnapshot {
+                tree_id: tree.tree_id,
+                tree_key,
+                file_count: tree_file_count,
+            },
+        );
+        manifest
+            .roots
+            .insert(root.id.clone(), tree_entries.into_values().collect());
+        let manifest_json_bytes = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_oid = crate::util::blake3_hex(&manifest_json_bytes);
+        let new_manifest_key = crate::store_encoded_object_bytes(
+            paths,
+            &paths.objects,
+            &manifest_oid,
+            &crate::encode_compact_snapshot_manifest_for_local(paths, &manifest)?,
+        )?;
+        conn.execute(
+            "update snapshots set manifest_key=?2, manifest_json='' where id=?1",
+            params![snapshot_id, new_manifest_key],
+        )?;
+        crate::insert_snapshot_payload_index(conn, &manifest)?;
+    }
+    Ok(stats)
+}
+
+fn root_record_is_managed(
+    root: &RootConfig,
+    ignore: &ignore::gitignore::Gitignore,
+    record: &FileRecord,
+) -> bool {
+    let rel = Path::new(&record.path);
+    if !is_included(&root.include, rel) {
+        return false;
+    }
+    !is_ignored(ignore, rel, record.kind == "directory")
 }
 
 fn root_list_cmd(conn: &Connection) -> Result<()> {
@@ -284,6 +394,30 @@ struct RootSizeRow {
 struct RootSizeReport<'a> {
     roots: &'a [RootSizeRow],
     totals: RootSizeTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<&'a RootSizeHistoryReport>,
+}
+
+#[derive(Serialize)]
+struct RootSizeHistoryReport {
+    retained_bytes: u64,
+    retained_payloads: usize,
+    scanned_snapshots: usize,
+    skipped_snapshots: usize,
+    rows: Vec<RootSizeHistoryRow>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct RootSizeHistoryRow {
+    bytes: u64,
+    kind: String,
+    snapshots: usize,
+    first_seen: String,
+    last_seen: String,
+    root: String,
+    path: String,
+    oid: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -310,8 +444,14 @@ struct RootSizeRemoteObjectCache {
     objects: Vec<RemoteObjectStat>,
 }
 
+struct RootSizeRemoteObjects {
+    objects: Vec<RemoteObjectStat>,
+    exact: bool,
+    scope: String,
+}
+
 struct RootSizeTotalsInput<'a> {
-    remote_sizes: &'a [RemoteObjectStat],
+    remote_objects: &'a RootSizeRemoteObjects,
     remote_size_map: &'a BTreeMap<String, u64>,
     unique_keys: &'a BTreeSet<String>,
     unique_payload_keys: &'a BTreeSet<String>,
@@ -354,7 +494,8 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
     let remote_sizes_task = remote.as_ref().map(|remote| {
         let paths = paths.clone();
         let remote = remote.clone();
-        thread::spawn(move || root_size_remote_objects(&paths, &remote))
+        let use_cache = !args.no_remote_cache;
+        thread::spawn(move || root_size_remote_objects(&paths, &remote, use_cache))
     });
     let packed_blobs = packed_blob_size_refs(conn)?;
     let manifest: SnapshotManifest = read_metadata_manifest(paths, remote.as_ref(), &manifest_key)
@@ -385,21 +526,24 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         }
     }
 
-    let remote_sizes = match remote_sizes_task {
-        Some(task) => {
-            if !args.json
-                && !task.is_finished()
-                && io::stderr().is_terminal()
-                && env::var("TERM").as_deref() != Ok("dumb")
-            {
-                eprintln!("root size: local root scan completed; waiting for S3 object listing...");
-            }
-            task.join()
-                .map_err(|err| anyhow!("root size remote listing worker panicked: {err:?}"))??
-        }
-        None => Vec::new(),
+    let stream_pending = root_size_should_stream_pending(args, remote_sizes_task.as_ref());
+    if stream_pending {
+        print!("{}", root_size_pending_table(&stats));
+        io::stdout().flush()?;
+    }
+
+    let remote_objects = match remote_sizes_task {
+        Some(task) => task
+            .join()
+            .map_err(|err| anyhow!("root size remote listing worker panicked: {err:?}"))??,
+        None => RootSizeRemoteObjects {
+            objects: Vec::new(),
+            exact: true,
+            scope: "no-remote".into(),
+        },
     };
-    let remote_size_map = remote_sizes
+    let remote_size_map = remote_objects
+        .objects
         .iter()
         .map(|object| (object.key.clone(), object.size))
         .collect::<BTreeMap<_, _>>();
@@ -455,7 +599,7 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         });
     }
     let totals = root_size_totals(RootSizeTotalsInput {
-        remote_sizes: &remote_sizes,
+        remote_objects: &remote_objects,
         remote_size_map: &remote_size_map,
         unique_keys: &unique_keys,
         unique_payload_keys: &unique_payload_keys,
@@ -474,18 +618,319 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
     if let Err(err) = write_cached_root_size_summary(paths, &summary) {
         eprintln!("warning: failed to update local root size summary cache: {err:#}");
     }
+    let history = if args.history {
+        Some(root_size_history_report(
+            paths,
+            conn,
+            remote.as_ref(),
+            &current,
+            args.history_limit,
+        )?)
+    } else {
+        None
+    };
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&RootSizeReport {
                 roots: &rows,
                 totals,
+                history: history.as_ref(),
             })?
         );
     } else {
+        if stream_pending && root_size_stdout_is_interactive() {
+            print!("\x1b[2J\x1b[H");
+        } else if stream_pending {
+            println!();
+            println!("--- remote object listing completed ---");
+            println!();
+        }
         print_root_size_table(&rows, &totals);
+        if let Some(history) = &history {
+            println!();
+            print_root_size_history(history);
+        }
     }
     Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PayloadIdentity {
+    oid: String,
+}
+
+#[derive(Clone)]
+struct PayloadOccurrence {
+    identity: PayloadIdentity,
+    kind: String,
+    bytes: u64,
+    root: String,
+    path: String,
+    snapshot_id: String,
+    seen_at: String,
+}
+
+#[derive(Default)]
+struct PayloadHistoryAgg {
+    bytes: u64,
+    kinds: BTreeSet<String>,
+    roots: BTreeSet<String>,
+    paths: BTreeSet<String>,
+    snapshots: BTreeSet<String>,
+    first_seen: Option<String>,
+    last_seen: Option<String>,
+}
+
+fn root_size_history_report(
+    paths: &Paths,
+    conn: &Connection,
+    remote: Option<&RemoteStore>,
+    current_snapshot: &str,
+    limit: usize,
+) -> Result<RootSizeHistoryReport> {
+    let current_payloads = snapshot_payload_occurrences(paths, conn, remote, current_snapshot)?
+        .into_iter()
+        .map(|occurrence| occurrence.identity)
+        .collect::<BTreeSet<_>>();
+
+    let mut stmt = conn.prepare("select id from snapshots order by created_at asc")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut aggregate = BTreeMap::<PayloadIdentity, PayloadHistoryAgg>::new();
+    let mut scanned_snapshots = 0usize;
+    let mut warnings = Vec::new();
+    for row in rows {
+        let snapshot_id = row?;
+        match snapshot_payload_occurrences(paths, conn, remote, &snapshot_id) {
+            Ok(occurrences) => {
+                scanned_snapshots += 1;
+                for occurrence in occurrences {
+                    if current_payloads.contains(&occurrence.identity) {
+                        continue;
+                    }
+                    let entry = aggregate.entry(occurrence.identity).or_default();
+                    entry.bytes = entry.bytes.max(occurrence.bytes);
+                    entry.kinds.insert(occurrence.kind);
+                    entry.roots.insert(occurrence.root);
+                    entry.paths.insert(occurrence.path);
+                    entry.snapshots.insert(occurrence.snapshot_id);
+                    match &entry.first_seen {
+                        Some(first_seen) if first_seen <= &occurrence.seen_at => {}
+                        _ => entry.first_seen = Some(occurrence.seen_at.clone()),
+                    }
+                    match &entry.last_seen {
+                        Some(last_seen) if last_seen >= &occurrence.seen_at => {}
+                        _ => entry.last_seen = Some(occurrence.seen_at),
+                    }
+                }
+            }
+            Err(err) => warnings.push(format!("{snapshot_id}: {err:#}")),
+        }
+    }
+    let retained_bytes = aggregate.values().map(|entry| entry.bytes).sum();
+    let retained_payloads = aggregate.len();
+    let skipped_snapshots = warnings.len();
+    let mut rows = aggregate
+        .into_iter()
+        .map(|(identity, entry)| RootSizeHistoryRow {
+            bytes: entry.bytes,
+            kind: join_examples(&entry.kinds, 2),
+            snapshots: entry.snapshots.len(),
+            first_seen: entry.first_seen.unwrap_or_default(),
+            last_seen: entry.last_seen.unwrap_or_default(),
+            root: join_examples(&entry.roots, 2),
+            path: join_examples(&entry.paths, 1),
+            oid: short_oid(&identity.oid),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| right.snapshots.cmp(&left.snapshots))
+            .then_with(|| left.root.cmp(&right.root))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    rows.truncate(limit);
+    Ok(RootSizeHistoryReport {
+        retained_bytes,
+        retained_payloads,
+        scanned_snapshots,
+        skipped_snapshots,
+        rows,
+        warnings,
+    })
+}
+
+fn snapshot_payload_occurrences(
+    paths: &Paths,
+    conn: &Connection,
+    remote: Option<&RemoteStore>,
+    snapshot_id: &str,
+) -> Result<Vec<PayloadOccurrence>> {
+    let (created_at, manifest_key, manifest_json): (String, String, String) = conn.query_row(
+        "select created_at, manifest_key, manifest_json from snapshots where id=?1",
+        params![snapshot_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let manifest: SnapshotManifest = if manifest_json.trim().is_empty() {
+        read_metadata_manifest(paths, remote, &manifest_key)
+            .with_context(|| format!("read snapshot manifest {manifest_key}"))?
+    } else {
+        serde_json::from_str(&manifest_json)
+            .with_context(|| format!("decode snapshot manifest json for {snapshot_id}"))?
+    };
+    let mut occurrences = Vec::new();
+    for (root_id, root_snapshot) in &manifest.root_trees {
+        let tree: TreeManifest = read_metadata_manifest(paths, remote, &root_snapshot.tree_key)
+            .with_context(|| format!("read root tree {}", root_snapshot.tree_key))?;
+        let entries = root_size_tree_entries(paths, remote, tree)?;
+        for (path, record) in entries {
+            add_payload_occurrence(
+                &mut occurrences,
+                snapshot_id,
+                &created_at,
+                root_id,
+                &path,
+                &record,
+            );
+        }
+    }
+    for (root_id, records) in &manifest.roots {
+        for record in records {
+            add_payload_occurrence(
+                &mut occurrences,
+                snapshot_id,
+                &created_at,
+                root_id,
+                &record.path,
+                record,
+            );
+        }
+    }
+    Ok(occurrences)
+}
+
+fn add_payload_occurrence(
+    occurrences: &mut Vec<PayloadOccurrence>,
+    snapshot_id: &str,
+    seen_at: &str,
+    root_id: &str,
+    path: &str,
+    record: &FileRecord,
+) {
+    let Some(identity) = payload_identity(&record.payload) else {
+        return;
+    };
+    occurrences.push(PayloadOccurrence {
+        identity,
+        kind: payload_kind(&record.payload).unwrap_or_else(|| "payload".into()),
+        bytes: record.size,
+        root: root_id.to_string(),
+        path: path.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        seen_at: seen_at.to_string(),
+    });
+}
+
+fn payload_identity(payload: &Payload) -> Option<PayloadIdentity> {
+    if let Some((oid, _)) = payload_blob_ref(payload) {
+        return Some(PayloadIdentity {
+            oid: oid.to_string(),
+        });
+    }
+    if let Some((oid, _, _)) = payload_large_ref(payload) {
+        return Some(PayloadIdentity {
+            oid: oid.to_string(),
+        });
+    }
+    None
+}
+
+fn payload_kind(payload: &Payload) -> Option<String> {
+    if payload_blob_ref(payload).is_some() {
+        return Some("blob".into());
+    }
+    if payload_large_ref(payload).is_some() {
+        return Some("large".into());
+    }
+    None
+}
+
+fn join_examples(values: &BTreeSet<String>, max_items: usize) -> String {
+    let mut items = values.iter().take(max_items).cloned().collect::<Vec<_>>();
+    if values.len() > max_items {
+        items.push(format!("+{}", values.len() - max_items));
+    }
+    items.join(",")
+}
+
+fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
+}
+
+fn print_root_size_history(report: &RootSizeHistoryReport) {
+    println!("履歴保持payload:");
+    println!(
+        "- current snapshotから外れている保持payload推定: {}",
+        format_mib(report.retained_bytes)
+    );
+    println!("  - payloads: {}", format_count(report.retained_payloads));
+    println!(
+        "  - scanned snapshots: {}",
+        format_count(report.scanned_snapshots)
+    );
+    if report.skipped_snapshots > 0 {
+        println!(
+            "  - skipped snapshots: {}",
+            format_count(report.skipped_snapshots)
+        );
+    }
+    if report.rows.is_empty() {
+        println!("- top historical payloads: none");
+    } else {
+        println!();
+        let rows = report
+            .rows
+            .iter()
+            .map(|row| {
+                vec![
+                    format_mib(row.bytes),
+                    row.kind.clone(),
+                    format_count(row.snapshots),
+                    row.first_seen.clone(),
+                    row.last_seen.clone(),
+                    row.root.clone(),
+                    row.path.clone(),
+                    row.oid.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_aligned_table(
+            &[
+                "size",
+                "kind",
+                "snapshots",
+                "first",
+                "last",
+                "root",
+                "path",
+                "oid",
+            ],
+            &[true, false, true, false, false, false, false, false],
+            &rows,
+        );
+    }
+    if !report.warnings.is_empty() {
+        println!();
+        println!("警告:");
+        for warning in report.warnings.iter().take(10) {
+            println!("- {warning}");
+        }
+        if report.warnings.len() > 10 {
+            println!("- ... and {} more", report.warnings.len() - 10);
+        }
+    }
 }
 
 fn root_size_summary_from_scan(
@@ -532,16 +977,52 @@ fn root_size_summary_from_scan(
     }
 }
 
-fn root_size_remote_objects(paths: &Paths, remote: &RemoteStore) -> Result<Vec<RemoteObjectStat>> {
+fn root_size_remote_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+    use_cache: bool,
+) -> Result<RootSizeRemoteObjects> {
     let cache_ttl = root_size_remote_cache_ttl();
-    if cache_ttl > Duration::zero()
-        && let Some(objects) = read_root_size_remote_object_cache(paths, remote, cache_ttl)?
+    if use_cache
+        && cache_ttl > Duration::zero()
+        && let Some(cache) = read_root_size_remote_object_cache(paths, remote, cache_ttl)?
     {
-        return Ok(objects);
+        return Ok(RootSizeRemoteObjects {
+            objects: cache.objects,
+            exact: true,
+            scope: format!("cached-prefix-list:{}", cache.fetched_at.to_rfc3339()),
+        });
+    }
+    if use_cache
+        && env::var("MAJUTSU_ROOT_SIZE_FORCE_SCAN").as_deref() != Ok("1")
+        && let Some(cache) = read_root_size_remote_object_cache_any_age(paths, remote)?
+    {
+        return Ok(RootSizeRemoteObjects {
+            objects: cache.objects,
+            exact: false,
+            scope: format!("stale-cached-prefix-list:{}", cache.fetched_at.to_rfc3339()),
+        });
+    }
+    if let Some(delay) = root_size_remote_list_delay() {
+        thread::sleep(delay);
     }
     let objects = remote.list_with_sizes("")?;
-    write_root_size_remote_object_cache(paths, remote, &objects)?;
-    Ok(objects)
+    if use_cache {
+        write_root_size_remote_object_cache(paths, remote, &objects)?;
+    }
+    Ok(RootSizeRemoteObjects {
+        objects,
+        exact: true,
+        scope: "full-prefix-scan".into(),
+    })
+}
+
+fn root_size_remote_list_delay() -> Option<StdDuration> {
+    env::var("MAJUTSU_ROOT_SIZE_REMOTE_LIST_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(StdDuration::from_millis)
 }
 
 fn root_size_remote_cache_ttl() -> Duration {
@@ -560,7 +1041,20 @@ fn read_root_size_remote_object_cache(
     paths: &Paths,
     remote: &RemoteStore,
     ttl: Duration,
-) -> Result<Option<Vec<RemoteObjectStat>>> {
+) -> Result<Option<RootSizeRemoteObjectCache>> {
+    let Some(cache) = read_root_size_remote_object_cache_any_age(paths, remote)? else {
+        return Ok(None);
+    };
+    if Utc::now().signed_duration_since(cache.fetched_at) > ttl {
+        return Ok(None);
+    }
+    Ok(Some(cache))
+}
+
+fn read_root_size_remote_object_cache_any_age(
+    paths: &Paths,
+    remote: &RemoteStore,
+) -> Result<Option<RootSizeRemoteObjectCache>> {
     let path = root_size_remote_object_cache_path(paths);
     if !path.exists() {
         return Ok(None);
@@ -572,10 +1066,7 @@ fn read_root_size_remote_object_cache(
     if cache.version != 1 || cache.remote != remote.describe() {
         return Ok(None);
     }
-    if Utc::now().signed_duration_since(cache.fetched_at) > ttl {
-        return Ok(None);
-    }
-    Ok(Some(cache.objects))
+    Ok(Some(cache))
 }
 
 fn write_root_size_remote_object_cache(
@@ -774,8 +1265,13 @@ fn sum_remote_keys(remote_size_map: &BTreeMap<String, u64>, keys: &BTreeSet<Stri
 }
 
 fn root_size_totals(input: RootSizeTotalsInput<'_>) -> RootSizeTotals {
-    let billed_bytes = input.remote_sizes.iter().map(|object| object.size).sum();
-    let billed_objects = input.remote_sizes.len();
+    let billed_bytes = input
+        .remote_objects
+        .objects
+        .iter()
+        .map(|object| object.size)
+        .sum();
+    let billed_objects = input.remote_objects.objects.len();
     let current_backend_bytes = sum_remote_keys(input.remote_size_map, input.unique_keys);
     let payload_bytes = sum_remote_keys(input.remote_size_map, input.unique_payload_keys);
     let metadata_bytes = sum_remote_keys(input.remote_size_map, input.unique_metadata_keys);
@@ -796,9 +1292,83 @@ fn root_size_totals(input: RootSizeTotalsInput<'_>) -> RootSizeTotals {
         objects: input.unique_keys.len(),
         backend_prefix_bytes: billed_bytes,
         backend_prefix_objects: billed_objects,
-        backend_prefix_exact: true,
-        backend_prefix_scope: "full-prefix-scan".into(),
+        backend_prefix_exact: input.remote_objects.exact,
+        backend_prefix_scope: input.remote_objects.scope.clone(),
     }
+}
+
+fn root_size_should_stream_pending(
+    args: &RootSizeArgs,
+    task: Option<&thread::JoinHandle<Result<RootSizeRemoteObjects>>>,
+) -> bool {
+    if args.json || args.history {
+        return false;
+    }
+    if task.is_none_or(|task| task.is_finished()) {
+        return false;
+    }
+    root_size_stdout_is_interactive()
+        || env::var("MAJUTSU_ROOT_SIZE_FORCE_STREAM").as_deref() == Ok("1")
+}
+
+fn root_size_stdout_is_interactive() -> bool {
+    io::stdout().is_terminal() && env::var("TERM").as_deref() != Ok("dumb")
+}
+
+fn root_size_pending_table(stats: &BTreeMap<String, RootSizeStat>) -> String {
+    let table_rows = stats
+        .iter()
+        .map(|(root, stat)| {
+            vec![
+                root.clone(),
+                format_count(stat.files),
+                format_count(stat.dirs),
+                format_mib(stat.client_bytes),
+                "|".into(),
+                "...".into(),
+                "...".into(),
+                "...".into(),
+                "...".into(),
+                "...".into(),
+                "...".into(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut out = String::new();
+    out.push_str(&aligned_table_text(
+        &[
+            "root", "files", "dirs", "client", "|", "backend", "used", "payload", "metadata",
+            "objects", "missing",
+        ],
+        &[
+            false, true, true, true, false, true, true, true, true, true, true,
+        ],
+        &table_rows,
+    ));
+    let client_bytes = stats
+        .values()
+        .fold(0_u64, |sum, stat| sum.saturating_add(stat.client_bytes));
+    let files = stats.values().map(|stat| stat.files).sum::<usize>();
+    let dirs = stats.values().map(|stat| stat.dirs).sum::<usize>();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "注: `|` より左はclient側、右はremote側。remote側はS3 object listing完了後に更新されます。"
+    )
+    .ok();
+    writeln!(out).ok();
+    writeln!(out, "全体:").ok();
+    writeln!(
+        out,
+        "- local root scan: files {}  dirs {}  client {}",
+        format_count(files),
+        format_count(dirs),
+        format_mib(client_bytes)
+    )
+    .ok();
+    writeln!(out, "- remote集計: ...").ok();
+    writeln!(out, "- S3上の実サイズbackend prefix全体: ...").ok();
+    out
 }
 
 fn print_root_size_table(rows: &[RootSizeRow], totals: &RootSizeTotals) {
@@ -947,6 +1517,10 @@ fn truncate_cell(value: &str, width: usize) -> String {
 }
 
 fn print_aligned_table(headers: &[&str], right_align: &[bool], rows: &[Vec<String>]) {
+    print!("{}", aligned_table_text(headers, right_align, rows));
+}
+
+fn aligned_table_text(headers: &[&str], right_align: &[bool], rows: &[Vec<String>]) -> String {
     let widths = headers
         .iter()
         .enumerate()
@@ -959,20 +1533,22 @@ fn print_aligned_table(headers: &[&str], right_align: &[bool], rows: &[Vec<Strin
                 .max(header.len())
         })
         .collect::<Vec<_>>();
-    print_table_line(headers, &widths, right_align);
+    let mut out = String::new();
+    write_table_line_text(&mut out, headers, &widths, right_align);
     let separator = widths
         .iter()
         .map(|width| "-".repeat(*width))
         .collect::<Vec<_>>()
         .join("  ");
-    println!("{separator}");
+    writeln!(out, "{separator}").ok();
     for row in rows {
         let cells = row.iter().map(String::as_str).collect::<Vec<_>>();
-        print_table_line(&cells, &widths, right_align);
+        write_table_line_text(&mut out, &cells, &widths, right_align);
     }
+    out
 }
 
-fn print_table_line(cells: &[&str], widths: &[usize], right_align: &[bool]) {
+fn write_table_line_text(out: &mut String, cells: &[&str], widths: &[usize], right_align: &[bool]) {
     let line = cells
         .iter()
         .enumerate()
@@ -985,7 +1561,7 @@ fn print_table_line(cells: &[&str], widths: &[usize], right_align: &[bool]) {
         })
         .collect::<Vec<_>>()
         .join("  ");
-    println!("{line}");
+    writeln!(out, "{line}").ok();
 }
 
 fn format_mib(bytes: u64) -> String {

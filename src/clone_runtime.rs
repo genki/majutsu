@@ -17,6 +17,7 @@ use crate::config::{
 };
 use crate::db_refs::persist_export_remote_refs;
 use crate::object_paths::local_object_keys;
+use crate::queue_runtime::import_remote_event_journals;
 use crate::remote_runtime::{read_remote_host_index, remote_host_index_with_legacy};
 use crate::remote_store::{RemoteStore, open_remote};
 
@@ -120,6 +121,11 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &export.config.host.id,
             &export.refs,
         )?;
+        let imported_journals =
+            import_remote_event_journals(&staging_paths, &remote, &export.config.host.id)?;
+        if imported_journals > 0 {
+            println!("imported_durable_journals {imported_journals}");
+        }
         trace.mark("import metadata");
         Ok(())
     })();
