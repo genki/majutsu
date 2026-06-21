@@ -1,26 +1,108 @@
 # CLI layout
 
-The stable commands remain compatible. Short aliases are additive.
+The stable top-level commands remain compatible. New names are additive aliases
+or namespace conveniences; maintenance commands stay top-level and are not
+moved under a `maintenance` parent command.
 
-## Daily workflow
+## Command groups
 
 ```text
-mj status (st)             protection dashboard
-mj health (doctor)         scriptable health result
-mj snapshot (snap)         capture roots
-mj sync (push)             publish to remote
-mj restore (recover)       plan/apply recovery
+Setup:
+  init
+  root
+
+Daily use:
+  status
+  health
+  state
+  log
+  diff
+  snapshot
+  commit    alias: snapshot
+
+History:
+  branch
+  switch    alias: branch switch
+  op        jj-style operation log
+
+Recovery:
+  restore
+  restore mount
+  restore unmount
+  restore hydrate
+  mount      compatibility top-level form
+  unmount    compatibility top-level form
+  hydrate    compatibility top-level form
+  clone
+
+Remote:
+  sync
+  remote
+  lifecycle
+
+Service:
+  watch
+  daemon
+
+Security:
+  key
+
+Storage maintenance:
+  large
+  cache
+  pack
+  prune
+  gc
+  fsck
+
+Advanced/debug:
+  event
 ```
 
-## Configuration/history
+## Git/Jujutsu familiarity
 
-`init`, `root`, `branch`, `log`, `diff`, `op`, and `key`.
+`status`, `log`, `diff`, `branch`, `restore`, `fsck`, and `gc` intentionally
+use familiar names. `op` is explicitly a jj-style operation log for internal
+operation history.
 
-## Remote/service
+`mj commit` is a user-facing alias for `mj snapshot`, but `snapshot` remains
+the canonical term. Majutsu preserves changes through the daemon/event journal
+and remote sync path; a snapshot is a durable checkpoint in the host timeline.
 
-`remote`, `clone`, `lifecycle`, `daemon` (`service`), and `watch`.
+`mj switch` is a top-level alias for `mj branch switch`.
 
-## Advanced maintenance
+## State inspection
 
-`state`, `fsck` (`check`), `pack`, `prune`, `gc`, `cache`, `event`, `large`,
-`mount`, `unmount`, and `hydrate`.
+`mj state <ref>` is the Git `status -s`-like command for a point in time.
+
+```sh
+mj state 1d
+mj state 1d -r moon
+mj state 03:40 -r moon --diff
+mj state op-123456789abc -g
+```
+
+Markers:
+
+```text
+A  added file
+M  content or restore-significant change
+D  deleted file
+m  metadata-only change; shown only with --meta
+```
+
+`--diff` prints colored unified-diff-style text hunks after file rows.
+`--meta` includes metadata-only changes such as directory mtime, mode, owner,
+or xattrs.
+
+## Restore view namespace
+
+Prefer the restore namespace for restore views:
+
+```sh
+mj restore mount /tmp/majutsu-view
+mj restore hydrate /tmp/majutsu-view --root moon --path README.md
+mj restore unmount /tmp/majutsu-view
+```
+
+Existing `mj mount`, `mj hydrate`, and `mj unmount` forms remain supported.

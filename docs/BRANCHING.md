@@ -14,7 +14,7 @@ mj branch create experiment --switch
 # ファイルを編集する
 mj snapshot --message 'experiment work'
 mj branch switch main --restore --force
-mj branch switch experiment --restore --force
+mj switch experiment --restore --force
 ```
 
 ## 過去時点からの分岐
@@ -40,10 +40,13 @@ mj branch list
 mj branch current
 mj branch create <name> [--snapshot <id> | --at <time>] [--switch] [--restore] [--force]
 mj branch switch <name> [--restore] [--force] [--to <dir>]
+mj switch <name> [--restore] [--force] [--to <dir>]
 mj branch set-head <name> [--snapshot <id> | --at <time>]
 mj branch rename <old> <new> [--force]
 mj branch delete <name> [--force]
 ```
+
+`mj switch` は `mj branch switch` の top-level alias である。
 
 ## ref layout
 

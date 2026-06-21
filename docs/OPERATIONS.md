@@ -17,6 +17,20 @@ mj daemon metrics
 branch heads、metadata 件数を確認する用途で使い分ける。自動確認では
 `mj state --json` を使う。
 
+指定時点からの管理対象ファイル差分は `mj state <ref>` を使う。root を絞る場合は
+`-r/--root`、全root表示を明示する場合は `-g/--global` を使う。
+
+```sh
+mj state 1d -r moon
+mj state 03:40 -r moon --diff
+mj state op-123456789abc -g
+```
+
+通常表示は `A/M/D` のファイル変更だけを出す。directory mtime、mode、owner、xattrs など
+metadata-only の変更は既定では隠し、必要な場合だけ `--meta` で小文字 `m` として表示する。
+`--diff` は text file の変更行を `@@` / `-` / `+` の色付き diff 形式で file row の直後に表示する。
+binary、special file、1 MiB 超のファイルは status row のみ表示し、diff body は省略する。
+
 `mj status` の先頭には remote head の同期状態が表示される。`Remote head synced (cached)`
 なら local current snapshot が最後に確認した remote current ref と一致している。
 これは quick signal であり、全 object の存在確認ではない。`lagging (cached)`、
@@ -430,6 +444,17 @@ mj restore resume <restore-job-id>
 
 provider が非同期 restore window を必要とする場合は、provider 側の restore 完了を待ってから resume する。
 
+## restore views
+
+restore view 操作は `restore` namespace 配下で実行できる。
+
+```sh
+mj restore mount /tmp/majutsu-view
+mj restore hydrate /tmp/majutsu-view --root photos --path sample.raw
+mj restore unmount /tmp/majutsu-view
+```
+
+互換性のため `mj mount`、`mj hydrate`、`mj unmount` も引き続き利用できる。
 
 ## branch / timeline operation
 
@@ -438,6 +463,7 @@ mj branch list
 mj branch create recovery-test --at '2026-06-06 10:30:00' --switch --restore --force
 mj snapshot --message 'recovery-test branch'
 mj branch switch main --restore --force
+mj switch main --restore --force
 ```
 
 working directory を上書きせずに古い branch を確認したい場合は、configured roots への

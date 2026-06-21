@@ -33,6 +33,8 @@ large object handling.
 - Root tree manifests stored as separate content-addressed objects
 - Normal blob pack files and pack indexes
 - Snapshot diff
+- Git/Jujutsu-friendly state inspection with root filters, short status,
+  optional line diffs, and metadata-only markers
 - Safe `prune --dry-run` and local loose-object `gc`
 - Persistent upload queue with retry on the next `mj sync`
 - Event journal records for snapshot/watch/root availability observations
@@ -48,6 +50,8 @@ large object handling.
 - Restore planning and restore to an alternate directory
 - Restore prepare/resume queue
 - Materialized and kernel-backed FUSE mount restore views
+- Restore view commands available both as top-level compatibility commands and
+  under `mj restore mount/unmount/hydrate`
 - Lifecycle policy generation for GCS and S3
 - Large object pin/unpin metadata
 - Basic object-store fsck
@@ -148,12 +152,37 @@ mj state
 mj state --json
 ```
 
+## Command Layout
+
+The stable top-level commands are grouped by purpose in `mj --help`; maintenance
+commands remain top-level for Git-style discoverability.
+
+```text
+Setup: init, root
+Daily use: status, health, state, log, diff, snapshot, commit
+History: branch, switch, op
+Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
+Remote: sync, remote, lifecycle
+Service: watch, daemon
+Security: key
+Storage maintenance: large, cache, pack, prune, gc, fsck
+Advanced/debug: event
+```
+
+`mj commit` is a visible alias for `mj snapshot`, intended for users familiar
+with Git/Jujutsu terminology. The canonical term remains `snapshot` because
+majutsu first preserves changes through the daemon/event journal and remote
+sync; snapshots are durable timeline checkpoints and compaction boundaries.
+
+`mj switch` is a top-level alias for `mj branch switch`.
+
 ## Quick Start
 
 ```sh
 mj init
 mj root add home-notes ~/notes --exclude '**/.git/**'
 mj snapshot --message 'first snapshot'
+mj state 1d -r home-notes --diff
 mj sync
 mj sync status
 mj remote fsck
@@ -181,6 +210,50 @@ missing or likely need archive hydration.
 Time arguments such as `--at` accept RFC3339 timestamps, `YYYY-MM-DD HH:MM:SS`
 as UTC, `YYYY-MM-DD` as midnight UTC, `now`, and relative values such as
 `10 minutes ago`.
+
+Restore views can be managed through the restore namespace:
+
+```sh
+mj restore mount /tmp/majutsu-view
+mj restore hydrate /tmp/majutsu-view --root home-notes --path README.md
+mj restore unmount /tmp/majutsu-view
+```
+
+The older top-level `mj mount`, `mj hydrate`, and `mj unmount` forms remain
+supported as compatibility aliases.
+
+## State and Diff Inspection
+
+`mj state <ref>` prints a Git `status -s`-style view of managed file changes
+since a snapshot, operation id, absolute time, or relative time.
+
+```sh
+mj state 1d
+mj state 1d -r home-notes
+mj state 03:40 -r home-notes --diff
+mj state op-123456789abc -g
+```
+
+Markers:
+
+```text
+A  added file
+M  content or restore-significant change
+D  deleted file
+m  metadata-only change, shown only with --meta
+```
+
+By default, metadata-only changes such as directory mtime updates are hidden so
+file additions do not also produce noisy parent-directory rows. Use `--meta`
+when mode, owner, xattrs, or directory mtime changes matter:
+
+```sh
+mj state 1d -r home-notes --meta
+```
+
+`--diff` appends colored unified-diff-style lines after each changed text file.
+Binary, special, and files larger than 1 MiB keep the status row but omit the
+diff body.
 
 ## Large Files
 
@@ -275,7 +348,7 @@ Majutsu は host snapshot 上の軽量な logical branch をサポートする�
 mj branch list
 mj branch create experiment --at "2026-06-06 10:30:00" --switch --restore --force
 mj snapshot --message "experiment from old state"
-mj branch switch main --restore --force
+mj switch main --restore --force
 ```
 
 branch は metadata refs (`current-branch` と `branches/<name>`) として保存されるため、
@@ -684,6 +757,15 @@ without parsing terminal tables. The JSON report contains per-root
 `client_bytes`, `backend_bytes`, `used_bytes`, `payload_bytes`,
 `metadata_bytes`, object, and missing counts plus the same overall totals shown
 in the text output.
+
+When the remote prefix listing is slow, interactive `mj root size` first shows
+the completed local root scan with remote-side columns as `...`, then updates
+the table when the backend object listing finishes. Use `--no-remote-cache` to
+force a direct backend scan instead of using the cached remote object listing:
+
+```sh
+mj root size --no-remote-cache
+```
 
 The overall section shows both logical restore accounting and the billed remote
 prefix size. If the billed S3/GCS prefix is much larger than the current
