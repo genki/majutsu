@@ -23,7 +23,33 @@ For a development checkout:
 cargo install --path .
 ```
 
-## 2. Create a Local State
+## 2. Choose a Remote
+
+Remote sync is the critical path for host-loss recovery. In production, start
+with an S3-compatible backend and encryption:
+
+```sh
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_ENDPOINT_URL=https://storage.googleapis.com
+export AWS_SIGNATURE_VERSION=s3v4
+
+export MAJUTSU_REMOTE=s3://bucket/prefix
+```
+
+Use a dedicated backend prefix per host or per majutsu instance unless you
+explicitly want to share a remote for multi-host recovery browsing.
+
+For a local-only trial, use a file remote instead:
+
+```sh
+export MAJUTSU_REMOTE=file:///tmp/mj-demo/remote
+```
+
+The rest of this guide uses `$MAJUTSU_REMOTE` so the same commands work with
+either backend.
+
+## 3. Create a Local State
 
 Start with a disposable directory so the first run is easy to inspect:
 
@@ -32,7 +58,7 @@ rm -rf /tmp/mj-demo
 mkdir -p /tmp/mj-demo/root
 echo "hello" > /tmp/mj-demo/root/README.md
 
-mj --home /tmp/mj-demo/state init --remote file:///tmp/mj-demo/remote
+mj --home /tmp/mj-demo/state init --encrypt --remote "$MAJUTSU_REMOTE"
 mj --home /tmp/mj-demo/state root add demo /tmp/mj-demo/root
 SNAPSHOT=$(
   mj --home /tmp/mj-demo/state snapshot --message 'initial demo snapshot' |
@@ -52,7 +78,13 @@ echo "$SNAPSHOT"
 `mj status` is the operational dashboard. `mj log` shows file-change operation
 history. `mj root list` shows configured roots.
 
-## 3. Inspect Changes
+Export the encryption master key and store it somewhere separate from the host:
+
+```sh
+mj --home /tmp/mj-demo/state key export
+```
+
+## 4. Inspect Changes
 
 Edit the root and compare it with a recent point in time:
 
@@ -94,10 +126,9 @@ The canonical term remains snapshot because majutsu first preserves changes
 through its event journal and sync path; snapshots are durable timeline
 checkpoints and compaction boundaries.
 
-## 4. Sync to a Remote
+## 5. Sync to the Remote
 
-Remote sync is the critical path for host-loss recovery. The demo state was
-initialized with a file remote so the flow can be validated locally:
+Upload metadata and objects to the configured remote:
 
 ```sh
 mj --home /tmp/mj-demo/state sync --wait
@@ -105,25 +136,7 @@ mj --home /tmp/mj-demo/state sync status
 mj --home /tmp/mj-demo/state remote fsck
 ```
 
-For S3-compatible storage:
-
-```sh
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_ENDPOINT_URL=https://storage.googleapis.com
-export AWS_SIGNATURE_VERSION=s3v4
-
-mj init --encrypt --remote s3://bucket/prefix
-mj root add work ~/work
-mj snapshot --message 'initial work snapshot'
-mj sync --wait
-mj remote fsck
-```
-
-Use a dedicated backend prefix per host or per majutsu instance unless you
-explicitly want to share a remote for multi-host recovery browsing.
-
-## 5. Keep the Daemon Running
+## 6. Keep the Daemon Running
 
 For crash protection, the daemon should be running after setup so filesystem
 changes are observed and synced without relying on manual snapshots.
@@ -164,7 +177,7 @@ Do not run the user instance with sudo to protect both user repos and system
 files. Keep user and system state homes, backend prefixes, and encryption keys
 separate.
 
-## 6. Verify Restore
+## 7. Verify Restore
 
 Restore into a temporary directory before trusting a new setup:
 
@@ -177,19 +190,16 @@ find /tmp/mj-demo/restore -maxdepth 3 -type f -print
 Recover from an empty state using the remote:
 
 ```sh
-mj --home /tmp/mj-demo/recovered clone --remote file:///tmp/mj-demo/remote
+MAJUTSU_MASTER_KEY=<64-hex-key> \
+  mj --home /tmp/mj-demo/recovered clone --remote "$MAJUTSU_REMOTE"
 mj --home /tmp/mj-demo/recovered fsck --quick
 mj --home /tmp/mj-demo/recovered restore apply --to /tmp/mj-demo/recovered-files
 ```
 
-For encrypted S3 remotes, export the master key and store it outside the host:
+For file remote trials, encryption still works the same way. Use the key printed
+by `mj key export` when cloning into the empty recovered state.
 
-```sh
-mj key export
-MAJUTSU_MASTER_KEY=<64-hex-key> mj --home /tmp/recovered clone --remote s3://bucket/prefix
-```
-
-## 7. Common Next Steps
+## 8. Common Next Steps
 
 - Use `mj root size` to compare local root size with remote restore data and
   billed backend prefix size.

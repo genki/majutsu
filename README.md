@@ -426,7 +426,7 @@ export MAJUTSU_S3_MULTIPART_THRESHOLD=$((64 * 1024 * 1024))
 mj init --remote s3://bucket/prefix
 mj root add sample /path/to/sample
 mj snapshot --message 'first remote snapshot'
-mj sync
+mj sync --wait
 mj remote check
 mj remote capabilities
 mj remote hosts
