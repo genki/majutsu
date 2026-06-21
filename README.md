@@ -220,8 +220,9 @@ Plans also summarize the object set needed for restore, including large-file
 chunk count, local availability, remote availability, and objects that are
 missing or likely need archive hydration.
 Time arguments such as `--at` accept RFC3339 timestamps, `YYYY-MM-DD HH:MM:SS`
-as UTC, `YYYY-MM-DD` as midnight UTC, `now`, and relative values such as
-`10 minutes ago`.
+in the local timezone, `YYYY-MM-DD` as local midnight, `now`, and relative
+values such as `10 minutes ago`. Use RFC3339 with an explicit offset, such as
+`2026-06-06T10:30:00+09:00`, when exchanging commands across hosts.
 
 Restore views can be managed through the restore namespace:
 

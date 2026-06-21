@@ -447,6 +447,10 @@ mj restore prepare --at '2026-06-06 10:30:00' --root photos --to /tmp/photos-res
 mj restore resume <restore-job-id>
 ```
 
+offset を含まない `YYYY-MM-DD HH:MM:SS` は実行環境の local timezone として扱う。
+ホスト間で手順を共有する場合は `2026-06-06T10:30:00+09:00` のように
+RFC3339 offset を明示する。
+
 provider が非同期 restore window を必要とする場合は、provider 側の restore 完了を待ってから resume する。
 
 ## restore views

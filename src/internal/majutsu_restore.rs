@@ -1,7 +1,7 @@
 #[cfg(not(feature = "standalone-crate"))]
 use crate::majutsu_core;
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 #[cfg(feature = "standalone-crate")]
 #[allow(clippy::single_component_path_imports)]
 use majutsu_core;
@@ -239,13 +239,13 @@ pub fn parse_restore_time(input: &str, now: DateTime<Utc>) -> Result<DateTime<Ut
         return Ok(dt.with_timezone(&Utc));
     }
     if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.and_utc());
+        return local_datetime(dt, input).map(|dt| dt.with_timezone(&Utc));
     }
     if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
-        return Ok(date
+        let dt = date
             .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| anyhow!("invalid date: {input}"))?
-            .and_utc());
+            .ok_or_else(|| anyhow!("invalid date: {input}"))?;
+        return local_datetime(dt, input).map(|dt| dt.with_timezone(&Utc));
     }
     if input == "now" {
         return Ok(now);
@@ -256,6 +256,14 @@ pub fn parse_restore_time(input: &str, now: DateTime<Utc>) -> Result<DateTime<Ut
     bail!(
         "time must be RFC3339, YYYY-MM-DD HH:MM:SS, YYYY-MM-DD, relative ago, or now, got: {input}"
     );
+}
+
+fn local_datetime(naive: NaiveDateTime, input: &str) -> Result<DateTime<Local>> {
+    match Local.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(value) => Ok(value),
+        chrono::LocalResult::Ambiguous(earliest, _) => Ok(earliest),
+        chrono::LocalResult::None => bail!("invalid local time: {input}"),
+    }
 }
 
 pub fn parse_restore_time_rfc3339(input: &str, now: DateTime<Utc>) -> Result<String> {
@@ -310,7 +318,7 @@ mod tests {
         count_restore_changes, parse_db_time, parse_duration_ago, parse_relative_ago,
         parse_restore_time, parse_restore_time_rfc3339, validate_relative_filter_path,
     };
-    use chrono::{DateTime, TimeZone, Utc};
+    use chrono::{DateTime, Local, TimeZone, Utc};
     use std::path::Path;
 
     fn time(seconds: i64) -> DateTime<Utc> {
@@ -553,6 +561,13 @@ mod tests {
     #[test]
     fn restore_time_accepts_spec_datetime_formats() {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let local_datetime = |year, month, day, hour, min, sec| {
+            Local
+                .with_ymd_and_hms(year, month, day, hour, min, sec)
+                .earliest()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
 
         assert_eq!(
             parse_restore_time("2026-06-06T14:05:00+09:00", now).unwrap(),
@@ -560,16 +575,16 @@ mod tests {
         );
         assert_eq!(
             parse_restore_time("2026-06-06 14:05:00", now).unwrap(),
-            Utc.with_ymd_and_hms(2026, 6, 6, 14, 5, 0).unwrap()
+            local_datetime(2026, 6, 6, 14, 5, 0)
         );
         assert_eq!(
             parse_restore_time("2026-06-06", now).unwrap(),
-            Utc.with_ymd_and_hms(2026, 6, 6, 0, 0, 0).unwrap()
+            local_datetime(2026, 6, 6, 0, 0, 0)
         );
         assert_eq!(parse_restore_time("now", now).unwrap(), now);
         assert_eq!(
             parse_restore_time_rfc3339("2026-06-06", now).unwrap(),
-            "2026-06-06T00:00:00+00:00"
+            local_datetime(2026, 6, 6, 0, 0, 0).to_rfc3339()
         );
     }
 
