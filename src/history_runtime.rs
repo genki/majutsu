@@ -1313,15 +1313,8 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
         .as_deref()
         .map(|reference| resolve_state_basis(paths, &conn, reference))
         .transpose()?;
-    if basis.is_some() && !args.json {
-        stream_state_short_changes(
-            paths,
-            &conn,
-            basis.as_ref().unwrap(),
-            &state_scope,
-            args.diff,
-            args.meta,
-        )?;
+    if let Some(basis) = basis.as_ref().filter(|_| !args.json) {
+        stream_state_short_changes(paths, &conn, basis, &state_scope, args.diff, args.meta)?;
         return Ok(());
     }
     let active_branch = ref_value_for_state(&conn, "current-branch")?;
@@ -2025,7 +2018,7 @@ fn stream_state_short_changes(
                     |change, diff_lines| {
                         let line = format!(
                             " {} {}",
-                            color_change_status(&ui, &change.status),
+                            color_change_status(&ui, change.status),
                             color_state_path(&ui, &change.path, local_paths)
                         );
                         tx.send(LogProducerMessage::Line(line))
