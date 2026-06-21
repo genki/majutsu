@@ -17678,9 +17678,7 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
                 fs::read(&metadata_path)
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|metadata| {
-                        metadata["refs"]["current"].as_str().map(str::to_string)
-                    })
+                    .and_then(|metadata| metadata["refs"]["current"].as_str().map(str::to_string))
             } else {
                 None
             };

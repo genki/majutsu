@@ -264,10 +264,8 @@ pub(crate) fn open_remote_with_upload_policy(
     max_parallel_uploads: usize,
 ) -> Result<RemoteStore> {
     let remote_url = config.url()?;
-    if let Some(path) = remote_url.strip_prefix("file://") {
-        return Ok(RemoteStore::File(FileRemote {
-            root: PathBuf::from(path),
-        }));
+    if let Some(path) = file_remote_path_from_url(&remote_url) {
+        return Ok(RemoteStore::File(FileRemote { root: path }));
     }
     if remote_url.starts_with("s3://") {
         let url = Url::parse(&remote_url)?;
@@ -306,6 +304,38 @@ pub(crate) fn open_remote_with_upload_policy(
         })));
     }
     bail!("unsupported remote URL: {remote_url}");
+}
+
+fn file_remote_path_from_url(remote_url: &str) -> Option<PathBuf> {
+    if let Some(path) = remote_url.strip_prefix("file://") {
+        return Some(file_remote_path_from_suffix(path));
+    }
+    #[cfg(windows)]
+    if let Some(path) = remote_url.strip_prefix("file:/") {
+        return Some(file_remote_path_from_suffix(path));
+    }
+    None
+}
+
+fn file_remote_path_from_suffix(path: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        return PathBuf::from(normalize_windows_file_remote_suffix(path));
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_windows_file_remote_suffix(path: &str) -> String {
+    let mut normalized = path.replace('/', "\\");
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'\\' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        normalized.remove(0);
+    }
+    normalized
 }
 
 impl RemoteStore {
@@ -1779,6 +1809,40 @@ mod storage_characteristic_tests {
             remote.multipart_parallelism_for_key("blobs/loose/aa/blob.enc"),
             8
         );
+    }
+
+    #[test]
+    fn normalizes_windows_file_remote_url_suffixes() {
+        assert_eq!(
+            normalize_windows_file_remote_suffix(r"C:\Users\genta\remote"),
+            r"C:\Users\genta\remote"
+        );
+        assert_eq!(
+            normalize_windows_file_remote_suffix("C:/Users/genta/remote"),
+            r"C:\Users\genta\remote"
+        );
+        assert_eq!(
+            normalize_windows_file_remote_suffix("/C:/Users/genta/remote"),
+            r"C:\Users\genta\remote"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_windows_file_remote_url_variants() {
+        for url in [
+            r"file://C:\Users\genta\remote",
+            "file:///C:/Users/genta/remote",
+            "file:/C:/Users/genta/remote",
+        ] {
+            let remote = open_remote(&RemoteConfig::from_url(url.to_string())).unwrap();
+            match remote {
+                RemoteStore::File(file) => {
+                    assert_eq!(file.root, PathBuf::from(r"C:\Users\genta\remote"));
+                }
+                RemoteStore::S3(_) => panic!("expected file remote for {url}"),
+            }
+        }
     }
 
     #[test]

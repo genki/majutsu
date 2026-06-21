@@ -18,6 +18,13 @@ are supported on Linux, macOS, and Windows.
 User state defaults to `%USERPROFILE%\.majutsu`. System state uses
 `%PROGRAMDATA%\Majutsu\state` and `%PROGRAMDATA%\Majutsu\config.toml`.
 
+File remotes accept both native Windows paths and URL-style drive paths:
+
+```powershell
+mj init --remote file://C:\Users\me\majutsu-remote
+mj init --remote file:///C:/Users/me/majutsu-remote
+```
+
 Generate a user task:
 
 ```powershell

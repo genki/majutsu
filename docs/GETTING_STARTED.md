@@ -46,6 +46,12 @@ For a local-only trial, use a file remote instead:
 export MAJUTSU_REMOTE=file:///tmp/mj-demo/remote
 ```
 
+On Windows, file remotes accept the usual URL-style drive form as well:
+
+```powershell
+$env:MAJUTSU_REMOTE = "file:///C:/Users/me/AppData/Local/Temp/mj-demo/remote"
+```
+
 The rest of this guide uses `$MAJUTSU_REMOTE` so the same commands work with
 either backend.
 
