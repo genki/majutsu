@@ -30,8 +30,8 @@ use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
 };
 use crate::snapshot_rules::{
-    apply_root_large_set, apply_root_presets, build_ignore, dedup_patterns, is_ignored,
-    is_included, root_large_override, warn_sensitive_root_defaults,
+    apply_default_root_excludes, apply_root_large_set, apply_root_presets, build_ignore,
+    dedup_patterns, is_ignored, is_included, root_large_override, warn_sensitive_root_defaults,
 };
 
 pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
@@ -61,7 +61,11 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             if snapshot_source.is_some() && args.snapshot_mode != "transactional" {
                 bail!("--snapshot-source requires --snapshot-mode transactional");
             }
-            let mut exclude = args.exclude.clone();
+            let mut exclude = Vec::new();
+            if !args.no_default_excludes {
+                apply_default_root_excludes(&mut exclude);
+            }
+            exclude.extend(args.exclude.clone());
             apply_root_presets(&mut exclude, &args.presets)?;
             warn_sensitive_root_defaults(&path, &exclude);
             let large = root_large_override(&args);

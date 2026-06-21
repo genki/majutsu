@@ -48,6 +48,7 @@ pub fn expanded_directory_exclude_patterns(pattern: &str) -> Vec<String> {
 
 pub fn root_preset_excludes(preset: &str) -> Result<Vec<String>> {
     match preset {
+        "default" | "best-practice" => Ok(default_root_excludes()),
         "git" | "git-working-tree" => Ok(vec![
             ".git/**",
             "/.git/**",
@@ -83,9 +84,108 @@ pub fn root_preset_excludes(preset: &str) -> Result<Vec<String>> {
                 .collect(),
         ),
         other => {
-            bail!("unknown root preset {other}; supported presets: git-working-tree, rust, node")
+            bail!(
+                "unknown root preset {other}; supported presets: default, git-working-tree, rust, node"
+            )
         }
     }
+}
+
+pub fn default_root_excludes() -> Vec<String> {
+    [
+        ".git/**",
+        "/.git/**",
+        "**/.git/**",
+        ".hg/**",
+        "/.hg/**",
+        "**/.hg/**",
+        ".svn/**",
+        "/.svn/**",
+        "**/.svn/**",
+        ".jj/**",
+        "/.jj/**",
+        "**/.jj/**",
+        "node_modules/**",
+        "/node_modules/**",
+        "**/node_modules/**",
+        "target/**",
+        "/target/**",
+        "**/target/**",
+        "build/**",
+        "/build/**",
+        "**/build/**",
+        "dist/**",
+        "/dist/**",
+        "**/dist/**",
+        "out/**",
+        "/out/**",
+        "**/out/**",
+        "tmp/**",
+        "/tmp/**",
+        "**/tmp/**",
+        "temp/**",
+        "/temp/**",
+        "**/temp/**",
+        ".cache/**",
+        "/.cache/**",
+        "**/.cache/**",
+        ".next/**",
+        "/.next/**",
+        "**/.next/**",
+        ".nuxt/**",
+        "/.nuxt/**",
+        "**/.nuxt/**",
+        ".svelte-kit/**",
+        "/.svelte-kit/**",
+        "**/.svelte-kit/**",
+        ".turbo/**",
+        "/.turbo/**",
+        "**/.turbo/**",
+        ".parcel-cache/**",
+        "/.parcel-cache/**",
+        "**/.parcel-cache/**",
+        ".vite/**",
+        "/.vite/**",
+        "**/.vite/**",
+        "coverage/**",
+        "/coverage/**",
+        "**/coverage/**",
+        "__pycache__/**",
+        "/__pycache__/**",
+        "**/__pycache__/**",
+        ".pytest_cache/**",
+        "/.pytest_cache/**",
+        "**/.pytest_cache/**",
+        ".mypy_cache/**",
+        "/.mypy_cache/**",
+        "**/.mypy_cache/**",
+        ".ruff_cache/**",
+        "/.ruff_cache/**",
+        "**/.ruff_cache/**",
+        ".tox/**",
+        "/.tox/**",
+        "**/.tox/**",
+        ".venv/**",
+        "/.venv/**",
+        "**/.venv/**",
+        "venv/**",
+        "/venv/**",
+        "**/venv/**",
+        ".DS_Store",
+        "**/.DS_Store",
+        "Thumbs.db",
+        "**/Thumbs.db",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn apply_default_root_excludes(excludes: &mut Vec<String>) {
+    for pattern in default_root_excludes() {
+        push_unique(excludes, pattern);
+    }
+    dedup_patterns(excludes);
 }
 
 pub fn apply_root_presets(excludes: &mut Vec<String>, presets: &[String]) -> Result<()> {
@@ -102,7 +202,7 @@ pub fn warn_sensitive_root_defaults(root_path: &Path, excludes: &[String]) {
     for sensitive in [".git", ".infracost", ".backup-kubeconfig", "etc/keys"] {
         if root_path.join(sensitive).exists() && !exclude_covers_path(excludes, sensitive) {
             eprintln!(
-                "warning: root contains {sensitive}; consider --preset git-working-tree or --exclude '{sensitive}/**'"
+                "warning: root contains {sensitive}; use encryption or add an explicit --exclude if this should not be backed up"
             );
         }
     }
@@ -115,7 +215,7 @@ pub fn warn_sensitive_root_defaults(root_path: &Path, excludes: &[String]) {
             .any(|name| name.starts_with(".kubeconfig"));
         if has_kubeconfig {
             eprintln!(
-                "warning: root contains .kubeconfig*; consider --preset git-working-tree or --exclude '.kubeconfig*'"
+                "warning: root contains .kubeconfig*; use encryption or add an explicit --exclude if this should not be backed up"
             );
         }
     }
@@ -374,5 +474,33 @@ mod moon_root_tests {
         }
         assert!(excludes.iter().any(|pattern| pattern == ".kubeconfig*"));
         assert!(is_included(&["**".into()], Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn default_root_excludes_cover_reproducible_subtrees_not_secrets() {
+        let mut excludes = Vec::new();
+        apply_default_root_excludes(&mut excludes);
+        for path in [
+            ".git",
+            ".hg",
+            ".svn",
+            ".jj",
+            "node_modules",
+            "target",
+            ".venv",
+        ] {
+            assert!(
+                exclude_covers_path(&excludes, path),
+                "default excludes should cover {path}"
+            );
+        }
+        assert!(
+            !exclude_covers_path(&excludes, ".env"),
+            "default excludes must not silently drop authored secret files"
+        );
+        assert!(
+            !exclude_covers_path(&excludes, ".kubeconfig"),
+            "default excludes must warn about credentials instead of dropping them"
+        );
     }
 }

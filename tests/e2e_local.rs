@@ -598,13 +598,21 @@ fn daemon_status_and_metrics_smoke() {
 }
 
 #[test]
-fn exclude_child_glob_hides_root_directory_entry() {
+fn default_excludes_hide_reproducible_directory_entries() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let repo = temp.path().join("repo");
     let restore = temp.path().join("restore");
     fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+    fs::create_dir_all(repo.join("target/debug")).unwrap();
     fs::write(repo.join(".git/config"), b"secret git config\n").unwrap();
+    fs::write(
+        repo.join("node_modules/pkg/index.js"),
+        b"generated dependency\n",
+    )
+    .unwrap();
+    fs::write(repo.join("target/debug/app"), b"generated build\n").unwrap();
     fs::write(repo.join("src.txt"), b"tracked\n").unwrap();
 
     assert_success(
@@ -612,17 +620,7 @@ fn exclude_child_glob_hides_root_directory_entry() {
         "init",
     );
     assert_success(
-        run_mj(
-            &home,
-            [
-                "root",
-                "add",
-                "repo",
-                repo.to_str().unwrap(),
-                "--exclude",
-                "**/.git/**",
-            ],
-        ),
+        run_mj(&home, ["root", "add", "repo", repo.to_str().unwrap()]),
         "root add repo",
     );
     assert_success(
@@ -639,7 +637,61 @@ fn exclude_child_glob_hides_root_directory_entry() {
     assert_file(&restore.join("repo/src.txt"), b"tracked\n");
     assert!(
         !restore.join("repo/.git").exists(),
-        ".git directory entry must be excluded"
+        ".git directory entry must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/node_modules").exists(),
+        "dependency directory must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/target").exists(),
+        "build directory must be excluded by default"
+    );
+}
+
+#[test]
+fn no_default_excludes_allows_full_root_capture() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let restore = temp.path().join("restore");
+    fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    fs::write(repo.join(".git/config"), b"git config\n").unwrap();
+    fs::write(repo.join("src.txt"), b"tracked\n").unwrap();
+
+    assert_success(
+        run_mj(&home, ["init", "--host-name", "include-vcs-e2e"]),
+        "init",
+    );
+    assert_success(
+        run_mj(
+            &home,
+            [
+                "root",
+                "add",
+                "repo",
+                repo.to_str().unwrap(),
+                "--no-default-excludes",
+            ],
+        ),
+        "root add repo",
+    );
+    assert_success(
+        run_mj(&home, ["snapshot", "--message", "full capture e2e"]),
+        "snapshot",
+    );
+    assert_success(
+        run_mj(
+            &home,
+            ["restore", "apply", "--to", restore.to_str().unwrap()],
+        ),
+        "restore apply",
+    );
+    assert_file(&restore.join("repo/src.txt"), b"tracked\n");
+    assert_file(&restore.join("repo/.git/config"), b"git config\n");
+    assert!(
+        restore.join("repo/.git/objects").exists(),
+        ".git subtree should be captured when defaults are disabled"
     );
 }
 

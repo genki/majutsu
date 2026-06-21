@@ -6,14 +6,25 @@
 
 `/**` で終わる exclude pattern は、配下のファイルだけでなく directory entry 自体も除外する。たとえば `**/.git/**` は `.git` directory record も抑止する。
 
-Git working tree を root にする場合は preset を使う。
+新規 root では、復旧価値が低く巨大化しやすい再生成物を既定で除外する。対象は VCS 内部
+（`.git`、`.jj`、`.hg`、`.svn`）、依存物（`node_modules`、virtualenv）、build output
+（`target`、`build`、`dist`、`out`）、代表的な cache / tmp 系である。Git working tree を
+root にするだけなら通常は追加指定不要。
+
+完全なファイルシステム像を意図的に保存したい場合だけ、root add 時に既定除外を無効化する。
+
+```sh
+mj root add full-root /path/to/root --no-default-excludes
+```
+
+moon 固有の sensitive path までまとめて外したい場合は preset を追加する。
 
 ```sh
 mj root add moon ~/moon --preset git-working-tree
 mj root set moon --preset git-working-tree
 ```
 
-`git-working-tree` preset は `.git`、`node_modules`、`target`、`tmp`、`.infracost`、`.backup-kubeconfig`、`.kubeconfig*`、`etc/keys` を除外する。root に代表的な sensitive path があり、対応する exclude が無い場合は warning を表示する。
+`git-working-tree` preset は既定除外に加え、`.infracost`、`.backup-kubeconfig`、`.kubeconfig*`、`etc/keys` などを除外する。root に代表的な sensitive path があり、対応する exclude が無い場合は warning を表示する。`.env` や kubeconfig のような authored secret は、既定では黙って除外しない。暗号化 remote で保護するか、復旧対象外にする場合だけ明示 exclude を追加する。
 
 ## sync
 

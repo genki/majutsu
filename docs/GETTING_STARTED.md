@@ -6,8 +6,9 @@ a verified restore. The examples use the installed CLI name, `mj`.
 Majutsu is not a Git replacement. It protects selected host directories as
 roots, records file changes in a host-level timeline, and syncs the data needed
 to recover the host after local disk loss. It can safely manage a Git working
-tree in parallel; exclude `.git` unless you intentionally need to protect Git
-internals.
+tree in parallel. New roots exclude VCS internals, dependency directories, build
+outputs, and common caches by default; use `--no-default-excludes` only when
+those generated files must be backed up too.
 
 ## 1. Install
 
@@ -32,7 +33,7 @@ mkdir -p /tmp/mj-demo/root
 echo "hello" > /tmp/mj-demo/root/README.md
 
 mj --home /tmp/mj-demo/state init --remote file:///tmp/mj-demo/remote
-mj --home /tmp/mj-demo/state root add demo /tmp/mj-demo/root --exclude '**/.git/**'
+mj --home /tmp/mj-demo/state root add demo /tmp/mj-demo/root
 SNAPSHOT=$(
   mj --home /tmp/mj-demo/state snapshot --message 'initial demo snapshot' |
     awk '/^snapshot / { print $2 }'
@@ -99,7 +100,7 @@ Remote sync is the critical path for host-loss recovery. The demo state was
 initialized with a file remote so the flow can be validated locally:
 
 ```sh
-mj --home /tmp/mj-demo/state sync
+mj --home /tmp/mj-demo/state sync --wait
 mj --home /tmp/mj-demo/state sync status
 mj --home /tmp/mj-demo/state remote fsck
 ```
@@ -113,9 +114,9 @@ export AWS_ENDPOINT_URL=https://storage.googleapis.com
 export AWS_SIGNATURE_VERSION=s3v4
 
 mj init --encrypt --remote s3://bucket/prefix
-mj root add work ~/work --exclude '**/.git/**'
+mj root add work ~/work
 mj snapshot --message 'initial work snapshot'
-mj sync
+mj sync --wait
 mj remote fsck
 ```
 
@@ -192,6 +193,9 @@ MAJUTSU_MASTER_KEY=<64-hex-key> mj --home /tmp/recovered clone --remote s3://buc
 
 - Use `mj root size` to compare local root size with remote restore data and
   billed backend prefix size.
+- Use `mj root add <id> <path> --no-default-excludes` only for roots where VCS
+  internals, dependency directories, build outputs, and caches are part of the
+  data you intentionally need to recover.
 - Use `mj state 1d -r <root> --diff` for Git-style inspection of recent file
   changes.
 - Use `mj branch create <name> --at <time> --switch --restore --force` to branch

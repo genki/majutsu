@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 const CLI_LONG_ABOUT: &str = r#"majutsu snapshots multiple directories on a development host so local data loss can be recovered.
 
-majutsu is not a Git- or jujutsu-compatible VCS. It records file state under configured roots in its own state directory. When adding a Git working tree as a root, normally exclude Git internals with `--exclude '**/.git/**'`.
+majutsu is not a Git- or jujutsu-compatible VCS. It records file state under configured roots in its own state directory. New roots use best-practice excludes for VCS internals, dependency directories, build outputs, and caches. Use `--no-default-excludes` only when those generated files must be backed up too.
 
 Basic flow:
   mj init
-  mj root add notes ~/notes --exclude '**/.git/**'
+  mj root add notes ~/notes
   mj snapshot --message 'first snapshot'
   mj log
   mj restore plan --root notes --to /tmp/majutsu-restore
@@ -15,7 +15,7 @@ Basic flow:
 
 Remote recovery flow:
   mj init --remote file:///mnt/backup/majutsu
-  mj sync
+  mj sync --wait
   mj remote fsck
   mj clone --remote file:///mnt/backup/majutsu --home /tmp/recovered-majutsu
 
@@ -434,15 +434,21 @@ pub(crate) struct RootAddArgs {
     #[arg(
         long = "exclude",
         value_name = "GLOB",
-        help = "Exclude a glob from snapshots. Use `**/.git/**` for Git working trees"
+        help = "Add an exclude glob on top of the default best-practice excludes"
     )]
     pub(crate) exclude: Vec<String>,
     #[arg(
         long = "preset",
         value_name = "NAME",
-        help = "Apply exclude presets such as git-working-tree, rust, or node"
+        help = "Apply additional exclude presets such as git-working-tree, rust, node, or default"
     )]
     pub(crate) presets: Vec<String>,
+    #[arg(
+        long = "no-default-excludes",
+        default_value_t = false,
+        help = "Do not apply best-practice excludes for VCS internals, dependencies, build outputs, and caches"
+    )]
+    pub(crate) no_default_excludes: bool,
     #[arg(
         long = "include",
         value_name = "GLOB",
@@ -551,7 +557,7 @@ pub(crate) struct RootSetArgs {
     #[arg(
         long = "preset",
         value_name = "NAME",
-        help = "Apply exclude presets such as git-working-tree, rust, or node"
+        help = "Apply exclude presets such as default, git-working-tree, rust, or node"
     )]
     pub(crate) presets: Vec<String>,
     #[arg(long, default_value_t = false)]

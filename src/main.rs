@@ -4447,6 +4447,7 @@ tier = "Bulk"
                 name: None,
                 exclude: Vec::new(),
                 presets: Vec::new(),
+                no_default_excludes: false,
                 include: Vec::new(),
                 follow_symlinks: false,
                 require_mount: false,

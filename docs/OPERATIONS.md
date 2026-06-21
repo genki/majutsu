@@ -56,9 +56,14 @@ event journal や queue では、apparent size が小さくても disk usage が
 
 ```sh
 mj init --encrypt --remote s3://bucket/prefix/user
-mj root add moon ~/moon --preset git-working-tree
+mj root add moon ~/moon
 mj daemon service --provider systemd --scope user
 ```
+
+新規 root は VCS 内部、依存物、build output、cache を既定で除外する。完全な
+ファイルシステム像を保存したい場合だけ `mj root add <id> <path> --no-default-excludes`
+を使う。root 固有に追加で外すものがある場合は `--exclude`、`--preset`、`mj root set`
+で明示する。
 
 `/etc`、systemd system unit、root所有のenvファイル、`/usr/local/sbin` の手製スクリプトなど、
 ホスト復旧に必要で通常ユーザーから読めない構成は、root権限のsystemインスタンスで保護する。

@@ -185,10 +185,10 @@ For a guided first run, see [Getting Started](docs/GETTING_STARTED.md).
 
 ```sh
 mj init
-mj root add home-notes ~/notes --exclude '**/.git/**'
+mj root add home-notes ~/notes
 mj snapshot --message 'first snapshot'
 mj state 1d -r home-notes --diff
-mj sync
+mj sync --wait
 mj sync status
 mj remote fsck
 mj log
@@ -342,6 +342,24 @@ mj root set app-data --snapshot-mode transactional \
 silently overwritten; use `root set` for intentional changes.
 `root set` records a `config-change` operation so root policy changes are
 visible in the operation log.
+
+New roots apply best-practice excludes by default for reproducible or generated
+subtrees such as VCS internals (`.git`, `.jj`, `.hg`, `.svn`), dependency
+directories (`node_modules`, virtualenvs), build outputs (`target`, `build`,
+`dist`, `out`), and common caches. This keeps root addition aligned with the
+host-loss recovery goal: protect authored data and avoid filling backend
+history with data that can be regenerated.
+
+If a root really must capture everything, opt out explicitly:
+
+```sh
+mj root add full-image /path/to/root --no-default-excludes
+```
+
+Use `--exclude`, `--preset`, or `mj root set` for additional root-specific
+policy. Sensitive authored files such as `.env` or kubeconfig files are not
+silently excluded by default; use encrypted state/remotes or add explicit
+excludes when those files should not be backed up.
 
 
 ## Branching
@@ -1020,13 +1038,13 @@ store structured watch fields when a path can be matched to a configured root:
 Git working tree や小ファイルが多い root では、次の形を推奨する。
 
 ```sh
-mj root add moon ~/moon --preset git-working-tree
-mj sync
+mj root add moon ~/moon
+mj sync --wait
 mj remote fsck
 mj remote fsck --deep
 ```
 
-`mj sync` は小さな loose blob が多い場合に自動 pack してから upload し、pack 済みになった旧 loose blob object は他 host の GC mark を確認してから remote から削除する。S3 互換 remote の list は pagination に対応し、`remote fsck` は通常 quick mode、`--deep` 指定時のみ payload 検証を行う。調整項目は `docs/MOON_ROOT_STORAGE_OPTIMIZATION.md` を参照する。
+新規 root は VCS 内部、依存物、build output、cache を既定で除外する。moon 固有の sensitive path もまとめて除外したい場合は `--preset git-working-tree` を追加する。`mj sync` は小さな loose blob が多い場合に自動 pack してから upload し、pack 済みになった旧 loose blob object は他 host の GC mark を確認してから remote から削除する。S3 互換 remote の list は pagination に対応し、`remote fsck` は通常 quick mode、`--deep` 指定時のみ payload 検証を行う。調整項目は `docs/MOON_ROOT_STORAGE_OPTIMIZATION.md` を参照する。
 
 
 ## remote metadata storage efficiency
