@@ -24,7 +24,9 @@ pub(crate) fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
     let conn = open_db(paths)?;
     let restore_args = RestoreArgs {
         snapshot: args.snapshot.clone(),
+        op: None,
         at: args.at.clone(),
+        ago: None,
         root: args.root.clone(),
         path: args.path.clone(),
         to: Some(args.mountpoint.clone()),

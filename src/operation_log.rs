@@ -366,6 +366,28 @@ pub(crate) fn query_operation(conn: &Connection, op_id: &str) -> Result<Operatio
     .ok_or_else(|| anyhow!("unknown operation: {op_id}"))
 }
 
+pub(crate) fn query_operation_resolved(conn: &Connection, input: &str) -> Result<OperationExport> {
+    match query_operation(conn, input) {
+        Ok(op) => Ok(op),
+        Err(_) => {
+            let matches = operation_ids_with_prefix(conn, input)?;
+            match matches.as_slice() {
+                [id] => query_operation(conn, id),
+                [] => Err(anyhow!("unknown operation: {input}")),
+                _ => Err(anyhow!("ambiguous operation prefix: {input}")),
+            }
+        }
+    }
+}
+
+fn operation_ids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("select id from operations where id like ?1 order by created_at")?;
+    let rows = stmt.query_map(params![format!("{prefix}%")], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 pub(crate) fn query_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
     let mut stmt = conn.prepare(
         "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state from operations order by created_at",

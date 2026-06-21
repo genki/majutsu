@@ -188,7 +188,8 @@ sync; snapshots are durable timeline checkpoints and compaction boundaries.
 
 ## Quick Start
 
-For a guided first run, see [Getting Started](docs/GETTING_STARTED.md).
+For a guided first run, see [Getting Started](docs/GETTING_STARTED.md). For
+restore-focused examples, see the [Restore Tutorial](docs/RESTORE_TUTORIAL.md).
 
 ```sh
 mj init
@@ -199,6 +200,9 @@ mj sync --wait
 mj sync status
 mj remote fsck
 mj log
+mj restore plan --ago 2h --root home-notes --to /tmp/majutsu-restore
+mj restore apply --ago 2h --root home-notes --to /tmp/majutsu-restore
+mj restore plan --op op-e0b88514 --root home-notes --to /tmp/majutsu-restore
 mj restore --at "2026-06-06 10:30:00" --root home-notes --to /tmp/majutsu-restore
 mj restore plan --to /tmp/majutsu-restore
 mj restore apply --to /tmp/majutsu-restore
@@ -223,6 +227,9 @@ Time arguments such as `--at` accept RFC3339 timestamps, `YYYY-MM-DD HH:MM:SS`
 in the local timezone, `YYYY-MM-DD` as local midnight, `now`, and relative
 values such as `10 minutes ago`. Use RFC3339 with an explicit offset, such as
 `2026-06-06T10:30:00+09:00`, when exchanging commands across hosts.
+Use `--ago 2h` for compact relative restore selectors. Use `--op op-e0b88514`
+to restore the state produced by an operation id or unambiguous operation id
+prefix.
 
 Restore views can be managed through the restore namespace:
 

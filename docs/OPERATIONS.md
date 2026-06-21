@@ -450,6 +450,10 @@ mj restore resume <restore-job-id>
 offset を含まない `YYYY-MM-DD HH:MM:SS` は実行環境の local timezone として扱う。
 ホスト間で手順を共有する場合は `2026-06-06T10:30:00+09:00` のように
 RFC3339 offset を明示する。
+相対時刻で復元する場合は `--ago 2h` のように指定できる。operation log 上の
+特定操作が作った状態を復元する場合は、曖昧でない prefix を使って
+`mj restore plan --op op-e0b88514 --root photos --to /tmp/photos-restore`
+のように指定する。
 
 provider が非同期 restore window を必要とする場合は、provider 側の restore 完了を待ってから resume する。
 

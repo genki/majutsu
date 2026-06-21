@@ -1,14 +1,15 @@
 use crate::majutsu_core::{
     FileRecord, RootSnapshot, SnapshotManifest, TreeManifest, TreeNodeManifest,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::fs;
 
 use crate::cli::RestoreArgs;
 use crate::config::Paths;
-use crate::util::parse_time;
+use crate::operation_log::query_operation_resolved;
+use crate::util::{parse_duration_ago, parse_time};
 
 pub(crate) fn current_snapshot(conn: &Connection) -> Result<Option<String>> {
     conn.query_row("select value from refs where name='current'", [], |row| {
@@ -23,14 +24,36 @@ pub(crate) fn load_snapshot_header(
     conn: &Connection,
     args: &RestoreArgs,
 ) -> Result<SnapshotManifest> {
-    let id = if let Some(id) = &args.snapshot {
-        id.clone()
-    } else if let Some(at) = &args.at {
-        snapshot_id_at(conn, at)?
-    } else {
-        current_snapshot(conn)?.ok_or_else(|| anyhow!("no current snapshot"))?
-    };
+    let selector_count = args.snapshot.is_some() as usize
+        + args.op.is_some() as usize
+        + args.at.is_some() as usize
+        + args.ago.is_some() as usize;
+    if selector_count > 1 {
+        bail!("use only one of --snapshot, --op, --at, or --ago");
+    }
+    let id = selected_snapshot_id(conn, args)?;
     load_snapshot_header_by_id(paths, conn, &id)
+}
+
+pub(crate) fn selected_snapshot_id(conn: &Connection, args: &RestoreArgs) -> Result<String> {
+    if let Some(id) = &args.snapshot {
+        return Ok(id.clone());
+    }
+    if let Some(op_id) = &args.op {
+        let op = query_operation_resolved(conn, op_id)?;
+        return op
+            .after_snapshot
+            .or(op.before_snapshot)
+            .ok_or_else(|| anyhow!("operation has no snapshot to restore: {op_id}"));
+    }
+    if let Some(at) = &args.at {
+        return snapshot_id_at(conn, at);
+    }
+    if let Some(ago) = &args.ago {
+        let at = parse_duration_ago(ago)?.to_rfc3339();
+        return snapshot_id_at(conn, &at);
+    }
+    current_snapshot(conn)?.ok_or_else(|| anyhow!("no current snapshot"))
 }
 
 pub(crate) fn snapshot_id_at(conn: &Connection, at: &str) -> Result<String> {

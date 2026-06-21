@@ -304,7 +304,9 @@ fn apply_branch_restore(
 ) -> Result<()> {
     let args = RestoreArgs {
         snapshot: Some(snapshot_id.to_string()),
+        op: None,
         at: None,
+        ago: None,
         root: None,
         path: None,
         to,

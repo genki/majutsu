@@ -683,19 +683,44 @@ pub(crate) struct RestoreTopArgs {
 
 #[derive(Args, Clone)]
 pub(crate) struct RestoreArgs {
-    #[arg(long)]
+    #[arg(long, help = "Restore this snapshot id")]
     pub(crate) snapshot: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Restore the state produced by this operation id or prefix"
+    )]
+    pub(crate) op: Option<String>,
+    #[arg(long, help = "Restore the latest snapshot at or before this time")]
     pub(crate) at: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Restore the latest snapshot at or before this relative duration, such as 2h"
+    )]
+    pub(crate) ago: Option<String>,
+    #[arg(long, help = "Limit restore to one configured root id")]
     pub(crate) root: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Limit restore to this relative path inside the selected root"
+    )]
     pub(crate) path: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Restore into this directory instead of the configured root paths"
+    )]
     pub(crate) to: Option<PathBuf>,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow overwrites and deletes during restore"
+    )]
     pub(crate) force: bool,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Refuse restore when destination files conflict with the selected snapshot"
+    )]
     pub(crate) check_conflicts: bool,
 }
 

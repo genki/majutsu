@@ -139,7 +139,9 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
             ensure_restore_job_not_blocked(&job)?;
             let args = RestoreArgs {
                 snapshot: Some(job.snapshot_id.clone()),
+                op: None,
                 at: None,
+                ago: None,
                 root: job.root.clone(),
                 path: job.path.as_ref().map(PathBuf::from),
                 to: if job.target == "original-roots" {

@@ -35,7 +35,7 @@ use crate::config::{Config, Paths, RootConfig, read_config};
 use crate::daemon_runtime::{
     DaemonHealth, DaemonHealthState, daemon_health, ensure_daemon_running,
 };
-use crate::operation_log::{query_operation, record_op};
+use crate::operation_log::{query_operation_resolved, record_op};
 use crate::process_runtime::process_lock_owner;
 use crate::queue_runtime::{
     event_journal_records, event_journal_stats, record_event, remote_event_journal_stats,
@@ -2773,25 +2773,7 @@ fn state_basis_from_snapshot(
 }
 
 fn resolve_operation(conn: &Connection, input: &str) -> Result<OperationExport> {
-    match query_operation(conn, input) {
-        Ok(op) => Ok(op),
-        Err(_) => {
-            let matches = operation_ids_with_prefix(conn, input)?;
-            match matches.as_slice() {
-                [id] => query_operation(conn, id),
-                [] => bail!("unknown operation: {input}"),
-                _ => bail!("ambiguous operation prefix: {input}"),
-            }
-        }
-    }
-}
-
-fn operation_ids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("select id from operations where id like ?1 order by created_at")?;
-    let rows = stmt.query_map(params![format!("{prefix}%")], |row| row.get(0))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    query_operation_resolved(conn, input)
 }
 
 fn resolve_snapshot_id(conn: &Connection, input: &str) -> Result<String> {
@@ -5151,7 +5133,7 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
     match command {
         OpCommand::Log(args) => print_op_log(paths, &conn, &args),
         OpCommand::Show(args) => {
-            let op = query_operation(&conn, &args.op_id)?;
+            let op = query_operation_resolved(&conn, &args.op_id)?;
             println!("id {}", op.id);
             println!("parent {}", op.parent_op.as_deref().unwrap_or("(none)"));
             println!("kind {}", op.kind);
@@ -5197,12 +5179,13 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
             Ok(())
         }
         OpCommand::Diff(args) => {
-            let op = query_operation(&conn, &args.op_id)?;
+            let op = query_operation_resolved(&conn, &args.op_id)?;
             print_op_diff(paths, &conn, &op, args.root.as_deref())?;
             Ok(())
         }
         OpCommand::Restore { op_id } => {
-            let op = query_operation(&conn, &op_id)?;
+            let op = query_operation_resolved(&conn, &op_id)?;
+            let resolved_op_id = op.id.clone();
             let before = current_snapshot(&conn)?;
             let snapshot = op
                 .before_snapshot
@@ -5219,7 +5202,7 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
                 "op-restore",
                 before.as_deref(),
                 Some(&snapshot),
-                Some(&op_id),
+                Some(&resolved_op_id),
             )?;
             println!("current {}", snapshot);
             Ok(())

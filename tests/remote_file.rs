@@ -7571,6 +7571,7 @@ fn relative_time_arguments_work_for_diff_and_restore() {
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
     let restore = tmp.path().join("restore");
+    let restore_ago = tmp.path().join("restore-ago");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
 
@@ -7622,6 +7623,25 @@ fn relative_time_arguments_work_for_diff_and_restore() {
     });
     assert!(diff.contains("M\tsample/alpha.txt"));
     assert!(diff.contains("A\tsample/beta.txt"));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--ago")
+            .arg("10m")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore_ago);
+        c
+    });
+    assert_eq!(
+        fs::read(restore_ago.join("sample/alpha.txt")).unwrap(),
+        b"alpha\n"
+    );
+    assert!(!restore_ago.join("sample/beta.txt").exists());
 
     run({
         let mut c = mj();
@@ -9901,6 +9921,7 @@ fn op_restore_moves_current_ref_to_operation_snapshot() {
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
     let restore = tmp.path().join("restore");
+    let restore_after_op = tmp.path().join("restore-after-op");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("alpha.txt"), b"one\n").unwrap();
 
@@ -9965,6 +9986,36 @@ fn op_restore_moves_current_ref_to_operation_snapshot() {
         .and_then(|line| line.split('\t').next())
         .unwrap()
         .to_string();
+    let second_snapshot_op_prefix = &second_snapshot_op[..12];
+
+    let op_show = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("op")
+            .arg("show")
+            .arg(second_snapshot_op_prefix);
+        c
+    });
+    assert!(op_show.contains(&format!("id {second_snapshot_op}")));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("--op")
+            .arg(second_snapshot_op_prefix)
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore_after_op);
+        c
+    });
+    assert_eq!(
+        fs::read_to_string(restore_after_op.join("sample/alpha.txt")).unwrap(),
+        "two\n"
+    );
 
     let restore_out = output({
         let mut c = mj();
@@ -9972,7 +10023,7 @@ fn op_restore_moves_current_ref_to_operation_snapshot() {
             .arg(&state)
             .arg("op")
             .arg("restore")
-            .arg(&second_snapshot_op);
+            .arg(second_snapshot_op_prefix);
         c
     });
     assert!(restore_out.contains(&format!("current {first_snapshot}")));
