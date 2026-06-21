@@ -12,6 +12,9 @@ selected directories are snapshotted into a host-level state directory
 (`$HOME/.majutsu` by default), with a jj-like operation log and Git LFS-like
 large object handling.
 
+Start with [Getting Started](docs/GETTING_STARTED.md) for a guided local setup,
+remote backup configuration, daemon operation, and restore check.
+
 ## Current MVP
 
 - Host-level state under CLI `--home`, `$MAJUTSU_HOME`, XDG config, or
@@ -177,6 +180,8 @@ sync; snapshots are durable timeline checkpoints and compaction boundaries.
 `mj switch` is a top-level alias for `mj branch switch`.
 
 ## Quick Start
+
+For a guided first run, see [Getting Started](docs/GETTING_STARTED.md).
 
 ```sh
 mj init
