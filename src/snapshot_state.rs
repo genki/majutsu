@@ -75,6 +75,32 @@ pub(crate) fn load_snapshot_header_by_id(
         .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
 }
 
+pub(crate) fn load_snapshot_header_by_id_optional(
+    paths: &Paths,
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<SnapshotManifest>> {
+    let Some((manifest_key, manifest_json)) = conn
+        .query_row(
+            "select manifest_key, manifest_json from snapshots where id=?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    if !manifest_json.trim().is_empty() {
+        return serde_json::from_str(&manifest_json)
+            .with_context(|| format!("parse snapshot manifest metadata {id}"))
+            .map(Some);
+    }
+    let bytes = read_snapshot_manifest_object_raw(paths, id, &manifest_key)?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
+        .map(Some)
+}
+
 pub(crate) fn snapshot_manifest_from_parts(
     paths: &Paths,
     id: &str,

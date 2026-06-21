@@ -45,8 +45,9 @@ use crate::remote_store::open_remote;
 use crate::root_state::roots;
 use crate::snapshot_rules::{build_ignore, is_ignored, is_included};
 use crate::snapshot_state::{
-    current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id, snapshot_contains_root,
-    snapshot_file_map, snapshot_id_at, visit_tree_records,
+    current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id,
+    load_snapshot_header_by_id_optional, snapshot_contains_root, snapshot_file_map, snapshot_id_at,
+    visit_tree_records,
 };
 use crate::util::{blake3_hex, parse_duration_ago, parse_time, path_to_slash, stable_read};
 
@@ -4613,9 +4614,14 @@ fn operation_file_changes(
     let Some(after_id) = op.after_snapshot.as_deref() else {
         return Ok(Vec::new());
     };
-    let after = load_snapshot_header_by_id(paths, conn, after_id)?;
+    let Some(after) = load_snapshot_header_by_id_optional(paths, conn, after_id)? else {
+        return Ok(Vec::new());
+    };
     let before = if let Some(before_id) = op.before_snapshot.as_deref() {
-        Some(load_snapshot_header_by_id(paths, conn, before_id)?)
+        match load_snapshot_header_by_id_optional(paths, conn, before_id)? {
+            Some(snapshot) => Some(snapshot),
+            None => return Ok(Vec::new()),
+        }
     } else {
         None
     };
