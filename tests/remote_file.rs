@@ -13007,6 +13007,7 @@ fn root_commands_sync_config_roots() {
             .arg("add")
             .arg("sample")
             .arg(&source)
+            .arg("--no-default-excludes")
             .arg("--exclude")
             .arg("*.tmp");
         c
@@ -13298,7 +13299,8 @@ fn root_set_exclude_forgets_unmanaged_history_payloads() {
             .arg("root")
             .arg("add")
             .arg("sample")
-            .arg(&source);
+            .arg(&source)
+            .arg("--no-default-excludes");
         c
     });
     run({
@@ -17670,15 +17672,25 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     assert!(op_show.contains("process_path "), "{op_show}");
     let mut synced = false;
     for _ in 0..100 {
-        let queue_empty = fs::read_dir(state.join("queue/uploads"))
-            .map(|entries| entries.count() == 0)
-            .unwrap_or(true);
-        if remote.join("hosts/index.json").exists()
-            && host_metadata_export_path(&remote).exists()
-            && queue_empty
-        {
-            synced = true;
-            break;
+        if let Some(current) = db_ref(&state, "current") {
+            let remote_current = if remote.join("hosts/index.json").exists() {
+                let metadata_path = host_metadata_export_path(&remote);
+                fs::read(&metadata_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|metadata| {
+                        metadata["refs"]["current"].as_str().map(str::to_string)
+                    })
+            } else {
+                None
+            };
+            let queue_empty = fs::read_dir(state.join("queue/uploads"))
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true);
+            if remote_current.as_deref() == Some(current.as_str()) && queue_empty {
+                synced = true;
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
