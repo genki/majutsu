@@ -69,13 +69,20 @@ Majutsu supports Linux, macOS, and Windows for snapshot, history, remote sync, c
 
 ## Install
 
+The recommended install path is the published crates.io package:
+
 ```sh
 cargo install majutsu
 ```
 
-This installs `mj`.
+This installs the `mj` binary. To install a specific released version:
 
-For local development builds, use:
+```sh
+cargo install majutsu --version 0.5.5 --locked
+```
+
+Use repository-local builds only for development or verification of unreleased
+changes:
 
 ```sh
 cargo install --path .
