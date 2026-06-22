@@ -2923,19 +2923,23 @@ fn watch_attribution_issue(records: &[crate::majutsu_db::EventJournalRecord]) ->
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let latest_fs_event = records
+    let latest_watch_event = records
         .iter()
-        .filter(|event| event.kind == "fs-event")
+        .filter(|event| matches!(event.kind.as_str(), "watch-start" | "watch-backend-error"))
         .max_by_key(|event| event.observed_at)?;
-    match latest_fs_event.raw_backend.as_deref() {
-        Some("fanotify") => None,
-        Some(backend) => Some(format!(
-            "latest filesystem event used {backend}; run a root-owned fanotify daemon to record the mutating process pid"
-        )),
-        None => Some(
-            "latest filesystem event has no backend; run a root-owned fanotify daemon to record the mutating process pid"
-                .into(),
-        ),
+    if latest_watch_event.kind == "watch-backend-error" {
+        return Some(format!(
+            "fanotify watch failed: {}; run a root-owned fanotify daemon to record the mutating process pid",
+            latest_watch_event.detail
+        ));
+    }
+    if latest_watch_event.detail.contains("backend=fanotify") {
+        None
+    } else {
+        Some(format!(
+            "watch is not using fanotify: {}; run a root-owned fanotify daemon to record the mutating process pid",
+            latest_watch_event.detail
+        ))
     }
 }
 
