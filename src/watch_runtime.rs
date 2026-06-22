@@ -18,7 +18,8 @@ use walkdir::WalkDir;
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{
-    WatchDaemonLaunchConfig, child_process_exe, start_daemon_ipc, start_watch_daemon,
+    ForegroundDaemonRuntime, WatchDaemonLaunchConfig, child_process_exe, start_daemon_ipc,
+    start_watch_daemon,
 };
 use crate::history_runtime::refresh_runtime_health;
 use crate::operation_log::{OperationOriginOverride, origin_override_from_pid};
@@ -70,6 +71,7 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
         return Ok(());
     }
     let _lock = acquire_process_lock(&paths.daemon_lock, "daemon")?;
+    let _runtime = ForegroundDaemonRuntime::register(paths)?;
     start_daemon_ipc(paths)?;
     match backend {
         "fanotify" => match watch_fanotify(paths, args.clone(), &config) {

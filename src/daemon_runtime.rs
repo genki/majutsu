@@ -7,6 +7,8 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 #[cfg(not(windows))]
@@ -805,6 +807,26 @@ fn cleanup_daemon_runtime(paths: &Paths) {
     let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
 }
 
+pub(crate) struct ForegroundDaemonRuntime {
+    paths: Paths,
+}
+
+impl ForegroundDaemonRuntime {
+    pub(crate) fn register(paths: &Paths) -> Result<Self> {
+        fs::create_dir_all(&paths.runtime)?;
+        fs::write(&paths.daemon_pid, std::process::id().to_string())?;
+        Ok(Self {
+            paths: paths.clone(),
+        })
+    }
+}
+
+impl Drop for ForegroundDaemonRuntime {
+    fn drop(&mut self) {
+        cleanup_daemon_runtime(&self.paths);
+    }
+}
+
 #[cfg(any(unix, windows))]
 pub(crate) fn start_daemon_ipc(paths: &Paths) -> Result<()> {
     use crate::platform_runtime::UnixListener;
@@ -813,6 +835,8 @@ pub(crate) fn start_daemon_ipc(paths: &Paths) -> Result<()> {
     let sock = paths.runtime.join("daemon.sock");
     let _ = fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
+    #[cfg(unix)]
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o666))?;
     let home = paths.home.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {

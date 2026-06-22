@@ -56,6 +56,19 @@ fn synced_object_count(output: &str) -> usize {
         .unwrap_or_else(|| panic!("missing synced object count in output:\n{output}"))
 }
 
+fn set_watch_backend(state: &std::path::Path, backend: &str) {
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        config.replace(
+            "backend = \"fanotify\"",
+            &format!("backend = \"{backend}\""),
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn top_level_help_groups_commands_without_hiding_maintenance_commands() {
     let help = output({
@@ -17045,6 +17058,7 @@ fn status_restarts_stale_daemon_for_active_roots() {
         c.arg("--home").arg(&state).arg("init");
         c
     });
+    set_watch_backend(&state, "notify");
     run({
         let mut c = mj();
         c.arg("--home")
@@ -18041,6 +18055,7 @@ fn root_add_auto_starts_daemon_by_default() {
         c.arg("--home").arg(&state).arg("init");
         c
     });
+    set_watch_backend(&state, "notify");
     let added = output({
         let mut c = mj_auto();
         c.arg("--home")
