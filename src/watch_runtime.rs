@@ -438,6 +438,7 @@ impl FanotifyFd {
         }
         let mut offset = 0usize;
         let n = n as usize;
+        let mut observed = None;
         while offset + mem::size_of::<FanotifyEventMetadata>() <= n {
             let metadata = unsafe {
                 buffer
@@ -456,13 +457,13 @@ impl FanotifyFd {
             }
             offset = offset.saturating_add(metadata.event_len as usize);
             if metadata.pid > 0 && (metadata.mask & (FAN_CLOSE_WRITE_MASK | FAN_MODIFY_MASK)) != 0 {
-                return Ok(Some(FanotifyObservedEvent {
+                observed = Some(FanotifyObservedEvent {
                     pid: metadata.pid as u32,
                     mask: metadata.mask,
-                }));
+                });
             }
         }
-        Ok(None)
+        Ok(observed)
     }
 
     fn drain_buffer(
@@ -525,9 +526,7 @@ impl FanotifyFd {
                 continue;
             }
             if let Some(event) = self.read_one()? {
-                if origin.is_none() {
-                    origin = event.origin();
-                }
+                origin = event.origin();
                 events += 1;
                 last_event = Instant::now();
             }
