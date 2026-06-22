@@ -1,7 +1,15 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::mem;
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
@@ -13,6 +21,7 @@ use crate::daemon_runtime::{
     WatchDaemonLaunchConfig, child_process_exe, start_daemon_ipc, start_watch_daemon,
 };
 use crate::history_runtime::refresh_runtime_health;
+use crate::operation_log::{OperationOriginOverride, origin_override_from_pid};
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{
     event_journal_records, record_event, record_file_event, upload_queue_stats,
@@ -61,11 +70,182 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     let _lock = acquire_process_lock(&paths.daemon_lock, "daemon")?;
     start_daemon_ipc(paths)?;
     match backend {
+        "fanotify" => match watch_fanotify(paths, args.clone(), &config) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                record_event(
+                    paths,
+                    "watch-backend-fallback",
+                    &format!("backend=fanotify fallback=inotify error={err:#}"),
+                )?;
+                eprintln!("fanotify unavailable; falling back to inotify: {err:#}");
+                watch_notify(paths, args, "inotify")
+            }
+        },
         "notify" => watch_notify(paths, args, "notify"),
         "inotify" => watch_notify(paths, args, "inotify"),
         "poll" => watch_poll(paths, &args),
         other => bail!("unsupported watch backend: {other}"),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn watch_fanotify(
+    _paths: &Paths,
+    _args: ResolvedWatchArgs,
+    _config: &crate::config::Config,
+) -> Result<()> {
+    bail!("fanotify backend is only available on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn watch_fanotify(
+    paths: &Paths,
+    args: ResolvedWatchArgs,
+    _config: &crate::config::Config,
+) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("fanotify backend requires root privileges")
+    }
+    let conn = open_db(paths)?;
+    let active_roots = roots(&conn)?
+        .into_iter()
+        .filter(|root| root.status == "active" && root.path.exists())
+        .collect::<Vec<_>>();
+    if active_roots.is_empty() {
+        bail!("no active roots are available to watch");
+    }
+    let fanotify = FanotifyFd::new()?;
+    let mut watched = 0usize;
+    for root in &active_roots {
+        let watch_dirs = match watchable_directories(root) {
+            Ok(watch_dirs) => watch_dirs,
+            Err(err) => {
+                record_event(
+                    paths,
+                    "watch-root-error",
+                    &format!("{} {}: {err:#}", root.id, root.path.display()),
+                )?;
+                continue;
+            }
+        };
+        for dir in &watch_dirs {
+            match fanotify.mark_dir(dir) {
+                Ok(()) => watched += 1,
+                Err(err) => record_event(
+                    paths,
+                    "watch-dir-error",
+                    &format!("{} {}: fanotify {err:#}", root.id, dir.display()),
+                )?,
+            }
+        }
+        record_event(
+            paths,
+            "watch-root",
+            &format!("{} {} backend=fanotify", root.id, root.path.display()),
+        )?;
+    }
+    if watched == 0 {
+        bail!("no active roots could be watched by fanotify");
+    }
+    record_event(
+        paths,
+        "watch-start",
+        &format!(
+            "backend=fanotify mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={}",
+            args.mode,
+            args.debounce_ms,
+            args.settle_ms,
+            args.buffer_max_ms,
+            args.buffer_max_events,
+            args.periodic_rescan_secs
+        ),
+    )?;
+    record_health(paths);
+    if replay_pending_journal_events(paths)? {
+        sync_current_external(paths)?;
+        record_health(paths);
+        if args.once {
+            record_event(
+                paths,
+                "watch-stop",
+                "foreground fanotify watch stopped after journal replay",
+            )?;
+            return Ok(());
+        }
+    }
+    loop {
+        let Some(event) = fanotify.recv(args.periodic_rescan_secs)? else {
+            notify_stalled_pending_journal(paths)?;
+            record_event(
+                paths,
+                "periodic-rescan",
+                &format!("interval_secs={}", args.periodic_rescan_secs),
+            )?;
+            snapshot_and_maybe_sync(
+                paths,
+                SnapshotArgs {
+                    message: Some("watch periodic rescan".into()),
+                    origin: None,
+                },
+            )?;
+            record_health(paths);
+            if args.once {
+                break;
+            }
+            continue;
+        };
+        record_fanotify_event(paths, &event)?;
+        let origin = event.origin();
+        if args.mode == "strict" {
+            snapshot_and_maybe_sync(
+                paths,
+                SnapshotArgs {
+                    message: Some("watch strict event snapshot".into()),
+                    origin,
+                },
+            )?;
+            if args.once {
+                break;
+            }
+            continue;
+        }
+        let buffer = FanotifyBufferConfig {
+            quiet: Duration::from_millis(args.debounce_ms.saturating_add(args.settle_ms).max(1)),
+            max_latency: Duration::from_millis(args.buffer_max_ms.max(1)),
+            max_events: args.buffer_max_events.max(1),
+        };
+        let outcome = fanotify.drain_buffer(buffer, origin)?;
+        record_event(
+            paths,
+            "watch-buffer-flush",
+            &format!(
+                "reason={} events={} elapsed_ms={} origin_pid={}",
+                outcome.reason,
+                outcome.events,
+                outcome.elapsed_ms,
+                outcome
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.process_id)
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "(none)".into())
+            ),
+        )?;
+        snapshot_and_maybe_sync(
+            paths,
+            SnapshotArgs {
+                message: Some("watch event snapshot".into()),
+                origin: outcome.origin,
+            },
+        )?;
+        record_health(paths);
+        if args.once {
+            break;
+        }
+    }
+    record_event(paths, "watch-stop", "foreground fanotify watch stopped")?;
+    Ok(())
 }
 
 fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedWatchArgs> {
@@ -99,6 +279,7 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
             paths,
             SnapshotArgs {
                 message: Some("watch snapshot".into()),
+                origin: None,
             },
         )?;
         record_health(paths);
@@ -152,6 +333,257 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
         NotifyConfig::default(),
     )?;
     watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx)
+}
+
+#[cfg(target_os = "linux")]
+const FAN_CLOSE_WRITE_MASK: u64 = 0x00000008;
+#[cfg(target_os = "linux")]
+const FAN_MODIFY_MASK: u64 = 0x00000002;
+#[cfg(target_os = "linux")]
+const FAN_EVENT_ON_CHILD_MASK: u64 = 0x08000000;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FanotifyEventMetadata {
+    event_len: u32,
+    vers: u8,
+    reserved: u8,
+    metadata_len: u16,
+    mask: u64,
+    fd: i32,
+    pid: i32,
+}
+
+#[cfg(target_os = "linux")]
+struct FanotifyFd {
+    fd: RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl FanotifyFd {
+    fn new() -> Result<Self> {
+        let fd = unsafe {
+            libc::fanotify_init(
+                libc::FAN_CLASS_NOTIF | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
+                (libc::O_RDONLY | libc::O_CLOEXEC) as u32,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("fanotify_init");
+        }
+        Ok(Self { fd })
+    }
+
+    fn mark_dir(&self, path: &Path) -> Result<()> {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .with_context(|| format!("fanotify path contains NUL: {}", path.display()))?;
+        let mask = FAN_CLOSE_WRITE_MASK | FAN_MODIFY_MASK | FAN_EVENT_ON_CHILD_MASK;
+        let rc = unsafe {
+            libc::fanotify_mark(
+                self.fd,
+                libc::FAN_MARK_ADD | libc::FAN_MARK_ONLYDIR | libc::FAN_MARK_DONT_FOLLOW,
+                mask,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("fanotify_mark");
+        }
+        Ok(())
+    }
+
+    fn recv(&self, periodic_rescan_secs: u64) -> Result<Option<FanotifyObservedEvent>> {
+        let timeout_ms = if periodic_rescan_secs == 0 {
+            -1
+        } else {
+            periodic_rescan_secs
+                .saturating_mul(1000)
+                .min(i32::MAX as u64) as i32
+        };
+        let mut pollfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("poll fanotify fd");
+        }
+        if rc == 0 {
+            return Ok(None);
+        }
+        self.read_one()
+    }
+
+    fn read_one(&self) -> Result<Option<FanotifyObservedEvent>> {
+        let mut buffer = [0u8; 8192];
+        let n = unsafe {
+            libc::read(
+                self.fd,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(err).context("read fanotify event");
+        }
+        let mut offset = 0usize;
+        let n = n as usize;
+        while offset + mem::size_of::<FanotifyEventMetadata>() <= n {
+            let metadata = unsafe {
+                buffer
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<FanotifyEventMetadata>()
+                    .read_unaligned()
+            };
+            if metadata.event_len == 0 {
+                break;
+            }
+            if metadata.fd >= 0 {
+                unsafe {
+                    libc::close(metadata.fd);
+                }
+            }
+            offset = offset.saturating_add(metadata.event_len as usize);
+            if metadata.pid > 0 && (metadata.mask & (FAN_CLOSE_WRITE_MASK | FAN_MODIFY_MASK)) != 0 {
+                return Ok(Some(FanotifyObservedEvent {
+                    pid: metadata.pid as u32,
+                    mask: metadata.mask,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn drain_buffer(
+        &self,
+        config: FanotifyBufferConfig,
+        mut origin: Option<OperationOriginOverride>,
+    ) -> Result<FanotifyBufferOutcome> {
+        let started = Instant::now();
+        let mut last_event = started;
+        let mut events = 1usize;
+        loop {
+            if events >= config.max_events {
+                return Ok(FanotifyBufferOutcome {
+                    reason: "max-events",
+                    events,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    origin,
+                });
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= config.max_latency {
+                return Ok(FanotifyBufferOutcome {
+                    reason: "max-latency",
+                    events,
+                    elapsed_ms: elapsed.as_millis(),
+                    origin,
+                });
+            }
+            let quiet_remaining = config
+                .quiet
+                .checked_sub(last_event.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if quiet_remaining.is_zero() {
+                return Ok(FanotifyBufferOutcome {
+                    reason: "quiet",
+                    events,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    origin,
+                });
+            }
+            let timeout = quiet_remaining
+                .min(config.max_latency.saturating_sub(elapsed))
+                .max(Duration::from_millis(1));
+            let mut pollfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut pollfd,
+                    1,
+                    timeout.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error()).context("poll fanotify buffer");
+            }
+            if rc == 0 {
+                continue;
+            }
+            if let Some(event) = self.read_one()? {
+                if origin.is_none() {
+                    origin = event.origin();
+                }
+                events += 1;
+                last_event = Instant::now();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FanotifyFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct FanotifyObservedEvent {
+    pid: u32,
+    mask: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl FanotifyObservedEvent {
+    fn origin(&self) -> Option<OperationOriginOverride> {
+        Some(origin_override_from_pid(
+            self.pid,
+            Some("fanotify".into()),
+            Some(format!("pid-{}", self.pid)),
+            "fanotify",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct FanotifyBufferConfig {
+    quiet: Duration,
+    max_latency: Duration,
+    max_events: usize,
+}
+
+#[cfg(target_os = "linux")]
+struct FanotifyBufferOutcome {
+    reason: &'static str,
+    events: usize,
+    elapsed_ms: u128,
+    origin: Option<OperationOriginOverride>,
+}
+
+#[cfg(target_os = "linux")]
+fn record_fanotify_event(paths: &Paths, event: &FanotifyObservedEvent) -> Result<()> {
+    record_event(
+        paths,
+        "fs-event",
+        &format!(
+            "fanotify mask=0x{:x} origin_pid={} origin_confidence=fanotify",
+            event.mask, event.pid
+        ),
+    )
 }
 
 fn watch_notify_loop<W: Watcher>(
@@ -225,6 +657,7 @@ fn watch_notify_loop<W: Watcher>(
                     paths,
                     SnapshotArgs {
                         message: Some("watch periodic rescan".into()),
+                        origin: None,
                     },
                 )?;
                 record_health(paths);
@@ -250,6 +683,7 @@ fn watch_notify_loop<W: Watcher>(
                 paths,
                 SnapshotArgs {
                     message: Some("watch strict event snapshot".into()),
+                    origin: None,
                 },
             )?;
             if args.once {
@@ -276,6 +710,7 @@ fn watch_notify_loop<W: Watcher>(
             paths,
             SnapshotArgs {
                 message: Some("watch event snapshot".into()),
+                origin: None,
             },
         )?;
         record_health(paths);
@@ -455,15 +890,34 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         return Ok(());
     }
 
+    let origin = args.origin;
     let message = args.message.unwrap_or_else(|| "watch snapshot".into());
     let exe = child_process_exe()?;
-    let output = std::process::Command::new(&exe)
+    let mut command = std::process::Command::new(&exe);
+    command
         .arg("--home")
         .arg(&paths.home)
         .arg("snapshot")
         .arg("--message")
-        .arg(&message)
-        .output()?;
+        .arg(&message);
+    if let Some(origin) = &origin {
+        if let Some(label) = &origin.label {
+            command.env("MAJUTSU_ORIGIN_LABEL", label);
+        }
+        if let Some(session_id) = &origin.session_id {
+            command.env("MAJUTSU_ORIGIN_SESSION_ID", session_id);
+        }
+        if let Some(pid) = origin.process_id {
+            command.env("MAJUTSU_ORIGIN_PID", pid.to_string());
+        }
+        if let Some(exe) = &origin.exe {
+            command.env("MAJUTSU_ORIGIN_EXE", exe);
+        }
+        if let Some(confidence) = &origin.confidence {
+            command.env("MAJUTSU_ORIGIN_CONFIDENCE", confidence);
+        }
+    }
+    let output = command.output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("snapshot already running with pid") {

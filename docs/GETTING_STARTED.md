@@ -150,7 +150,15 @@ changes are observed and synced without relying on manual snapshots.
 Foreground check:
 
 ```sh
-mj watch --foreground --backend notify --debounce-ms 1500
+mj watch --foreground true --debounce-ms 1500
+```
+
+On Linux, majutsu defaults to `fanotify` and falls back to `inotify` when
+fanotify is unavailable. Run the system instance as root when origin attribution
+matters:
+
+```sh
+sudo mj --system watch --foreground true --backend fanotify
 ```
 
 User-level systemd service:
@@ -179,9 +187,10 @@ sudo mj --system daemon service --provider systemd --scope system \
 sudo systemctl enable --now majutsu.service
 ```
 
-Do not run the user instance with sudo to protect both user repos and system
-files. Keep user and system state homes, backend prefixes, and encryption keys
-separate.
+For Linux host protection, the system instance is also the preferred daemon for
+fanotify-based origin attribution. Do not run the user instance with sudo to
+protect both user repos and system files. Keep user and system state homes,
+backend prefixes, and encryption keys separate.
 
 ## 7. Verify Restore
 

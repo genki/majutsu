@@ -400,6 +400,7 @@ fn sync_configured_remote(
             message: Some("pushed metadata and objects"),
             error: None,
             remote_sync_state: Some("queued"),
+            origin: None,
         },
     )?;
     trace.mark("record sync op");

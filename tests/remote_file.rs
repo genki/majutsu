@@ -16941,6 +16941,7 @@ fn watch_uses_configured_timing_defaults() {
     let config_path = state.join("config.toml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
+        .replace("backend = \"fanotify\"", "backend = \"notify\"")
         .replace("backend = \"inotify\"", "backend = \"notify\"")
         .replace("debounce = 1500", "debounce = \"25ms\"")
         .replace("settle = 500", "settle = \"15ms\"")
@@ -17061,7 +17062,7 @@ fn linux_inotify_backend_records_native_events() {
         c
     });
     let config = fs::read_to_string(state.join("config.toml")).unwrap();
-    assert!(config.contains("backend = \"inotify\""));
+    assert!(config.contains("backend = \"fanotify\""));
     run({
         let mut c = mj();
         c.arg("--home")
@@ -17108,7 +17109,7 @@ fn linux_inotify_backend_records_native_events() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_watch_defaults_to_inotify_backend() {
+fn linux_watch_defaults_to_fanotify_and_falls_back_without_root() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
@@ -17150,6 +17151,9 @@ fn linux_watch_defaults_to_inotify_backend() {
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
         .collect::<Vec<_>>()
         .join("\n");
+    assert!(events.contains("backend=fanotify"));
+    assert!(events.contains("watch-backend-fallback"));
+    assert!(events.contains("fallback=inotify"));
     assert!(events.contains("backend=inotify"));
     assert!(events.contains("fs-event"));
 }

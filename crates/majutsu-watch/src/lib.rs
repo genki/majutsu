@@ -3,6 +3,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchBackend {
     Native,
+    Fanotify,
     Inotify,
     Poll,
 }
@@ -12,6 +13,13 @@ impl WatchBackend {
         match value {
             "notify" | "native" => Ok(Self::Native),
             "poll" => Ok(Self::Poll),
+            "fanotify" => {
+                if cfg!(target_os = "linux") {
+                    Ok(Self::Fanotify)
+                } else {
+                    Err("fanotify backend is only available on Linux".into())
+                }
+            }
             "inotify" => {
                 if cfg!(target_os = "linux") {
                     Ok(Self::Inotify)
@@ -25,7 +33,7 @@ impl WatchBackend {
 
     pub fn default_native() -> Self {
         if cfg!(target_os = "linux") {
-            Self::Inotify
+            Self::Fanotify
         } else {
             Self::Native
         }
@@ -34,6 +42,7 @@ impl WatchBackend {
     pub fn as_cli(&self) -> &'static str {
         match self {
             Self::Native => "notify",
+            Self::Fanotify => "fanotify",
             Self::Inotify => "inotify",
             Self::Poll => "poll",
         }
@@ -141,8 +150,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_defaults_to_inotify_backend() {
-        assert_eq!(WatchBackend::default_native(), WatchBackend::Inotify);
-        assert_eq!(default_backend(), "inotify");
+        assert_eq!(WatchBackend::default_native(), WatchBackend::Fanotify);
+        assert_eq!(default_backend(), "fanotify");
+        assert_eq!(
+            WatchBackend::normalize("fanotify").unwrap(),
+            WatchBackend::Fanotify
+        );
         assert_eq!(
             WatchBackend::normalize("inotify").unwrap(),
             WatchBackend::Inotify

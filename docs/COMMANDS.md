@@ -222,6 +222,16 @@ Foreground OS-native filesystem watching:
 mj watch --foreground --mode default --debounce-ms 1500 --settle-ms 500 --periodic-rescan-secs 3600
 ```
 
+On Linux, the default backend is `fanotify`. It is intended for root-owned
+system daemons because fanotify events include the originating pid. If fanotify
+is unavailable or the daemon is not running as root, majutsu records a
+`watch-backend-fallback` event and shrinks to `inotify`.
+
+```sh
+sudo mj --system watch --foreground true --backend fanotify
+mj watch --foreground true --backend inotify
+```
+
 Polling fallback:
 
 ```sh
@@ -240,7 +250,9 @@ mj daemon service --provider systemd --scope user > ~/.config/systemd/user/majut
 
 The daemon is a process wrapper around foreground watch. It records filesystem
 events in the event journal and exposes status IPC under
-`$MAJUTSU_HOME/runtime/daemon.sock`.
+`$MAJUTSU_HOME/runtime/daemon.sock`. On Linux, prefer a root-owned
+`mj --system` daemon so `mj log` can show `fanotify:pid-...` for changes whose
+source process is observable.
 
 ## Prune, pack, and GC
 

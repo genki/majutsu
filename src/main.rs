@@ -186,8 +186,7 @@ use object_paths::{
     large_chunk_base, remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
 };
 use operation_log::{
-    OperationDetails, query_operations, record_op, record_op_with_details, record_op_with_id,
-    rewrite_local_oplog,
+    OperationDetails, query_operations, record_op, record_op_with_details, rewrite_local_oplog,
 };
 use pack_runtime::pack_cmd;
 use process_runtime::acquire_process_lock;
@@ -581,13 +580,19 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
          on conflict(name) do update set value=excluded.value",
         params![manifest.snapshot_id],
     )?;
-    record_op_with_id(
+    record_op_with_details(
         &tx,
-        &op_id,
-        snapshot_operation_kind(args.message.as_deref(), manifest.parent.as_deref()),
-        manifest.parent.as_deref(),
-        Some(&manifest.snapshot_id),
-        args.message.as_deref(),
+        OperationDetails {
+            id: &op_id,
+            kind: snapshot_operation_kind(args.message.as_deref(), manifest.parent.as_deref()),
+            before: manifest.parent.as_deref(),
+            after: Some(&manifest.snapshot_id),
+            status: "done",
+            message: args.message.as_deref(),
+            error: None,
+            remote_sync_state: None,
+            origin: args.origin.clone(),
+        },
     )?;
     insert_snapshot_payload_index(&tx, &manifest)?;
     branch_runtime::update_active_branch_head(&tx, &snapshot_id)?;
@@ -660,6 +665,7 @@ fn record_snapshot_failure(
             message: Some(&message),
             error: Some(&message),
             remote_sync_state: None,
+            origin: None,
         },
     )
 }
@@ -711,6 +717,7 @@ fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
         paths,
         SnapshotArgs {
             message: Some("watch journal replay snapshot".into()),
+            origin: None,
         },
     ) {
         Ok(()) => {}
@@ -4650,6 +4657,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("initial".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -4672,6 +4680,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("after-pack".into()),
+                origin: None,
             },
         )
         .unwrap();

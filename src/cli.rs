@@ -1161,6 +1161,8 @@ pub(crate) struct RootSetArgs {
 pub(crate) struct SnapshotArgs {
     #[arg(long)]
     pub(crate) message: Option<String>,
+    #[arg(skip)]
+    pub(crate) origin: Option<crate::operation_log::OperationOriginOverride>,
 }
 
 #[derive(Args, Clone)]

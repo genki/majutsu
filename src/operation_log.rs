@@ -53,6 +53,7 @@ pub(crate) fn record_op_with_id_and_status(
             message,
             error: None,
             remote_sync_state: None,
+            origin: None,
         },
     )
 }
@@ -66,6 +67,33 @@ pub(crate) struct OperationDetails<'a> {
     pub(crate) message: Option<&'a str>,
     pub(crate) error: Option<&'a str>,
     pub(crate) remote_sync_state: Option<&'a str>,
+    pub(crate) origin: Option<OperationOriginOverride>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OperationOriginOverride {
+    pub(crate) label: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) process_id: Option<u32>,
+    pub(crate) process_path: Option<Vec<u32>>,
+    pub(crate) exe: Option<String>,
+    pub(crate) confidence: Option<String>,
+}
+
+pub(crate) fn origin_override_from_pid(
+    pid: u32,
+    label: Option<String>,
+    session_id: Option<String>,
+    confidence: &str,
+) -> OperationOriginOverride {
+    OperationOriginOverride {
+        label,
+        session_id,
+        process_id: Some(pid),
+        process_path: Some(process_path(pid)),
+        exe: process_exe_string(pid),
+        confidence: Some(confidence.to_string()),
+    }
 }
 
 pub(crate) fn record_op_with_details(
@@ -77,7 +105,11 @@ pub(crate) fn record_op_with_details(
     let actor = operation_actor();
     let session = operation_session();
     let process = operation_process();
-    let origin = operation_origin(&session, &process);
+    let origin = details
+        .origin
+        .clone()
+        .map(OperationOrigin::from)
+        .unwrap_or_else(|| operation_origin(&session, &process));
     let process_path_json = process
         .path
         .as_ref()
@@ -141,6 +173,19 @@ pub(crate) fn record_op_with_details(
     append_local_oplog(conn, &op)?;
     append_operation_audit_log(conn, &op)?;
     Ok(())
+}
+
+impl From<OperationOriginOverride> for OperationOrigin {
+    fn from(value: OperationOriginOverride) -> Self {
+        Self {
+            label: value.label,
+            session_id: value.session_id,
+            process_id: value.process_id,
+            process_path: value.process_path,
+            exe: value.exe,
+            confidence: value.confidence,
+        }
+    }
 }
 
 pub(crate) fn append_local_oplog(conn: &Connection, op: &OperationExport) -> Result<()> {
@@ -364,6 +409,18 @@ fn current_exe_string() -> Option<String> {
     env::current_exe()
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn process_exe_string(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_exe_string(_pid: u32) -> Option<String> {
+    None
 }
 
 fn process_path(pid: u32) -> Vec<u32> {

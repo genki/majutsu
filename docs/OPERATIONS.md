@@ -520,12 +520,15 @@ terminal 系の session 環境変数、最後に記録元 pid へフォールバ
 
 `origin_label`、`origin_session_id`、`origin_process_id`、`origin_process_path`、
 `origin_exe`、`origin_confidence` は実変更者またはその推定値を表す。通常CLI操作では
-現在の `mj` process を `origin_confidence=self` として保存する。daemon / inotify 経由の
-ファイル変更では、kernel の filesystem event から元の editor pid は通常得られないため、
-明示的な origin hint がない限り `origin` は不明として表示される。daemon 自体は
-`session_label=daemon` と `session_id=daemon-pid-<pid>` で `recorded_by` として残る。
+現在の `mj` process を `origin_confidence=self` として保存する。Linux root daemon では
+`fanotify` が既定backendになり、取得できたイベント元pidを `origin_confidence=fanotify`
+として保存する。fanotifyが使えない場合は `watch-backend-fallback` を記録してinotifyへ縮退する。
+inotify / notify 経由のファイル変更では、kernel の filesystem event から元の editor pid は
+通常得られないため、明示的な origin hint がない限り `origin` は不明として表示される。
+daemon 自体は `session_label=daemon` と `session_id=daemon-pid-<pid>` で `recorded_by`
+として残る。
 
-外部ラッパーや将来のfanotify backendが変更元を特定できる場合は、次のhintを渡せる。
+外部ラッパーが変更元を特定できる場合は、次のhintを渡せる。
 
 ```sh
 export MAJUTSU_ORIGIN_LABEL=codex
