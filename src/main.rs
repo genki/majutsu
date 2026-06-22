@@ -3524,9 +3524,14 @@ fn import_metadata(conn: &mut Connection, export: &MetadataExport) -> Result<()>
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let origin_process_path_json = op
+            .origin_process_path
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         tx.execute(
-            "insert or replace into operations(id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "insert or replace into operations(id, parent_op, kind, actor, session_id, session_label, process_id, process_path, origin_label, origin_session_id, origin_process_id, origin_process_path, origin_exe, origin_confidence, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 op.id,
                 op.parent_op,
@@ -3536,6 +3541,12 @@ fn import_metadata(conn: &mut Connection, export: &MetadataExport) -> Result<()>
                 op.session_label,
                 op.process_id,
                 process_path_json,
+                op.origin_label,
+                op.origin_session_id,
+                op.origin_process_id,
+                origin_process_path_json,
+                op.origin_exe,
+                op.origin_confidence,
                 op.status,
                 op.before_snapshot,
                 op.after_snapshot,

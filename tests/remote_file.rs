@@ -11797,6 +11797,11 @@ fn operations_are_appended_to_local_oplog() {
     assert!(op_show.contains("session_label agent-test"));
     assert!(op_show.contains("process_id "));
     assert!(op_show.contains("process_path "));
+    assert!(op_show.contains("origin_label agent-test"));
+    assert!(op_show.contains("origin_session_id session-test-1"));
+    assert!(op_show.contains("origin_process_id "));
+    assert!(op_show.contains("origin_process_path "));
+    assert!(op_show.contains("origin_confidence self"));
     assert!(op_show.contains("status done"));
     run({
         let mut c = mj();
@@ -11838,6 +11843,11 @@ fn operations_are_appended_to_local_oplog() {
     assert_eq!(op["session_label"], "agent-test");
     assert!(op["process_id"].as_u64().unwrap() > 0);
     assert!(!op["process_path"].as_array().unwrap().is_empty());
+    assert_eq!(op["origin_label"], "agent-test");
+    assert_eq!(op["origin_session_id"], "session-test-1");
+    assert!(op["origin_process_id"].as_u64().unwrap() > 0);
+    assert!(!op["origin_process_path"].as_array().unwrap().is_empty());
+    assert_eq!(op["origin_confidence"], "self");
 }
 
 #[test]
@@ -17969,7 +17979,8 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
         c.arg("--home").arg(&state).arg("op").arg("log");
         c
     });
-    assert!(op_log.contains("daemon:daemon-pid-"), "{op_log}");
+    assert!(op_log.contains("file-events-batch"), "{op_log}");
+    assert!(op_log.contains("\tunknown\t"), "{op_log}");
     assert!(!op_log.contains("operator-session"), "{op_log}");
     let daemon_op = op_log
         .lines()
@@ -17989,6 +18000,9 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     assert!(op_show.contains("session_label daemon"), "{op_show}");
     assert!(op_show.contains("process_id "), "{op_show}");
     assert!(op_show.contains("process_path "), "{op_show}");
+    assert!(op_show.contains("origin_label \n"), "{op_show}");
+    assert!(op_show.contains("origin_session_id \n"), "{op_show}");
+    assert!(op_show.contains("origin_process_id \n"), "{op_show}");
     let mut synced = false;
     for _ in 0..100 {
         if let Some(current) = db_ref(&state, "current") {

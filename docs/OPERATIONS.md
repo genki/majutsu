@@ -496,7 +496,11 @@ mj op diff <op-id> --root moon
 `mj op log` は操作単位の履歴、`mj op diff` はその操作の before / after snapshot から
 導出した file-level diff を表示する。
 
-`mj op log` と `mj op show` は、操作を記録した session / process の手掛かりも表示する。
+`mj op log` と `mj op show` は、変更発生源の推定情報と、操作を記録した
+session / process の手掛かりを分けて表示する。通常の `mj log` / `mj op log`
+では `origin_*` を優先して表示し、daemon が観測して記録しただけの変更を
+`daemon:daemon-pid-...` が編集したようには見せない。
+
 複数の coding agent や terminal が同じ root を操作する場合は、次の環境変数を設定しておくと
 op log 上で識別しやすい。
 
@@ -510,11 +514,26 @@ terminal 系の session 環境変数、最後に記録元 pid へフォールバ
 `MAJUTSU_SESSION_LABEL` または `MAJUTSU_AGENT_NAME` を優先する。
 
 `process_id` は操作を記録した `mj` process の pid、`process_path` は OS の root process から
-その pid に至る枝だけを pid 列として保存する。全 process tree は保存しない。daemon / inotify
-経由のファイル変更では、kernel の filesystem event から元の editor pid は通常得られないため、
-変更を観測して snapshot / sync を記録した daemon または子 `mj` process が source process として残る。
-daemon は起動者の `MAJUTSU_SESSION_ID` を継承せず、`session_label=daemon` と
-`session_id=daemon-pid-<pid>` で記録する。
+その pid に至る枝だけを pid 列として保存する。全 process tree は保存しない。これらは
+`recorded_by` 相当の監査情報であり、互換性のため既存の `actor` / `session_*` /
+`process_*` フィールドとして保存し続ける。
+
+`origin_label`、`origin_session_id`、`origin_process_id`、`origin_process_path`、
+`origin_exe`、`origin_confidence` は実変更者またはその推定値を表す。通常CLI操作では
+現在の `mj` process を `origin_confidence=self` として保存する。daemon / inotify 経由の
+ファイル変更では、kernel の filesystem event から元の editor pid は通常得られないため、
+明示的な origin hint がない限り `origin` は不明として表示される。daemon 自体は
+`session_label=daemon` と `session_id=daemon-pid-<pid>` で `recorded_by` として残る。
+
+外部ラッパーや将来のfanotify backendが変更元を特定できる場合は、次のhintを渡せる。
+
+```sh
+export MAJUTSU_ORIGIN_LABEL=codex
+export MAJUTSU_ORIGIN_SESSION_ID=codex-20260623-a
+export MAJUTSU_ORIGIN_PID=12345
+export MAJUTSU_ORIGIN_EXE=/usr/bin/code
+export MAJUTSU_ORIGIN_CONFIDENCE=observed
+```
 
 
 ## remote metadata storage efficiency

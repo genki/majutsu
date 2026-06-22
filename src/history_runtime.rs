@@ -4124,7 +4124,7 @@ where
                 ui.paint(&display_log_timestamp(&op.created_at), "1;34"),
                 display_op_id(&op.id),
                 ui.paint(&op.kind, "36"),
-                operation_session_label(&op),
+                operation_origin_label(&op),
                 summary,
                 op.message.as_deref().unwrap_or_default()
             ))?;
@@ -4539,7 +4539,7 @@ fn recent_change_operations(
     offset: usize,
 ) -> Result<Vec<OperationExport>> {
     let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
+        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, origin_label, origin_session_id, origin_process_id, origin_process_path, origin_exe, origin_confidence, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
          from operations
          where after_snapshot is not null
            and (before_snapshot is null or before_snapshot != after_snapshot)
@@ -4560,7 +4560,7 @@ fn recent_change_operations(
 
 fn recent_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
     let mut stmt = conn.prepare(
-        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
+        "select id, parent_op, kind, actor, session_id, session_label, process_id, process_path, origin_label, origin_session_id, origin_process_id, origin_process_path, origin_exe, origin_confidence, status, before_snapshot, after_snapshot, created_at, message, error, remote_sync_state
          from operations order by rowid desc",
     )?;
     let rows = stmt.query_map([], operation_from_row)?;
@@ -4573,6 +4573,7 @@ fn recent_operations(conn: &Connection) -> Result<Vec<OperationExport>> {
 
 fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationExport> {
     let process_path_json: Option<String> = row.get(7)?;
+    let origin_process_path_json: Option<String> = row.get(11)?;
     Ok(OperationExport {
         id: row.get(0)?,
         parent_op: row.get(1)?,
@@ -4584,13 +4585,21 @@ fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationExpo
         process_path: process_path_json
             .and_then(|value| serde_json::from_str::<Vec<u32>>(&value).ok())
             .filter(|tree| !tree.is_empty()),
-        status: row.get(8)?,
-        before_snapshot: row.get(9)?,
-        after_snapshot: row.get(10)?,
-        created_at: row.get(11)?,
-        message: row.get(12)?,
-        error: row.get(13)?,
-        remote_sync_state: row.get(14)?,
+        origin_label: row.get(8)?,
+        origin_session_id: row.get(9)?,
+        origin_process_id: row.get::<_, Option<i64>>(10)?.map(|pid| pid as u32),
+        origin_process_path: origin_process_path_json
+            .and_then(|value| serde_json::from_str::<Vec<u32>>(&value).ok())
+            .filter(|tree| !tree.is_empty()),
+        origin_exe: row.get(12)?,
+        origin_confidence: row.get(13)?,
+        status: row.get(14)?,
+        before_snapshot: row.get(15)?,
+        after_snapshot: row.get(16)?,
+        created_at: row.get(17)?,
+        message: row.get(18)?,
+        error: row.get(19)?,
+        remote_sync_state: row.get(20)?,
     })
 }
 
@@ -5062,7 +5071,7 @@ fn print_op_log(paths: &Paths, conn: &Connection, args: &LogArgs) -> Result<()> 
     let mut output = String::new();
     let ui = StatusUi::new();
     for row in rows {
-        let session = operation_session_label(&row);
+        let session = operation_origin_label(&row);
         let id = row.id;
         let kind = row.kind;
         let before = row.before_snapshot;
@@ -5141,6 +5150,23 @@ fn operation_session_label(op: &OperationExport) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+fn operation_origin_label(op: &OperationExport) -> String {
+    op.origin_label
+        .as_deref()
+        .zip(op.origin_session_id.as_deref())
+        .map(|(label, id)| format!("{label}:{id}"))
+        .or_else(|| op.origin_session_id.clone())
+        .or_else(|| op.origin_process_id.map(|pid| format!("origin-pid:{pid}")))
+        .or_else(|| {
+            if op.session_label.as_deref() == Some("daemon") {
+                Some("unknown".into())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| operation_session_label(op))
+}
+
 pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
@@ -5172,6 +5198,34 @@ pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {
                             .join(",")
                     })
                     .unwrap_or_default()
+            );
+            println!("origin_label {}", op.origin_label.as_deref().unwrap_or(""));
+            println!(
+                "origin_session_id {}",
+                op.origin_session_id.as_deref().unwrap_or("")
+            );
+            println!(
+                "origin_process_id {}",
+                op.origin_process_id
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_default()
+            );
+            println!(
+                "origin_process_path {}",
+                op.origin_process_path
+                    .as_ref()
+                    .map(|tree| {
+                        tree.iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default()
+            );
+            println!("origin_exe {}", op.origin_exe.as_deref().unwrap_or(""));
+            println!(
+                "origin_confidence {}",
+                op.origin_confidence.as_deref().unwrap_or("")
             );
             println!("status {}", op.status);
             println!(
