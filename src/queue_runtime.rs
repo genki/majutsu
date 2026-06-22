@@ -19,7 +19,7 @@ use crate::snapshot_rules::{
     build_ignore, classify_large, effective_large_config, is_ignored, is_included, looks_binary,
 };
 use crate::snapshot_state::{current_snapshot, load_root_tree_entries, load_snapshot_by_id};
-use crate::util::{blake3_hex, new_id, path_to_slash, stable_read};
+use crate::util::{blake3_hex, new_id, path_to_slash, stable_read, stable_read_in_root};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UploadQueueStats {
@@ -665,7 +665,11 @@ fn scan_live_root_for_journal(
                     continue;
                 }
             }
-            let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
+            let bytes = if root.follow_symlinks {
+                stable_read(entry.path(), root.snapshot_mode.as_str())?
+            } else {
+                stable_read_in_root(scan_base, &rel, root.snapshot_mode.as_str())?
+            };
             let oid = blake3_hex(&bytes);
             FileRecord {
                 root_id: root.id.clone(),
@@ -866,8 +870,17 @@ fn enrich_remote_event_journal_payload(
     let large_config = effective_large_config(config, root);
     let binary = looks_binary(&source).unwrap_or(false);
     if classify_large(&large_config, Path::new(rel_path), meta.len(), binary) {
-        let (oid, manifest_key, chunk_count) =
-            crate::store_large_file(paths, &source, Path::new(rel_path), &large_config, binary)?;
+        let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
+            crate::store_large_file(paths, &source, Path::new(rel_path), &large_config, binary)?
+        } else {
+            crate::store_large_file_in_root(
+                paths,
+                journal_source_base(root),
+                Path::new(rel_path),
+                &large_config,
+                binary,
+            )?
+        };
         enqueue_large_manifest_uploads(paths, &manifest_key)?;
         record.durable_payload_oid = Some(oid);
         record.durable_payload_size = Some(meta.len());
@@ -878,8 +891,17 @@ fn enrich_remote_event_journal_payload(
     if large_config.enabled && meta.len() >= large_config.chunked_min_size {
         let mut chunked_config = large_config.clone();
         chunked_config.chunk_size = large_config.chunked_chunk_size;
-        let (oid, manifest_key, chunk_count) =
-            crate::store_large_file(paths, &source, Path::new(rel_path), &chunked_config, binary)?;
+        let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
+            crate::store_large_file(paths, &source, Path::new(rel_path), &chunked_config, binary)?
+        } else {
+            crate::store_large_file_in_root(
+                paths,
+                journal_source_base(root),
+                Path::new(rel_path),
+                &chunked_config,
+                binary,
+            )?
+        };
         enqueue_large_manifest_uploads(paths, &manifest_key)?;
         record.durable_payload_oid = Some(oid);
         record.durable_payload_size = Some(meta.len());
@@ -887,7 +909,15 @@ fn enrich_remote_event_journal_payload(
         record.durable_large_chunk_count = Some(chunk_count);
         return Ok(());
     }
-    let bytes = stable_read(&source, root.snapshot_mode.as_str())?;
+    let bytes = if root.follow_symlinks {
+        stable_read(&source, root.snapshot_mode.as_str())?
+    } else {
+        stable_read_in_root(
+            journal_source_base(root),
+            Path::new(rel_path),
+            root.snapshot_mode.as_str(),
+        )?
+    };
     let oid = blake3_hex(&bytes);
     let object_key = crate::store_bytes(paths, &paths.objects, &oid, &bytes)?;
     let local_object = paths.home.join(&object_key);

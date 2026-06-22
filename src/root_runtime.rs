@@ -33,6 +33,7 @@ use crate::snapshot_rules::{
     apply_default_root_excludes, apply_root_large_set, apply_root_presets, build_ignore,
     dedup_patterns, is_ignored, is_included, root_large_override, warn_sensitive_root_defaults,
 };
+use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
 
 pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
     crate::ensure_ready(paths)?;
@@ -1185,7 +1186,8 @@ fn read_metadata_manifest<T: for<'de> serde::Deserialize<'de>>(
         if let Ok(value) = serde_json::from_slice(&decoded) {
             return Ok(value);
         }
-        if let Ok(decompressed) = zstd::stream::decode_all(decoded.as_slice())
+        if let Ok(decompressed) =
+            zstd_decode_all_limited(decoded.as_slice(), REMOTE_METADATA_DECODE_LIMIT, key)
             && let Ok(value) = serde_cbor::from_slice(&decompressed)
         {
             return Ok(value);

@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -83,6 +83,67 @@ fn top_level_help_groups_commands_without_hiding_maintenance_commands() {
 }
 
 #[test]
+fn clone_quarantines_remote_hooks_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"safe\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--pre-snapshot")
+            .arg("true")
+            .arg("--post-snapshot")
+            .arg("true");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let clone_out = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone)
+            .arg("clone")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(
+        clone_out.contains("quarantined_remote_hooks 2"),
+        "{clone_out}"
+    );
+    let cloned_config = fs::read_to_string(clone.join("config.toml")).unwrap();
+    assert!(!cloned_config.contains("pre_snapshot"), "{cloned_config}");
+    assert!(!cloned_config.contains("post_snapshot"), "{cloned_config}");
+}
+
+#[test]
 fn commit_and_switch_top_level_aliases_follow_git_like_flow() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -137,6 +198,106 @@ fn commit_and_switch_top_level_aliases_follow_git_like_flow() {
         c
     });
     assert!(current.contains("branch side"), "{current}");
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_does_not_read_symlink_target_when_follow_symlinks_is_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    let outside = tmp.path().join("outside-secret.txt");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(&outside, b"outside secret\n").unwrap();
+    symlink(&outside, source.join("link")).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    let restored_link = restore.join("sample/link");
+    assert_eq!(fs::read_link(&restored_link).unwrap(), outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_rejects_symlink_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let restore = tmp.path().join("restore");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(source.join("dir")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(source.join("dir/file.txt"), b"inside\n").unwrap();
+    fs::write(outside.join("file.txt"), b"outside\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::create_dir_all(restore.join("sample")).unwrap();
+    symlink(&outside, restore.join("sample/dir")).unwrap();
+
+    let failed = {
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore)
+            .arg("--force");
+        c.output().unwrap()
+    };
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("restore target is a symlink"), "{stderr}");
+    assert_eq!(fs::read(outside.join("file.txt")).unwrap(), b"outside\n");
 }
 
 fn root_list_has(root_list: &str, id: &str, status: &str) -> bool {

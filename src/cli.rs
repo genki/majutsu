@@ -1565,6 +1565,11 @@ pub(crate) struct CloneArgs {
     pub(crate) remote: String,
     #[arg(long)]
     pub(crate) host: Option<String>,
+    #[arg(
+        long,
+        help = "Trust executable hooks and application plugins from remote metadata"
+    )]
+    pub(crate) trust_remote_hooks: bool,
 }
 
 #[derive(Args)]

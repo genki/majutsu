@@ -220,8 +220,9 @@ use snapshot_state::{
 };
 use sync_runtime::sync_cmd;
 use util::{
-    blake3_hex, media_type_for_path, modified_secs, new_id, parse_db_time, parse_time,
-    path_to_slash, stable_metadata_matches, stable_read,
+    REMOTE_METADATA_DECODE_LIMIT, blake3_hex, media_type_for_path, modified_secs, new_id,
+    parse_db_time, parse_time, path_to_slash, stable_metadata_matches, stable_open_file_in_root,
+    stable_read, stable_read_in_root, zstd_decode_all_limited,
 };
 use watch_runtime::watch_cmd;
 
@@ -676,7 +677,11 @@ pub(crate) fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
 ) -> Result<T> {
     let compressed = decode_object(paths, bytes)?;
-    let cbor = zstd::stream::decode_all(compressed.as_slice())?;
+    let cbor = zstd_decode_all_limited(
+        compressed.as_slice(),
+        REMOTE_METADATA_DECODE_LIMIT,
+        "canonical remote export",
+    )?;
     Ok(serde_cbor::from_slice(&cbor)?)
 }
 
@@ -685,7 +690,11 @@ pub(crate) fn decode_canonical_remote_oplog(
     bytes: &[u8],
 ) -> Result<Vec<OperationExport>> {
     let compressed = decode_object(paths, bytes)?;
-    let cborl = zstd::stream::decode_all(compressed.as_slice())?;
+    let cborl = zstd_decode_all_limited(
+        compressed.as_slice(),
+        REMOTE_METADATA_DECODE_LIMIT,
+        "canonical remote oplog",
+    )?;
     decode_operation_log(&cborl)
 }
 
@@ -2581,8 +2590,11 @@ fn scan_root(
         let binary = looks_binary(entry.path()).unwrap_or(false);
         let large = classify_large(&large_config, &rel, meta.len(), binary);
         let payload = if large {
-            let (oid, manifest_key, chunk_count) =
-                store_large_file(paths, entry.path(), &rel, &large_config, binary)?;
+            let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
+                store_large_file(paths, entry.path(), &rel, &large_config, binary)?
+            } else {
+                store_large_file_in_root(paths, &root.path, &rel, &large_config, binary)?
+            };
             Payload::LargeObject {
                 oid,
                 manifest_key,
@@ -2598,15 +2610,22 @@ fn scan_root(
         } else if large_config.enabled && meta.len() >= large_config.chunked_min_size {
             let mut chunked_config = large_config.clone();
             chunked_config.chunk_size = large_config.chunked_chunk_size;
-            let (oid, manifest_key, chunk_count) =
-                store_large_file(paths, entry.path(), &rel, &chunked_config, binary)?;
+            let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
+                store_large_file(paths, entry.path(), &rel, &chunked_config, binary)?
+            } else {
+                store_large_file_in_root(paths, &root.path, &rel, &chunked_config, binary)?
+            };
             Payload::ChunkedBlob {
                 oid,
                 manifest_key,
                 chunk_count,
             }
         } else {
-            let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
+            let bytes = if root.follow_symlinks {
+                stable_read(entry.path(), root.snapshot_mode.as_str())?
+            } else {
+                stable_read_in_root(&root.path, &rel, root.snapshot_mode.as_str())?
+            };
             let oid = blake3_hex(&bytes);
             let object_key = if let Some(object_key) = packed_blob_keys.get(oid.as_str()) {
                 object_key.clone()
@@ -2877,19 +2896,33 @@ pub(crate) fn store_large_file(
     if config.default_chunking == "fixed" {
         return store_large_file_fixed_streaming(paths, path, rel, config, binary);
     }
-    store_large_file_buffered(paths, path, rel, config, binary)
+    let bytes = stable_read(path, "strict")?;
+    store_large_bytes_buffered(paths, rel, config, binary, &bytes)
 }
 
-fn store_large_file_buffered(
+pub(crate) fn store_large_file_in_root(
     paths: &Paths,
-    path: &Path,
+    root: &Path,
     rel: &Path,
     config: &LargeConfig,
     binary: bool,
 ) -> Result<(String, String, usize)> {
-    let bytes = stable_read(path, "strict")?;
+    if config.default_chunking == "fixed" {
+        return store_large_file_fixed_streaming_in_root(paths, root, rel, config, binary);
+    }
+    let bytes = stable_read_in_root(root, rel, "strict")?;
+    store_large_bytes_buffered(paths, rel, config, binary, &bytes)
+}
+
+fn store_large_bytes_buffered(
+    paths: &Paths,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+    bytes: &[u8],
+) -> Result<(String, String, usize)> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&bytes);
+    hasher.update(bytes);
     let oid = hasher.finalize().to_hex().to_string();
     let conn = open_db(paths)?;
     if let Some((manifest_key, chunk_count)) =
@@ -2901,7 +2934,7 @@ fn store_large_file_buffered(
     let ranges = crate::majutsu_large::chunk_ranges_for_bytes(
         &config.default_chunking,
         config.chunk_size,
-        &bytes,
+        bytes,
     );
     for (index, (start, end)) in ranges.into_iter().enumerate() {
         let chunk = &bytes[start..end];
@@ -2964,6 +2997,28 @@ fn store_large_file_fixed_streaming(
     Err(last_error.unwrap_or_else(|| anyhow!("file changed while reading: {}", path.display())))
 }
 
+fn store_large_file_fixed_streaming_in_root(
+    paths: &Paths,
+    root: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+) -> Result<(String, String, usize)> {
+    let attempts = 8;
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match store_large_file_fixed_streaming_in_root_once(paths, root, rel, config, binary) {
+            Ok(result) => return Ok(result),
+            Err(err) if is_file_changed_error(&err) => {
+                last_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("file changed while reading: {}", root.join(rel).display())))
+}
+
 fn store_large_file_fixed_streaming_once(
     paths: &Paths,
     path: &Path,
@@ -3004,6 +3059,99 @@ fn store_large_file_fixed_streaming_once(
     let after = fs::metadata(path)?;
     if !stable_metadata_matches(&before, &after) {
         bail!("file changed while reading: {}", path.display());
+    }
+    let oid = hasher.finalize().to_hex().to_string();
+    if let Some((manifest_key, chunk_count)) =
+        existing_large_object_manifest(paths, &conn, &oid, config)?
+    {
+        return Ok((oid, manifest_key, chunk_count));
+    }
+    let manifest = LargeManifest {
+        version: 1,
+        oid: oid.clone(),
+        size: offset,
+        media_type: media_type_for_path(rel),
+        binary,
+        chunking: config.default_chunking.clone(),
+        chunk_size: config.chunk_size,
+        chunks,
+    };
+    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+    let manifest_oid = blake3_hex(&manifest_json);
+    let manifest_key = store_bytes(paths, &paths.large_manifests, &manifest_oid, &manifest_json)?;
+    for chunk in &manifest.chunks {
+        conn.execute(
+            "insert or replace into chunks(oid, size, object_key) values (?1, ?2, ?3)",
+            params![chunk.oid, chunk.len, chunk.object_key],
+        )?;
+    }
+    conn.execute(
+        "insert or replace into large_objects(oid, size, chunk_count, manifest_key) values (?1, ?2, ?3, ?4)",
+        params![oid, manifest.size, manifest.chunks.len(), manifest_key],
+    )?;
+    insert_large_object_chunk_index(&conn, &manifest)?;
+    Ok((oid, manifest_key, manifest.chunks.len()))
+}
+
+fn store_large_file_fixed_streaming_in_root_once(
+    paths: &Paths,
+    root: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+) -> Result<(String, String, usize)> {
+    let (file, before) = stable_open_file_in_root(root, rel)?;
+    store_large_file_fixed_streaming_from_file(
+        paths,
+        file,
+        before,
+        &root.join(rel),
+        rel,
+        config,
+        binary,
+    )
+}
+
+fn store_large_file_fixed_streaming_from_file(
+    paths: &Paths,
+    mut file: File,
+    before: fs::Metadata,
+    display_path: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+) -> Result<(String, String, usize)> {
+    let conn = open_db(paths)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunks = Vec::new();
+    let mut buffer = vec![0u8; config.chunk_size.max(1)];
+    let mut offset = 0u64;
+    let mut index = 0usize;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buffer[..n];
+        hasher.update(chunk);
+        let chunk_oid = blake3_hex(chunk);
+        let stored = compress_large_chunk(config, rel, chunk)?;
+        let object_key = store_large_chunk_bytes(paths, &conn, config, &chunk_oid, &stored.bytes)?;
+        chunks.push(LargeChunk {
+            index,
+            offset,
+            len: n as u64,
+            stored_len: Some(stored.bytes.len() as u64),
+            compression: stored.compression,
+            oid: chunk_oid,
+            object_key,
+        });
+        offset += n as u64;
+        index += 1;
+    }
+    let after = file.metadata()?;
+    if !stable_metadata_matches(&before, &after) {
+        bail!("file changed while reading: {}", display_path.display());
     }
     let oid = hasher.finalize().to_hex().to_string();
     if let Some((manifest_key, chunk_count)) =

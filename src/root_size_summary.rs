@@ -9,6 +9,7 @@ use crate::majutsu_core::{
     FileRecord, LargeManifest, Payload, SnapshotExport, SnapshotManifest, TreeManifest,
     TreeNodeManifest, payload_blob_ref,
 };
+use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
 
 const ROOT_SIZE_SUMMARY_VERSION: u32 = 1;
 
@@ -257,7 +258,8 @@ fn read_local_metadata_object<T: for<'de> serde::Deserialize<'de>>(
     if let Ok(value) = serde_json::from_slice(&decoded) {
         return Ok(value);
     }
-    if let Ok(decompressed) = zstd::stream::decode_all(decoded.as_slice())
+    if let Ok(decompressed) =
+        zstd_decode_all_limited(decoded.as_slice(), REMOTE_METADATA_DECODE_LIMIT, key)
         && let Ok(value) = serde_cbor::from_slice(&decompressed)
     {
         return Ok(value);

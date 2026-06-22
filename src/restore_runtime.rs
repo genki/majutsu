@@ -23,8 +23,9 @@ use crate::config::{Paths, read_config};
 use crate::operation_log::record_op;
 use crate::remote_store::open_remote;
 use crate::restore_apply::{
-    apply_file_metadata, prepare_directory_restore_destination, prepare_file_restore_destination,
-    restore_special_file, restore_special_matches, restore_symlink,
+    apply_file_metadata, ensure_restore_parent_beneath, ensure_restore_target_not_symlink,
+    prepare_directory_restore_destination, prepare_file_restore_destination, restore_special_file,
+    restore_special_matches, restore_symlink, validate_restore_relative_path,
 };
 use crate::util::blake3_hex;
 use crate::{HydrateStats, pack_entry_payload};
@@ -277,6 +278,7 @@ pub(crate) fn ensure_restore_job_has_no_missing_objects(job: &RestoreQueueItem) 
 }
 
 pub(crate) fn restore_destination(plan: &RestorePlan, record: &FileRecord) -> Result<PathBuf> {
+    validate_restore_relative_path(&record.path)?;
     if let Some(to) = &plan.to {
         return Ok(to.join(&record.root_id).join(&record.path));
     }
@@ -307,6 +309,7 @@ pub(crate) fn restore_delete_destination(
     plan: &RestorePlan,
     delete: &RestoreDelete,
 ) -> Result<PathBuf> {
+    validate_restore_relative_path(&delete.path)?;
     if let Some(to) = &plan.to {
         return Ok(to.join(&delete.root_id).join(&delete.path));
     }
@@ -707,6 +710,9 @@ pub(crate) fn apply_restore_plan(
     trace.mark("check conflicts");
     for delete in &plan.deletes {
         let dest = restore_delete_destination(plan, delete)?;
+        let base = restore_root_base(plan.to.as_ref(), &plan.root_paths, &delete.root_id)?;
+        ensure_restore_parent_beneath(&base, &dest)?;
+        ensure_restore_target_not_symlink(&dest)?;
         if fs::symlink_metadata(&dest).is_ok() {
             fs::remove_file(&dest)?;
             remove_empty_restore_parents(plan, delete, &dest)?;
@@ -716,16 +722,17 @@ pub(crate) fn apply_restore_plan(
     let mut directory_metadata = Vec::new();
     for record in &plan.files {
         let dest = restore_destination(plan, record)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let base = restore_root_base(plan.to.as_ref(), &plan.root_paths, &record.root_id)?;
+        ensure_restore_parent_beneath(&base, &dest)?;
         match &record.payload {
             Payload::Directory => {
+                ensure_restore_target_not_symlink(&dest)?;
                 prepare_directory_restore_destination(&dest, force)?;
                 fs::create_dir_all(&dest)?;
                 directory_metadata.push((dest, record));
             }
             Payload::Special { special_kind } => {
+                ensure_restore_target_not_symlink(&dest)?;
                 restore_special_file(&dest, record, special_kind, force)?;
             }
             Payload::Symlink { target } => {
@@ -733,10 +740,12 @@ pub(crate) fn apply_restore_plan(
             }
             payload => {
                 if let Some((oid, object_key)) = payload_blob_ref(payload) {
+                    ensure_restore_target_not_symlink(&dest)?;
                     prepare_file_restore_destination(&dest, force)?;
                     write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
                     apply_file_metadata(&dest, record)?;
                 } else if let Some((_, manifest_key, _)) = payload_large_ref(payload) {
+                    ensure_restore_target_not_symlink(&dest)?;
                     prepare_file_restore_destination(&dest, force)?;
                     let manifest: LargeManifest =
                         serde_json::from_slice(&read_object(paths, manifest_key)?)?;

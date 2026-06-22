@@ -12,7 +12,8 @@ use crate::config::{LazyMountEntry, MountViewMetadata, Paths};
 use crate::fuse_mount::{is_mountpoint, mount_fuse_cmd, prepare_mountpoint, unmount_fuse};
 use crate::operation_log::record_op;
 use crate::restore_apply::{
-    apply_file_metadata, prepare_directory_restore_destination, restore_special_file,
+    apply_file_metadata, ensure_restore_parent_beneath, ensure_restore_target_not_symlink,
+    prepare_directory_restore_destination, restore_special_file, validate_restore_relative_path,
 };
 use crate::util::path_to_slash;
 use crate::{
@@ -50,17 +51,19 @@ pub(crate) fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
     let mut hydrated_large = 0usize;
     let mut directory_metadata = Vec::new();
     for record in &plan.files {
+        validate_restore_relative_path(&record.path)?;
         let dest = mountpoint.join(&record.root_id).join(&record.path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let base = mountpoint.join(&record.root_id);
+        ensure_restore_parent_beneath(&base, &dest)?;
         match &record.payload {
             Payload::Directory => {
+                ensure_restore_target_not_symlink(&dest)?;
                 prepare_directory_restore_destination(&dest, false)?;
                 fs::create_dir_all(&dest)?;
                 directory_metadata.push((dest, record));
             }
             Payload::Special { special_kind } => {
+                ensure_restore_target_not_symlink(&dest)?;
                 restore_special_file(&dest, record, special_kind, true)?;
             }
             Payload::Symlink { target } => {
@@ -68,9 +71,11 @@ pub(crate) fn mount_cmd(paths: &Paths, args: MountArgs) -> Result<()> {
             }
             payload => {
                 if let Some((oid, object_key)) = payload_blob_ref(payload) {
+                    ensure_restore_target_not_symlink(&dest)?;
                     write_atomic(&dest, &read_blob_payload(paths, &conn, oid, object_key)?)?;
                     apply_file_metadata(&dest, record)?;
                 } else if let Some((_, manifest_key, chunk_count)) = payload_large_ref(payload) {
+                    ensure_restore_target_not_symlink(&dest)?;
                     if args.hydrate_large {
                         let manifest: LargeManifest =
                             serde_json::from_slice(&read_object(paths, manifest_key)?)?;

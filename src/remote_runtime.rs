@@ -16,7 +16,10 @@ use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
 use crate::snapshot_state::current_snapshot;
-use crate::util::{blake3_hex, parse_db_time};
+use crate::util::{
+    REMOTE_HEAD_DECODE_LIMIT, REMOTE_METADATA_DECODE_LIMIT, blake3_hex, parse_db_time,
+    zstd_decode_all_limited,
+};
 use crate::{
     decode_object, ensure_ready, export_metadata, open_db, remote_object_available, remote_ref,
 };
@@ -60,7 +63,8 @@ fn read_remote_head(
         return Ok(None);
     };
     let decoded = decode_object(paths, &bytes)?;
-    let decompressed = zstd::stream::decode_all(decoded.as_slice())?;
+    let decompressed =
+        zstd_decode_all_limited(decoded.as_slice(), REMOTE_HEAD_DECODE_LIMIT, "remote head")?;
     Ok(Some(serde_cbor::from_slice(&decompressed)?))
 }
 
@@ -304,8 +308,11 @@ fn compressed_metadata_key(key: &str) -> String {
 
 fn decode_remote_metadata_bytes(key: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     if key.ends_with(".zst") {
-        return zstd::stream::decode_all(bytes)
-            .with_context(|| format!("decode compressed metadata {key}"));
+        return zstd_decode_all_limited(
+            bytes,
+            REMOTE_METADATA_DECODE_LIMIT,
+            &format!("compressed metadata {key}"),
+        );
     }
     Ok(bytes.to_vec())
 }

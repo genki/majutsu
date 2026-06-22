@@ -49,7 +49,9 @@ use crate::snapshot_state::{
     load_snapshot_header_by_id_optional, snapshot_contains_root, snapshot_file_map, snapshot_id_at,
     visit_tree_records,
 };
-use crate::util::{blake3_hex, parse_duration_ago, parse_time, path_to_slash, stable_read};
+use crate::util::{
+    blake3_hex, parse_duration_ago, parse_time, path_to_slash, stable_read, stable_read_in_root,
+};
 
 pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
@@ -2364,10 +2366,14 @@ fn state_live_change_diff(
         .transpose()?
         .unwrap_or_default();
     let new_bytes = if live.is_some() {
-        stable_read(
-            &root.path.join(Path::new(path)),
-            root.snapshot_mode.as_str(),
-        )?
+        if root.follow_symlinks {
+            stable_read(
+                &root.path.join(Path::new(path)),
+                root.snapshot_mode.as_str(),
+            )?
+        } else {
+            stable_read_in_root(&root.path, Path::new(path), root.snapshot_mode.as_str())?
+        }
     } else {
         Vec::new()
     };
@@ -2481,10 +2487,14 @@ fn state_stream_payload_changed(
     let Some(previous_oid) = state_payload_oid(&previous.payload) else {
         return Ok(false);
     };
-    let bytes = stable_read(
-        &root.path.join(Path::new(path)),
-        root.snapshot_mode.as_str(),
-    )?;
+    let bytes = if root.follow_symlinks {
+        stable_read(
+            &root.path.join(Path::new(path)),
+            root.snapshot_mode.as_str(),
+        )?
+    } else {
+        stable_read_in_root(&root.path, Path::new(path), root.snapshot_mode.as_str())?
+    };
     Ok(blake3_hex(&bytes) != previous_oid)
 }
 
@@ -2587,7 +2597,11 @@ fn scan_live_root_for_state_each(
                 continue;
             }
             let oid = if hash_files {
-                let bytes = stable_read(entry.path(), root.snapshot_mode.as_str())?;
+                let bytes = if root.follow_symlinks {
+                    stable_read(entry.path(), root.snapshot_mode.as_str())?
+                } else {
+                    stable_read_in_root(&root.path, &rel, root.snapshot_mode.as_str())?
+                };
                 blake3_hex(&bytes)
             } else {
                 String::new()

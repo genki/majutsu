@@ -1,7 +1,7 @@
 use crate::majutsu_core::FileRecord;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::fs_meta::{apply_xattrs, special_file_kind};
 
@@ -16,6 +16,98 @@ pub(crate) fn restore_symlink(dest: &Path, target: &str, force: bool) -> Result<
         fs::remove_file(dest)?;
     }
     crate::platform_runtime::create_symlink(target, dest)
+}
+
+pub(crate) fn validate_restore_relative_path(path: &str) -> Result<()> {
+    let rel = Path::new(path);
+    let mut has_component = false;
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) => has_component = true,
+            _ => bail!("restore path must stay inside its root: {path}"),
+        }
+    }
+    if !has_component {
+        bail!("restore path must not be empty");
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_restore_parent_beneath(base: &Path, dest: &Path) -> Result<()> {
+    let Some(parent) = dest.parent() else {
+        return Ok(());
+    };
+    ensure_directory_path_without_symlinks(base)?;
+    if parent == base {
+        return Ok(());
+    }
+    let rel = parent
+        .strip_prefix(base)
+        .with_context(|| format!("restore destination escapes base {}", base.display()))?;
+    let mut current = base.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(part) = component else {
+            bail!("restore parent escapes base: {}", parent.display());
+        };
+        current.push(part);
+        ensure_directory_path_leaf_without_symlinks(&current)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_restore_target_not_symlink(dest: &Path) -> Result<()> {
+    if fs::symlink_metadata(dest)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!("restore target is a symlink: {}", dest.display());
+    }
+    Ok(())
+}
+
+fn ensure_directory_path_without_symlinks(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::RootDir | Component::Prefix(_)) {
+            continue;
+        }
+        ensure_directory_path_leaf_without_symlinks(&current)?;
+    }
+    Ok(())
+}
+
+fn ensure_directory_path_leaf_without_symlinks(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!("restore path component is a symlink: {}", path.display());
+            }
+            if !meta.is_dir() {
+                bail!(
+                    "restore path component is not a directory: {}",
+                    path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path)
+                .with_context(|| format!("create restore directory {}", path.display()))?;
+            let meta = fs::symlink_metadata(path)
+                .with_context(|| format!("inspect created restore directory {}", path.display()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                bail!(
+                    "created restore path is not a directory: {}",
+                    path.display()
+                );
+            }
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspect restore directory {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_file_restore_destination(dest: &Path, force: bool) -> Result<()> {

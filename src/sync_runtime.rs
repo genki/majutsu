@@ -53,7 +53,9 @@ use crate::root_size_summary::{
 };
 use crate::root_state::roots;
 use crate::snapshot_state::{current_snapshot, load_snapshot_by_id};
-use crate::util::{blake3_hex, new_id, parse_db_time};
+use crate::util::{
+    REMOTE_HEAD_DECODE_LIMIT, blake3_hex, new_id, parse_db_time, zstd_decode_all_limited,
+};
 use crate::{
     decode_object, encode_object, ensure_ready, export_metadata, open_db, read_object,
     remote_object_available, remote_ref,
@@ -179,7 +181,8 @@ fn persist_remote_root_acks(
 
 fn decode_remote_head(paths: &Paths, bytes: &[u8]) -> Result<RemoteHeadExport> {
     let decoded = decode_object(paths, bytes)?;
-    let decompressed = zstd::stream::decode_all(decoded.as_slice())?;
+    let decompressed =
+        zstd_decode_all_limited(decoded.as_slice(), REMOTE_HEAD_DECODE_LIMIT, "remote head")?;
     Ok(serde_cbor::from_slice(&decompressed)?)
 }
 

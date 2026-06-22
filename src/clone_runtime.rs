@@ -20,6 +20,7 @@ use crate::object_paths::local_object_keys;
 use crate::queue_runtime::import_remote_event_journals;
 use crate::remote_runtime::{read_remote_host_index, remote_host_index_with_legacy};
 use crate::remote_store::{RemoteStore, open_remote};
+use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
 
 pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let trace = CloneTrace::new();
@@ -46,6 +47,11 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         }
     };
     export.config.remote = Some(remote_config);
+    let quarantined_hooks = if args.trust_remote_hooks {
+        0
+    } else {
+        quarantine_remote_hooks(&mut export.config)
+    };
     refresh_s3_bootstrap_host_summary(&remote, &mut loaded, &export);
     let compact_snapshot_metadata = export.snapshots.iter().any(snapshot_metadata_is_compact);
     let staging_home = clone_staging_home(&paths.home);
@@ -146,8 +152,27 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     })?;
     println!("cloned {} into {}", remote.describe(), paths.home.display());
     println!("host {} {}", export.config.host.name, export.config.host.id);
+    if quarantined_hooks > 0 {
+        println!("quarantined_remote_hooks {quarantined_hooks}");
+    }
     trace.mark("finish");
     Ok(())
+}
+
+fn quarantine_remote_hooks(config: &mut crate::config::Config) -> usize {
+    let mut count = 0usize;
+    for root in &mut config.roots {
+        if root.pre_snapshot.take().is_some() {
+            count += 1;
+        }
+        if root.post_snapshot.take().is_some() {
+            count += 1;
+        }
+        if root.application_plugin.take().is_some() {
+            count += 1;
+        }
+    }
+    count
 }
 
 struct CloneTrace {
@@ -190,16 +215,22 @@ fn clone_metadata_bytes(remote: &RemoteStore, key: &str) -> Result<Vec<u8>> {
             let bytes = remote
                 .get(key)
                 .with_context(|| format!("read compressed metadata {key}"))?;
-            return zstd::stream::decode_all(bytes.as_slice())
-                .with_context(|| format!("decode compressed metadata {key}"));
+            return zstd_decode_all_limited(
+                bytes.as_slice(),
+                REMOTE_METADATA_DECODE_LIMIT,
+                &format!("compressed metadata {key}"),
+            );
         }
         let compressed_key = compressed_metadata_key(key);
         if let Some(bytes) = remote
             .get_optional(&compressed_key)
             .with_context(|| format!("read compressed metadata {compressed_key}"))?
         {
-            return zstd::stream::decode_all(bytes.as_slice())
-                .with_context(|| format!("decode compressed metadata {compressed_key}"));
+            return zstd_decode_all_limited(
+                bytes.as_slice(),
+                REMOTE_METADATA_DECODE_LIMIT,
+                &format!("compressed metadata {compressed_key}"),
+            );
         }
     }
     remote
@@ -281,8 +312,11 @@ fn clone_loaded_metadata_from_bootstrap(
     else {
         return Ok(None);
     };
-    let decoded = zstd::stream::decode_all(bytes.as_slice())
-        .with_context(|| format!("decode clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?;
+    let decoded = zstd_decode_all_limited(
+        bytes.as_slice(),
+        REMOTE_METADATA_DECODE_LIMIT,
+        &format!("clone bootstrap {CLONE_BOOTSTRAP_KEY}"),
+    )?;
     let bootstrap: CloneBootstrapExport = serde_json::from_slice(&decoded)
         .with_context(|| format!("parse clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?;
     if bootstrap.version != 1 && bootstrap.version != CLONE_BOOTSTRAP_VERSION {
