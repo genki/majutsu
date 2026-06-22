@@ -81,17 +81,17 @@ matching `src/internal/*.rs` mirror.
 4. Verify installation from crates.io.
 
    ```sh
-   cargo install majutsu --version 0.5.7 --locked --root "$(mktemp -d)"
+   cargo install majutsu --version 0.5.8 --locked --root "$(mktemp -d)"
    ```
 
 ## Version display policy
 
 Published crates.io and GitHub release versions use clean SemVer package
-versions, such as `0.5.7`. The released `mj --version` output should match the
+versions, such as `0.5.8`. The released `mj --version` output should match the
 package version:
 
 ```text
-mj 0.5.7
+mj 0.5.8
 ```
 
 Build metadata such as `+build.N` is reserved for local development builds and
@@ -104,7 +104,7 @@ MAJUTSU_DEV_BUILD=1 cargo build
 That produces version output such as:
 
 ```text
-mj 0.5.7+build.5
+mj 0.5.8+build.5
 ```
 
 `BUILD_NUMBER` can still be incremented for local batches, but it must not be
