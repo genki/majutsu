@@ -3353,6 +3353,7 @@ pub(crate) fn create_layout(paths: &Paths) -> Result<()> {
     ] {
         fs::create_dir_all(paths.home.join(dir))?;
     }
+    restrict_state_permissions(paths)?;
     let recipients = paths.home.join("keys/recipients.toml");
     if !recipients.exists() {
         fs::write(recipients, "recipients = []\n")?;
@@ -3361,6 +3362,26 @@ pub(crate) fn create_layout(paths: &Paths) -> Result<()> {
     if !log.exists() {
         File::create(log)?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_state_permissions(paths: &Paths) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in [
+        paths.home.clone(),
+        paths.home.join("keys"),
+        paths.home.join("runtime"),
+        paths.home.join("locks"),
+    ] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("set state directory permissions {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_state_permissions(_: &Paths) -> Result<()> {
     Ok(())
 }
 

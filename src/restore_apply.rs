@@ -280,3 +280,28 @@ pub(crate) fn restore_special_file(
 pub(crate) fn restore_special_matches(meta: &fs::Metadata, special_kind: &str) -> Result<bool> {
     Ok(special_file_kind(meta).as_deref() == Some(special_kind))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_restore_parent_beneath_rejects_parent_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, base.join("link")).unwrap();
+
+        let err = ensure_restore_parent_beneath(&base, &base.join("link/file.txt")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("restore path component is a symlink"),
+            "{err:#}"
+        );
+    }
+}

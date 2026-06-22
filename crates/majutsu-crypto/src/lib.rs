@@ -145,8 +145,34 @@ pub fn write_master_key(master_key_path: &Path, hex_key: &str) -> Result<()> {
     validate_key_hex(hex_key)?;
     if let Some(parent) = master_key_path.parent() {
         fs::create_dir_all(parent)?;
+        restrict_key_parent_permissions(parent)?;
     }
     fs::write(master_key_path, format!("{}\n", hex_key.trim()))?;
+    restrict_key_file_permissions(master_key_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_key_parent_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("set key directory permissions {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_key_parent_permissions(_: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_key_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set master key permissions {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_key_file_permissions(_: &Path) -> Result<()> {
     Ok(())
 }
 

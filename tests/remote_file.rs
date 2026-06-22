@@ -112,7 +112,9 @@ fn clone_quarantines_remote_hooks_by_default() {
             .arg("--pre-snapshot")
             .arg("true")
             .arg("--post-snapshot")
-            .arg("true");
+            .arg("true")
+            .arg("--application-plugin")
+            .arg("dangerous-plugin");
         c
     });
     run({
@@ -135,12 +137,16 @@ fn clone_quarantines_remote_hooks_by_default() {
         c
     });
     assert!(
-        clone_out.contains("quarantined_remote_hooks 2"),
+        clone_out.contains("quarantined_remote_hooks 3"),
         "{clone_out}"
     );
     let cloned_config = fs::read_to_string(clone.join("config.toml")).unwrap();
     assert!(!cloned_config.contains("pre_snapshot"), "{cloned_config}");
     assert!(!cloned_config.contains("post_snapshot"), "{cloned_config}");
+    assert!(
+        !cloned_config.contains("application_plugin"),
+        "{cloned_config}"
+    );
 }
 
 #[test]
@@ -298,6 +304,39 @@ fn restore_rejects_symlink_escape() {
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(stderr.contains("restore target is a symlink"), "{stderr}");
     assert_eq!(fs::read(outside.join("file.txt")).unwrap(), b"outside\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn encrypted_init_restricts_state_and_master_key_permissions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init").arg("--encrypt");
+        c
+    });
+
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(state.join("keys"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(state.join("keys/master.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 fn root_list_has(root_list: &str, id: &str, status: &str) -> bool {

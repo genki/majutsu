@@ -9,6 +9,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::blocking::{Body, Client};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
+use reqwest::redirect::Policy as RedirectPolicy;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -97,6 +98,7 @@ pub(crate) fn s3_http_client() -> Result<Client> {
     Ok(Client::builder()
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
+        .redirect(RedirectPolicy::none())
         .build()?)
 }
 
@@ -274,14 +276,16 @@ pub(crate) fn open_remote_with_upload_policy(
             .ok_or_else(|| anyhow!("s3 remote is missing bucket: {remote_url}"))?
             .to_string();
         let prefix = url.path().trim_matches('/').to_string();
+        let endpoint = config
+            .endpoint
+            .clone()
+            .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
+            .unwrap_or_else(|| "https://storage.googleapis.com".into());
+        validate_s3_endpoint_security(&endpoint)?;
         return Ok(RemoteStore::S3(Box::new(S3Remote {
             bucket,
             prefix,
-            endpoint: config
-                .endpoint
-                .clone()
-                .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
-                .unwrap_or_else(|| "https://storage.googleapis.com".into()),
+            endpoint,
             region: config
                 .region
                 .clone()
@@ -304,6 +308,31 @@ pub(crate) fn open_remote_with_upload_policy(
         })));
     }
     bail!("unsupported remote URL: {remote_url}");
+}
+
+fn validate_s3_endpoint_security(endpoint: &str) -> Result<()> {
+    let url = Url::parse(endpoint).with_context(|| format!("parse S3 endpoint {endpoint}"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if s3_insecure_endpoint_allowed(&url) => Ok(()),
+        "http" => bail!(
+            "insecure S3 endpoint is not allowed: {endpoint}; use https or set MAJUTSU_ALLOW_INSECURE_REMOTE=1 for trusted local testing"
+        ),
+        scheme => bail!("unsupported S3 endpoint scheme {scheme}: {endpoint}"),
+    }
+}
+
+fn s3_insecure_endpoint_allowed(url: &Url) -> bool {
+    if env::var("MAJUTSU_ALLOW_INSECURE_REMOTE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    matches!(
+        url.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
 }
 
 fn file_remote_path_from_url(remote_url: &str) -> Option<PathBuf> {
@@ -1825,6 +1854,14 @@ mod storage_characteristic_tests {
             normalize_windows_file_remote_suffix("/C:/Users/genta/remote"),
             r"C:\Users\genta\remote"
         );
+    }
+
+    #[test]
+    fn s3_endpoint_security_rejects_non_local_plain_http() {
+        let err = validate_s3_endpoint_security("http://storage.example.com").unwrap_err();
+        assert!(err.to_string().contains("insecure S3 endpoint"), "{err:#}");
+        validate_s3_endpoint_security("http://127.0.0.1:9000").unwrap();
+        validate_s3_endpoint_security("https://storage.googleapis.com").unwrap();
     }
 
     #[cfg(windows)]

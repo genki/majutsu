@@ -160,7 +160,23 @@ pub(crate) fn stable_open_file_in_root(root: &Path, rel: &Path) -> Result<(File,
     Ok((file, before))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn stable_open_file_in_root(root: &Path, rel: &Path) -> Result<(File, fs::Metadata)> {
+    validate_relative_components(rel)?;
+    let file = open_regular_file_in_root_windows(root, rel)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        bail!(
+            "snapshot path is not a regular file: {}",
+            root.join(rel).display()
+        );
+    }
+    reject_windows_reparse_metadata(&before, &root.join(rel))?;
+    ensure_windows_handle_beneath_root(&file, root, rel)?;
+    Ok((file, before))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn stable_open_file_in_root(root: &Path, rel: &Path) -> Result<(File, fs::Metadata)> {
     validate_relative_components(rel)?;
     let file = File::open(root.join(rel))
@@ -287,9 +303,118 @@ fn stable_read_in_root_platform(root: &Path, rel: &Path, mode: &str) -> Result<V
     Err(last_error.unwrap_or_else(|| anyhow!("file did not become stable: {}", rel.display())))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn stable_read_in_root_platform(root: &Path, rel: &Path, mode: &str) -> Result<Vec<u8>> {
+    let attempts = if mode == "strict" { 8 } else { 3 };
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match stable_open_file_in_root(root, rel) {
+            Ok((mut file, before)) => {
+                let mut bytes = Vec::with_capacity(before.len().min(1024 * 1024) as usize);
+                file.read_to_end(&mut bytes)?;
+                let after = file.metadata()?;
+                reject_windows_reparse_metadata(&after, &root.join(rel))?;
+                if stable_metadata_matches(&before, &after) {
+                    return Ok(bytes);
+                }
+                last_error = Some(anyhow!("file changed while reading: {}", rel.display()));
+            }
+            Err(err) => {
+                last_error = Some(err);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1) as u64));
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("file did not become stable: {}", rel.display())))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn stable_read_in_root_platform(root: &Path, rel: &Path, mode: &str) -> Result<Vec<u8>> {
     stable_read(&root.join(rel), mode)
+}
+
+#[cfg(windows)]
+fn open_regular_file_in_root_windows(root: &Path, rel: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root.join(rel))
+        .with_context(|| format!("secure-open snapshot path {}", root.join(rel).display()))
+}
+
+#[cfg(windows)]
+fn reject_windows_reparse_metadata(meta: &fs::Metadata, path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        bail!("snapshot path is a reparse point: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_handle_beneath_root(file: &File, root: &Path, rel: &Path) -> Result<()> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("canonicalize snapshot root {}", root.display()))?;
+    let root = normalize_windows_final_path(&root);
+    let opened = windows_final_path(file)
+        .with_context(|| format!("resolve opened snapshot path {}", rel.display()))?;
+    let opened = normalize_windows_final_path(Path::new(&opened));
+    let root_with_sep = if root.ends_with('\\') {
+        root.clone()
+    } else {
+        format!("{root}\\")
+    };
+    if opened != root && !opened.starts_with(&root_with_sep) {
+        bail!(
+            "snapshot path escapes root: {} resolved to {}",
+            rel.display(),
+            opened
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_final_path(file: &File) -> Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    let mut buf = vec![0u16; 32768];
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if len == 0 {
+        return Err(std::io::Error::last_os_error()).context("GetFinalPathNameByHandleW failed");
+    }
+    let len = len as usize;
+    if len >= buf.len() {
+        bail!("opened path is too long");
+    }
+    Ok(String::from_utf16_lossy(&buf[..len]))
+}
+
+#[cfg(windows)]
+fn normalize_windows_final_path(path: &Path) -> String {
+    let mut value = path.to_string_lossy().replace('/', "\\");
+    if let Some(stripped) = value.strip_prefix(r"\\?\") {
+        value = stripped.to_string();
+    }
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_ascii_lowercase()
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -357,4 +482,20 @@ fn stable_file_id(meta: &fs::Metadata) -> Option<u64> {
 #[cfg(not(any(unix, windows)))]
 fn stable_file_id(_: &fs::Metadata) -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zstd_decode_all_limited_rejects_oversized_output() {
+        let compressed = zstd::stream::encode_all(vec![b'x'; 4096].as_slice(), 3).unwrap();
+        let err = zstd_decode_all_limited(&compressed, 1024, "test metadata").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("decoded test metadata exceeds limit"),
+            "{err:#}"
+        );
+    }
 }
