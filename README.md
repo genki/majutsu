@@ -190,6 +190,8 @@ sync; snapshots are durable timeline checkpoints and compaction boundaries.
 
 For a guided first run, see [Getting Started](docs/GETTING_STARTED.md). For
 restore-focused examples, see the [Restore Tutorial](docs/RESTORE_TUTORIAL.md).
+For a disposable clean-environment demo, see the
+[Container Demo](docs/CONTAINER_DEMO.md).
 
 ```sh
 mj init

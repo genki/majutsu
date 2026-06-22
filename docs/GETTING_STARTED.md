@@ -222,6 +222,7 @@ by `mj key export` when cloning into the empty recovered state.
 ## Related Documentation
 
 - [CLI layout](CLI_LAYOUT.md)
+- [Container demo](CONTAINER_DEMO.md)
 - [Restore tutorial](RESTORE_TUTORIAL.md)
 - [Operations runbook](OPERATIONS.md)
 - [Branching](BRANCHING.md)
