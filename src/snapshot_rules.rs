@@ -257,6 +257,39 @@ pub fn is_included(patterns: &[String], rel: &Path) -> bool {
         .any(|pattern| path_pattern_match(pattern, &rel))
 }
 
+pub fn explicitly_included(patterns: &[String], rel: &Path) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let rel = path_to_slash(rel);
+    patterns
+        .iter()
+        .filter(|pattern| !is_catch_all_include_pattern(pattern))
+        .any(|pattern| path_pattern_match(pattern, &rel))
+}
+
+pub fn include_may_match_inside_dir(patterns: &[String], rel: &Path) -> bool {
+    if patterns.is_empty()
+        || patterns
+            .iter()
+            .all(|pattern| is_catch_all_include_pattern(pattern))
+    {
+        return false;
+    }
+    let dir = path_to_slash(rel);
+    let dir = dir.trim_matches('/');
+    if dir.is_empty() {
+        return true;
+    }
+    patterns
+        .iter()
+        .any(|pattern| include_pattern_may_match_inside_dir(pattern, dir))
+}
+
+fn is_catch_all_include_pattern(pattern: &str) -> bool {
+    matches!(pattern.trim().trim_start_matches('/'), "**" | "*")
+}
+
 pub fn is_ignored(ignore: &Gitignore, rel: &Path, is_dir: bool) -> bool {
     ignore.matched_path_or_any_parents(rel, is_dir).is_ignore()
 }
@@ -329,6 +362,10 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 fn path_pattern_match(pattern: &str, rel: &str) -> bool {
+    let pattern = pattern.trim().trim_start_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
     if pattern == "**" || pattern == "*" {
         return true;
     }
@@ -349,6 +386,31 @@ fn path_pattern_match(pattern: &str, rel: &str) -> bool {
         return rel == suffix || rel.ends_with(&format!("/{suffix}"));
     }
     rel == pattern || rel.starts_with(&format!("{pattern}/"))
+}
+
+fn include_pattern_may_match_inside_dir(pattern: &str, dir: &str) -> bool {
+    let pattern = pattern.trim().trim_start_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "**" || pattern == "*" || pattern.starts_with("**/") {
+        return true;
+    }
+    if path_pattern_match(pattern, dir) {
+        return true;
+    }
+    let literal_prefix = pattern
+        .split(['*', '?', '['])
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    if literal_prefix.is_empty() {
+        return true;
+    }
+    literal_prefix == dir
+        || literal_prefix.starts_with(&format!("{dir}/"))
+        || dir.starts_with(&format!("{literal_prefix}/"))
 }
 
 pub fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {

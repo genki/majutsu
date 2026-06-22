@@ -14,7 +14,7 @@ use crate::majutsu_core::SnapshotManifest;
 use crate::majutsu_store::canonical_remote_alias;
 use crate::object_paths::local_object_keys;
 use crate::operation_log::record_op;
-use crate::remote_store::{RemoteStore, open_remote_with_upload_policy};
+use crate::remote_store::{RemoteStore, open_remote_with_upload_policy, remote_config_diagnostics};
 use crate::snapshot_state::current_snapshot;
 use crate::util::{
     REMOTE_HEAD_DECODE_LIMIT, REMOTE_METADATA_DECODE_LIMIT, blake3_hex, parse_db_time,
@@ -71,11 +71,17 @@ fn read_remote_head(
 pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
+    let remote_config = config
+        .remote
+        .as_ref()
+        .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?;
+    if matches!(command, RemoteCommand::Check) {
+        for (name, value) in remote_config_diagnostics(remote_config)? {
+            println!("{name} {value}");
+        }
+    }
     let remote = open_remote_with_upload_policy(
-        config
-            .remote
-            .as_ref()
-            .ok_or_else(|| anyhow!("remote is not configured; run `mj init --remote ...`"))?,
+        remote_config,
         config.large.multipart,
         config.large.max_parallel_uploads,
     )?;

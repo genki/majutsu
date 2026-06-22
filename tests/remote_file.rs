@@ -83,6 +83,144 @@ fn top_level_help_groups_commands_without_hiding_maintenance_commands() {
 }
 
 #[test]
+fn root_list_supports_json_and_no_truncate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let root = tmp
+        .path()
+        .join("very")
+        .join("long")
+        .join("path")
+        .join("for")
+        .join("root")
+        .join("list")
+        .join("display");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.txt"), b"hello\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("demo")
+            .arg(&root);
+        c
+    });
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("list")
+            .arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["total"], serde_json::Value::from(1));
+    assert_eq!(value["active"], serde_json::Value::from(1));
+    assert_eq!(value["issues"], serde_json::Value::from(0));
+    assert_eq!(value["roots"][0]["id"], "demo");
+    assert_eq!(value["roots"][0]["path"], root.display().to_string());
+
+    let narrow = output({
+        let mut c = mj();
+        c.env("COLUMNS", "40")
+            .arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("list");
+        c
+    });
+    assert!(!narrow.contains(&root.display().to_string()), "{narrow}");
+
+    let full = output({
+        let mut c = mj();
+        c.env("COLUMNS", "40")
+            .arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("list")
+            .arg("--no-truncate");
+        c
+    });
+    assert!(full.contains(&root.display().to_string()), "{full}");
+}
+
+#[test]
+fn explicit_include_can_reach_files_below_excluded_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(root.join("secret")).unwrap();
+    fs::write(root.join("secret").join("keep.txt"), b"keep\n").unwrap();
+    fs::write(root.join("secret").join("drop.txt"), b"drop\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&root)
+            .arg("--exclude")
+            .arg("secret/**")
+            .arg("--include")
+            .arg("secret/keep.txt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("include override");
+        c
+    });
+    fs::remove_dir_all(&root).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    assert_eq!(
+        fs::read_to_string(restore.join("sample").join("secret").join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(
+        !restore
+            .join("sample")
+            .join("secret")
+            .join("drop.txt")
+            .exists()
+    );
+}
+
+#[test]
 fn clone_quarantines_remote_hooks_by_default() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -695,6 +833,7 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c.arg("--home").arg(&state).arg("remote").arg("check");
         c
     });
+    assert!(remote_check.contains("remote_type file"));
     assert!(remote_check.contains("remote file://"));
     assert!(remote_check.contains("metadata ok"));
     assert!(remote_check.contains("range_get 1"));
@@ -5991,6 +6130,11 @@ signature_version = "s3v4"
             .env("AWS_SECRET_ACCESS_KEY", "dummy");
         c
     });
+    assert!(check.contains("remote_type s3"));
+    assert!(check.contains("endpoint_source config.remote.endpoint"));
+    assert!(check.contains("region_source config.remote.region"));
+    assert!(check.contains("access_key_source env:AWS_ACCESS_KEY_ID"));
+    assert!(check.contains("secret_key_source env:AWS_SECRET_ACCESS_KEY"));
     assert!(check.contains("metadata ok"));
     assert!(check.contains("range_get 1"));
 

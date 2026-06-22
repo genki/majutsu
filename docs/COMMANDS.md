@@ -139,7 +139,12 @@ List roots:
 
 ```sh
 mj root list
+mj root list --json
+mj root list --no-truncate
 ```
+
+Use `--json` for scripts and dashboards. Use `--no-truncate` when you need the
+complete root paths in a narrow terminal or captured log.
 
 Size roots and remote usage:
 
@@ -181,6 +186,15 @@ mj root add photos /mnt/photos --require-mount
 
 Symlinks are stored as symlink entries by default. Use `--follow-symlinks` when
 the root should snapshot linked file contents instead.
+
+New roots apply best-practice excludes for VCS internals, dependency
+directories, build outputs, and caches. A path matched by `--include` is treated
+as an explicit exception and remains reachable even when an excluded parent
+directory would otherwise be pruned:
+
+```sh
+mj root add sample ./sample --exclude 'secret/**' --include 'secret/keep.txt'
+```
 
 ## Large files
 

@@ -16,7 +16,8 @@ use crate::config::{Config, Paths, RootConfig};
 use crate::object_paths::prefer_canonical_remote_only;
 use crate::remote_store::RemoteStore;
 use crate::snapshot_rules::{
-    build_ignore, classify_large, effective_large_config, is_ignored, is_included, looks_binary,
+    build_ignore, classify_large, effective_large_config, explicitly_included,
+    include_may_match_inside_dir, is_ignored, is_included, looks_binary,
 };
 use crate::snapshot_state::{current_snapshot, load_root_tree_entries, load_snapshot_by_id};
 use crate::util::{blake3_hex, new_id, path_to_slash, stable_read, stable_read_in_root};
@@ -590,7 +591,10 @@ fn scan_live_root_for_journal(
             let Ok(rel) = entry.path().strip_prefix(scan_base) else {
                 return true;
             };
-            !is_ignored(&ignore, rel, entry.file_type().is_dir())
+            if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
+                return true;
+            }
+            !entry.file_type().is_dir() || include_may_match_inside_dir(&root.include, rel)
         });
     for entry in walker {
         let entry = entry?;
@@ -601,7 +605,9 @@ fn scan_live_root_for_journal(
         if !is_included(&root.include, &rel) {
             continue;
         }
-        if is_ignored(&ignore, &rel, entry.file_type().is_dir()) {
+        if is_ignored(&ignore, &rel, entry.file_type().is_dir())
+            && !explicitly_included(&root.include, &rel)
+        {
             continue;
         }
         let rel_s = path_to_slash(&rel);

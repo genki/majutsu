@@ -728,7 +728,7 @@ pub(crate) enum RootCommand {
     #[command(about = "Update an existing root")]
     Set(RootSetArgs),
     #[command(about = "List configured roots")]
-    List,
+    List(RootListArgs),
     #[command(about = "Show client and backend sizes for current roots")]
     Size(RootSizeArgs),
     #[command(about = "Remove a root from the configuration")]
@@ -739,6 +739,22 @@ pub(crate) enum RootCommand {
     Resume { id: String },
     #[command(about = "Record a root as deleted")]
     MarkDeleted { id: String },
+}
+
+#[derive(Args)]
+pub(crate) struct RootListArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Emit machine-readable JSON instead of the aligned table"
+    )]
+    pub(crate) json: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Do not shorten columns to fit the terminal width"
+    )]
+    pub(crate) no_truncate: bool,
 }
 
 #[derive(Args)]

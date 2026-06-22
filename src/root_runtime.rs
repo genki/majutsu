@@ -15,7 +15,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration as StdDuration;
 
-use crate::cli::{RootCommand, RootSizeArgs};
+use crate::cli::{RootCommand, RootListArgs, RootSizeArgs};
 use crate::config::{
     Paths, RootConfig, default_include, read_config, validate_large_chunking,
     validate_snapshot_mode,
@@ -31,7 +31,8 @@ use crate::root_state::{
 };
 use crate::snapshot_rules::{
     apply_default_root_excludes, apply_root_large_set, apply_root_presets, build_ignore,
-    dedup_patterns, is_ignored, is_included, root_large_override, warn_sensitive_root_defaults,
+    dedup_patterns, explicitly_included, is_ignored, is_included, root_large_override,
+    warn_sensitive_root_defaults,
 };
 use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
 
@@ -195,8 +196,8 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             record_op(&conn, "config-change", None, None, Some(&root.id))?;
             println!("updated root {} -> {}", root.id, root.path.display());
         }
-        RootCommand::List => {
-            root_list_cmd(&conn)?;
+        RootCommand::List(args) => {
+            root_list_cmd(&conn, &args)?;
         }
         RootCommand::Size(args) => {
             root_size_cmd(paths, &conn, &args)?;
@@ -325,10 +326,28 @@ fn root_record_is_managed(
     if !is_included(&root.include, rel) {
         return false;
     }
-    !is_ignored(ignore, rel, record.kind == "directory")
+    !is_ignored(ignore, rel, record.kind == "directory") || explicitly_included(&root.include, rel)
 }
 
-fn root_list_cmd(conn: &Connection) -> Result<()> {
+#[derive(Serialize)]
+struct RootListRow {
+    id: String,
+    status: String,
+    name: String,
+    path: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RootListOutput {
+    total: usize,
+    active: usize,
+    issues: usize,
+    roots: Vec<RootListRow>,
+}
+
+fn root_list_cmd(conn: &Connection, args: &RootListArgs) -> Result<()> {
     let mut roots = roots(conn)?;
     roots.sort_by(|left, right| {
         root_status_rank(&left.status)
@@ -338,7 +357,32 @@ fn root_list_cmd(conn: &Connection) -> Result<()> {
     let total = roots.len();
     let active = roots.iter().filter(|root| root.status == "active").count();
     let problematic = roots.iter().filter(|root| root.status != "active").count();
-    let width = terminal_width();
+    if args.json {
+        let output = RootListOutput {
+            total,
+            active,
+            issues: problematic,
+            roots: roots
+                .iter()
+                .map(|root| RootListRow {
+                    id: root.id.clone(),
+                    status: root.status.clone(),
+                    name: root.name.clone(),
+                    path: root.path.display().to_string(),
+                    include: root.include.clone(),
+                    exclude: root.exclude.clone(),
+                })
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    let width = if args.no_truncate {
+        usize::MAX
+    } else {
+        terminal_width()
+    };
     let mut output = String::new();
     output.push_str("Roots\n");
     output.push_str(&format!(

@@ -37,6 +37,14 @@ export AWS_SIGNATURE_VERSION=s3v4
 export MAJUTSU_REMOTE=s3://bucket/prefix
 ```
 
+`mj remote check` prints the resolved remote type, endpoint, region, signature
+version, and credential source labels before it opens the backend. It never
+prints secret values:
+
+```sh
+mj remote check
+```
+
 Use a dedicated backend prefix per host or per majutsu instance unless you
 explicitly want to share a remote for multi-host recovery browsing.
 
@@ -139,6 +147,7 @@ Upload metadata and objects to the configured remote:
 ```sh
 mj --home /tmp/mj-demo/state sync --wait
 mj --home /tmp/mj-demo/state sync status
+mj --home /tmp/mj-demo/state remote check
 mj --home /tmp/mj-demo/state remote fsck
 ```
 

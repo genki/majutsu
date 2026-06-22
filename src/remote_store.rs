@@ -260,6 +260,90 @@ pub(crate) fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
     open_remote_with_upload_policy(config, true, default_large_max_parallel_uploads())
 }
 
+pub(crate) fn remote_config_diagnostics(config: &RemoteConfig) -> Result<Vec<(String, String)>> {
+    let remote_url = config.url()?;
+    if let Some(path) = file_remote_path_from_url(&remote_url) {
+        return Ok(vec![
+            ("remote_type".into(), "file".into()),
+            ("remote_url".into(), format!("file://{}", path.display())),
+            ("remote_path".into(), path.display().to_string()),
+        ]);
+    }
+    if remote_url.starts_with("s3://") {
+        let url = Url::parse(&remote_url)?;
+        let bucket = url
+            .host_str()
+            .ok_or_else(|| anyhow!("s3 remote is missing bucket: {remote_url}"))?
+            .to_string();
+        let prefix = url.path().trim_matches('/').to_string();
+        let (endpoint, endpoint_source) = if let Some(endpoint) = &config.endpoint {
+            (endpoint.clone(), "config.remote.endpoint")
+        } else if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
+            (endpoint, "env:AWS_ENDPOINT_URL")
+        } else {
+            ("https://storage.googleapis.com".into(), "default")
+        };
+        let (region, region_source) = if let Some(region) = &config.region {
+            (region.clone(), "config.remote.region")
+        } else if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+            (region, "env:AWS_DEFAULT_REGION")
+        } else {
+            ("us-east-1".into(), "default")
+        };
+        let (signature_version, signature_version_source) =
+            if let Some(signature_version) = &config.signature_version {
+                (signature_version.clone(), "config.remote.signature_version")
+            } else if let Ok(signature_version) = env::var("AWS_SIGNATURE_VERSION") {
+                (signature_version, "env:AWS_SIGNATURE_VERSION")
+            } else {
+                ("s3v4".into(), "default")
+            };
+        return Ok(vec![
+            ("remote_type".into(), "s3".into()),
+            ("remote_url".into(), format!("s3://{bucket}/{prefix}")),
+            ("bucket".into(), bucket),
+            ("prefix".into(), prefix),
+            ("endpoint".into(), endpoint),
+            ("endpoint_source".into(), endpoint_source.into()),
+            ("region".into(), region),
+            ("region_source".into(), region_source.into()),
+            ("signature_version".into(), signature_version),
+            (
+                "signature_version_source".into(),
+                signature_version_source.into(),
+            ),
+            (
+                "access_key_source".into(),
+                env_source_presence("AWS_ACCESS_KEY_ID"),
+            ),
+            (
+                "secret_key_source".into(),
+                env_source_presence("AWS_SECRET_ACCESS_KEY"),
+            ),
+            (
+                "storage_class_source".into(),
+                env_source_presence("MAJUTSU_S3_STORAGE_CLASS"),
+            ),
+            (
+                "object_tags_source".into(),
+                env_source_presence("MAJUTSU_S3_OBJECT_TAGS"),
+            ),
+        ]);
+    }
+    Ok(vec![
+        ("remote_type".into(), "unsupported".into()),
+        ("remote_url".into(), remote_url),
+    ])
+}
+
+fn env_source_presence(name: &str) -> String {
+    if env::var_os(name).is_some() {
+        format!("env:{name}")
+    } else {
+        "missing".into()
+    }
+}
+
 pub(crate) fn open_remote_with_upload_policy(
     config: &RemoteConfig,
     multipart_enabled: bool,

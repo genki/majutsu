@@ -43,7 +43,9 @@ use crate::queue_runtime::{
 };
 use crate::remote_store::open_remote;
 use crate::root_state::roots;
-use crate::snapshot_rules::{build_ignore, is_ignored, is_included};
+use crate::snapshot_rules::{
+    build_ignore, explicitly_included, include_may_match_inside_dir, is_ignored, is_included,
+};
 use crate::snapshot_state::{
     current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id,
     load_snapshot_header_by_id_optional, snapshot_contains_root, snapshot_file_map, snapshot_id_at,
@@ -2530,7 +2532,10 @@ fn scan_live_root_for_state_each(
             let Ok(rel) = entry.path().strip_prefix(&root.path) else {
                 return true;
             };
-            !is_ignored(&ignore, rel, entry.file_type().is_dir())
+            if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
+                return true;
+            }
+            !entry.file_type().is_dir() || include_may_match_inside_dir(&root.include, rel)
         });
     for entry in walker {
         let entry = entry?;
@@ -2541,7 +2546,9 @@ fn scan_live_root_for_state_each(
         if !is_included(&root.include, &rel) {
             continue;
         }
-        if is_ignored(&ignore, &rel, entry.file_type().is_dir()) {
+        if is_ignored(&ignore, &rel, entry.file_type().is_dir())
+            && !explicitly_included(&root.include, &rel)
+        {
             continue;
         }
         let rel_s = path_to_slash(&rel);
