@@ -155,6 +155,65 @@ fn root_list_supports_json_and_no_truncate() {
 }
 
 #[test]
+fn volatile_exclude_is_omitted_from_snapshots_and_root_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let source = tmp.path().join("source");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("app.sqlite"), b"db\n").unwrap();
+    fs::write(source.join("app.sqlite-wal"), b"wal\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("db")
+            .arg(&source)
+            .arg("--volatile")
+            .arg("**/*.sqlite-wal")
+            .arg("--volatile-mode")
+            .arg("exclude");
+        c
+    });
+    let roots = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("list")
+            .arg("--json");
+        c
+    });
+    assert!(roots.contains("\"volatile\""), "{roots}");
+    assert!(roots.contains("**/*.sqlite-wal"), "{roots}");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    assert_eq!(fs::read(restore.join("db/app.sqlite")).unwrap(), b"db\n");
+    assert!(!restore.join("db/app.sqlite-wal").exists());
+}
+
+#[test]
 fn explicit_include_can_reach_files_below_excluded_directories() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
@@ -688,6 +747,30 @@ fn first_blob_object_key(state: &std::path::Path) -> String {
     let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
     conn.query_row("select object_key from blobs limit 1", [], |row| row.get(0))
         .unwrap()
+}
+
+fn remove_remote_payload_aliases(remote: &std::path::Path, key: &str) -> Vec<std::path::PathBuf> {
+    let oid = key
+        .rsplit('/')
+        .next()
+        .unwrap_or(key)
+        .trim_end_matches(".enc");
+    let mut removed = Vec::new();
+    for entry in walkdir::WalkDir::new(remote)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let path = entry.path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if path.strip_prefix(remote).unwrap() == std::path::Path::new(key) || name.contains(oid) {
+            removed.push(path.to_path_buf());
+        }
+    }
+    for path in &removed {
+        fs::remove_file(path).unwrap();
+    }
+    removed
 }
 
 fn local_snapshot_manifest(state: &std::path::Path, order: &str) -> serde_json::Value {
@@ -5492,7 +5575,12 @@ fn tree_format_v2_omits_flat_entries_and_restores_from_root_node() {
 
     run({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("sync").arg("--wait");
+        c.env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0")
+            .env("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE", "0")
+            .arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("--wait");
         c
     });
     run({
@@ -15829,7 +15917,7 @@ fn restore_applies_durable_journal_after_current_snapshot() {
     let restore = tmp.path().join("restore");
     let state = tmp.path().join("state");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("note.txt"), b"snapshot content\n").unwrap();
+    fs::write(source.join("note.bin"), vec![b'x'; 256 * 1024]).unwrap();
 
     run({
         let mut c = mj();
@@ -16064,6 +16152,100 @@ fn sync_live_diff_preserves_unsnapshotted_change_without_watch_event() {
     assert_eq!(
         fs::read(restore.join("sample/note.txt")).unwrap(),
         b"durable content\n"
+    );
+}
+
+#[test]
+fn remote_init_seeds_empty_file_remote_host_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let init = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("init");
+        c
+    });
+    assert!(init.contains("initialized hosts/index.json"), "{init}");
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
+    assert_eq!(index["version"], 1);
+    assert_eq!(index["hosts"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn sync_wait_repairs_missing_remote_object_when_local_copy_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.bin"), vec![b'x'; 256 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0")
+            .env("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE", "0")
+            .arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("--wait");
+        c
+    });
+
+    let missing_key = first_blob_object_key(&state);
+    let removed = remove_remote_payload_aliases(&remote, &missing_key);
+    assert!(
+        !removed.is_empty(),
+        "remote object missing before test setup"
+    );
+
+    let repaired = output({
+        let mut c = mj();
+        c.env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0")
+            .env("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE", "0")
+            .arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("--wait");
+        c
+    });
+    assert!(
+        repaired.contains("wait_remote_repair_repaired 1"),
+        "{repaired}"
     );
 }
 

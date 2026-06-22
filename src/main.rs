@@ -213,7 +213,7 @@ use root_state::{
 use snapshot_rules::{
     build_ignore, classify_large, effective_large_config, explicitly_included,
     include_allows_descend, include_may_match_inside_dir, is_ignored, is_included,
-    large_pointer_compression, looks_binary,
+    is_volatile_excluded, large_pointer_compression, looks_binary,
 };
 use snapshot_state::{
     carry_forward_root_snapshot, current_snapshot, load_snapshot_by_id, load_snapshot_header,
@@ -2523,6 +2523,9 @@ fn scan_root(
             if entry.file_type().is_dir() && !include_allows_descend(&root.include, rel) {
                 return false;
             }
+            if entry.file_type().is_dir() && is_volatile_excluded(root, rel) {
+                return false;
+            }
             if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
                 return true;
             }
@@ -2535,6 +2538,9 @@ fn scan_root(
         }
         let rel = entry.path().strip_prefix(&root.path)?.to_path_buf();
         if !is_included(&root.include, &rel) {
+            continue;
+        }
+        if is_volatile_excluded(root, &rel) {
             continue;
         }
         if is_ignored(&ignore, &rel, entry.file_type().is_dir())
@@ -4659,6 +4665,8 @@ tier = "Bulk"
                 large_chunking: None,
                 large_always: Vec::new(),
                 large_never: Vec::new(),
+                volatile: Vec::new(),
+                volatile_mode: "checkpoint".into(),
             }),
         )
         .unwrap();

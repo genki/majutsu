@@ -6,6 +6,7 @@ use crate::config::{
     Config, ConfigRoot, Paths, RootConfig, default_root_status, read_config,
     validate_large_chunking, validate_snapshot_mode, write_config,
 };
+use crate::snapshot_rules::validate_volatile_mode;
 
 pub(crate) fn roots(conn: &Connection) -> Result<Vec<RootConfig>> {
     let mut stmt = conn.prepare("select data_json from roots order by id")?;
@@ -35,6 +36,7 @@ impl From<&RootConfig> for ConfigRoot {
             snapshot_source: root.snapshot_source.clone(),
             application_plugin: root.application_plugin.clone(),
             large: root.large.clone(),
+            volatile: root.volatile.clone(),
         }
     }
 }
@@ -73,6 +75,15 @@ impl ConfigRoot {
         {
             validate_large_chunking(chunking)?;
         }
+        if let Some(volatile) = &self.volatile {
+            validate_volatile_mode(&volatile.mode)?;
+            if volatile.patterns.is_empty() {
+                bail!(
+                    "root {} volatile policy requires at least one pattern",
+                    self.id
+                );
+            }
+        }
         let snapshot_source = self
             .snapshot_source
             .as_ref()
@@ -107,6 +118,7 @@ impl ConfigRoot {
             snapshot_source,
             application_plugin: self.application_plugin.clone(),
             large: self.large.clone(),
+            volatile: self.volatile.clone(),
         })
     }
 }

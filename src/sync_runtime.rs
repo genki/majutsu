@@ -45,7 +45,7 @@ use crate::queue_runtime::{
     enqueue_live_diff_event_journals, enqueue_remote_event_journal_uploads, event_journal_records,
     upload_queue_stats,
 };
-use crate::remote_runtime::read_remote_host_index;
+use crate::remote_runtime::{read_remote_host_index, repair_missing_referenced_objects};
 use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
 use crate::root_size_summary::{
     RootSizeSummary, build_root_size_summary, encode_root_size_summary, root_size_summary_key,
@@ -560,6 +560,20 @@ fn wait_for_sync_catchup(
         }
         let status = sync_wait_status(paths, conn, remote)?;
         if status.is_caught_up() {
+            let repair = repair_missing_referenced_objects(paths, remote)?;
+            if repair.missing > 0 || repair.repaired > 0 {
+                println!("wait_remote_repair_checked {}", repair.checked);
+                println!("wait_remote_repair_total {}", repair.total);
+                println!("wait_remote_repair_missing {}", repair.missing);
+                println!("wait_remote_repair_repaired {}", repair.repaired);
+                println!("wait_remote_repair_missing_local {}", repair.missing_local);
+            }
+            if repair.missing_local > 0 {
+                bail!(
+                    "remote is caught up but {} referenced local object(s) are unavailable for repair",
+                    repair.missing_local
+                );
+            }
             print_sync_wait_status(&status);
             println!("wait_target_current {}", target_current);
             println!("status_mode quick");

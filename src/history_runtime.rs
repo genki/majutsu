@@ -45,7 +45,7 @@ use crate::remote_store::open_remote;
 use crate::root_state::roots;
 use crate::snapshot_rules::{
     build_ignore, explicitly_included, include_allows_descend, include_may_match_inside_dir,
-    is_ignored, is_included,
+    is_ignored, is_included, is_volatile_excluded,
 };
 use crate::snapshot_state::{
     current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id,
@@ -2536,6 +2536,9 @@ fn scan_live_root_for_state_each(
             if entry.file_type().is_dir() && !include_allows_descend(&root.include, rel) {
                 return false;
             }
+            if entry.file_type().is_dir() && is_volatile_excluded(root, rel) {
+                return false;
+            }
             if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
                 return true;
             }
@@ -2548,6 +2551,9 @@ fn scan_live_root_for_state_each(
         }
         let rel = entry.path().strip_prefix(&root.path)?.to_path_buf();
         if !is_included(&root.include, &rel) {
+            continue;
+        }
+        if is_volatile_excluded(root, &rel) {
             continue;
         }
         if is_ignored(&ignore, &rel, entry.file_type().is_dir())

@@ -18,6 +18,7 @@ export AWS_DEFAULT_REGION=ap-northeast-1
 export AWS_SIGNATURE_VERSION=s3v4
 
 mj init --remote s3://bucket/prefix
+mj remote init
 mj root add sample /path/to/sample
 mj snapshot --message 'first remote snapshot'
 mj sync --wait
@@ -67,6 +68,15 @@ For local validation:
 type = "file"
 path = "/tmp/majutsu-remote"
 ```
+
+`mj remote init` seeds an empty remote prefix with `hosts/index.json`. It refuses
+to initialize a non-empty prefix without `--force`, so first-run S3/GCS setup can
+distinguish an empty Majutsu backend from an accidental shared prefix.
+
+`mj sync --wait` waits for the current snapshot and upload queue to catch up. As
+a final guard it verifies referenced payload objects and re-uploads missing
+objects when the local copy still exists. If the local copy was already pruned,
+it reports the missing-local count and asks for explicit repair/recovery work.
 
 ## Shared bucket design
 

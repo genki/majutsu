@@ -228,6 +228,17 @@ mj root set photos --clear-exclude --exclude '**/.DS_Store'
 mj root set photos --large-min-size 8388608 --large-always '*.heic'
 ```
 
+High-frequency files can be marked volatile. The default `checkpoint` mode
+suppresses watch-triggered immediate snapshots for matching paths, while manual
+or periodic checkpoints still capture the latest content. Use `exclude` when a
+path should be removed from snapshots and future history:
+
+```sh
+mj root add app ./app --volatile '**/*.sqlite-wal'
+mj root set app --volatile 'runtime/**' --volatile-mode exclude
+mj root set app --clear-volatile
+```
+
 ## Watch and daemon
 
 Foreground OS-native filesystem watching:

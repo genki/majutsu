@@ -86,6 +86,23 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         config.large.max_parallel_uploads,
     )?;
     match command {
+        RemoteCommand::Init { force } => {
+            let existing_objects = remote.list("")?;
+            let has_host_index = remote.exists(REMOTE_HOST_INDEX_KEY)?;
+            if !force && has_host_index {
+                bail!("remote is already initialized: {REMOTE_HOST_INDEX_KEY}");
+            }
+            if !force && !existing_objects.is_empty() && !has_host_index {
+                bail!(
+                    "remote is not empty and has no majutsu host index; rerun with --force only if this prefix is dedicated to majutsu"
+                );
+            }
+            let index = RemoteHostIndex::empty(Utc::now());
+            remote.put(REMOTE_HOST_INDEX_KEY, &serde_json::to_vec_pretty(&index)?)?;
+            println!("remote {}", remote.describe());
+            println!("initialized {REMOTE_HOST_INDEX_KEY}");
+            println!("hosts 0");
+        }
         RemoteCommand::Check => {
             let keys = remote.list("")?;
             println!("remote {}", remote.describe());
@@ -245,6 +262,23 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn repair_missing_referenced_objects(
+    paths: &Paths,
+    remote: &RemoteStore,
+) -> Result<RepairSummary> {
+    remote_repair_summary(
+        paths,
+        remote,
+        RemoteObjectScanOptions {
+            parallelism: 16,
+            sample: None,
+            timeout: Some(Duration::from_secs(120)),
+        },
+        false,
+        false,
+    )
 }
 
 fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
@@ -788,6 +822,32 @@ fn remote_repair(
     options: RemoteObjectScanOptions,
     dry_run: bool,
 ) -> Result<()> {
+    let summary = remote_repair_summary(paths, remote, options, dry_run, true)?;
+    if summary.missing_local > 0 {
+        bail!(
+            "remote repair could not repair {} object(s) because local copies are missing",
+            summary.missing_local
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RepairSummary {
+    pub(crate) checked: usize,
+    pub(crate) total: usize,
+    pub(crate) missing: usize,
+    pub(crate) repaired: usize,
+    pub(crate) missing_local: usize,
+}
+
+fn remote_repair_summary(
+    paths: &Paths,
+    remote: &RemoteStore,
+    options: RemoteObjectScanOptions,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<RepairSummary> {
     let mut keys = referenced_local_object_keys(paths)?;
     if let Some(sample) = options.sample {
         keys.truncate(sample);
@@ -804,28 +864,36 @@ fn remote_repair(
             continue;
         };
         if dry_run {
-            println!("repair_candidate {key} -> {remote_key}");
+            if verbose {
+                println!("repair_candidate {key} -> {remote_key}");
+            }
             still_missing.insert(key.clone());
             continue;
         }
         if remote.put_file_if_absent(&remote_key, &source)? {
             repaired += 1;
-            println!("repaired {key} -> {remote_key}");
+            if verbose {
+                println!("repaired {key} -> {remote_key}");
+            }
         } else {
-            println!("already_present {key} -> {remote_key}");
+            if verbose {
+                println!("already_present {key} -> {remote_key}");
+            }
         }
     }
-    if scan.timed_out {
+    if verbose && scan.timed_out {
         eprintln!(
             "remote repair scan timed out after checking {}/{} object(s)",
             scan.checked, scan.total
         );
     }
-    if scan.resumed {
+    if verbose && scan.resumed {
         println!("resumed true");
     }
     if let Some(session_path) = &scan.session_path {
-        println!("session {}", session_path.display());
+        if verbose {
+            println!("session {}", session_path.display());
+        }
         if scan.timed_out || missing_local > 0 || (dry_run && !scan.missing.is_empty()) {
             save_repair_session(
                 session_path,
@@ -845,19 +913,22 @@ fn remote_repair(
             let _ = fs::remove_file(session_path);
         }
     }
-    println!("remote repair complete");
-    println!("checked_objects {}", scan.checked);
-    println!("total_objects {}", scan.total);
-    println!("missing_objects {}", scan.missing.len());
-    println!("repaired_objects {repaired}");
-    println!("missing_local_objects {missing_local}");
-    println!("dry_run {dry_run}");
-    if missing_local > 0 {
-        bail!(
-            "remote repair could not repair {missing_local} object(s) because local copies are missing"
-        );
+    if verbose {
+        println!("remote repair complete");
+        println!("checked_objects {}", scan.checked);
+        println!("total_objects {}", scan.total);
+        println!("missing_objects {}", scan.missing.len());
+        println!("repaired_objects {repaired}");
+        println!("missing_local_objects {missing_local}");
+        println!("dry_run {dry_run}");
     }
-    Ok(())
+    Ok(RepairSummary {
+        checked: scan.checked,
+        total: scan.total,
+        missing: scan.missing.len(),
+        repaired,
+        missing_local,
+    })
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]

@@ -94,3 +94,8 @@ mj root add full-image /path/to/root --no-default-excludes
 Sensitive authored files such as `.env` or kubeconfig files are not silently
 excluded by default. Use encrypted state/remotes or explicit excludes when those
 files should not be backed up.
+
+For high-frequency generated state such as database WAL files, use a volatile
+policy. `checkpoint` mode keeps the latest value in checkpoints without letting
+every write trigger a watch snapshot, and `exclude` mode removes matching paths
+from managed history.

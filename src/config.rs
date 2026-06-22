@@ -382,6 +382,8 @@ pub(crate) struct ConfigRoot {
     pub(crate) application_plugin: Option<String>,
     #[serde(default)]
     pub(crate) large: Option<RootLargeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) volatile: Option<RootVolatileConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -444,6 +446,8 @@ pub(crate) struct RootConfig {
     pub(crate) application_plugin: Option<String>,
     #[serde(default)]
     pub(crate) large: Option<RootLargeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) volatile: Option<RootVolatileConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -475,6 +479,14 @@ pub(crate) struct RootLargeConfig {
     pub(crate) always: Vec<String>,
     #[serde(default)]
     pub(crate) never: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct RootVolatileConfig {
+    #[serde(default)]
+    pub(crate) patterns: Vec<String>,
+    #[serde(default = "default_volatile_mode")]
+    pub(crate) mode: String,
 }
 
 pub(crate) fn resolve_paths(home_arg: Option<PathBuf>) -> Result<Paths> {
@@ -773,6 +785,10 @@ pub(crate) fn default_root_status() -> String {
 
 pub(crate) fn default_snapshot_mode() -> String {
     "default".into()
+}
+
+pub(crate) fn default_volatile_mode() -> String {
+    "checkpoint".into()
 }
 
 pub(crate) fn default_large_chunking() -> String {

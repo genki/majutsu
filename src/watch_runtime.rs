@@ -27,7 +27,9 @@ use crate::queue_runtime::{
     event_journal_records, record_event, record_file_event, upload_queue_stats,
 };
 use crate::root_state::roots;
-use crate::snapshot_rules::{build_ignore, is_ignored};
+use crate::snapshot_rules::{
+    build_ignore, is_ignored, is_volatile_excluded, volatile_allows_watch_snapshot,
+};
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
 use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
 
@@ -852,6 +854,9 @@ fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
             let Ok(rel) = entry.path().strip_prefix(&root.path) else {
                 return true;
             };
+            if entry.file_type().is_dir() && is_volatile_excluded(root, rel) {
+                return false;
+            }
             !is_ignored(&ignore, rel, entry.file_type().is_dir())
         });
     let mut dirs = Vec::new();
@@ -1088,6 +1093,9 @@ fn event_path_for_roots(active_roots: &[RootConfig], path: &Path) -> Option<(Str
 }
 
 fn root_ignores_relative_path(root: &RootConfig, relative: &Path, is_dir: bool) -> bool {
+    if !volatile_allows_watch_snapshot(root, relative) {
+        return true;
+    }
     build_ignore(root)
         .map(|ignore| is_ignored(&ignore, relative, is_dir))
         .unwrap_or(false)
@@ -1349,6 +1357,47 @@ mod tests {
     }
 
     #[test]
+    fn volatile_checkpoint_events_do_not_trigger_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir_all(root_path.join("data")).unwrap();
+        let mut root = test_root(root_path.clone(), Vec::new());
+        root.volatile = Some(crate::config::RootVolatileConfig {
+            patterns: vec!["**/*.sqlite-wal".into()],
+            mode: "checkpoint".into(),
+        });
+
+        assert!(!event_relevant_for_roots(
+            std::slice::from_ref(&root),
+            &test_event_abs(root_path.join("data/app.sqlite-wal"))
+        ));
+        assert!(event_relevant_for_roots(
+            &[root],
+            &test_event_abs(root_path.join("data/app.sqlite"))
+        ));
+    }
+
+    #[test]
+    fn volatile_exclude_subtrees_are_not_watched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir_all(root_path.join("runtime/cache")).unwrap();
+        std::fs::create_dir_all(root_path.join("src")).unwrap();
+        let mut root = test_root(root_path.clone(), Vec::new());
+        root.volatile = Some(crate::config::RootVolatileConfig {
+            patterns: vec!["runtime/**".into()],
+            mode: "exclude".into(),
+        });
+
+        let dirs = watchable_directories(&root).unwrap();
+
+        assert!(dirs.contains(&root_path));
+        assert!(dirs.contains(&root_path.join("src")));
+        assert!(!dirs.contains(&root_path.join("runtime")));
+        assert!(!dirs.contains(&root_path.join("runtime/cache")));
+    }
+
+    #[test]
     fn event_buffer_flushes_after_sliding_quiet_window() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path().join("home"));
@@ -1490,6 +1539,7 @@ mod tests {
             snapshot_source: None,
             application_plugin: None,
             large: None,
+            volatile: None,
         }
     }
 

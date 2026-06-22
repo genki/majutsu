@@ -30,8 +30,9 @@ use crate::root_state::{
     root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
 };
 use crate::snapshot_rules::{
-    apply_default_root_excludes, apply_root_large_set, apply_root_presets, build_ignore,
-    dedup_patterns, explicitly_included, is_ignored, is_included, root_large_override,
+    apply_default_root_excludes, apply_root_large_set, apply_root_presets, apply_root_volatile_set,
+    build_ignore, dedup_patterns, explicitly_included, is_ignored, is_included,
+    is_volatile_excluded, root_large_override, root_volatile_override,
     warn_sensitive_root_defaults,
 };
 use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
@@ -71,6 +72,7 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             apply_root_presets(&mut exclude, &args.presets)?;
             warn_sensitive_root_defaults(&path, &exclude);
             let large = root_large_override(&args);
+            let volatile = root_volatile_override(&args)?;
             let root = RootConfig {
                 name: args.name.unwrap_or_else(|| args.id.clone()),
                 id: args.id,
@@ -91,6 +93,7 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 snapshot_source,
                 application_plugin: args.application_plugin,
                 large,
+                volatile,
             };
             conn.execute(
                 "insert into roots(id, data_json) values (?1, ?2)",
@@ -181,9 +184,10 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                 bail!("--snapshot-source requires snapshot_mode transactional");
             }
             apply_root_large_set(&mut root, &args)?;
+            apply_root_volatile_set(&mut root, &args)?;
+            let forgotten = forget_unmanaged_root_history(paths, &conn, &root)?;
             save_root(&conn, &root)?;
             sync_roots_to_config(paths, &conn)?;
-            let forgotten = forget_unmanaged_root_history(paths, &conn, &root)?;
             if forgotten.records > 0 {
                 let removed = crate::prune_runtime::prune_unreferenced_metadata(paths, &conn)?;
                 println!("forgotten_unmanaged_records {}", forgotten.records);
@@ -336,6 +340,9 @@ fn root_record_is_managed(
     if !is_included(&root.include, rel) {
         return false;
     }
+    if is_volatile_excluded(root, rel) {
+        return false;
+    }
     !is_ignored(ignore, rel, record.kind == "directory") || explicitly_included(&root.include, rel)
 }
 
@@ -347,6 +354,7 @@ struct RootListRow {
     path: String,
     include: Vec<String>,
     exclude: Vec<String>,
+    volatile: Option<crate::config::RootVolatileConfig>,
 }
 
 #[derive(Serialize)]
@@ -381,6 +389,7 @@ fn root_list_cmd(conn: &Connection, args: &RootListArgs) -> Result<()> {
                     path: root.path.display().to_string(),
                     include: root.include.clone(),
                     exclude: root.exclude.clone(),
+                    volatile: root.volatile.clone(),
                 })
                 .collect(),
         };

@@ -1100,6 +1100,19 @@ pub(crate) struct RootAddArgs {
         help = "Never treat matching files as large objects"
     )]
     pub(crate) large_never: Vec<String>,
+    #[arg(
+        long = "volatile",
+        value_name = "GLOB",
+        help = "Mark matching high-frequency paths as volatile"
+    )]
+    pub(crate) volatile: Vec<String>,
+    #[arg(
+        long = "volatile-mode",
+        default_value = "checkpoint",
+        value_name = "MODE",
+        help = "Volatile path handling: checkpoint or exclude"
+    )]
+    pub(crate) volatile_mode: String,
 }
 
 #[derive(Args)]
@@ -1171,6 +1184,12 @@ pub(crate) struct RootSetArgs {
     pub(crate) clear_large_always: bool,
     #[arg(long, default_value_t = false)]
     pub(crate) clear_large_never: bool,
+    #[arg(long = "volatile", value_name = "GLOB")]
+    pub(crate) volatile: Vec<String>,
+    #[arg(long = "volatile-mode", value_name = "MODE")]
+    pub(crate) volatile_mode: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub(crate) clear_volatile: bool,
 }
 
 #[derive(Args)]
@@ -1440,6 +1459,15 @@ pub(crate) struct LargeUnpinArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RemoteCommand {
+    #[command(about = "Initialize an empty remote with majutsu host index metadata")]
+    Init {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Overwrite an existing empty or host index object"
+        )]
+        force: bool,
+    },
     #[command(about = "Check that the configured remote is reachable and supports required APIs")]
     Check,
     #[command(

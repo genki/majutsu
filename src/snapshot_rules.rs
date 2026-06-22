@@ -7,7 +7,9 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::cli::{RootAddArgs, RootSetArgs};
-use crate::config::{Config, LargeConfig, RootConfig, RootLargeConfig, validate_large_chunking};
+use crate::config::{
+    Config, LargeConfig, RootConfig, RootLargeConfig, RootVolatileConfig, validate_large_chunking,
+};
 use crate::util::path_to_slash;
 
 pub fn build_ignore(root: &RootConfig) -> Result<Gitignore> {
@@ -304,6 +306,77 @@ fn is_catch_all_include_pattern(pattern: &str) -> bool {
 
 pub fn is_ignored(ignore: &Gitignore, rel: &Path, is_dir: bool) -> bool {
     ignore.matched_path_or_any_parents(rel, is_dir).is_ignore()
+}
+
+pub fn validate_volatile_mode(mode: &str) -> Result<()> {
+    match mode {
+        "checkpoint" | "exclude" => Ok(()),
+        other => bail!("unsupported volatile mode {other}; supported modes: checkpoint, exclude"),
+    }
+}
+
+pub fn root_volatile_override(args: &RootAddArgs) -> Result<Option<RootVolatileConfig>> {
+    validate_volatile_mode(&args.volatile_mode)?;
+    if args.volatile.is_empty() && args.volatile_mode != "checkpoint" {
+        bail!("--volatile-mode requires at least one --volatile pattern");
+    }
+    if args.volatile.is_empty() && args.volatile_mode == "checkpoint" {
+        return Ok(None);
+    }
+    Ok(Some(RootVolatileConfig {
+        patterns: args.volatile.clone(),
+        mode: args.volatile_mode.clone(),
+    }))
+}
+
+pub fn apply_root_volatile_set(root: &mut RootConfig, args: &RootSetArgs) -> Result<()> {
+    if args.clear_volatile {
+        root.volatile = None;
+    }
+    if let Some(mode) = &args.volatile_mode {
+        validate_volatile_mode(mode)?;
+        let volatile = root.volatile.get_or_insert_with(|| RootVolatileConfig {
+            patterns: Vec::new(),
+            mode: "checkpoint".into(),
+        });
+        volatile.mode = mode.clone();
+    }
+    if !args.volatile.is_empty() {
+        let volatile = root.volatile.get_or_insert_with(|| RootVolatileConfig {
+            patterns: Vec::new(),
+            mode: "checkpoint".into(),
+        });
+        volatile.patterns.extend(args.volatile.clone());
+        dedup_patterns(&mut volatile.patterns);
+    }
+    if let Some(volatile) = &root.volatile
+        && volatile.patterns.is_empty()
+    {
+        root.volatile = None;
+    }
+    Ok(())
+}
+
+pub fn is_volatile(root: &RootConfig, rel: &Path) -> bool {
+    let Some(volatile) = &root.volatile else {
+        return false;
+    };
+    let rel = path_to_slash(rel);
+    volatile
+        .patterns
+        .iter()
+        .any(|pattern| path_pattern_match(pattern, &rel))
+}
+
+pub fn is_volatile_excluded(root: &RootConfig, rel: &Path) -> bool {
+    root.volatile
+        .as_ref()
+        .is_some_and(|volatile| volatile.mode == "exclude")
+        && is_volatile(root, rel)
+}
+
+pub fn volatile_allows_watch_snapshot(root: &RootConfig, rel: &Path) -> bool {
+    !is_volatile(root, rel)
 }
 
 pub fn effective_large_config(config: &Config, root: &RootConfig) -> LargeConfig {
