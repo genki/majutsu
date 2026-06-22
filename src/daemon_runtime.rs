@@ -199,12 +199,12 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             scope,
         } => {
             let exe = env::current_exe()?;
-            let backend = normalize_watch_backend(&config.watch.backend)?;
             let scope = match scope.as_str() {
                 "user" => DaemonServiceScope::User,
                 "system" => DaemonServiceScope::System,
                 other => bail!("unsupported daemon service scope: {other}"),
             };
+            let backend = daemon_service_backend(&config.watch.backend, scope)?;
             let service = render_daemon_service(DaemonServiceConfig {
                 provider: &provider,
                 style: &style,
@@ -269,6 +269,16 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn daemon_service_backend(
+    configured_backend: &str,
+    scope: DaemonServiceScope,
+) -> Result<&'static str> {
+    if cfg!(target_os = "linux") && matches!(scope, DaemonServiceScope::System) {
+        return Ok("fanotify");
+    }
+    normalize_watch_backend(configured_backend)
 }
 
 fn format_daemon_status_reply(reply: &str) -> String {

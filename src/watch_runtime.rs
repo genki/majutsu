@@ -77,11 +77,10 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
             Err(err) => {
                 record_event(
                     paths,
-                    "watch-backend-fallback",
-                    &format!("backend=fanotify fallback=inotify error={err:#}"),
+                    "watch-backend-error",
+                    &format!("backend=fanotify error={err:#}"),
                 )?;
-                eprintln!("fanotify unavailable; falling back to inotify: {err:#}");
-                watch_notify(paths, args, "inotify")
+                Err(err)
             }
         },
         "notify" => watch_notify(paths, args, "notify"),

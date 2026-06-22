@@ -250,7 +250,9 @@ mj watch --foreground --mode default --debounce-ms 1500 --settle-ms 500 --period
 On Linux, the default backend is `fanotify`. It is intended for root-owned
 system daemons because fanotify events include the originating pid. If fanotify
 is unavailable or the daemon is not running as root, majutsu records a
-`watch-backend-fallback` event and shrinks to `inotify`.
+`watch-backend-error` event and fails instead of silently losing process
+attribution. Use `inotify` only when explicitly accepting unattributed watch
+events.
 
 ```sh
 sudo mj --system watch --foreground true --backend fanotify

@@ -17515,14 +17515,14 @@ fn watch_once_creates_snapshot_without_daemonizing() {
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
-    let output = mj()
+    let status_output = mj()
         .arg("--home")
         .arg(&state)
         .arg("status")
         .output()
         .unwrap();
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("current snap-"));
+    assert!(status_output.status.success());
+    assert!(String::from_utf8_lossy(&status_output.stdout).contains("current snap-"));
     let events = fs::read_dir(state.join("queue/events"))
         .unwrap()
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
@@ -17704,14 +17704,14 @@ fn linux_inotify_backend_records_native_events() {
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
-    let output = mj()
+    let status_output = mj()
         .arg("--home")
         .arg(&state)
         .arg("status")
         .output()
         .unwrap();
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("current snap-"));
+    assert!(status_output.status.success());
+    assert!(String::from_utf8_lossy(&status_output.stdout).contains("current snap-"));
     let events = fs::read_dir(state.join("queue/events"))
         .unwrap()
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
@@ -17719,11 +17719,20 @@ fn linux_inotify_backend_records_native_events() {
         .join("\n");
     assert!(events.contains("backend=inotify"));
     assert!(events.contains("fs-event"));
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health");
+        c
+    });
+    assert!(
+        health.contains("issue critical watch-attribution-unavailable"),
+        "{health}"
+    );
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_watch_defaults_to_fanotify_and_falls_back_without_root() {
+fn linux_watch_defaults_to_fanotify_and_requires_root() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
@@ -17745,7 +17754,7 @@ fn linux_watch_defaults_to_fanotify_and_falls_back_without_root() {
             .arg(&source);
         c
     });
-    let mut child = mj()
+    let output = mj()
         .arg("--home")
         .arg(&state)
         .arg("watch")
@@ -17754,22 +17763,22 @@ fn linux_watch_defaults_to_fanotify_and_falls_back_without_root() {
         .arg("100")
         .arg("--settle-ms")
         .arg("50")
-        .spawn()
+        .output()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
-    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
-    let status = child.wait().unwrap();
-    assert!(status.success());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fanotify backend requires root privileges"),
+        "{stderr}"
+    );
     let events = fs::read_dir(state.join("queue/events"))
         .unwrap()
         .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(events.contains("backend=fanotify"));
-    assert!(events.contains("watch-backend-fallback"));
-    assert!(events.contains("fallback=inotify"));
-    assert!(events.contains("backend=inotify"));
-    assert!(events.contains("fs-event"));
+    assert!(events.contains("watch-backend-error"), "{events}");
+    assert!(events.contains("backend=fanotify"), "{events}");
+    assert!(!events.contains("fallback=inotify"), "{events}");
 }
 
 #[test]
@@ -18100,7 +18109,12 @@ fn daemon_doctor_and_restart_clean_stale_pid() {
 
     let restarted = output({
         let mut c = mj_auto();
-        c.arg("--home").arg(&state).arg("daemon").arg("restart");
+        c.arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("restart")
+            .arg("--backend")
+            .arg("notify");
         c
     });
     assert!(restarted.contains("cleaned stale daemon runtime"));
@@ -18599,7 +18613,8 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     });
     assert!(op_log.contains("file-events-batch"), "{op_log}");
     assert!(
-        op_log.contains("\twatch:notify:daemon-pid-") || op_log.contains("\tdaemon:daemon-pid-"),
+        op_log.contains("\twatch:notify:daemon-pid-")
+            || op_log.contains("\tunattributed:watch-replay\t"),
         "{op_log}"
     );
     assert!(!op_log.contains("\tunknown\t"), "{op_log}");

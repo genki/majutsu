@@ -91,6 +91,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let event_records = event_journal_records(paths)?;
     let event_count = event_records.len();
     let pending_event_count = pending_journal_event_count(&event_records);
+    let watch_attribution_issue = watch_attribution_issue(&event_records);
     let remote_journal_stats = remote_event_journal_stats(paths)?;
 
     let health = build_health_report(HealthInputs {
@@ -105,6 +106,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         upload_stats: &upload_stats,
         pending_event_count,
         durable_journal_pending: remote_journal_stats.pending,
+        watch_attribution_issue,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
         conn: &conn,
@@ -607,6 +609,7 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
     let upload_stats = upload_queue_stats(paths)?;
     let event_records = event_journal_records(paths)?;
     let pending_event_count = pending_journal_event_count(&event_records);
+    let watch_attribution_issue = watch_attribution_issue(&event_records);
     let remote_journal_stats = remote_event_journal_stats(paths)?;
     let daemon = daemon_health(paths)?;
     build_health_report(HealthInputs {
@@ -621,6 +624,7 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
         upload_stats: &upload_stats,
         pending_event_count,
         durable_journal_pending: remote_journal_stats.pending,
+        watch_attribution_issue,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
         conn: &conn,
@@ -753,6 +757,7 @@ struct HealthInputs<'a> {
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
     durable_journal_pending: usize,
+    watch_attribution_issue: Option<String>,
     current_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     remote_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     conn: &'a Connection,
@@ -771,6 +776,7 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         upload_stats,
         pending_event_count,
         durable_journal_pending,
+        watch_attribution_issue,
         current_manifest,
         remote_manifest,
         conn,
@@ -887,6 +893,15 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
             severity: HealthSeverity::Critical,
             code: "daemon-unhealthy".into(),
             message: format!("watch daemon is {}", daemon.label()),
+        });
+    }
+    if active_roots > 0
+        && let Some(message) = watch_attribution_issue
+    {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Critical,
+            code: "watch-attribution-unavailable".into(),
+            message,
         });
     }
     if let Some(error) = auto_daemon_error {
@@ -2902,6 +2917,26 @@ fn pending_journal_event_count(records: &[crate::majutsu_db::EventJournalRecord]
                     .unwrap_or(true)
         })
         .count()
+}
+
+fn watch_attribution_issue(records: &[crate::majutsu_db::EventJournalRecord]) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let latest_fs_event = records
+        .iter()
+        .filter(|event| event.kind == "fs-event")
+        .max_by_key(|event| event.observed_at)?;
+    match latest_fs_event.raw_backend.as_deref() {
+        Some("fanotify") => None,
+        Some(backend) => Some(format!(
+            "latest filesystem event used {backend}; run a root-owned fanotify daemon to record the mutating process pid"
+        )),
+        None => Some(
+            "latest filesystem event has no backend; run a root-owned fanotify daemon to record the mutating process pid"
+                .into(),
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -5391,6 +5426,21 @@ fn operation_origin_label(op: &OperationExport) -> String {
         .map(|(label, id)| format!("{label}:{id}"))
         .or_else(|| op.origin_session_id.clone())
         .or_else(|| op.origin_process_id.map(|pid| format!("origin-pid:{pid}")))
+        .or_else(|| {
+            if op.kind == "file-events-batch" && op.session_label.as_deref() == Some("daemon") {
+                if op
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("journal replay"))
+                {
+                    Some("unattributed:watch-replay".into())
+                } else {
+                    Some("unattributed:watch".into())
+                }
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| operation_session_label(op))
 }
 
