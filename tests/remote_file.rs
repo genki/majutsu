@@ -15742,6 +15742,103 @@ fn state_reference_reports_file_changes_since_operation() {
 }
 
 #[test]
+fn state_and_log_mark_large_and_volatile_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("db.sqlite-wal"), b"wal-1\n").unwrap();
+    fs::write(source.join("model.bin"), vec![b'a'; 64]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--volatile")
+            .arg("**/*.sqlite-wal")
+            .arg("--large-min-size")
+            .arg("32");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("baseline");
+        c
+    });
+    let baseline_op: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select op_id from snapshots order by created_at asc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    fs::write(source.join("db.sqlite-wal"), b"wal-2\n").unwrap();
+    fs::write(source.join("model.bin"), vec![b'b'; 64]).unwrap();
+    let state_output = output({
+        let mut c = mj();
+        c.env("TERM", "dumb")
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op);
+        c
+    });
+    assert!(
+        state_output.contains("M sample/db.sqlite-wal [volatile:checkpoint]"),
+        "{state_output}"
+    );
+    assert!(
+        state_output.contains("M sample/model.bin [large]"),
+        "{state_output}"
+    );
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("changed");
+        c
+    });
+    let log_output = output({
+        let mut c = mj();
+        c.env("TERM", "dumb")
+            .arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("1")
+            .arg("--full");
+        c
+    });
+    assert!(
+        log_output.contains("M\tsample/db.sqlite-wal [volatile:checkpoint]"),
+        "{log_output}"
+    );
+    assert!(
+        log_output.contains("M\tsample/model.bin [large]"),
+        "{log_output}"
+    );
+}
+
+#[test]
 fn state_inside_root_uses_local_paths_and_global_flag_restores_root_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

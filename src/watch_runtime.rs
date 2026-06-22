@@ -791,6 +791,7 @@ fn pending_journal_summary(paths: &Paths) -> Result<Option<(usize, u64)>> {
         .iter()
         .filter(|event| {
             event.is_pending_trigger()
+                && event.remote_journal_synced_at.is_none()
                 && last_snapshot_finish
                     .map(|finished_at| event.observed_at > finished_at)
                     .unwrap_or(true)
@@ -1504,6 +1505,32 @@ mod tests {
 
         assert_eq!(pending, 1);
         assert!(oldest_age_secs < 10);
+    }
+
+    #[test]
+    fn pending_journal_summary_ignores_durable_remote_synced_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_event(&paths, "snapshot-finish", "finished").unwrap();
+        let mut event = crate::majutsu_db::EventJournalRecord::new_file_event(
+            "event-synced".into(),
+            Utc::now(),
+            "synced event".into(),
+            "sample".into(),
+            "db.sqlite-wal".into(),
+            "modify".into(),
+            "inotify".into(),
+        );
+        event.remote_journal_key = Some("hosts/host/journal/event-synced.json".into());
+        event.remote_journal_synced_at = Some(Utc::now());
+        std::fs::create_dir_all(&paths.event_queue).unwrap();
+        std::fs::write(
+            paths.event_queue.join("event-synced.json"),
+            serde_json::to_vec_pretty(&event).unwrap(),
+        )
+        .unwrap();
+
+        assert!(pending_journal_summary(&paths).unwrap().is_none());
     }
 
     fn test_event(path: &str) -> Event {

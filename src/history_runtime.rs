@@ -45,7 +45,7 @@ use crate::remote_store::open_remote;
 use crate::root_state::roots;
 use crate::snapshot_rules::{
     build_ignore, explicitly_included, include_allows_descend, include_may_match_inside_dir,
-    is_ignored, is_included, is_volatile_excluded,
+    is_ignored, is_included, is_volatile, is_volatile_excluded,
 };
 use crate::snapshot_state::{
     current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id,
@@ -2023,9 +2023,10 @@ fn stream_state_short_changes(
                     include_meta,
                     |change, diff_lines| {
                         let line = format!(
-                            " {} {}",
+                            " {} {}{}",
                             color_change_status(&ui, change.status),
-                            color_state_path(&ui, &change.path, local_paths)
+                            color_state_path(&ui, &change.path, local_paths),
+                            format_change_tags(&ui, &change)
                         );
                         tx.send(LogProducerMessage::Line(line))
                             .map_err(|err| anyhow!("send state line: {err}"))?;
@@ -2238,23 +2239,37 @@ fn state_live_file_changes_for_root(
             format!("{}/{}", root.id, path)
         };
         match (from_files.get(&path), live_files.get(&path)) {
-            (None, Some(_)) => changes.push(FileChange {
-                status: "A",
-                path: display_path,
-            }),
-            (Some(_), None) => changes.push(FileChange {
-                status: "D",
-                path: display_path,
-            }),
+            (None, Some(live)) => changes.push(FileChange::from_record(
+                "A",
+                display_path,
+                Some(root),
+                &path,
+                Some(live),
+            )),
+            (Some(previous), None) => changes.push(FileChange::from_record(
+                "D",
+                display_path,
+                Some(root),
+                &path,
+                Some(previous),
+            )),
             (Some(a), Some(b)) => match state_record_change_status(a, b) {
-                Some("M") => changes.push(FileChange {
-                    status: "M",
-                    path: display_path,
-                }),
-                Some("m") if include_meta => changes.push(FileChange {
-                    status: "m",
-                    path: display_path,
-                }),
+                Some("M") => changes.push(FileChange::from_records(
+                    "M",
+                    display_path,
+                    Some(root),
+                    &path,
+                    Some(a),
+                    Some(b),
+                )),
+                Some("m") if include_meta => changes.push(FileChange::from_records(
+                    "m",
+                    display_path,
+                    Some(root),
+                    &path,
+                    Some(a),
+                    Some(b),
+                )),
                 _ => {}
             },
             _ => {}
@@ -2280,10 +2295,7 @@ fn state_stream_live_file_changes_for_root(
                 let diff =
                     state_live_change_diff(paths, root, &path, None, Some(&live), show_diff)?;
                 emit(
-                    FileChange {
-                        status: "A",
-                        path: display_path,
-                    },
+                    FileChange::from_record("A", display_path, Some(root), &path, Some(&live)),
                     diff,
                 )?
             }
@@ -2302,18 +2314,26 @@ fn state_stream_live_file_changes_for_root(
                         show_diff,
                     )?;
                     emit(
-                        FileChange {
-                            status: "M",
-                            path: display_path,
-                        },
+                        FileChange::from_records(
+                            "M",
+                            display_path,
+                            Some(root),
+                            &path,
+                            Some(&previous),
+                            Some(&live),
+                        ),
                         diff,
                     )?
                 } else if fast_status == Some("m") && include_meta {
                     emit(
-                        FileChange {
-                            status: "m",
-                            path: display_path,
-                        },
+                        FileChange::from_records(
+                            "m",
+                            display_path,
+                            Some(root),
+                            &path,
+                            Some(&previous),
+                            Some(&live),
+                        ),
                         Vec::new(),
                     )?
                 }
@@ -2324,10 +2344,13 @@ fn state_stream_live_file_changes_for_root(
     for (path, previous) in &from_files {
         let diff = state_live_change_diff(paths, root, path, Some(previous), None, show_diff)?;
         emit(
-            FileChange {
-                status: "D",
-                path: state_display_path(root, path, local_paths),
-            },
+            FileChange::from_record(
+                "D",
+                state_display_path(root, path, local_paths),
+                Some(root),
+                path,
+                Some(previous),
+            ),
             diff,
         )?;
     }
@@ -2854,6 +2877,7 @@ fn pending_journal_event_count(records: &[crate::majutsu_db::EventJournalRecord]
         .iter()
         .filter(|event| {
             event.is_pending_trigger()
+                && event.remote_journal_synced_at.is_none()
                 && last_snapshot_finish
                     .map(|finished_at| event.observed_at > finished_at)
                     .unwrap_or(true)
@@ -4119,6 +4143,10 @@ where
     let file_limit = if args.full { usize::MAX } else { 120 };
     let limit = args.limit.unwrap_or(usize::MAX);
     let batch_size = limit.max(20).saturating_mul(4).min(500);
+    let configured_roots = roots(conn)?
+        .into_iter()
+        .map(|root| (root.id.clone(), root))
+        .collect::<BTreeMap<_, _>>();
     let mut offset = 0usize;
     while printed < limit {
         let operations = recent_change_operations(conn, batch_size, offset)?;
@@ -4130,8 +4158,14 @@ where
             if printed >= limit {
                 break;
             }
-            let changes =
-                operation_file_changes(paths, conn, &op, args.root.as_deref(), args.full)?;
+            let changes = operation_file_changes(
+                paths,
+                conn,
+                &op,
+                args.root.as_deref(),
+                args.full,
+                &configured_roots,
+            )?;
             if changes.is_empty() {
                 continue;
             }
@@ -4148,9 +4182,10 @@ where
             let change_count = changes.len();
             for change in changes.into_iter().take(file_limit) {
                 write_line(&format!(
-                    "{}\t{}",
+                    "{}\t{}{}",
                     color_change_status(&ui, change.status),
-                    change.path
+                    change.path,
+                    format_change_tags(&ui, &change)
                 ))?;
             }
             if change_count > file_limit {
@@ -4624,6 +4659,53 @@ fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationExpo
 struct FileChange {
     status: &'static str,
     path: String,
+    large: bool,
+    volatile_mode: Option<String>,
+}
+
+impl FileChange {
+    fn plain(status: &'static str, path: String) -> Self {
+        Self {
+            status,
+            path,
+            large: false,
+            volatile_mode: None,
+        }
+    }
+
+    fn from_record(
+        status: &'static str,
+        path: String,
+        root: Option<&RootConfig>,
+        rel_path: &str,
+        record: Option<&FileRecord>,
+    ) -> Self {
+        Self::from_records(status, path, root, rel_path, None, record)
+    }
+
+    fn from_records(
+        status: &'static str,
+        path: String,
+        root: Option<&RootConfig>,
+        rel_path: &str,
+        previous: Option<&FileRecord>,
+        current: Option<&FileRecord>,
+    ) -> Self {
+        let large = previous.or(current).is_some_and(record_is_large);
+        let volatile_mode = root
+            .filter(|root| is_volatile(root, Path::new(rel_path)))
+            .and_then(|root| root.volatile.as_ref().map(|volatile| volatile.mode.clone()));
+        Self {
+            status,
+            path,
+            large,
+            volatile_mode,
+        }
+    }
+}
+
+fn record_is_large(record: &FileRecord) -> bool {
+    payload_large_ref(&record.payload).is_some()
 }
 
 fn operation_file_changes(
@@ -4632,6 +4714,7 @@ fn operation_file_changes(
     op: &OperationExport,
     root: Option<&str>,
     full: bool,
+    configured_roots: &BTreeMap<String, RootConfig>,
 ) -> Result<Vec<FileChange>> {
     let Some(after_id) = op.after_snapshot.as_deref() else {
         return Ok(Vec::new());
@@ -4647,7 +4730,7 @@ fn operation_file_changes(
     } else {
         None
     };
-    snapshot_file_changes(paths, before.as_ref(), &after, root, full)
+    snapshot_file_changes(paths, before.as_ref(), &after, root, full, configured_roots)
 }
 
 fn snapshot_file_changes(
@@ -4656,9 +4739,17 @@ fn snapshot_file_changes(
     to: &crate::majutsu_core::SnapshotManifest,
     root: Option<&str>,
     full: bool,
+    configured_roots: &BTreeMap<String, RootConfig>,
 ) -> Result<Vec<FileChange>> {
     if from.is_some_and(|snapshot| !snapshot.root_trees.is_empty()) || !to.root_trees.is_empty() {
-        return snapshot_file_changes_from_root_trees(paths, from, to, root, full);
+        return snapshot_file_changes_from_root_trees(
+            paths,
+            from,
+            to,
+            root,
+            full,
+            configured_roots,
+        );
     }
     let from_files = from.map(snapshot_file_map).transpose()?.unwrap_or_default();
     let to_files = snapshot_file_map(to)?;
@@ -4678,24 +4769,46 @@ fn snapshot_file_changes(
             continue;
         }
         match (from_files.get(&key), to_files.get(&key)) {
-            (None, Some(_)) => changes.push(FileChange {
-                status: "A",
-                path: key,
-            }),
-            (Some(_), None) => changes.push(FileChange {
-                status: "D",
-                path: key,
-            }),
+            (None, Some(record)) => changes.push(change_from_full_path(
+                "A",
+                key,
+                configured_roots,
+                None,
+                Some(record),
+            )),
+            (Some(record), None) => changes.push(change_from_full_path(
+                "D",
+                key,
+                configured_roots,
+                Some(record),
+                None,
+            )),
             (Some(a), Some(b)) if a != b => {
-                changes.push(FileChange {
-                    status: "M",
-                    path: key,
-                });
+                changes.push(change_from_full_path(
+                    "M",
+                    key,
+                    configured_roots,
+                    Some(a),
+                    Some(b),
+                ));
             }
             _ => {}
         }
     }
     Ok(changes)
+}
+
+fn change_from_full_path(
+    status: &'static str,
+    path: String,
+    configured_roots: &BTreeMap<String, RootConfig>,
+    previous: Option<&FileRecord>,
+    current: Option<&FileRecord>,
+) -> FileChange {
+    let (root_id, rel_path) = path.split_once('/').unwrap_or((path.as_str(), ""));
+    let root = configured_roots.get(root_id);
+    let rel_path = rel_path.to_string();
+    FileChange::from_records(status, path, root, &rel_path, previous, current)
 }
 
 fn snapshot_file_changes_from_root_trees(
@@ -4704,6 +4817,7 @@ fn snapshot_file_changes_from_root_trees(
     to: &crate::majutsu_core::SnapshotManifest,
     root: Option<&str>,
     full: bool,
+    configured_roots: &BTreeMap<String, RootConfig>,
 ) -> Result<Vec<FileChange>> {
     const DEFAULT_TREE_DETAIL_LIMIT: usize = 1_000;
     let mut roots = Vec::new();
@@ -4728,13 +4842,13 @@ fn snapshot_file_changes_from_root_trees(
             continue;
         }
         if !full && large_tree_fold_required(paths, from_tree, to_tree, DEFAULT_TREE_DETAIL_LIMIT) {
-            changes.push(FileChange {
-                status: folded_root_status(from_tree, to_tree),
-                path: format!("{root_id}/** (large tree folded; use --full for file list)"),
-            });
+            changes.push(FileChange::plain(
+                folded_root_status(from_tree, to_tree),
+                format!("{root_id}/** (large tree folded; use --full for file list)"),
+            ));
             continue;
         }
-        append_root_file_changes(paths, from, to, &root_id, &mut changes)?;
+        append_root_file_changes(paths, from, to, &root_id, configured_roots, &mut changes)?;
     }
     Ok(changes)
 }
@@ -4744,25 +4858,33 @@ fn append_root_file_changes(
     from: Option<&SnapshotManifest>,
     to: &SnapshotManifest,
     root_id: &str,
+    configured_roots: &BTreeMap<String, RootConfig>,
     changes: &mut Vec<FileChange>,
 ) -> Result<()> {
     let from_tree = from.and_then(|snapshot| snapshot.root_trees.get(root_id));
     let to_tree = to.root_trees.get(root_id);
     match (from_tree, to_tree) {
         (None, Some(tree)) if !snapshot_root_has_flat_records(to, root_id) => {
-            append_tree_records_with_status(paths, root_id, tree, "A", changes)?;
+            append_tree_records_with_status(paths, root_id, tree, "A", configured_roots, changes)?;
             return Ok(());
         }
         (Some(tree), None)
             if from.is_some_and(|snapshot| !snapshot_root_has_flat_records(snapshot, root_id)) =>
         {
-            append_tree_records_with_status(paths, root_id, tree, "D", changes)?;
+            append_tree_records_with_status(paths, root_id, tree, "D", configured_roots, changes)?;
             return Ok(());
         }
         (Some(from_tree), Some(to_tree))
             if from.is_some_and(|snapshot| !snapshot_root_has_flat_records(snapshot, root_id))
                 && !snapshot_root_has_flat_records(to, root_id)
-                && append_v2_tree_diff(paths, root_id, from_tree, to_tree, changes)? =>
+                && append_v2_tree_diff(
+                    paths,
+                    root_id,
+                    from_tree,
+                    to_tree,
+                    configured_roots,
+                    changes,
+                )? =>
         {
             return Ok(());
         }
@@ -4781,20 +4903,31 @@ fn append_root_file_changes(
     paths_all.sort();
     for path in paths_all {
         let full_path = format!("{root_id}/{path}");
+        let root = configured_roots.get(root_id);
         match (from_files.get(&path), to_files.get(&path)) {
-            (None, Some(_)) => changes.push(FileChange {
-                status: "A",
-                path: full_path,
-            }),
-            (Some(_), None) => changes.push(FileChange {
-                status: "D",
-                path: full_path,
-            }),
+            (None, Some(record)) => changes.push(FileChange::from_record(
+                "A",
+                full_path,
+                root,
+                &path,
+                Some(record),
+            )),
+            (Some(record), None) => changes.push(FileChange::from_record(
+                "D",
+                full_path,
+                root,
+                &path,
+                Some(record),
+            )),
             (Some(a), Some(b)) if a != b => {
-                changes.push(FileChange {
-                    status: "M",
-                    path: full_path,
-                });
+                changes.push(FileChange::from_records(
+                    "M",
+                    full_path,
+                    root,
+                    &path,
+                    Some(a),
+                    Some(b),
+                ));
             }
             _ => {}
         }
@@ -4811,13 +4944,17 @@ fn append_tree_records_with_status(
     root_id: &str,
     root_tree: &RootSnapshot,
     status: &'static str,
+    configured_roots: &BTreeMap<String, RootConfig>,
     changes: &mut Vec<FileChange>,
 ) -> Result<()> {
     crate::snapshot_state::visit_tree_records(paths, root_tree, |record| {
-        changes.push(FileChange {
+        changes.push(FileChange::from_record(
             status,
-            path: format!("{root_id}/{}", record.path),
-        });
+            format!("{root_id}/{}", record.path),
+            configured_roots.get(root_id),
+            &record.path,
+            Some(record),
+        ));
         Ok(())
     })
 }
@@ -4827,6 +4964,7 @@ fn append_v2_tree_diff(
     root_id: &str,
     from_tree: &RootSnapshot,
     to_tree: &RootSnapshot,
+    configured_roots: &BTreeMap<String, RootConfig>,
     changes: &mut Vec<FileChange>,
 ) -> Result<bool> {
     let from = read_tree_manifest(paths, from_tree)?;
@@ -4837,7 +4975,14 @@ fn append_v2_tree_diff(
     if !from.entries.is_empty() || !to.entries.is_empty() {
         return Ok(false);
     }
-    append_node_diff(paths, root_id, Some(from_node), Some(to_node), changes)?;
+    append_node_diff(
+        paths,
+        root_id,
+        Some(from_node),
+        Some(to_node),
+        configured_roots,
+        changes,
+    )?;
     Ok(true)
 }
 
@@ -4853,22 +4998,43 @@ fn append_node_diff(
     root_id: &str,
     from: Option<&TreeNodeRef>,
     to: Option<&TreeNodeRef>,
+    configured_roots: &BTreeMap<String, RootConfig>,
     changes: &mut Vec<FileChange>,
 ) -> Result<()> {
     match (from, to) {
         (Some(a), Some(b)) if a.node_key == b.node_key => return Ok(()),
         (None, Some(node)) => {
-            return append_node_records_with_status(paths, root_id, node, "A", changes);
+            return append_node_records_with_status(
+                paths,
+                root_id,
+                node,
+                "A",
+                configured_roots,
+                changes,
+            );
         }
         (Some(node), None) => {
-            return append_node_records_with_status(paths, root_id, node, "D", changes);
+            return append_node_records_with_status(
+                paths,
+                root_id,
+                node,
+                "D",
+                configured_roots,
+                changes,
+            );
         }
         (None, None) => return Ok(()),
         _ => {}
     }
     let from_node = read_tree_node(paths, &from.expect("matched above").node_key)?;
     let to_node = read_tree_node(paths, &to.expect("matched above").node_key)?;
-    append_entry_map_diff(root_id, &from_node.entries, &to_node.entries, changes);
+    append_entry_map_diff(
+        root_id,
+        &from_node.entries,
+        &to_node.entries,
+        configured_roots,
+        changes,
+    );
     let child_paths = from_node
         .child_nodes
         .keys()
@@ -4881,6 +5047,7 @@ fn append_node_diff(
             root_id,
             from_node.child_nodes.get(&path),
             to_node.child_nodes.get(&path),
+            configured_roots,
             changes,
         )?;
     }
@@ -4891,6 +5058,7 @@ fn append_entry_map_diff(
     root_id: &str,
     from: &BTreeMap<String, FileRecord>,
     to: &BTreeMap<String, FileRecord>,
+    configured_roots: &BTreeMap<String, RootConfig>,
     changes: &mut Vec<FileChange>,
 ) {
     let paths = from
@@ -4900,19 +5068,30 @@ fn append_entry_map_diff(
         .collect::<BTreeSet<_>>();
     for path in paths {
         let full_path = format!("{root_id}/{path}");
+        let root = configured_roots.get(root_id);
         match (from.get(&path), to.get(&path)) {
-            (None, Some(_)) => changes.push(FileChange {
-                status: "A",
-                path: full_path,
-            }),
-            (Some(_), None) => changes.push(FileChange {
-                status: "D",
-                path: full_path,
-            }),
-            (Some(a), Some(b)) if a != b => changes.push(FileChange {
-                status: "M",
-                path: full_path,
-            }),
+            (None, Some(record)) => changes.push(FileChange::from_record(
+                "A",
+                full_path,
+                root,
+                &path,
+                Some(record),
+            )),
+            (Some(record), None) => changes.push(FileChange::from_record(
+                "D",
+                full_path,
+                root,
+                &path,
+                Some(record),
+            )),
+            (Some(a), Some(b)) if a != b => changes.push(FileChange::from_records(
+                "M",
+                full_path,
+                root,
+                &path,
+                Some(a),
+                Some(b),
+            )),
             _ => {}
         }
     }
@@ -4923,17 +5102,21 @@ fn append_node_records_with_status(
     root_id: &str,
     node: &TreeNodeRef,
     status: &'static str,
+    configured_roots: &BTreeMap<String, RootConfig>,
     changes: &mut Vec<FileChange>,
 ) -> Result<()> {
     let node = read_tree_node(paths, &node.node_key)?;
     for record in node.entries.values() {
-        changes.push(FileChange {
+        changes.push(FileChange::from_record(
             status,
-            path: format!("{root_id}/{}", record.path),
-        });
+            format!("{root_id}/{}", record.path),
+            configured_roots.get(root_id),
+            &record.path,
+            Some(record),
+        ));
     }
     for child in node.child_nodes.values() {
-        append_node_records_with_status(paths, root_id, child, status, changes)?;
+        append_node_records_with_status(paths, root_id, child, status, configured_roots, changes)?;
     }
     Ok(())
 }
@@ -5066,6 +5249,21 @@ fn color_state_path(ui: &StatusUi, path: &str, local_paths: bool) -> String {
         return path.to_string();
     };
     format!("{}/{}", ui.paint(root, "1;96"), rest)
+}
+
+fn format_change_tags(ui: &StatusUi, change: &FileChange) -> String {
+    let mut tags = Vec::new();
+    if change.large {
+        tags.push(ui.paint("[large]", "35"));
+    }
+    if let Some(mode) = &change.volatile_mode {
+        tags.push(ui.paint(&format!("[volatile:{mode}]"), "36"));
+    }
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", tags.join(" "))
+    }
 }
 
 fn color_state_diff_line(ui: &StatusUi, line: &str) -> String {
@@ -5344,7 +5542,8 @@ fn print_snapshot_diff(
     to: &crate::majutsu_core::SnapshotManifest,
     root: Option<&str>,
 ) -> Result<()> {
-    for change in snapshot_file_changes(paths, from, to, root, true)? {
+    let configured_roots = BTreeMap::new();
+    for change in snapshot_file_changes(paths, from, to, root, true, &configured_roots)? {
         println!("{}\t{}", change.status, change.path);
     }
     Ok(())
