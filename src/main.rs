@@ -63,7 +63,6 @@ use crate::majutsu_store::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use clap::Parser;
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
@@ -164,7 +163,7 @@ use branch_runtime::branch_cmd;
 use cache_runtime::{cache_cmd, prune_synced_metadata_cache, prune_synced_payload_cache};
 #[cfg(test)]
 use cli::PackArgs;
-use cli::{Cli, Command, InitArgs, RestoreArgs, SnapshotArgs};
+use cli::{Command, InitArgs, RestoreArgs, SnapshotArgs, parse_cli};
 use clone_runtime::clone_cmd;
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
@@ -228,7 +227,7 @@ use watch_runtime::watch_cmd;
 
 fn main() -> Result<()> {
     platform_runtime::initialize_process_environment();
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let paths = resolve_paths_with_scope(cli.home, cli.system)?;
     apply_env_files(&paths)?;
     match cli.command {

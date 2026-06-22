@@ -4,6 +4,16 @@ The stable top-level commands remain compatible. New names are additive aliases
 or namespace conveniences; maintenance commands stay top-level and are not
 moved under a `maintenance` parent command.
 
+## Language
+
+Human-facing help and command descriptions respect `LC_ALL`, `LC_MESSAGES`,
+and `LANG` for English, Japanese, Chinese, Spanish, and French. Empty locale
+variables are ignored so `LANG=ja_JP.UTF-8 mj --help` works in a clean shell.
+
+Machine-oriented output remains stable: JSON field names, tabular keys,
+operation kinds, status markers, and `key value` reports stay in English so
+scripts do not break when the user's locale changes.
+
 ## Command groups
 
 ```text

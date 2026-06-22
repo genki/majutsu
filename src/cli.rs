@@ -1,4 +1,5 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Command as ClapCommand, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::env;
 use std::path::PathBuf;
 
 const CLI_LONG_ABOUT: &str = r#"majutsu snapshots multiple directories on a development host so local data loss can be recovered.
@@ -61,6 +62,550 @@ pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 }
+
+pub(crate) fn parse_cli() -> Cli {
+    let command = localize_command(Cli::command());
+    let matches = command.get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+}
+
+fn localize_command(mut command: ClapCommand) -> ClapCommand {
+    let locale = CliLocale::detect();
+    let text = locale.text();
+    command = command
+        .about(text.top_about)
+        .long_about(text.top_long_about)
+        .after_help(text.after_help);
+    command = command
+        .mut_arg("home", |arg| {
+            arg.help(text.home_help).long_help(text.home_long_help)
+        })
+        .mut_arg("system", |arg| {
+            arg.help(text.system_help).long_help(text.system_long_help)
+        });
+    command
+        .mut_subcommand("init", |cmd| cmd.about(text.init_about))
+        .mut_subcommand("root", |cmd| cmd.about(text.root_about))
+        .mut_subcommand("snapshot", |cmd| cmd.about(text.snapshot_about))
+        .mut_subcommand("status", |cmd| cmd.about(text.status_about))
+        .mut_subcommand("health", |cmd| cmd.about(text.health_about))
+        .mut_subcommand("state", |cmd| cmd.about(text.state_about))
+        .mut_subcommand("log", |cmd| cmd.about(text.log_about))
+        .mut_subcommand("diff", |cmd| cmd.about(text.diff_about))
+        .mut_subcommand("branch", |cmd| cmd.about(text.branch_about))
+        .mut_subcommand("switch", |cmd| cmd.about(text.switch_about))
+        .mut_subcommand("op", |cmd| cmd.about(text.op_about))
+        .mut_subcommand("restore", |cmd| {
+            cmd.about(text.restore_about)
+                .mut_arg("snapshot", |arg| arg.help(text.restore_snapshot_help))
+                .mut_arg("op", |arg| arg.help(text.restore_op_help))
+                .mut_arg("at", |arg| arg.help(text.restore_at_help))
+                .mut_arg("ago", |arg| arg.help(text.restore_ago_help))
+                .mut_arg("root", |arg| arg.help(text.restore_root_help))
+                .mut_arg("path", |arg| arg.help(text.restore_path_help))
+                .mut_arg("to", |arg| arg.help(text.restore_to_help))
+                .mut_arg("force", |arg| arg.help(text.restore_force_help))
+                .mut_arg("check_conflicts", |arg| {
+                    arg.help(text.restore_check_conflicts_help)
+                })
+                .mut_subcommand("plan", |sub| sub.about(text.restore_plan_about))
+                .mut_subcommand("apply", |sub| sub.about(text.restore_apply_about))
+                .mut_subcommand("prepare", |sub| sub.about(text.restore_prepare_about))
+                .mut_subcommand("resume", |sub| sub.about(text.restore_resume_about))
+                .mut_subcommand("mount", |sub| sub.about(text.mount_about))
+                .mut_subcommand("unmount", |sub| sub.about(text.unmount_about))
+                .mut_subcommand("hydrate", |sub| sub.about(text.hydrate_about))
+        })
+        .mut_subcommand("mount", |cmd| cmd.about(text.mount_about))
+        .mut_subcommand("unmount", |cmd| cmd.about(text.unmount_about))
+        .mut_subcommand("hydrate", |cmd| cmd.about(text.hydrate_about))
+        .mut_subcommand("clone", |cmd| cmd.about(text.clone_about))
+        .mut_subcommand("sync", |cmd| cmd.about(text.sync_about))
+        .mut_subcommand("remote", |cmd| cmd.about(text.remote_about))
+        .mut_subcommand("lifecycle", |cmd| cmd.about(text.lifecycle_about))
+        .mut_subcommand("watch", |cmd| cmd.about(text.watch_about))
+        .mut_subcommand("daemon", |cmd| cmd.about(text.daemon_about))
+        .mut_subcommand("key", |cmd| cmd.about(text.key_about))
+        .mut_subcommand("large", |cmd| cmd.about(text.large_about))
+        .mut_subcommand("cache", |cmd| cmd.about(text.cache_about))
+        .mut_subcommand("pack", |cmd| cmd.about(text.pack_about))
+        .mut_subcommand("prune", |cmd| cmd.about(text.prune_about))
+        .mut_subcommand("gc", |cmd| cmd.about(text.gc_about))
+        .mut_subcommand("fsck", |cmd| cmd.about(text.fsck_about))
+        .mut_subcommand("event", |cmd| cmd.about(text.event_about))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CliLocale {
+    En,
+    Ja,
+    Zh,
+    Es,
+    Fr,
+}
+
+impl CliLocale {
+    fn detect() -> Self {
+        let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .into_iter()
+            .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if locale.starts_with("ja") {
+            Self::Ja
+        } else if locale.starts_with("zh") {
+            Self::Zh
+        } else if locale.starts_with("es") {
+            Self::Es
+        } else if locale.starts_with("fr") {
+            Self::Fr
+        } else {
+            Self::En
+        }
+    }
+
+    fn text(self) -> &'static CliText {
+        match self {
+            Self::En => &CLI_TEXT_EN,
+            Self::Ja => &CLI_TEXT_JA,
+            Self::Zh => &CLI_TEXT_ZH,
+            Self::Es => &CLI_TEXT_ES,
+            Self::Fr => &CLI_TEXT_FR,
+        }
+    }
+}
+
+struct CliText {
+    top_about: &'static str,
+    top_long_about: &'static str,
+    after_help: &'static str,
+    home_help: &'static str,
+    home_long_help: &'static str,
+    system_help: &'static str,
+    system_long_help: &'static str,
+    init_about: &'static str,
+    root_about: &'static str,
+    snapshot_about: &'static str,
+    status_about: &'static str,
+    health_about: &'static str,
+    state_about: &'static str,
+    log_about: &'static str,
+    diff_about: &'static str,
+    branch_about: &'static str,
+    switch_about: &'static str,
+    op_about: &'static str,
+    restore_about: &'static str,
+    mount_about: &'static str,
+    unmount_about: &'static str,
+    hydrate_about: &'static str,
+    clone_about: &'static str,
+    sync_about: &'static str,
+    remote_about: &'static str,
+    lifecycle_about: &'static str,
+    watch_about: &'static str,
+    daemon_about: &'static str,
+    key_about: &'static str,
+    large_about: &'static str,
+    cache_about: &'static str,
+    pack_about: &'static str,
+    prune_about: &'static str,
+    gc_about: &'static str,
+    fsck_about: &'static str,
+    event_about: &'static str,
+    restore_plan_about: &'static str,
+    restore_apply_about: &'static str,
+    restore_prepare_about: &'static str,
+    restore_resume_about: &'static str,
+    restore_snapshot_help: &'static str,
+    restore_op_help: &'static str,
+    restore_at_help: &'static str,
+    restore_ago_help: &'static str,
+    restore_root_help: &'static str,
+    restore_path_help: &'static str,
+    restore_to_help: &'static str,
+    restore_force_help: &'static str,
+    restore_check_conflicts_help: &'static str,
+}
+
+static CLI_TEXT_EN: CliText = CliText {
+    top_about: "Host-level multi-root snapshot history tool",
+    top_long_about: CLI_LONG_ABOUT,
+    after_help: "See README.md and docs/OPERATIONS.md for detailed usage.",
+    home_help: "Use a specific majutsu state directory",
+    home_long_help: "Use a specific majutsu state directory containing `config.toml`, the SQLite database, local objects, and the operation log. If omitted, majutsu checks MAJUTSU_HOME, XDG config, and $HOME/.majutsu in that order.",
+    system_help: "Use the system majutsu instance",
+    system_long_help: "Use the system majutsu instance intended for root-owned host configuration such as /etc and systemd units. If --home is not also provided, majutsu checks /etc/majutsu/config.toml and then falls back to /var/lib/majutsu.",
+    init_about: "Initialize the majutsu state directory",
+    root_about: "Add, update, list, or pause snapshot roots",
+    snapshot_about: "Create a commit-like checkpoint of configured roots",
+    status_about: "Show roots, current snapshot, queues, and daemon state",
+    health_about: "Report protection health for normal operation",
+    state_about: "Inspect state home paths, refs, branches, and metadata",
+    log_about: "Show recent managed file changes",
+    diff_about: "Show differences between snapshots or points in time",
+    branch_about: "Create, list, switch, or delete logical history branches",
+    switch_about: "Switch the active branch and optionally restore its files",
+    op_about: "Inspect or restore jj-style operation-log entries",
+    restore_about: "Plan, apply, prepare, or resume a restore",
+    mount_about: "Mount a read-only restore view",
+    unmount_about: "Unmount a restore view",
+    hydrate_about: "Hydrate large objects in a materialized restore view",
+    clone_about: "Bootstrap an empty state directory from remote metadata",
+    sync_about: "Sync metadata and objects to the configured remote",
+    remote_about: "Check remote reachability, integrity, and host timelines",
+    lifecycle_about: "Generate, inspect, or apply S3/GCS lifecycle policy",
+    watch_about: "Watch the filesystem and snapshot detected changes",
+    daemon_about: "Start, stop, inspect, or export metrics for the watch daemon",
+    key_about: "Export, import, or rotate the encryption master key",
+    large_about: "List, verify, and pin large objects",
+    cache_about: "Inspect or prune synced local payload cache",
+    pack_about: "Pack or compact normal blob objects",
+    prune_about: "Prune old history according to retention settings",
+    gc_about: "Remove unreferenced local loose objects",
+    fsck_about: "Check local metadata, objects, queues, and refs",
+    event_about: "Inspect or compact the local filesystem event journal",
+    restore_plan_about: "Build a restore plan without changing files",
+    restore_apply_about: "Apply a restore plan to the configured root paths or --to directory",
+    restore_prepare_about: "Prepare missing remote objects and archive restores before apply",
+    restore_resume_about: "Resume a prepared restore job after missing objects become available",
+    restore_snapshot_help: "Restore this snapshot id",
+    restore_op_help: "Restore the state produced by this operation id or prefix",
+    restore_at_help: "Restore the latest snapshot at or before this time",
+    restore_ago_help: "Restore the latest snapshot at or before this relative duration, such as 2h",
+    restore_root_help: "Limit restore to one configured root id",
+    restore_path_help: "Limit restore to this relative path inside the selected root",
+    restore_to_help: "Restore into this directory instead of the configured root paths",
+    restore_force_help: "Allow overwrites and deletes during restore",
+    restore_check_conflicts_help: "Refuse restore when destination files conflict with the selected snapshot",
+};
+
+static CLI_TEXT_JA: CliText = CliText {
+    top_about: "ホスト単位のmulti-root snapshot履歴ツール",
+    top_long_about: r#"majutsuは、ローカルデータ喪失から復旧できるように開発ホスト上の複数ディレクトリをsnapshot化します。
+
+majutsuはGitやjujutsu互換のVCSではありません。設定したroot配下のファイル状態を独自の状態ディレクトリに記録します。新しいrootにはVCS内部、依存ディレクトリ、build出力、cacheを避けるbest-practice excludeが既定で適用されます。生成物も保護対象にする必要がある場合だけ `--no-default-excludes` を使ってください。
+
+基本フロー:
+  mj init
+  mj root add notes ~/notes
+  mj snapshot --message 'first snapshot'
+  mj log
+  mj restore plan --root notes --to /tmp/majutsu-restore
+  mj restore apply --root notes --to /tmp/majutsu-restore
+
+remote復旧フロー:
+  mj init --remote file:///mnt/backup/majutsu
+  mj sync --wait
+  mj remote fsck
+  mj clone --remote file:///mnt/backup/majutsu --home /tmp/recovered-majutsu
+
+コマンド分類:
+  Setup: init, root
+  Daily use: status, health, state, log, diff, snapshot, commit
+  History: branch, switch, op
+  Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
+  Remote: sync, remote, lifecycle
+  Service: watch, daemon
+  Security: key
+  Storage maintenance: large, cache, pack, prune, gc, fsck
+  Advanced/debug: event
+
+状態ディレクトリは `--home`、`MAJUTSU_HOME`、XDG config、`$HOME/.majutsu` の順に解決されます。
+ホスト単位のsystem保護には `mj --system ...` を使います。これは `/etc/majutsu/config.toml` を読み、なければ `/var/lib/majutsu` にフォールバックします。"#,
+    after_help: "詳細な使い方は README.md と docs/OPERATIONS.md を参照してください。",
+    home_help: "使用するmajutsu状態ディレクトリを指定します",
+    home_long_help: "`config.toml`、SQLite DB、ローカルobject、operation logを含むmajutsu状態ディレクトリを指定します。省略時は MAJUTSU_HOME、XDG config、$HOME/.majutsu の順に確認します。",
+    system_help: "system用のmajutsuインスタンスを使います",
+    system_long_help: "/etc や systemd unit などroot所有のホスト設定を保護するためのsystem用majutsuインスタンスを使います。--homeを同時指定しない場合は /etc/majutsu/config.toml を確認し、その後 /var/lib/majutsu にフォールバックします。",
+    init_about: "majutsu状態ディレクトリを初期化します",
+    root_about: "snapshot rootの追加、更新、一覧表示、一時停止を行います",
+    snapshot_about: "設定済みrootのcommit相当のcheckpointを作成します",
+    status_about: "root、current snapshot、queue、daemon状態を表示します",
+    health_about: "通常運用に必要な保護状態を診断します",
+    state_about: "状態ディレクトリ、ref、branch、metadataを確認します",
+    log_about: "管理対象ファイルの最近の変更を表示します",
+    diff_about: "snapshotや時点間の差分を表示します",
+    branch_about: "論理履歴branchの作成、一覧、切替、削除を行います",
+    switch_about: "active branchを切り替え、必要ならファイルも復元します",
+    op_about: "jj風のoperation log entryを確認または復元します",
+    restore_about: "復元の計画、適用、準備、再開を行います",
+    mount_about: "読み取り専用の復元viewをmountします",
+    unmount_about: "復元viewをunmountします",
+    hydrate_about: "materialized restore view内のlarge objectをhydrateします",
+    clone_about: "remote metadataから空の状態ディレクトリを復旧します",
+    sync_about: "metadataとobjectを設定済みremoteへ同期します",
+    remote_about: "remoteの到達性、整合性、host timelineを確認します",
+    lifecycle_about: "S3/GCS lifecycle policyの生成、確認、適用を行います",
+    watch_about: "filesystemを監視し、検出した変更をsnapshot化します",
+    daemon_about: "watch daemonの起動、停止、確認、metrics出力を行います",
+    key_about: "暗号化master keyのexport、import、rotationを行います",
+    large_about: "large objectの一覧、検証、pin管理を行います",
+    cache_about: "同期済みlocal payload cacheの確認や削除を行います",
+    pack_about: "通常blob objectをpackまたはcompactします",
+    prune_about: "retention設定に従って古い履歴をpruneします",
+    gc_about: "参照されていないlocal loose objectを削除します",
+    fsck_about: "local metadata、object、queue、refを検査します",
+    event_about: "local filesystem event journalを確認またはcompactします",
+    restore_plan_about: "ファイルを変更せず復元計画を作成します",
+    restore_apply_about: "設定済みroot pathまたは--toディレクトリへ復元を適用します",
+    restore_prepare_about: "適用前に不足remote objectやarchive restoreを準備します",
+    restore_resume_about: "不足objectが利用可能になった後、準備済みrestore jobを再開します",
+    restore_snapshot_help: "このsnapshot idを復元します",
+    restore_op_help: "このoperation idまたはprefixが作った状態を復元します",
+    restore_at_help: "この時刻以前の最新snapshotを復元します",
+    restore_ago_help: "2hなどの相対時間以前の最新snapshotを復元します",
+    restore_root_help: "復元対象を1つの設定済みroot idに限定します",
+    restore_path_help: "選択root内の相対pathに復元対象を限定します",
+    restore_to_help: "設定済みroot pathではなく、このディレクトリへ復元します",
+    restore_force_help: "復元時の上書きや削除を許可します",
+    restore_check_conflicts_help: "選択snapshotと復元先ファイルが衝突する場合は復元を拒否します",
+};
+
+static CLI_TEXT_ZH: CliText = CliText {
+    top_about: "主机级 multi-root snapshot 历史工具",
+    top_long_about: r#"majutsu 会为开发主机上的多个目录创建 snapshot，以便在本地数据丢失后恢复。
+
+majutsu 不是 Git 或 jujutsu 兼容的 VCS。它把已配置 root 下的文件状态记录到自己的状态目录中。新 root 默认使用 best-practice excludes，排除 VCS 内部文件、依赖目录、build 输出和缓存。只有这些生成物也必须备份时，才使用 `--no-default-excludes`。
+
+基本流程:
+  mj init
+  mj root add notes ~/notes
+  mj snapshot --message 'first snapshot'
+  mj log
+  mj restore plan --root notes --to /tmp/majutsu-restore
+  mj restore apply --root notes --to /tmp/majutsu-restore
+
+remote 恢复流程:
+  mj init --remote file:///mnt/backup/majutsu
+  mj sync --wait
+  mj remote fsck
+  mj clone --remote file:///mnt/backup/majutsu --home /tmp/recovered-majutsu
+
+命令分组:
+  Setup: init, root
+  Daily use: status, health, state, log, diff, snapshot, commit
+  History: branch, switch, op
+  Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
+  Remote: sync, remote, lifecycle
+  Service: watch, daemon
+  Security: key
+  Storage maintenance: large, cache, pack, prune, gc, fsck
+  Advanced/debug: event
+
+状态目录按 `--home`、`MAJUTSU_HOME`、XDG config、`$HOME/.majutsu` 的顺序解析。
+主机级系统保护请使用 `mj --system ...`；它会读取 `/etc/majutsu/config.toml`，然后回退到 `/var/lib/majutsu`。"#,
+    after_help: "详细用法请参阅 README.md 和 docs/OPERATIONS.md。",
+    home_help: "使用指定的 majutsu 状态目录",
+    home_long_help: "使用包含 `config.toml`、SQLite 数据库、本地对象和操作日志的 majutsu 状态目录。省略时按 MAJUTSU_HOME、XDG config、$HOME/.majutsu 的顺序查找。",
+    system_help: "使用系统级 majutsu 实例",
+    system_long_help: "使用面向 /etc 和 systemd unit 等 root 拥有的主机配置的系统级 majutsu 实例。若未同时指定 --home，则先检查 /etc/majutsu/config.toml，再回退到 /var/lib/majutsu。",
+    init_about: "初始化 majutsu 状态目录",
+    root_about: "添加、更新、列出或暂停 snapshot root",
+    snapshot_about: "为已配置 root 创建类似 commit 的检查点",
+    status_about: "显示 root、current snapshot、queue 和 daemon 状态",
+    health_about: "报告正常运行所需的保护健康状态",
+    state_about: "检查状态目录、ref、branch 和 metadata",
+    log_about: "显示最近的受管文件变更",
+    diff_about: "显示 snapshot 或时间点之间的差异",
+    branch_about: "创建、列出、切换或删除逻辑历史 branch",
+    switch_about: "切换 active branch，并可选择恢复文件",
+    op_about: "检查或恢复 jj 风格的 operation log entry",
+    restore_about: "规划、应用、准备或继续恢复",
+    mount_about: "挂载只读恢复视图",
+    unmount_about: "卸载恢复视图",
+    hydrate_about: "在 materialized restore view 中 hydrate large object",
+    clone_about: "从 remote metadata 引导空状态目录",
+    sync_about: "将 metadata 和 object 同步到配置的 remote",
+    remote_about: "检查 remote 可达性、完整性和 host timeline",
+    lifecycle_about: "生成、检查或应用 S3/GCS lifecycle policy",
+    watch_about: "监视 filesystem 并为检测到的变更创建 snapshot",
+    daemon_about: "启动、停止、检查或导出 watch daemon metrics",
+    key_about: "导出、导入或轮换加密 master key",
+    large_about: "列出、验证和 pin large object",
+    cache_about: "检查或清理已同步的本地 payload cache",
+    pack_about: "打包或压缩普通 blob object",
+    prune_about: "根据 retention 设置清理旧历史",
+    gc_about: "删除未引用的本地 loose object",
+    fsck_about: "检查本地 metadata、object、queue 和 ref",
+    event_about: "检查或压缩本地 filesystem event journal",
+    restore_plan_about: "在不修改文件的情况下构建恢复计划",
+    restore_apply_about: "将恢复计划应用到配置的 root path 或 --to 目录",
+    restore_prepare_about: "应用前准备缺失的 remote object 和 archive restore",
+    restore_resume_about: "缺失对象可用后继续已准备的 restore job",
+    restore_snapshot_help: "恢复此 snapshot id",
+    restore_op_help: "恢复此 operation id 或 prefix 产生的状态",
+    restore_at_help: "恢复此时间点之前的最新 snapshot",
+    restore_ago_help: "恢复相对时长之前的最新 snapshot，例如 2h",
+    restore_root_help: "仅恢复一个已配置的 root id",
+    restore_path_help: "仅恢复所选 root 内的相对 path",
+    restore_to_help: "恢复到此目录，而不是配置的 root path",
+    restore_force_help: "允许恢复时覆盖和删除",
+    restore_check_conflicts_help: "当目标文件与所选 snapshot 冲突时拒绝恢复",
+};
+
+static CLI_TEXT_ES: CliText = CliText {
+    top_about: "Herramienta de historial snapshot multi-root a nivel de host",
+    top_long_about: r#"majutsu crea snapshots de varios directorios en un host de desarrollo para poder recuperarse de una pérdida local de datos.
+
+majutsu no es un VCS compatible con Git o jujutsu. Registra el estado de archivos bajo roots configurados en su propio directorio de estado. Los roots nuevos aplican excludes de buenas prácticas para internals de VCS, dependencias, salidas de build y cachés. Usa `--no-default-excludes` solo cuando esos generados también deban respaldarse.
+
+Flujo básico:
+  mj init
+  mj root add notes ~/notes
+  mj snapshot --message 'first snapshot'
+  mj log
+  mj restore plan --root notes --to /tmp/majutsu-restore
+  mj restore apply --root notes --to /tmp/majutsu-restore
+
+Flujo de recuperación remota:
+  mj init --remote file:///mnt/backup/majutsu
+  mj sync --wait
+  mj remote fsck
+  mj clone --remote file:///mnt/backup/majutsu --home /tmp/recovered-majutsu
+
+Grupos de comandos:
+  Setup: init, root
+  Daily use: status, health, state, log, diff, snapshot, commit
+  History: branch, switch, op
+  Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
+  Remote: sync, remote, lifecycle
+  Service: watch, daemon
+  Security: key
+  Storage maintenance: large, cache, pack, prune, gc, fsck
+  Advanced/debug: event
+
+El directorio de estado se resuelve en este orden: `--home`, `MAJUTSU_HOME`, XDG config y `$HOME/.majutsu`.
+Para protección de sistema a nivel de host, usa `mj --system ...`; lee `/etc/majutsu/config.toml` y luego usa `/var/lib/majutsu`."#,
+    after_help: "Consulta README.md y docs/OPERATIONS.md para uso detallado.",
+    home_help: "Usa un directorio de estado de majutsu específico",
+    home_long_help: "Usa un directorio de estado de majutsu que contiene `config.toml`, la base SQLite, objetos locales y el registro de operaciones. Si se omite, majutsu revisa MAJUTSU_HOME, XDG config y $HOME/.majutsu en ese orden.",
+    system_help: "Usa la instancia de majutsu del sistema",
+    system_long_help: "Usa la instancia de majutsu del sistema para configuración del host propiedad de root, como /etc y unidades systemd. Si no se indica --home, revisa /etc/majutsu/config.toml y luego usa /var/lib/majutsu.",
+    init_about: "Inicializa el directorio de estado de majutsu",
+    root_about: "Agrega, actualiza, lista o pausa snapshot roots",
+    snapshot_about: "Crea un checkpoint tipo commit de los roots configurados",
+    status_about: "Muestra roots, current snapshot, queues y estado del daemon",
+    health_about: "Informa la salud de protección para operación normal",
+    state_about: "Inspecciona rutas de estado, refs, branches y metadata",
+    log_about: "Muestra cambios recientes en archivos gestionados",
+    diff_about: "Muestra diferencias entre snapshots o puntos en el tiempo",
+    branch_about: "Crea, lista, cambia o elimina branches lógicos de historial",
+    switch_about: "Cambia el active branch y opcionalmente restaura archivos",
+    op_about: "Inspecciona o restaura entradas de operation log estilo jj",
+    restore_about: "Planifica, aplica, prepara o reanuda una restauración",
+    mount_about: "Monta una vista de restauración de solo lectura",
+    unmount_about: "Desmonta una vista de restauración",
+    hydrate_about: "Hydrate large objects en una materialized restore view",
+    clone_about: "Inicializa un estado vacío desde remote metadata",
+    sync_about: "Sincroniza metadata y objetos al remote configurado",
+    remote_about: "Comprueba alcance, integridad y timelines de hosts remotos",
+    lifecycle_about: "Genera, inspecciona o aplica políticas lifecycle S3/GCS",
+    watch_about: "Vigila el filesystem y crea snapshots de cambios detectados",
+    daemon_about: "Inicia, detiene, inspecciona o exporta metrics del watch daemon",
+    key_about: "Exporta, importa o rota la master key de cifrado",
+    large_about: "Lista, verifica y fija large objects",
+    cache_about: "Inspecciona o limpia payload cache local ya sincronizada",
+    pack_about: "Empaqueta o compacta objetos blob normales",
+    prune_about: "Elimina historial antiguo según la configuración de retention",
+    gc_about: "Elimina loose objects locales no referenciados",
+    fsck_about: "Comprueba metadata, objetos, queues y refs locales",
+    event_about: "Inspecciona o compacta el filesystem event journal local",
+    restore_plan_about: "Construye un plan de restauración sin cambiar archivos",
+    restore_apply_about: "Aplica un plan a los root paths configurados o a --to",
+    restore_prepare_about: "Prepara objetos remotos faltantes y archive restores antes de aplicar",
+    restore_resume_about: "Reanuda un restore job preparado cuando los objetos faltantes estén disponibles",
+    restore_snapshot_help: "Restaura este snapshot id",
+    restore_op_help: "Restaura el estado producido por este operation id o prefix",
+    restore_at_help: "Restaura el snapshot más reciente en o antes de este momento",
+    restore_ago_help: "Restaura el snapshot más reciente antes de una duración relativa, como 2h",
+    restore_root_help: "Limita la restauración a un root id configurado",
+    restore_path_help: "Limita la restauración a esta ruta relativa dentro del root",
+    restore_to_help: "Restaura en este directorio en vez de los root paths configurados",
+    restore_force_help: "Permite sobrescrituras y eliminaciones durante la restauración",
+    restore_check_conflicts_help: "Rechaza la restauración si los archivos de destino entran en conflicto con el snapshot",
+};
+
+static CLI_TEXT_FR: CliText = CliText {
+    top_about: "Outil d'historique snapshot multi-root au niveau hôte",
+    top_long_about: r#"majutsu crée des snapshots de plusieurs répertoires sur un hôte de développement afin de permettre la récupération après une perte de données locale.
+
+majutsu n'est pas un VCS compatible Git ou jujutsu. Il enregistre l'état des fichiers sous les roots configurés dans son propre répertoire d'état. Les nouveaux roots appliquent par défaut des excludes de bonnes pratiques pour les internals VCS, dépendances, sorties de build et caches. Utilisez `--no-default-excludes` uniquement si ces fichiers générés doivent aussi être sauvegardés.
+
+Flux de base:
+  mj init
+  mj root add notes ~/notes
+  mj snapshot --message 'first snapshot'
+  mj log
+  mj restore plan --root notes --to /tmp/majutsu-restore
+  mj restore apply --root notes --to /tmp/majutsu-restore
+
+Flux de récupération remote:
+  mj init --remote file:///mnt/backup/majutsu
+  mj sync --wait
+  mj remote fsck
+  mj clone --remote file:///mnt/backup/majutsu --home /tmp/recovered-majutsu
+
+Groupes de commandes:
+  Setup: init, root
+  Daily use: status, health, state, log, diff, snapshot, commit
+  History: branch, switch, op
+  Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
+  Remote: sync, remote, lifecycle
+  Service: watch, daemon
+  Security: key
+  Storage maintenance: large, cache, pack, prune, gc, fsck
+  Advanced/debug: event
+
+Le répertoire d'état est résolu dans l'ordre suivant: `--home`, `MAJUTSU_HOME`, config XDG puis `$HOME/.majutsu`.
+Pour la protection système au niveau hôte, utilisez `mj --system ...`; cela lit `/etc/majutsu/config.toml` puis utilise `/var/lib/majutsu`."#,
+    after_help: "Consultez README.md et docs/OPERATIONS.md pour l'utilisation détaillée.",
+    home_help: "Utilise un répertoire d'état majutsu spécifique",
+    home_long_help: "Utilise un répertoire d'état majutsu contenant `config.toml`, la base SQLite, les objets locaux et le journal des opérations. S'il est omis, majutsu vérifie MAJUTSU_HOME, la config XDG puis $HOME/.majutsu.",
+    system_help: "Utilise l'instance majutsu système",
+    system_long_help: "Utilise l'instance majutsu système destinée à la configuration hôte appartenant à root, comme /etc et les unités systemd. Si --home n'est pas fourni, majutsu vérifie /etc/majutsu/config.toml puis utilise /var/lib/majutsu.",
+    init_about: "Initialise le répertoire d'état majutsu",
+    root_about: "Ajoute, met à jour, liste ou met en pause les snapshot roots",
+    snapshot_about: "Crée un checkpoint de type commit des roots configurés",
+    status_about: "Affiche roots, current snapshot, queues et état du daemon",
+    health_about: "Rapporte la santé de protection pour l'exploitation normale",
+    state_about: "Inspecte les chemins d'état, refs, branches et metadata",
+    log_about: "Affiche les changements récents des fichiers gérés",
+    diff_about: "Affiche les différences entre snapshots ou instants",
+    branch_about: "Crée, liste, change ou supprime des branches logiques d'historique",
+    switch_about: "Change l'active branch et restaure éventuellement les fichiers",
+    op_about: "Inspecte ou restaure des entrées d'operation log de style jj",
+    restore_about: "Planifie, applique, prépare ou reprend une restauration",
+    mount_about: "Monte une vue de restauration en lecture seule",
+    unmount_about: "Démonte une vue de restauration",
+    hydrate_about: "Hydrate les large objects dans une materialized restore view",
+    clone_about: "Amorce un état vide depuis la remote metadata",
+    sync_about: "Synchronise metadata et objets vers le remote configuré",
+    remote_about: "Vérifie l'accessibilité, l'intégrité et les timelines d'hôtes distants",
+    lifecycle_about: "Génère, inspecte ou applique une policy lifecycle S3/GCS",
+    watch_about: "Surveille le filesystem et snapshot les changements détectés",
+    daemon_about: "Démarre, arrête, inspecte ou exporte les metrics du watch daemon",
+    key_about: "Exporte, importe ou renouvelle la master key de chiffrement",
+    large_about: "Liste, vérifie et épingle les large objects",
+    cache_about: "Inspecte ou nettoie le payload cache local synchronisé",
+    pack_about: "Pack ou compacte les objets blob normaux",
+    prune_about: "Élague l'ancien historique selon les paramètres de retention",
+    gc_about: "Supprime les loose objects locaux non référencés",
+    fsck_about: "Vérifie metadata, objets, queues et refs locaux",
+    event_about: "Inspecte ou compacte le filesystem event journal local",
+    restore_plan_about: "Construit un plan de restauration sans modifier les fichiers",
+    restore_apply_about: "Applique un plan aux root paths configurés ou au répertoire --to",
+    restore_prepare_about: "Prépare les remote objects manquants et archive restores avant application",
+    restore_resume_about: "Reprend un restore job préparé lorsque les objets manquants sont disponibles",
+    restore_snapshot_help: "Restaure ce snapshot id",
+    restore_op_help: "Restaure l'état produit par cet operation id ou prefix",
+    restore_at_help: "Restaure le snapshot le plus récent à cet instant ou avant",
+    restore_ago_help: "Restaure le snapshot le plus récent avant une durée relative, comme 2h",
+    restore_root_help: "Limite la restauration à un root id configuré",
+    restore_path_help: "Limite la restauration à ce chemin relatif dans le root choisi",
+    restore_to_help: "Restaure dans ce répertoire au lieu des root paths configurés",
+    restore_force_help: "Autorise les écrasements et suppressions pendant la restauration",
+    restore_check_conflicts_help: "Refuse la restauration si les fichiers de destination entrent en conflit avec le snapshot choisi",
+};
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
