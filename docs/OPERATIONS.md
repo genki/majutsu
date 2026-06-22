@@ -123,6 +123,7 @@ MAJUTSU_SNAPSHOT_ALLOW_NOOP=1 mj snapshot
 
 ```sh
 mj health
+mj health --verbose
 mj health --json
 ```
 
@@ -130,6 +131,7 @@ mj health --json
 pending event journal、sync lock、暗号化key fileの基本状態から、`protected` / `degraded` /
 `unprotected` を返す。クラッシュ対策として日常的に監視すべきなのは full fsck ではなくこの
 軽量 health signal である。
+通常のテキスト出力は要約のみを表示し、root別の詳細行は `mj health --verbose` で表示する。
 `mj health --json` には root 別に `present`、`current_snapshot_includes`、
 `current_file_count`、`current_tree_id`、`last_changed_snapshot`、`last_changed_at` も含まれる。
 `mj status` の Roots 表も current snapshot 上の file count、tree id、最終変更時刻を表示する。

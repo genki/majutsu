@@ -940,6 +940,13 @@ pub(crate) struct HealthArgs {
         help = "Emit machine-readable JSON instead of text"
     )]
     pub(crate) json: bool,
+    #[arg(
+        short = 'v',
+        long,
+        default_value_t = false,
+        help = "Include per-root health details in text output"
+    )]
+    pub(crate) verbose: bool,
 }
 
 #[derive(Args)]

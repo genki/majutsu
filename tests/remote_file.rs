@@ -16904,6 +16904,27 @@ fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
         .collect::<Vec<_>>();
     assert!(codes.contains(&"daemon-unhealthy"), "{health}");
     assert!(codes.contains(&"remote-not-configured"), "{health}");
+
+    let text = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health");
+        c
+    });
+    assert!(text.contains("state unprotected"), "{text}");
+    assert!(text.contains("issues "), "{text}");
+    assert!(text.contains("daemon state="), "{text}");
+    assert!(text.contains("remote configured="), "{text}");
+    assert!(text.contains("queue uploads="), "{text}");
+    assert!(text.contains("roots active=1 total=1"), "{text}");
+    assert!(text.contains("issue critical daemon-unhealthy"), "{text}");
+    assert!(!text.contains("root sample status="), "{text}");
+
+    let verbose = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--verbose");
+        c
+    });
+    assert!(verbose.contains("root sample status=active"), "{verbose}");
 }
 
 #[test]
@@ -18577,7 +18598,11 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
         c
     });
     assert!(op_log.contains("file-events-batch"), "{op_log}");
-    assert!(op_log.contains("\tunknown\t"), "{op_log}");
+    assert!(
+        op_log.contains("\twatch:notify:daemon-pid-") || op_log.contains("\tdaemon:daemon-pid-"),
+        "{op_log}"
+    );
+    assert!(!op_log.contains("\tunknown\t"), "{op_log}");
     assert!(!op_log.contains("operator-session"), "{op_log}");
     let daemon_op = op_log
         .lines()
@@ -18597,8 +18622,11 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     assert!(op_show.contains("session_label daemon"), "{op_show}");
     assert!(op_show.contains("process_id "), "{op_show}");
     assert!(op_show.contains("process_path "), "{op_show}");
-    assert!(op_show.contains("origin_label \n"), "{op_show}");
-    assert!(op_show.contains("origin_session_id \n"), "{op_show}");
+    assert!(op_show.contains("origin_label watch:notify"), "{op_show}");
+    assert!(
+        op_show.contains("origin_session_id daemon-pid-"),
+        "{op_show}"
+    );
     assert!(op_show.contains("origin_process_id \n"), "{op_show}");
     let mut synced = false;
     for _ in 0..100 {

@@ -570,7 +570,7 @@ pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    print_health_report(&report);
+    print_health_report(&report, args.verbose);
     Ok(())
 }
 
@@ -1193,72 +1193,50 @@ fn health_notice_marker_path(paths: &Paths) -> std::path::PathBuf {
     paths.runtime.join("health-notice.sent.json")
 }
 
-fn print_health_report(report: &HealthReport) {
+fn print_health_report(report: &HealthReport, verbose: bool) {
     println!("state {}", report.state.as_str());
     println!(
-        "current_snapshot {}",
+        "snapshot {}",
         report.current_snapshot.as_deref().unwrap_or("(none)")
     );
-    println!("active_roots {}", report.active_roots);
-    println!("roots_total {}", report.roots_total);
-    println!("daemon {}", report.daemon_state);
-    println!("daemon_ipc {}", report.daemon_ipc);
-    println!("remote_configured {}", report.remote_configured);
-    println!("remote_available {}", report.remote_available);
-    println!("remote_head {}", report.remote_head_status);
-    println!("queued_uploads {}", report.queued_uploads);
-    println!("queued_uploads_retrying {}", report.queued_uploads_retrying);
-    println!("queued_uploads_delayed {}", report.queued_uploads_delayed);
-    println!("pending_journal_events {}", report.pending_journal_events);
-    println!("durable_journal_pending {}", report.durable_journal_pending);
+    println!("issues {}", report.issue_count());
     println!(
-        "sync_lock_pid {}",
+        "daemon state={} ipc={}",
+        report.daemon_state, report.daemon_ipc
+    );
+    println!(
+        "remote configured={} available={} head={}",
+        report.remote_configured, report.remote_available, report.remote_head_status
+    );
+    println!(
+        "queue uploads={} retrying={} delayed={} journal_pending={} durable_journal={} sync_lock={}",
+        report.queued_uploads,
+        report.queued_uploads_retrying,
+        report.queued_uploads_delayed,
+        report.pending_journal_events,
+        report.durable_journal_pending,
         report
             .sync_lock_pid
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "(none)".into())
     );
+    println!(
+        "roots active={} total={} missing={} unsynced={} degraded={}",
+        report.active_roots,
+        report.roots_total,
+        report.roots.iter().filter(|root| !root.present).count(),
+        report
+            .roots
+            .iter()
+            .filter(|root| root.status == "active" && !root.remote_synced)
+            .count(),
+        report
+            .roots
+            .iter()
+            .filter(|root| root.degraded_kind.is_some())
+            .count()
+    );
     println!("encryption {}", report.encryption);
-    for root in &report.roots {
-        println!(
-            "root {} status={} present={} current={} files={} tree={}",
-            root.id,
-            root.status,
-            root.present,
-            root.current_snapshot_includes,
-            root.current_file_count
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".into()),
-            root.current_tree_id.as_deref().unwrap_or("-")
-        );
-        if let Some(changed_at) = &root.last_changed_at {
-            println!(
-                "root_last_changed {} snapshot={} at={}",
-                root.id,
-                root.last_changed_snapshot.as_deref().unwrap_or("-"),
-                changed_at
-            );
-        }
-        if let Some(kind) = &root.degraded_kind {
-            println!(
-                "root_degraded {} kind={} at={} message={}",
-                root.id,
-                kind,
-                root.degraded_at.as_deref().unwrap_or("-"),
-                root.degraded_message.as_deref().unwrap_or("-")
-            );
-        }
-        println!(
-            "root_remote {} current={} synced={} snapshot={} at={} tree={}",
-            root.id,
-            root.remote_snapshot_includes,
-            root.remote_synced,
-            root.remote_synced_snapshot.as_deref().unwrap_or("-"),
-            root.remote_synced_at.as_deref().unwrap_or("-"),
-            root.remote_tree_id.as_deref().unwrap_or("-")
-        );
-    }
-    println!("issue_count {}", report.issue_count());
     for issue in &report.issues {
         println!(
             "issue {} {} {}",
@@ -1266,6 +1244,47 @@ fn print_health_report(report: &HealthReport) {
             issue.code,
             issue.message
         );
+    }
+    if verbose {
+        for root in &report.roots {
+            println!(
+                "root {} status={} present={} current={} files={} tree={}",
+                root.id,
+                root.status,
+                root.present,
+                root.current_snapshot_includes,
+                root.current_file_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                root.current_tree_id.as_deref().unwrap_or("-")
+            );
+            if let Some(changed_at) = &root.last_changed_at {
+                println!(
+                    "root_last_changed {} snapshot={} at={}",
+                    root.id,
+                    root.last_changed_snapshot.as_deref().unwrap_or("-"),
+                    changed_at
+                );
+            }
+            if let Some(kind) = &root.degraded_kind {
+                println!(
+                    "root_degraded {} kind={} at={} message={}",
+                    root.id,
+                    kind,
+                    root.degraded_at.as_deref().unwrap_or("-"),
+                    root.degraded_message.as_deref().unwrap_or("-")
+                );
+            }
+            println!(
+                "root_remote {} current={} synced={} snapshot={} at={} tree={}",
+                root.id,
+                root.remote_snapshot_includes,
+                root.remote_synced,
+                root.remote_synced_snapshot.as_deref().unwrap_or("-"),
+                root.remote_synced_at.as_deref().unwrap_or("-"),
+                root.remote_tree_id.as_deref().unwrap_or("-")
+            );
+        }
     }
 }
 
@@ -5372,13 +5391,6 @@ fn operation_origin_label(op: &OperationExport) -> String {
         .map(|(label, id)| format!("{label}:{id}"))
         .or_else(|| op.origin_session_id.clone())
         .or_else(|| op.origin_process_id.map(|pid| format!("origin-pid:{pid}")))
-        .or_else(|| {
-            if op.session_label.as_deref() == Some("daemon") {
-                Some("unknown".into())
-            } else {
-                None
-            }
-        })
         .unwrap_or_else(|| operation_session_label(op))
 }
 

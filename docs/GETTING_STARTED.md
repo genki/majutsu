@@ -186,7 +186,9 @@ mj health
 
 `mj health` is the lightweight signal to monitor. It reports whether active
 roots, daemon state, pending events, upload queue, and cached remote head are in
-a protected state.
+a protected state. The default text output is intentionally compact; use
+`mj health --verbose` for per-root detail or `mj health --json` for monitoring
+integrations.
 
 For root-owned host configuration, use a separate system instance:
 

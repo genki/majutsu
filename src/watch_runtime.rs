@@ -188,7 +188,7 @@ fn watch_fanotify(
                 paths,
                 SnapshotArgs {
                     message: Some("watch periodic rescan".into()),
-                    origin: None,
+                    origin: fallback_watch_origin("watch:fanotify", Some("fanotify")),
                 },
             )?;
             record_health(paths);
@@ -659,7 +659,10 @@ fn watch_notify_loop<W: Watcher>(
                     paths,
                     SnapshotArgs {
                         message: Some("watch periodic rescan".into()),
-                        origin: None,
+                        origin: fallback_watch_origin(
+                            &format!("watch:{backend_label}"),
+                            Some(backend_label),
+                        ),
                     },
                 )?;
                 record_health(paths);
@@ -685,7 +688,10 @@ fn watch_notify_loop<W: Watcher>(
                 paths,
                 SnapshotArgs {
                     message: Some("watch strict event snapshot".into()),
-                    origin: None,
+                    origin: fallback_watch_origin(
+                        &format!("watch:{backend_label}"),
+                        Some(backend_label),
+                    ),
                 },
             )?;
             if args.once {
@@ -712,7 +718,10 @@ fn watch_notify_loop<W: Watcher>(
             paths,
             SnapshotArgs {
                 message: Some("watch event snapshot".into()),
-                origin: None,
+                origin: fallback_watch_origin(
+                    &format!("watch:{backend_label}"),
+                    Some(backend_label),
+                ),
             },
         )?;
         record_health(paths);
@@ -896,7 +905,9 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         return Ok(());
     }
 
-    let origin = args.origin;
+    let origin = args
+        .origin
+        .or_else(|| fallback_watch_origin("watch", Some("watch")));
     let message = args.message.unwrap_or_else(|| "watch snapshot".into());
     let exe = child_process_exe()?;
     let mut command = std::process::Command::new(&exe);
@@ -980,6 +991,17 @@ fn sync_current_external(paths: &Paths) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn fallback_watch_origin(label: &str, confidence: Option<&str>) -> Option<OperationOriginOverride> {
+    Some(OperationOriginOverride {
+        label: Some(label.into()),
+        session_id: Some(format!("daemon-pid-{}", std::process::id())),
+        process_id: None,
+        process_path: None,
+        exe: None,
+        confidence: confidence.map(str::to_string),
+    })
 }
 
 pub fn recv_watch_event(
