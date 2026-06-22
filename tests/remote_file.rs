@@ -221,6 +221,170 @@ fn explicit_include_can_reach_files_below_excluded_directories() {
 }
 
 #[test]
+fn selective_include_prunes_unmatched_dirs_and_supports_relative_globs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(root.join("session-a")).unwrap();
+    fs::create_dir_all(root.join("unrelated").join("nested")).unwrap();
+    fs::write(root.join("app-service-prod.env"), b"service\n").unwrap();
+    fs::write(root.join("app-daemon-prod.env"), b"daemon\n").unwrap();
+    fs::write(
+        root.join("session-a").join(".preview-context.json"),
+        b"{}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("unrelated").join("nested").join("ignored.txt"),
+        b"ignored\n",
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(root.join("unrelated"), fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&root)
+            .arg("--include")
+            .arg("app-service*.env")
+            .arg("--include")
+            .arg("app-daemon*.env")
+            .arg("--include")
+            .arg("session-*/.preview-context.json");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("selective include");
+        c
+    });
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(root.join("unrelated"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::remove_dir_all(&root).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    let restored = restore.join("sample");
+    assert_eq!(
+        fs::read_to_string(restored.join("app-service-prod.env")).unwrap(),
+        "service\n"
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("app-daemon-prod.env")).unwrap(),
+        "daemon\n"
+    );
+    assert_eq!(
+        fs::read_to_string(restored.join("session-a").join(".preview-context.json")).unwrap(),
+        "{}\n"
+    );
+    assert!(!restored.join("unrelated").exists());
+}
+
+#[test]
+fn one_level_include_glob_matches_relative_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let root = tmp.path().join("root");
+    let restore = tmp.path().join("restore");
+    fs::create_dir_all(root.join("session-a")).unwrap();
+    fs::create_dir_all(root.join("session-a").join("nested")).unwrap();
+    fs::write(root.join("session-a").join(".preview-ws.json"), b"[]\n").unwrap();
+    fs::write(
+        root.join("session-a")
+            .join("nested")
+            .join(".preview-ws.json"),
+        b"ignored\n",
+    )
+    .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&root)
+            .arg("--include")
+            .arg("*/.preview-ws.json");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("one level include");
+        c
+    });
+    fs::remove_dir_all(&root).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("apply")
+            .arg("--root")
+            .arg("sample")
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+
+    let restored = restore.join("sample");
+    assert_eq!(
+        fs::read_to_string(restored.join("session-a").join(".preview-ws.json")).unwrap(),
+        "[]\n"
+    );
+    assert!(
+        !restored
+            .join("session-a")
+            .join("nested")
+            .join(".preview-ws.json")
+            .exists()
+    );
+}
+
+#[test]
 fn clone_quarantines_remote_hooks_by_default() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -6133,8 +6297,8 @@ signature_version = "s3v4"
     assert!(check.contains("remote_type s3"));
     assert!(check.contains("endpoint_source config.remote.endpoint"));
     assert!(check.contains("region_source config.remote.region"));
-    assert!(check.contains("access_key_source env:AWS_ACCESS_KEY_ID"));
-    assert!(check.contains("secret_key_source env:AWS_SECRET_ACCESS_KEY"));
+    assert!(check.contains("access_key_source env:AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"));
+    assert!(check.contains("secret_key_source env:AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"));
     assert!(check.contains("metadata ok"));
     assert!(check.contains("range_get 1"));
 
@@ -10757,6 +10921,8 @@ fn lifecycle_apply_puts_s3_bucket_lifecycle_configuration() {
         listener.set_nonblocking(true).unwrap();
         let started = std::time::Instant::now();
         let mut seen = Vec::new();
+        let mut saw_provider_apply = false;
+        let mut saw_status_artifact = false;
         loop {
             let Ok((mut stream, _)) = listener.accept() else {
                 if started.elapsed() > Duration::from_secs(5) {
@@ -10793,13 +10959,17 @@ fn lifecycle_apply_puts_s3_bucket_lifecycle_configuration() {
             }
             let first = header.lines().next().unwrap_or("").to_string();
             let body = String::from_utf8_lossy(&request[header_end..]).to_string();
-            let saw_status_artifact =
-                first.starts_with("PUT ") && first.contains("/majutsu/v1/lifecycle/status.json");
+            if first.starts_with("PUT ") && first.contains("?lifecycle") {
+                saw_provider_apply = true;
+            }
+            if first.starts_with("PUT ") && first.contains("/majutsu/v1/lifecycle/status.json") {
+                saw_status_artifact = true;
+            }
             seen.push((first, body));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
-            if saw_status_artifact {
+            if saw_provider_apply && saw_status_artifact {
                 break;
             }
         }

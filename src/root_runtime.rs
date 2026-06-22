@@ -269,8 +269,18 @@ fn forget_unmanaged_root_history(
         };
         let tree: TreeManifest =
             read_metadata_manifest(paths, remote.as_ref(), &root_snapshot.tree_key)
-                .with_context(|| format!("read root tree {}", root_snapshot.tree_key))?;
-        let entries = root_size_tree_entries(paths, remote.as_ref(), tree)?;
+                .with_context(|| {
+                    format!(
+                        "read existing root tree {} for root {} while applying root set; run `mj fsck` and `mj remote fsck --objects`, then `mj remote repair` if referenced objects are missing",
+                        root_snapshot.tree_key, root.id
+                    )
+                })?;
+        let entries = root_size_tree_entries(paths, remote.as_ref(), tree).with_context(|| {
+            format!(
+                "expand existing root tree for root {} while applying root set; run `mj fsck` and `mj remote fsck --objects`, then `mj remote repair` if referenced objects are missing",
+                root.id
+            )
+        })?;
         let before = entries.len();
         let kept = entries
             .into_values()

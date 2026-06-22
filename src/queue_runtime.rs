@@ -17,7 +17,7 @@ use crate::object_paths::prefer_canonical_remote_only;
 use crate::remote_store::RemoteStore;
 use crate::snapshot_rules::{
     build_ignore, classify_large, effective_large_config, explicitly_included,
-    include_may_match_inside_dir, is_ignored, is_included, looks_binary,
+    include_allows_descend, include_may_match_inside_dir, is_ignored, is_included, looks_binary,
 };
 use crate::snapshot_state::{current_snapshot, load_root_tree_entries, load_snapshot_by_id};
 use crate::util::{blake3_hex, new_id, path_to_slash, stable_read, stable_read_in_root};
@@ -591,6 +591,9 @@ fn scan_live_root_for_journal(
             let Ok(rel) = entry.path().strip_prefix(scan_base) else {
                 return true;
             };
+            if entry.file_type().is_dir() && !include_allows_descend(&root.include, rel) {
+                return false;
+            }
             if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
                 return true;
             }

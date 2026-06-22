@@ -14,7 +14,7 @@ For S3-compatible storage:
 ```sh
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-export AWS_ENDPOINT_URL=https://storage.googleapis.com
+export AWS_DEFAULT_REGION=ap-northeast-1
 export AWS_SIGNATURE_VERSION=s3v4
 
 mj init --remote s3://bucket/prefix
@@ -26,6 +26,10 @@ mj remote capabilities
 mj remote hosts
 mj remote fsck
 ```
+
+When `AWS_ENDPOINT_URL` is not set, Majutsu derives the AWS S3 endpoint from
+`AWS_DEFAULT_REGION` or `remote.region`. For GCS S3-compatible access and MinIO,
+set `AWS_ENDPOINT_URL` or `remote.endpoint` explicitly.
 
 Podman can run local MinIO for S3-compatible E2E validation:
 
@@ -40,8 +44,19 @@ scripts/e2e-minio.sh
 type = "s3"
 bucket = "my-majutsu-backup"
 prefix = "majutsu/v1/workstation"
+region = "ap-northeast-1"
+signature_version = "s3v4"
+```
+
+GCS S3-compatible example:
+
+```toml
+[remote]
+type = "s3"
+bucket = "my-majutsu-backup"
+prefix = "majutsu/v1/workstation"
 endpoint = "https://storage.googleapis.com"
-region = "us-east-1"
+region = "auto"
 signature_version = "s3v4"
 ```
 

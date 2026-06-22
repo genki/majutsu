@@ -193,7 +193,11 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         DaemonCommand::Doctor => {
             daemon_doctor(paths)?;
         }
-        DaemonCommand::Service { provider, scope } => {
+        DaemonCommand::Service {
+            provider,
+            style,
+            scope,
+        } => {
             let exe = env::current_exe()?;
             let backend = normalize_watch_backend(&config.watch.backend)?;
             let scope = match scope.as_str() {
@@ -203,6 +207,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             };
             let service = render_daemon_service(DaemonServiceConfig {
                 provider: &provider,
+                style: &style,
                 scope,
                 exe: &exe,
                 home: &paths.home,

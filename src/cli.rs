@@ -1688,6 +1688,13 @@ pub(crate) enum DaemonCommand {
         provider: String,
         #[arg(
             long,
+            default_value = "foreground",
+            value_parser = ["foreground", "forking"],
+            help = "Service style: foreground supervises `mj watch`, forking delegates lifecycle to `mj daemon start/stop`"
+        )]
+        style: String,
+        #[arg(
+            long,
             default_value = "user",
             value_parser = ["user", "system"],
             help = "Render a user service or root-owned system service"

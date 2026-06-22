@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use globset::GlobBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -286,6 +287,17 @@ pub fn include_may_match_inside_dir(patterns: &[String], rel: &Path) -> bool {
         .any(|pattern| include_pattern_may_match_inside_dir(pattern, dir))
 }
 
+pub fn include_allows_descend(patterns: &[String], rel: &Path) -> bool {
+    if patterns.is_empty()
+        || patterns
+            .iter()
+            .all(|pattern| is_catch_all_include_pattern(pattern))
+    {
+        return true;
+    }
+    is_included(patterns, rel) || include_may_match_inside_dir(patterns, rel)
+}
+
 fn is_catch_all_include_pattern(pattern: &str) -> bool {
     matches!(pattern.trim().trim_start_matches('/'), "**" | "*")
 }
@@ -377,6 +389,9 @@ fn path_pattern_match(pattern: &str, rel: &str) -> bool {
             .to_ascii_lowercase()
             .ends_with(&format!(".{}", ext.to_ascii_lowercase()));
     }
+    if pattern_has_glob_meta(pattern) && glob_path_match(pattern, rel) {
+        return true;
+    }
     if let Some(suffix) = pattern.strip_prefix("**/") {
         if let Some(middle) = suffix.strip_suffix("/**") {
             return rel == middle
@@ -399,6 +414,9 @@ fn include_pattern_may_match_inside_dir(pattern: &str, dir: &str) -> bool {
     if path_pattern_match(pattern, dir) {
         return true;
     }
+    if pattern_has_glob_meta(pattern) && glob_pattern_may_match_inside_dir(pattern, dir) {
+        return true;
+    }
     let literal_prefix = pattern
         .split(['*', '?', '['])
         .next()
@@ -411,6 +429,45 @@ fn include_pattern_may_match_inside_dir(pattern: &str, dir: &str) -> bool {
     literal_prefix == dir
         || literal_prefix.starts_with(&format!("{dir}/"))
         || dir.starts_with(&format!("{literal_prefix}/"))
+}
+
+fn pattern_has_glob_meta(pattern: &str) -> bool {
+    pattern
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'{'))
+}
+
+fn glob_path_match(pattern: &str, rel: &str) -> bool {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(true)
+        .build()
+        .map(|glob| glob.compile_matcher().is_match(rel))
+        .unwrap_or(false)
+}
+
+fn glob_pattern_may_match_inside_dir(pattern: &str, dir: &str) -> bool {
+    let pattern_parts = pattern
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let dir_parts = dir
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if pattern_parts.len() <= dir_parts.len() {
+        return false;
+    }
+    for (pattern_part, dir_part) in pattern_parts.iter().zip(dir_parts.iter()) {
+        if *pattern_part == "**" {
+            return true;
+        }
+        if !glob_path_match(pattern_part, dir_part) {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn root_large_override(args: &RootAddArgs) -> Option<RootLargeConfig> {

@@ -69,7 +69,7 @@ To protect a host against local disk loss, configure a remote and run the daemon
 ```sh
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-export AWS_ENDPOINT_URL=https://storage.googleapis.com
+export AWS_DEFAULT_REGION=ap-northeast-1
 
 mj init --encrypt --remote s3://bucket/prefix
 mj root add notes ~/notes

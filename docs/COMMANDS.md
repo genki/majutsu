@@ -260,6 +260,7 @@ mj daemon status
 mj daemon metrics
 mj daemon stop
 mj daemon service --provider systemd --scope user > ~/.config/systemd/user/majutsu.service
+mj daemon service --provider systemd --scope user --style forking > ~/.config/systemd/user/majutsu.service
 ```
 
 The daemon is a process wrapper around foreground watch. It records filesystem
@@ -267,6 +268,10 @@ events in the event journal and exposes status IPC under
 `$MAJUTSU_HOME/runtime/daemon.sock`. On Linux, prefer a root-owned
 `mj --system` daemon so `mj log` can show `fanotify:pid-...` for changes whose
 source process is observable.
+
+The default generated systemd unit supervises `mj watch --foreground true`
+directly. Use `--style forking` when the host should delegate lifecycle to
+`mj daemon start` / `mj daemon stop` and track `runtime/daemon.pid`.
 
 ## Prune, pack, and GC
 

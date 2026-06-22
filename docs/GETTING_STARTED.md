@@ -31,11 +31,13 @@ with an S3-compatible backend and encryption:
 ```sh
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-export AWS_ENDPOINT_URL=https://storage.googleapis.com
+export AWS_DEFAULT_REGION=ap-northeast-1
 export AWS_SIGNATURE_VERSION=s3v4
 
 export MAJUTSU_REMOTE=s3://bucket/prefix
 ```
+
+For GCS S3-compatible access or MinIO, set `AWS_ENDPOINT_URL` explicitly.
 
 `mj remote check` prints the resolved remote type, endpoint, region, signature
 version, and credential source labels before it opens the backend. It never

@@ -1837,6 +1837,11 @@ fn print_sync_status(status: &SyncStatusSnapshot) {
         "upload_queue_backpressure {}",
         status.upload_queue_backpressure
     );
+    if status.missing_remote_objects > 0 {
+        println!(
+            "hint missing remote objects may be repairable from local cache; run `mj remote repair --dry-run` then `mj remote repair`"
+        );
+    }
 }
 
 fn metadata_export_json_for_remote(

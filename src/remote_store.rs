@@ -276,20 +276,11 @@ pub(crate) fn remote_config_diagnostics(config: &RemoteConfig) -> Result<Vec<(St
             .ok_or_else(|| anyhow!("s3 remote is missing bucket: {remote_url}"))?
             .to_string();
         let prefix = url.path().trim_matches('/').to_string();
-        let (endpoint, endpoint_source) = if let Some(endpoint) = &config.endpoint {
-            (endpoint.clone(), "config.remote.endpoint")
-        } else if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
-            (endpoint, "env:AWS_ENDPOINT_URL")
-        } else {
-            ("https://storage.googleapis.com".into(), "default")
-        };
-        let (region, region_source) = if let Some(region) = &config.region {
-            (region.clone(), "config.remote.region")
-        } else if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
-            (region, "env:AWS_DEFAULT_REGION")
-        } else {
-            ("us-east-1".into(), "default")
-        };
+        let (region, region_source) = resolve_s3_region(config);
+        let (endpoint, endpoint_source) = resolve_s3_endpoint(config, &region);
+        let credentials_source = resolve_aws_credentials()
+            .map(|credentials| credentials.source)
+            .unwrap_or_else(|_| "missing".into());
         let (signature_version, signature_version_source) =
             if let Some(signature_version) = &config.signature_version {
                 (signature_version.clone(), "config.remote.signature_version")
@@ -312,14 +303,8 @@ pub(crate) fn remote_config_diagnostics(config: &RemoteConfig) -> Result<Vec<(St
                 "signature_version_source".into(),
                 signature_version_source.into(),
             ),
-            (
-                "access_key_source".into(),
-                env_source_presence("AWS_ACCESS_KEY_ID"),
-            ),
-            (
-                "secret_key_source".into(),
-                env_source_presence("AWS_SECRET_ACCESS_KEY"),
-            ),
+            ("access_key_source".into(), credentials_source.clone()),
+            ("secret_key_source".into(), credentials_source),
             (
                 "storage_class_source".into(),
                 env_source_presence("MAJUTSU_S3_STORAGE_CLASS"),
@@ -360,30 +345,22 @@ pub(crate) fn open_remote_with_upload_policy(
             .ok_or_else(|| anyhow!("s3 remote is missing bucket: {remote_url}"))?
             .to_string();
         let prefix = url.path().trim_matches('/').to_string();
-        let endpoint = config
-            .endpoint
-            .clone()
-            .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
-            .unwrap_or_else(|| "https://storage.googleapis.com".into());
+        let (region, _) = resolve_s3_region(config);
+        let (endpoint, _) = resolve_s3_endpoint(config, &region);
+        let credentials = resolve_aws_credentials()?;
         validate_s3_endpoint_security(&endpoint)?;
         return Ok(RemoteStore::S3(Box::new(S3Remote {
             bucket,
             prefix,
             endpoint,
-            region: config
-                .region
-                .clone()
-                .or_else(|| env::var("AWS_DEFAULT_REGION").ok())
-                .unwrap_or_else(|| "us-east-1".into()),
+            region,
             signature_version: config
                 .signature_version
                 .clone()
                 .or_else(|| env::var("AWS_SIGNATURE_VERSION").ok())
                 .unwrap_or_else(|| "s3v4".into()),
-            access_key: env::var("AWS_ACCESS_KEY_ID")
-                .context("AWS_ACCESS_KEY_ID is required for s3 remote")?,
-            secret_key: env::var("AWS_SECRET_ACCESS_KEY")
-                .context("AWS_SECRET_ACCESS_KEY is required for s3 remote")?,
+            access_key: credentials.access_key,
+            secret_key: credentials.secret_key,
             storage_class: optional_env("MAJUTSU_S3_STORAGE_CLASS")?,
             object_tags: parse_s3_object_tags_env()?,
             multipart_enabled,
@@ -392,6 +369,105 @@ pub(crate) fn open_remote_with_upload_policy(
         })));
     }
     bail!("unsupported remote URL: {remote_url}");
+}
+
+fn resolve_s3_region(config: &RemoteConfig) -> (String, &'static str) {
+    if let Some(region) = &config.region {
+        return (region.clone(), "config.remote.region");
+    }
+    if let Ok(region) = env::var("AWS_REGION") {
+        return (region, "env:AWS_REGION");
+    }
+    if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+        return (region, "env:AWS_DEFAULT_REGION");
+    }
+    ("us-east-1".into(), "default")
+}
+
+fn resolve_s3_endpoint(config: &RemoteConfig, region: &str) -> (String, &'static str) {
+    if let Some(endpoint) = &config.endpoint {
+        return (endpoint.clone(), "config.remote.endpoint");
+    }
+    if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL") {
+        return (endpoint, "env:AWS_ENDPOINT_URL");
+    }
+    (
+        format!("https://s3.{region}.amazonaws.com"),
+        "default:aws-region",
+    )
+}
+
+struct AwsCredentials {
+    access_key: String,
+    secret_key: String,
+    source: String,
+}
+
+fn resolve_aws_credentials() -> Result<AwsCredentials> {
+    if let (Ok(access_key), Ok(secret_key)) = (
+        env::var("AWS_ACCESS_KEY_ID"),
+        env::var("AWS_SECRET_ACCESS_KEY"),
+    ) {
+        return Ok(AwsCredentials {
+            access_key,
+            secret_key,
+            source: "env:AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY".into(),
+        });
+    }
+    read_aws_shared_credentials().with_context(|| {
+        "AWS credentials are required for s3 remote; set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure ~/.aws/credentials"
+    })
+}
+
+fn read_aws_shared_credentials() -> Result<AwsCredentials> {
+    let profile = env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+    let path = env::var_os("AWS_SHARED_CREDENTIALS_FILE")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".aws/credentials")))
+        .ok_or_else(|| anyhow!("HOME is not set and AWS_SHARED_CREDENTIALS_FILE is not set"))?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("read AWS shared credentials {}", path.display()))?;
+    let section = parse_ini_section(&content, &profile)
+        .ok_or_else(|| anyhow!("AWS shared credentials profile not found: {profile}"))?;
+    let access_key = section
+        .get("aws_access_key_id")
+        .cloned()
+        .ok_or_else(|| anyhow!("aws_access_key_id missing in profile {profile}"))?;
+    let secret_key = section
+        .get("aws_secret_access_key")
+        .cloned()
+        .ok_or_else(|| anyhow!("aws_secret_access_key missing in profile {profile}"))?;
+    Ok(AwsCredentials {
+        access_key,
+        secret_key,
+        source: format!("shared-credentials:{}#{}", path.display(), profile),
+    })
+}
+
+fn parse_ini_section(
+    content: &str,
+    wanted: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut current: Option<String> = None;
+    let mut out = std::collections::BTreeMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            current = Some(line[1..line.len() - 1].trim().to_string());
+            continue;
+        }
+        if current.as_deref() != Some(wanted) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        out.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn validate_s3_endpoint_security(endpoint: &str) -> Result<()> {
@@ -1892,6 +1968,56 @@ mod storage_characteristic_tests {
             adaptive_multipart_part_size(huge, "https://s3.amazonaws.com")
                 > MIN_MULTIPART_PART_SIZE
         );
+    }
+
+    #[test]
+    fn s3_endpoint_defaults_to_aws_region_when_not_configured() {
+        let config = RemoteConfig {
+            url: Some("s3://bucket/prefix".into()),
+            remote_type: None,
+            path: None,
+            bucket: None,
+            prefix: None,
+            endpoint: None,
+            region: Some("ap-northeast-1".into()),
+            signature_version: None,
+        };
+        let diagnostics = remote_config_diagnostics(&config).unwrap();
+        assert!(diagnostics.contains(&(
+            "endpoint".into(),
+            "https://s3.ap-northeast-1.amazonaws.com".into()
+        )));
+        assert!(diagnostics.contains(&("endpoint_source".into(), "default:aws-region".into())));
+
+        let configured = RemoteConfig {
+            endpoint: Some("https://storage.googleapis.com".into()),
+            ..config
+        };
+        let diagnostics = remote_config_diagnostics(&configured).unwrap();
+        assert!(
+            diagnostics.contains(&("endpoint".into(), "https://storage.googleapis.com".into()))
+        );
+        assert!(diagnostics.contains(&("endpoint_source".into(), "config.remote.endpoint".into())));
+    }
+
+    #[test]
+    fn parses_aws_shared_credentials_profile() {
+        let content = r#"
+[default]
+aws_access_key_id = default-key
+aws_secret_access_key = default-secret
+
+[backup]
+aws_access_key_id=backup-key
+aws_secret_access_key=backup-secret
+"#;
+        let profile = parse_ini_section(content, "backup").unwrap();
+        assert_eq!(profile.get("aws_access_key_id").unwrap(), "backup-key");
+        assert_eq!(
+            profile.get("aws_secret_access_key").unwrap(),
+            "backup-secret"
+        );
+        assert!(parse_ini_section(content, "missing").is_none());
     }
 
     #[test]

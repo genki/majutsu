@@ -15,6 +15,7 @@ pub struct DaemonStatus {
 #[derive(Debug, Clone, Copy)]
 pub struct DaemonServiceConfig<'a> {
     pub provider: &'a str,
+    pub style: &'a str,
     pub scope: DaemonServiceScope,
     pub exe: &'a Path,
     pub home: &'a Path,
@@ -35,7 +36,6 @@ pub enum DaemonServiceScope {
 }
 
 pub fn render_daemon_service(config: DaemonServiceConfig<'_>) -> Result<String, String> {
-    let args = daemon_watch_args(&config);
     let provider = if config.provider == "auto" {
         if cfg!(target_os = "windows") {
             "windows-task"
@@ -48,9 +48,12 @@ pub fn render_daemon_service(config: DaemonServiceConfig<'_>) -> Result<String, 
         config.provider
     };
     match provider {
-        "systemd" => Ok(render_systemd_service(&config, args)),
-        "launchd" => Ok(render_launchd_plist(&config, args)),
-        "windows-task" | "schtasks" => Ok(render_windows_task_script(&config, args)),
+        "systemd" => Ok(render_systemd_service(&config)),
+        "launchd" => Ok(render_launchd_plist(&config, daemon_watch_args(&config))),
+        "windows-task" | "schtasks" => Ok(render_windows_task_script(
+            &config,
+            daemon_watch_args(&config),
+        )),
         other => Err(format!("unsupported daemon service provider: {other}")),
     }
 }
@@ -82,12 +85,51 @@ fn daemon_watch_args(config: &DaemonServiceConfig<'_>) -> Vec<String> {
     ]
 }
 
-fn render_systemd_service(config: &DaemonServiceConfig<'_>, args: Vec<String>) -> String {
-    let args = args
-        .into_iter()
-        .map(|arg| systemd_quote(&arg))
-        .collect::<Vec<_>>()
-        .join(" ");
+fn daemon_start_args(config: &DaemonServiceConfig<'_>) -> Vec<String> {
+    vec![
+        config.exe.display().to_string(),
+        "--home".into(),
+        config.home.display().to_string(),
+        "daemon".into(),
+        "start".into(),
+    ]
+}
+
+fn daemon_stop_args(config: &DaemonServiceConfig<'_>) -> Vec<String> {
+    vec![
+        config.exe.display().to_string(),
+        "--home".into(),
+        config.home.display().to_string(),
+        "daemon".into(),
+        "stop".into(),
+    ]
+}
+
+fn render_systemd_service(config: &DaemonServiceConfig<'_>) -> String {
+    let foreground = config.style != "forking";
+    let args = if foreground {
+        daemon_watch_args(config)
+    } else {
+        daemon_start_args(config)
+    }
+    .into_iter()
+    .map(|arg| systemd_quote(&arg))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let service_type = if foreground { "simple" } else { "forking" };
+    let stop_and_pid = if foreground {
+        String::new()
+    } else {
+        let stop_args = daemon_stop_args(config)
+            .into_iter()
+            .map(|arg| systemd_quote(&arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "ExecStop={stop_args}\nPIDFile={}\n",
+            systemd_quote(&format!("{}/runtime/daemon.pid", config.home.display()))
+        )
+    };
     let daemon_env = format!(
         "-{}",
         systemd_quote(&format!("{}/daemon.env", config.home.display()))
@@ -110,10 +152,11 @@ fn render_systemd_service(config: &DaemonServiceConfig<'_>, args: Vec<String>) -
          After=network-online.target\n\
          Wants=network-online.target\n\n\
          [Service]\n\
-         Type=simple\n\
+         Type={service_type}\n\
          EnvironmentFile={daemon_env}\n\
          EnvironmentFile={s3_env}\n\
          ExecStart={args}\n\
+         {stop_and_pid}\
          {service_scope}\
          Restart=on-failure\n\
          RestartSec=10s\n\n\
@@ -249,6 +292,7 @@ mod tests {
     fn renders_systemd_service_with_quoted_paths() {
         let service = render_daemon_service(DaemonServiceConfig {
             provider: "systemd",
+            style: "foreground",
             scope: DaemonServiceScope::User,
             exe: Path::new("/opt/Majutsu Bin/mj"),
             home: Path::new("/home/alice/.majutsu%prod"),
@@ -279,6 +323,7 @@ mod tests {
     fn renders_systemd_system_service() {
         let service = render_daemon_service(DaemonServiceConfig {
             provider: "systemd",
+            style: "foreground",
             scope: DaemonServiceScope::System,
             exe: Path::new("/usr/local/bin/mj"),
             home: Path::new("/var/lib/majutsu"),
@@ -300,9 +345,41 @@ mod tests {
     }
 
     #[test]
+    fn renders_systemd_forking_service() {
+        let service = render_daemon_service(DaemonServiceConfig {
+            provider: "systemd",
+            style: "forking",
+            scope: DaemonServiceScope::User,
+            exe: Path::new("/usr/local/bin/mj"),
+            home: Path::new("/home/alice/.majutsu"),
+            backend: "fanotify",
+            mode: "default",
+            interval_secs: 60,
+            debounce_ms: 1500,
+            settle_ms: 500,
+            buffer_max_ms: 60000,
+            buffer_max_events: 1000,
+            periodic_rescan_secs: 3600,
+        })
+        .unwrap();
+
+        assert!(service.contains("Type=forking"));
+        assert!(
+            service
+                .contains("ExecStart=/usr/local/bin/mj --home /home/alice/.majutsu daemon start")
+        );
+        assert!(
+            service.contains("ExecStop=/usr/local/bin/mj --home /home/alice/.majutsu daemon stop")
+        );
+        assert!(service.contains("PIDFile=/home/alice/.majutsu/runtime/daemon.pid"));
+        assert!(!service.contains("ExecStart=/usr/local/bin/mj --home /home/alice/.majutsu watch"));
+    }
+
+    #[test]
     fn renders_launchd_plist_with_escaped_paths() {
         let service = render_daemon_service(DaemonServiceConfig {
             provider: "launchd",
+            style: "foreground",
             scope: DaemonServiceScope::User,
             exe: Path::new("/opt/majutsu/mj"),
             home: Path::new("/Users/alice/.majutsu&prod"),
@@ -328,6 +405,7 @@ mod tests {
         assert!(
             render_daemon_service(DaemonServiceConfig {
                 provider: "cron",
+                style: "foreground",
                 scope: DaemonServiceScope::User,
                 exe: Path::new("/usr/bin/mj"),
                 home: Path::new("/tmp/majutsu"),

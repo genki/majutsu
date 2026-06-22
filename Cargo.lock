@@ -1485,6 +1485,7 @@ dependencies = [
  "crossterm",
  "filetime",
  "fuser",
+ "globset",
  "hex",
  "hmac",
  "ignore",
