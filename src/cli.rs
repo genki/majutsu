@@ -990,6 +990,13 @@ pub(crate) struct StateArgs {
     )]
     pub(crate) deleted: bool,
     #[arg(
+        short = 's',
+        long = "status",
+        value_name = "MARK",
+        help = "Filter by change status. May be repeated or comma-separated; valid marks are A, M, D, and m"
+    )]
+    pub(crate) status: Vec<String>,
+    #[arg(
         long,
         default_value_t = false,
         help = "Include metadata-only changes such as directory mtime, mode, owner, or xattrs"

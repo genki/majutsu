@@ -42,6 +42,7 @@ mj state 1d -r home-notes
 mj state 03:40 -r home-notes --diff
 mj state op-123456789abc -g
 mj state --deleted
+mj state --status A,M
 ```
 
 Markers:
@@ -66,11 +67,16 @@ Binary, special, and files larger than 1 MiB keep the status row but omit the
 diff body.
 
 Use `--deleted` to list only paths that are still managed in the basis snapshot
-but no longer exist in the live root:
+but no longer exist in the live root. It is equivalent to `--status D`.
+Use `-s/--status` for arbitrary status filtering; it may be repeated or
+comma-separated.
 
 ```sh
 mj state --deleted
 mj state --deleted -r home-notes
+mj state --status D
+mj state --status A,M
+mj state -s A -s D
 ```
 
 ## History and operations

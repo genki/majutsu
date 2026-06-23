@@ -25,13 +25,15 @@ mj state 1d -r moon
 mj state 03:40 -r moon --diff
 mj state op-123456789abc -g
 mj state --deleted
+mj state --status A,M
 ```
 
 通常表示は `A/M/D` のファイル変更だけを出す。directory mtime、mode、owner、xattrs など
 metadata-only の変更は既定では隠し、必要な場合だけ `--meta` で小文字 `m` として表示する。
 `--diff` は text file の変更行を `@@` / `-` / `+` の色付き diff 形式で file row の直後に表示する。
 binary、special file、1 MiB 超のファイルは status row のみ表示し、diff body は省略する。
-実体が削除済みの管理対象だけを確認する場合は `--deleted` を使う。
+実体が削除済みの管理対象だけを確認する場合は `--deleted` または `--status D` を使う。
+任意の状態で絞る場合は `--status A,M` や `-s A -s D` のように指定する。
 
 `mj status` の先頭には remote head の同期状態が表示される。`Remote head synced (cached)`
 なら local current snapshot が最後に確認した remote current ref と一致している。

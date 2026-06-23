@@ -1348,9 +1348,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let current = current_snapshot(&conn)?;
     let configured_roots = roots(&conn)?;
     let state_scope = resolve_state_scope(&configured_roots, &args)?;
-    let filter = StateChangeFilter {
-        deleted_only: args.deleted,
-    };
+    let filter = StateChangeFilter::from_args(&args)?;
     let basis = if let Some(reference) = args.reference.as_deref() {
         Some(resolve_state_basis(paths, &conn, reference)?)
     } else {
@@ -1393,7 +1391,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
         Some(state_change_report(
             state_live_file_changes(paths, &from, &state_scope.roots, false, args.meta)?,
             current.as_deref().unwrap_or("(none)").to_string(),
-            filter,
+            &filter,
         ))
     } else {
         None
@@ -2014,18 +2012,46 @@ struct StateFileChange {
     path: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StateChangeFilter {
-    deleted_only: bool,
+    statuses: Option<BTreeSet<String>>,
 }
 
 impl StateChangeFilter {
-    fn allows(self, status: &str) -> bool {
-        !self.deleted_only || status == "D"
+    fn from_args(args: &StateArgs) -> Result<Self> {
+        let mut statuses = BTreeSet::new();
+        if args.deleted {
+            statuses.insert("D".to_string());
+        }
+        for raw in &args.status {
+            for part in raw.split(',') {
+                let status = part.trim();
+                if status.is_empty() {
+                    continue;
+                }
+                if !matches!(status, "A" | "M" | "D" | "m") {
+                    bail!("invalid state status filter: {status}; expected one of A, M, D, m");
+                }
+                statuses.insert(status.to_string());
+            }
+        }
+        Ok(Self {
+            statuses: if statuses.is_empty() {
+                None
+            } else {
+                Some(statuses)
+            },
+        })
+    }
+
+    fn allows(&self, status: &str) -> bool {
+        self.statuses
+            .as_ref()
+            .is_none_or(|statuses| statuses.contains(status))
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StateChangeOptions {
     show_diff: bool,
     include_meta: bool,
@@ -2035,7 +2061,7 @@ struct StateChangeOptions {
 fn state_change_report(
     changes: Vec<FileChange>,
     current_snapshot: String,
-    filter: StateChangeFilter,
+    filter: &StateChangeFilter,
 ) -> StateChangeReport {
     let mut files = Vec::with_capacity(changes.len());
     let mut added = 0usize;
@@ -2087,6 +2113,7 @@ fn stream_state_short_changes(
             let tx = tx.clone();
             let paths = paths.clone();
             let snapshot_id = snapshot_id.clone();
+            let options = options.clone();
             handles.push(thread::spawn(move || {
                 let ui = StatusUi::new();
                 let result = state_stream_live_file_changes_for_root(

@@ -94,6 +94,7 @@ mj state 1d -r moon
 mj state 03:40 -r moon --diff
 mj state op-123456789abc -g
 mj state --deleted
+mj state --status A,M
 ```
 
 Markers:
@@ -108,7 +109,8 @@ m  metadata-only change; shown only with --meta
 `--diff` prints colored unified-diff-style text hunks after file rows.
 `--meta` includes metadata-only changes such as directory mtime, mode, owner,
 or xattrs.
-`--deleted` filters the output to `D` rows.
+`--deleted` filters the output to `D` rows and is equivalent to `--status D`.
+`-s/--status` accepts repeated or comma-separated `A`, `M`, `D`, and `m`.
 
 ## Restore view namespace
 

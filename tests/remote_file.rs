@@ -15602,6 +15602,50 @@ fn state_reference_reports_file_changes_since_operation() {
         c
     });
     assert_eq!(deleted_output, " D sample/deleted.txt\n");
+    let status_deleted_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--status")
+            .arg("D");
+        c
+    });
+    assert_eq!(status_deleted_output, deleted_output);
+    let status_added_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--status")
+            .arg("A");
+        c
+    });
+    let mut status_added_lines = status_added_output.lines().collect::<Vec<_>>();
+    status_added_lines.sort();
+    assert_eq!(
+        status_added_lines,
+        vec![" A sample/added.txt", " A sample/memo/new.md"]
+    );
+    let status_added_deleted_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--status")
+            .arg("A,D");
+        c
+    });
+    let mut status_added_deleted_lines = status_added_deleted_output.lines().collect::<Vec<_>>();
+    status_added_deleted_lines.sort();
+    assert_eq!(
+        status_added_deleted_lines,
+        vec![
+            " A sample/added.txt",
+            " A sample/memo/new.md",
+            " D sample/deleted.txt",
+        ]
+    );
     assert!(!state_output.contains("m sample/memo"), "{state_output}");
     let root_filtered_output = output({
         let mut c = mj();
