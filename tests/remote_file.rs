@@ -6032,7 +6032,10 @@ fn log_defaults_to_managed_file_changes_not_sync_operations() {
         c
     });
     assert!(colored_log.contains("\u{1b}[1;34m20"));
-    assert!(colored_log.contains("\u{1b}[1;33mM\u{1b}[0m\tsample/alpha.txt"));
+    assert!(
+        colored_log.contains("\u{1b}[1;33mM\u{1b}[0m\t\u{1b}[1;96msample\u{1b}[0m/alpha.txt"),
+        "{colored_log:?}"
+    );
 }
 
 #[test]
@@ -7702,6 +7705,23 @@ fn diff_reports_added_modified_and_deleted_paths() {
     let stdout = String::from_utf8_lossy(&diff_output.stdout);
     assert!(stdout.contains("D\tsample/alpha.txt"));
     assert!(stdout.contains("A\tsample/beta.txt"));
+    let colored_diff = output({
+        let mut c = mj();
+        c.env("MJ_COLOR", "always")
+            .env_remove("NO_COLOR")
+            .arg("--home")
+            .arg(&state)
+            .arg("diff");
+        c
+    });
+    assert!(
+        colored_diff.contains("\u{1b}[1;31mD\u{1b}[0m\t\u{1b}[1;96msample\u{1b}[0m/alpha.txt"),
+        "{colored_diff:?}"
+    );
+    assert!(
+        colored_diff.contains("\u{1b}[1;32mA\u{1b}[0m\t\u{1b}[1;96msample\u{1b}[0m/beta.txt"),
+        "{colored_diff:?}"
+    );
     let positional = output({
         let mut c = mj();
         c.arg("--home")

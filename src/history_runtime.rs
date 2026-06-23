@@ -2125,7 +2125,7 @@ fn stream_state_short_changes(
                         let line = format!(
                             " {} {}{}",
                             color_change_status(&ui, change.status),
-                            color_state_path(&ui, &change.path, local_paths),
+                            color_root_path(&ui, &change.path, local_paths),
                             format_change_tags(&ui, &change)
                         );
                         tx.send(LogProducerMessage::Line(line))
@@ -4370,7 +4370,7 @@ where
                 write_line(&format!(
                     "{}\t{}{}",
                     color_change_status(&ui, change.status),
-                    change.path,
+                    color_root_path(&ui, &change.path, false),
                     format_change_tags(&ui, &change)
                 ))?;
             }
@@ -5427,7 +5427,7 @@ fn color_change_status(ui: &StatusUi, status: &str) -> String {
     ui.severity(status, severity)
 }
 
-fn color_state_path(ui: &StatusUi, path: &str, local_paths: bool) -> String {
+fn color_root_path(ui: &StatusUi, path: &str, local_paths: bool) -> String {
     if local_paths {
         return path.to_string();
     }
@@ -5785,8 +5785,13 @@ fn print_snapshot_diff(
     root: Option<&str>,
 ) -> Result<()> {
     let configured_roots = BTreeMap::new();
+    let ui = StatusUi::new();
     for change in snapshot_file_changes(paths, from, to, root, true, &configured_roots)? {
-        println!("{}\t{}", change.status, change.path);
+        println!(
+            "{}\t{}",
+            color_change_status(&ui, change.status),
+            color_root_path(&ui, &change.path, false)
+        );
     }
     Ok(())
 }
