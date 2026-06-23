@@ -6,9 +6,9 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
 #[cfg(unix)]
 use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 
 fn mj() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
@@ -16042,6 +16042,68 @@ fn note_edits_operation_and_snapshot_messages() {
         }),
         ""
     );
+}
+
+#[test]
+fn log_waits_for_busy_database_instead_of_failing_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let db = state.join("db/majutsu.sqlite");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let holder = thread::spawn(move || {
+        let conn = Connection::open(db).unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        conn.execute_batch("create table if not exists busy_test(id integer)")
+            .unwrap();
+        conn.execute_batch("begin immediate; insert into busy_test(id) values (1)")
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        thread::sleep(Duration::from_millis(900));
+        conn.execute_batch("commit").unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    let started = Instant::now();
+    let log = output({
+        let mut c = mj();
+        c.env("MAJUTSU_DB_BUSY_TIMEOUT_SECS", "5")
+            .arg("--home")
+            .arg(&state)
+            .arg("log");
+        c
+    });
+    holder.join().unwrap();
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "mj log should wait for the writer lock instead of racing past it"
+    );
+    assert!(log.contains("initial-scan"), "{log}");
 }
 
 #[test]

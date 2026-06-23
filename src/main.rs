@@ -74,6 +74,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -350,6 +351,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let mut total_files = 0usize;
     let mut large_files = 0usize;
     let mut pending_blob_inserts = Vec::new();
+    let mut pending_tracked_paths = Vec::new();
     for root in roots(&conn)? {
         if root.status != "active" {
             eprintln!("root {}, skipped: status={}", root.id, root.status);
@@ -488,6 +490,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         };
         let records = scanned.records;
         pending_blob_inserts.extend(scanned.blobs);
+        pending_tracked_paths.extend(scanned.tracked_paths);
         if let Err(err) = post_result {
             record_snapshot_failure(
                 &conn,
@@ -566,6 +569,9 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             "insert or ignore into blobs(oid, size, object_key) values (?1, ?2, ?3)",
             params![blob.oid.as_str(), blob.size, blob.object_key.as_str()],
         )?;
+    }
+    for (root_id, path) in &pending_tracked_paths {
+        mark_path_tracked(&tx, root_id, path)?;
     }
     tx.execute(
         "insert into snapshots(id, parent_id, op_id, created_at, manifest_key, manifest_json)
@@ -2494,6 +2500,7 @@ pub(crate) fn pack_entry_payload<'a>(oid: &str, entry: &'a [u8]) -> Result<&'a [
 struct ScannedRoot {
     records: Vec<FileRecord>,
     blobs: Vec<BlobInsert>,
+    tracked_paths: Vec<(String, String)>,
 }
 
 struct BlobInsert {
@@ -2661,10 +2668,15 @@ fn scan_root(
             payload,
         });
     }
-    for record in &records {
-        mark_path_tracked(conn, &root.id, &record.path)?;
-    }
-    Ok(ScannedRoot { records, blobs })
+    let tracked_paths = records
+        .iter()
+        .map(|record| (record.root_id.clone(), record.path.clone()))
+        .collect();
+    Ok(ScannedRoot {
+        records,
+        blobs,
+        tracked_paths,
+    })
 }
 
 fn packed_blob_object_keys(conn: &Connection) -> Result<BTreeMap<String, String>> {
@@ -3409,12 +3421,27 @@ fn open_db(paths: &Paths) -> Result<Connection> {
         fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(&paths.db)?;
+    configure_db_connection(&conn)?;
     migrate(&conn)?;
     if paths.config.exists() {
         let config = read_config(paths)?;
         sync_config_roots(paths, &conn, &config)?;
     }
     Ok(conn)
+}
+
+fn configure_db_connection(conn: &Connection) -> Result<()> {
+    let timeout_secs = env::var("MAJUTSU_DB_BUSY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120);
+    conn.busy_timeout(Duration::from_secs(timeout_secs))?;
+    let journal_mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+    }
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
