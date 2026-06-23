@@ -15,6 +15,17 @@ mj daemon metrics
 `mj status` は運用上の要点確認に使う。`mj state` は Git の `status -s` に近い
 管理対象ファイル差分の確認に使う。
 
+既存の operation / snapshot に運用上の説明を後から付けたい場合は `mj note` を使う。
+引数なしの表示ではなく、`mj note REF` で現在の note を表示し、`-m`、`--stdin`、
+`--clear` で更新する。`snap-...` は、その snapshot を作成した operation に解決されるため、
+checkpoint として作った snapshot に後から説明を付けられる。
+
+```sh
+mj note snap-12345678
+mj note snap-12345678 -m 'migration前のcheckpoint'
+mj note op-12345678 --clear
+```
+
 `mj state` を引数なしで実行すると、初回 snapshot から現在の live filesystem までの
 全変更を表示する。指定時点からの差分は `mj state <ref>` を使う。root を絞る場合は
 `-r/--root`、全root表示を明示する場合は `-g/--global` を使う。

@@ -25,12 +25,13 @@ Daily use:
   status
   health
   state
-  track
-  untrack
   log
   diff
   snapshot
   commit    alias: snapshot
+  note
+  track
+  untrack
 
 History:
   branch
@@ -82,6 +83,16 @@ the canonical term. Majutsu preserves changes through the daemon/event journal
 and remote sync path; a snapshot is a durable checkpoint in the host timeline.
 
 `mj switch` is a top-level alias for `mj branch switch`.
+
+`mj note` edits the human note/message on an existing operation. It also accepts
+`snap-...` references and resolves them to the operation that created the
+snapshot.
+
+```sh
+mj note op-12345678
+mj note op-12345678 -m "before migration"
+mj note snap-12345678 --clear
+```
 
 ## State inspection
 

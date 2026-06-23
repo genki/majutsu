@@ -247,6 +247,21 @@ pub(crate) fn update_operation_result(
     Ok(())
 }
 
+pub(crate) fn update_operation_message(
+    conn: &Connection,
+    id: &str,
+    message: Option<&str>,
+) -> Result<OperationExport> {
+    conn.execute(
+        "update operations set message=?2 where id=?1",
+        params![id, message],
+    )?;
+    rewrite_local_oplog(conn)?;
+    let op = query_operation(conn, id)?;
+    append_operation_audit_log(conn, &op)?;
+    Ok(op)
+}
+
 pub(crate) fn local_oplog_path(conn: &Connection) -> Result<Option<PathBuf>> {
     let db_path = conn
         .query_row(

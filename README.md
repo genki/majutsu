@@ -113,6 +113,8 @@ mj state 03:40 -r notes --diff
 mj state op-123456789abc -g
 mj state --deleted
 mj state --status A,M
+mj log
+mj note snap-12345678 -m 'before migration'
 mj track path/to/file
 mj untrack path/to/file
 ```

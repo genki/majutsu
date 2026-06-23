@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal, Read as _, Write as _};
 #[cfg(unix)]
 use std::mem;
 #[cfg(unix)]
@@ -30,12 +30,12 @@ use std::time::Duration as StdDuration;
 use walkdir::WalkDir;
 
 use crate::atomic_io::write_atomic;
-use crate::cli::{DiffArgs, HealthArgs, LogArgs, OpCommand, StateArgs, StatusArgs};
+use crate::cli::{DiffArgs, HealthArgs, LogArgs, NoteArgs, OpCommand, StateArgs, StatusArgs};
 use crate::config::{Config, Paths, RootConfig, read_config};
 use crate::daemon_runtime::{
     DaemonHealth, DaemonHealthState, daemon_health, ensure_daemon_running,
 };
-use crate::operation_log::{query_operation_resolved, record_op};
+use crate::operation_log::{query_operation_resolved, record_op, update_operation_message};
 use crate::process_runtime::process_lock_owner;
 use crate::queue_runtime::{
     event_journal_records, event_journal_stats, record_event, remote_event_journal_stats,
@@ -5574,6 +5574,54 @@ fn operation_origin_label(op: &OperationExport) -> String {
             }
         })
         .unwrap_or_else(|| operation_session_label(op))
+}
+
+pub(crate) fn note_cmd(paths: &Paths, args: NoteArgs) -> Result<()> {
+    crate::ensure_ready(paths)?;
+    let conn = crate::open_db(paths)?;
+    let op_id = resolve_note_operation_id(&conn, &args.reference)?;
+    if args.message.is_none() && !args.stdin && !args.clear {
+        let op = query_operation_resolved(&conn, &op_id)?;
+        if let Some(message) = op.message {
+            println!("{message}");
+        }
+        return Ok(());
+    }
+    let message = if args.clear {
+        None
+    } else if args.stdin {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        let trimmed = input.trim_end_matches(['\r', '\n']).to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    } else {
+        args.message.filter(|message| !message.is_empty())
+    };
+    let op = update_operation_message(&conn, &op_id, message.as_deref())?;
+    println!("noted {}", display_op_id(&op.id));
+    if let Some(message) = op.message {
+        println!("{message}");
+    }
+    Ok(())
+}
+
+fn resolve_note_operation_id(conn: &Connection, reference: &str) -> Result<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        bail!("note reference must not be empty");
+    }
+    if reference.starts_with("snap-") {
+        let snapshot = resolve_snapshot_id(conn, reference)?;
+        return conn
+            .query_row(
+                "select op_id from snapshots where id=?1",
+                params![snapshot],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("snapshot has no operation: {reference}"));
+    }
+    Ok(query_operation_resolved(conn, reference)?.id)
 }
 
 pub(crate) fn op_cmd(paths: &Paths, command: OpCommand) -> Result<()> {

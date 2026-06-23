@@ -10,7 +10,7 @@ maintenance commands remain top-level for Git-style discoverability.
 
 ```text
 Setup: init, root
-Daily use: status, health, state, log, diff, snapshot, commit
+Daily use: status, health, state, log, diff, snapshot, commit, note, track, untrack
 History: branch, switch, op
 Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
 Remote: sync, remote, lifecycle
@@ -114,6 +114,20 @@ mj op show <op-id> --files
 mj op diff <op-id>
 mj op restore <op-id>
 ```
+
+Show or edit an operation note:
+
+```sh
+mj note op-12345678
+mj note op-12345678 -m "before migration"
+mj note snap-12345678 -m "checkpoint before dependency upgrade"
+mj note op-12345678 --stdin
+mj note op-12345678 --clear
+```
+
+`mj note` accepts operation ids and snapshot ids. A `snap-...` reference is
+resolved to the operation that created the snapshot, so release checkpoints and
+manual snapshots can be annotated after the fact without rewriting file data.
 
 The first baseline snapshot is recorded as `initial-scan`. Later manual
 snapshots are recorded as `manual-snapshot`, while watch-created snapshots are

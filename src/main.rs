@@ -177,7 +177,7 @@ use config::{
 use daemon_runtime::{apply_env_files, daemon_cmd};
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
 use fsck_runtime::fsck;
-use history_runtime::{diff_cmd, health_cmd, log_cmd, op_cmd, state_cmd, status_cmd};
+use history_runtime::{diff_cmd, health_cmd, log_cmd, note_cmd, op_cmd, state_cmd, status_cmd};
 use key_runtime::key_cmd;
 use large_runtime::large_cmd;
 use lifecycle_runtime::lifecycle_cmd;
@@ -240,6 +240,7 @@ fn main() -> Result<()> {
         Command::Status(args) => status_cmd(&paths, args),
         Command::Health(args) => health_cmd(&paths, args),
         Command::State(args) => state_cmd(&paths, args),
+        Command::Note(args) => note_cmd(&paths, args),
         Command::Track(args) => root_runtime::track_cmd(&paths, args),
         Command::Untrack(args) => root_runtime::untrack_cmd(&paths, args),
         Command::Log(args) => log_cmd(&paths, args),

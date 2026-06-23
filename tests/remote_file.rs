@@ -15918,6 +15918,133 @@ fn state_reference_reports_file_changes_since_operation() {
 }
 
 #[test]
+fn note_edits_operation_and_snapshot_messages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let snapshot_id = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("old note");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    let op_id: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select op_id from snapshots where id=?1",
+            [&snapshot_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let initial = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("note").arg(&op_id);
+        c
+    });
+    assert_eq!(initial, "old note\n");
+
+    let snapshot_note = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("note")
+            .arg(&snapshot_id)
+            .arg("-m")
+            .arg("new note");
+        c
+    });
+    assert!(snapshot_note.contains("noted op-"), "{snapshot_note}");
+    assert!(snapshot_note.contains("new note"), "{snapshot_note}");
+    let shown = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("note").arg(&op_id);
+        c
+    });
+    assert_eq!(shown, "new note\n");
+
+    let mut stdin_command = mj();
+    stdin_command
+        .arg("--home")
+        .arg(&state)
+        .arg("note")
+        .arg(&op_id)
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = stdin_command.spawn().expect("spawn note --stdin");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"stdin note\n")
+        .unwrap();
+    let stdin_output = child.wait_with_output().expect("wait note --stdin");
+    assert!(
+        stdin_output.status.success(),
+        "note --stdin failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdin_output.stdout),
+        String::from_utf8_lossy(&stdin_output.stderr)
+    );
+    let stdin_stdout = String::from_utf8_lossy(&stdin_output.stdout);
+    assert!(stdin_stdout.contains("noted op-"), "{stdin_stdout}");
+    assert!(stdin_stdout.contains("stdin note"), "{stdin_stdout}");
+    assert_eq!(
+        output({
+            let mut c = mj();
+            c.arg("--home").arg(&state).arg("note").arg(&op_id);
+            c
+        }),
+        "stdin note\n"
+    );
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("note")
+            .arg(&op_id)
+            .arg("--clear");
+        c
+    });
+    assert_eq!(
+        output({
+            let mut c = mj();
+            c.arg("--home").arg(&state).arg("note").arg(&op_id);
+            c
+        }),
+        ""
+    );
+}
+
+#[test]
 fn state_and_log_mark_large_and_volatile_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
