@@ -17,6 +17,7 @@ pub const REMOTE_REFS_TABLE: &str = "remote_refs";
 pub const SNAPSHOT_PAYLOAD_INDEX_TABLE: &str = "snapshot_payload_index";
 pub const SNAPSHOT_PAYLOADS_TABLE: &str = "snapshot_payloads";
 pub const LARGE_OBJECT_CHUNKS_TABLE: &str = "large_object_chunks";
+pub const TRACKED_PATHS_TABLE: &str = "tracked_paths";
 
 pub const SCHEMA_SQL: &str = "
 create table if not exists roots(id text primary key, data_json text not null);
@@ -79,6 +80,15 @@ create table if not exists large_object_chunks(
   chunk_oid text not null,
   primary key(large_oid, chunk_oid)
 );
+create table if not exists tracked_paths(
+  root_id text not null,
+  path text not null,
+  status text not null,
+  first_seen_at text not null,
+  last_seen_at text not null,
+  untracked_at text,
+  primary key(root_id, path)
+);
 ";
 
 pub const COMPAT_MIGRATIONS: &[&str] = &[
@@ -103,6 +113,7 @@ pub const COMPAT_MIGRATIONS: &[&str] = &[
     "create table if not exists snapshot_payload_index(snapshot_id text primary key, indexed_at text not null)",
     "create table if not exists snapshot_payloads(snapshot_id text not null, kind text not null, oid text not null, primary key(snapshot_id, kind, oid))",
     "create table if not exists large_object_chunks(large_oid text not null, chunk_oid text not null, primary key(large_oid, chunk_oid))",
+    "create table if not exists tracked_paths(root_id text not null, path text not null, status text not null, first_seen_at text not null, last_seen_at text not null, untracked_at text, primary key(root_id, path))",
 ];
 
 pub fn schema_sql() -> &'static str {
@@ -701,6 +712,7 @@ mod tests {
             SNAPSHOT_PAYLOAD_INDEX_TABLE,
             SNAPSHOT_PAYLOADS_TABLE,
             LARGE_OBJECT_CHUNKS_TABLE,
+            TRACKED_PATHS_TABLE,
         ] {
             assert!(
                 SCHEMA_SQL.contains(&format!("create table if not exists {table}")),

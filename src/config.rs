@@ -363,6 +363,10 @@ pub(crate) struct ConfigRoot {
     #[serde(default)]
     pub(crate) exclude: Vec<String>,
     #[serde(default)]
+    pub(crate) explicit_track: Vec<String>,
+    #[serde(default)]
+    pub(crate) explicit_untrack: Vec<String>,
+    #[serde(default)]
     pub(crate) follow_symlinks: bool,
     #[serde(default)]
     pub(crate) require_mount: bool,
@@ -427,6 +431,10 @@ pub(crate) struct RootConfig {
     pub(crate) include: Vec<String>,
     #[serde(default)]
     pub(crate) exclude: Vec<String>,
+    #[serde(default)]
+    pub(crate) explicit_track: Vec<String>,
+    #[serde(default)]
+    pub(crate) explicit_untrack: Vec<String>,
     pub(crate) follow_symlinks: bool,
     #[serde(default)]
     pub(crate) require_mount: bool,

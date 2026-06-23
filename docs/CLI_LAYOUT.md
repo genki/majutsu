@@ -25,6 +25,8 @@ Daily use:
   status
   health
   state
+  track
+  untrack
   log
   diff
   snapshot
@@ -95,6 +97,8 @@ mj state 03:40 -r moon --diff
 mj state op-123456789abc -g
 mj state --deleted
 mj state --status A,M
+mj track path/to/file
+mj untrack path/to/file
 ```
 
 Markers:
@@ -111,6 +115,9 @@ m  metadata-only change; shown only with --meta
 or xattrs.
 `--deleted` filters the output to `D` rows and is equivalent to `--status D`.
 `-s/--status` accepts repeated or comma-separated `A`, `M`, `D`, and `m`.
+`mj track` explicitly protects a path even if root excludes would normally hide
+it. `mj untrack` is the explicit operation for removing a path from management;
+plain `rm` remains a tracked deletion.
 
 ## Restore view namespace
 

@@ -29,7 +29,8 @@ use crate::queue_runtime::{
 };
 use crate::root_state::roots;
 use crate::snapshot_rules::{
-    build_ignore, is_ignored, is_volatile_excluded, volatile_allows_watch_snapshot,
+    build_ignore, explicitly_untracked, is_ignored, root_dir_allows_descend,
+    volatile_allows_watch_snapshot,
 };
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
 use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
@@ -864,10 +865,7 @@ fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
             let Ok(rel) = entry.path().strip_prefix(&root.path) else {
                 return true;
             };
-            if entry.file_type().is_dir() && is_volatile_excluded(root, rel) {
-                return false;
-            }
-            !is_ignored(&ignore, rel, entry.file_type().is_dir())
+            !entry.file_type().is_dir() || root_dir_allows_descend(root, &ignore, rel)
         });
     let mut dirs = Vec::new();
     for entry in walker {
@@ -1116,6 +1114,9 @@ fn event_path_for_roots(active_roots: &[RootConfig], path: &Path) -> Option<(Str
 }
 
 fn root_ignores_relative_path(root: &RootConfig, relative: &Path, is_dir: bool) -> bool {
+    if explicitly_untracked(root, relative) {
+        return true;
+    }
     if !volatile_allows_watch_snapshot(root, relative) {
         return true;
     }
@@ -1578,6 +1579,8 @@ mod tests {
             path,
             include: vec!["**".into()],
             exclude,
+            explicit_track: Vec::new(),
+            explicit_untrack: Vec::new(),
             follow_symlinks: false,
             require_mount: false,
             status: "active".into(),

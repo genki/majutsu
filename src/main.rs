@@ -208,12 +208,12 @@ use restore_runtime::{
 };
 use root_runtime::root_cmd;
 use root_state::{
-    roots, sync_config_roots, sync_roots_to_config, update_root_degraded, update_root_status,
+    mark_path_tracked, roots, sync_config_roots, sync_roots_to_config, update_root_degraded,
+    update_root_status,
 };
 use snapshot_rules::{
-    build_ignore, classify_large, effective_large_config, explicitly_included,
-    include_allows_descend, include_may_match_inside_dir, is_ignored, is_included,
-    is_volatile_excluded, large_pointer_compression, looks_binary,
+    build_ignore, classify_large, effective_large_config, large_pointer_compression, looks_binary,
+    root_dir_allows_descend, root_record_is_managed,
 };
 use snapshot_state::{
     carry_forward_root_snapshot, current_snapshot, load_snapshot_by_id, load_snapshot_header,
@@ -240,6 +240,8 @@ fn main() -> Result<()> {
         Command::Status(args) => status_cmd(&paths, args),
         Command::Health(args) => health_cmd(&paths, args),
         Command::State(args) => state_cmd(&paths, args),
+        Command::Track(args) => root_runtime::track_cmd(&paths, args),
+        Command::Untrack(args) => root_runtime::untrack_cmd(&paths, args),
         Command::Log(args) => log_cmd(&paths, args),
         Command::Op { command } => op_cmd(&paths, command),
         Command::Diff(args) => diff_cmd(&paths, args),
@@ -2520,16 +2522,7 @@ fn scan_root(
             let Ok(rel) = entry.path().strip_prefix(&root.path) else {
                 return true;
             };
-            if entry.file_type().is_dir() && !include_allows_descend(&root.include, rel) {
-                return false;
-            }
-            if entry.file_type().is_dir() && is_volatile_excluded(root, rel) {
-                return false;
-            }
-            if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
-                return true;
-            }
-            !entry.file_type().is_dir() || include_may_match_inside_dir(&root.include, rel)
+            !entry.file_type().is_dir() || root_dir_allows_descend(root, &ignore, rel)
         });
     for entry in walker {
         let entry = entry?;
@@ -2537,18 +2530,7 @@ fn scan_root(
             continue;
         }
         let rel = entry.path().strip_prefix(&root.path)?.to_path_buf();
-        if !is_included(&root.include, &rel) {
-            continue;
-        }
-        if is_volatile_excluded(root, &rel) {
-            continue;
-        }
-        if is_ignored(&ignore, &rel, entry.file_type().is_dir())
-            && !explicitly_included(&root.include, &rel)
-        {
-            if entry.file_type().is_dir() {
-                continue;
-            }
+        if !root_record_is_managed(root, &ignore, &rel, entry.file_type().is_dir()) {
             continue;
         }
         let rel_s = path_to_slash(&rel);
@@ -2677,6 +2659,9 @@ fn scan_root(
             xattrs: read_xattrs(entry.path()),
             payload,
         });
+    }
+    for record in &records {
+        mark_path_tracked(conn, &root.id, &record.path)?;
     }
     Ok(ScannedRoot { records, blobs })
 }

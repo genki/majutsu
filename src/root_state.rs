@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow, bail};
+use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::{
@@ -26,6 +28,8 @@ impl From<&RootConfig> for ConfigRoot {
             path: root.path.clone(),
             include: root.include.clone(),
             exclude: root.exclude.clone(),
+            explicit_track: root.explicit_track.clone(),
+            explicit_untrack: root.explicit_untrack.clone(),
             follow_symlinks: root.follow_symlinks,
             require_mount: root.require_mount,
             status: Some(root.status.clone()),
@@ -101,6 +105,8 @@ impl ConfigRoot {
             path: config_relative_path(paths, &self.path)?,
             include: self.include.clone(),
             exclude: self.exclude.clone(),
+            explicit_track: self.explicit_track.clone(),
+            explicit_untrack: self.explicit_untrack.clone(),
             follow_symlinks: self.follow_symlinks,
             require_mount: self.require_mount,
             status: self
@@ -145,6 +151,45 @@ pub(crate) fn root_by_id_optional(conn: &Connection, id: &str) -> Result<Option<
 
 pub(crate) fn root_by_id(conn: &Connection, id: &str) -> Result<RootConfig> {
     root_by_id_optional(conn, id)?.ok_or_else(|| anyhow!("unknown root: {id}"))
+}
+
+pub(crate) fn mark_path_tracked(conn: &Connection, root_id: &str, path: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "insert into tracked_paths(root_id, path, status, first_seen_at, last_seen_at, untracked_at)
+         values (?1, ?2, 'tracked', ?3, ?3, null)
+         on conflict(root_id, path) do update set
+           status='tracked',
+           last_seen_at=excluded.last_seen_at,
+           untracked_at=null",
+        params![root_id, path, now],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn mark_path_untracked(conn: &Connection, root_id: &str, path: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "insert into tracked_paths(root_id, path, status, first_seen_at, last_seen_at, untracked_at)
+         values (?1, ?2, 'untracked', ?3, ?3, ?3)
+         on conflict(root_id, path) do update set
+           status='untracked',
+           last_seen_at=excluded.last_seen_at,
+           untracked_at=excluded.untracked_at",
+        params![root_id, path, now],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn tracked_paths_for_root(conn: &Connection, root_id: &str) -> Result<BTreeSet<String>> {
+    let mut stmt =
+        conn.prepare("select path from tracked_paths where root_id=?1 and status='tracked'")?;
+    let rows = stmt.query_map(params![root_id], |row| row.get::<_, String>(0))?;
+    let mut paths = BTreeSet::new();
+    for row in rows {
+        paths.insert(row?);
+    }
+    Ok(paths)
 }
 
 pub(crate) fn save_root(conn: &Connection, root: &RootConfig) -> Result<()> {

@@ -308,6 +308,87 @@ pub fn is_ignored(ignore: &Gitignore, rel: &Path, is_dir: bool) -> bool {
     ignore.matched_path_or_any_parents(rel, is_dir).is_ignore()
 }
 
+pub fn explicitly_tracked(root: &RootConfig, rel: &Path) -> bool {
+    path_list_covers(&root.explicit_track, rel)
+}
+
+pub fn explicitly_untracked(root: &RootConfig, rel: &Path) -> bool {
+    path_list_covers(&root.explicit_untrack, rel)
+}
+
+pub fn explicit_track_may_match_inside_dir(root: &RootConfig, rel: &Path) -> bool {
+    path_list_may_match_inside_dir(&root.explicit_track, rel)
+}
+
+pub fn root_record_is_managed(
+    root: &RootConfig,
+    ignore: &Gitignore,
+    rel: &Path,
+    is_dir: bool,
+) -> bool {
+    if explicitly_untracked(root, rel) {
+        return false;
+    }
+    if explicitly_tracked(root, rel) {
+        return true;
+    }
+    if !is_included(&root.include, rel) {
+        return false;
+    }
+    if is_volatile_excluded(root, rel) {
+        return false;
+    }
+    !is_ignored(ignore, rel, is_dir) || explicitly_included(&root.include, rel)
+}
+
+pub fn root_dir_allows_descend(root: &RootConfig, ignore: &Gitignore, rel: &Path) -> bool {
+    if explicitly_untracked(root, rel) {
+        return false;
+    }
+    if include_allows_descend(&root.include, rel) && !is_volatile_excluded(root, rel) {
+        if !is_ignored(ignore, rel, true) {
+            return true;
+        }
+        if include_may_match_inside_dir(&root.include, rel) {
+            return true;
+        }
+    }
+    explicit_track_may_match_inside_dir(root, rel) || !root.explicit_track.is_empty()
+}
+
+fn path_list_covers(patterns: &[String], rel: &Path) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let rel = path_to_slash(rel);
+    let rel = rel.trim_matches('/');
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.trim().trim_matches('/');
+        !pattern.is_empty()
+            && (pattern == rel
+                || rel
+                    .strip_prefix(pattern)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                || path_pattern_match(pattern, rel))
+    })
+}
+
+fn path_list_may_match_inside_dir(patterns: &[String], rel: &Path) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let dir = path_to_slash(rel);
+    let dir = dir.trim_matches('/');
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.trim().trim_matches('/');
+        !pattern.is_empty()
+            && (pattern
+                .strip_prefix(dir)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+                || include_pattern_may_match_inside_dir(pattern, dir))
+    })
+}
+
 pub fn validate_volatile_mode(mode: &str) -> Result<()> {
     match mode {
         "checkpoint" | "exclude" => Ok(()),
@@ -694,5 +775,42 @@ mod moon_root_tests {
             !exclude_covers_path(&excludes, ".kubeconfig"),
             "default excludes must warn about credentials instead of dropping them"
         );
+    }
+
+    #[test]
+    fn explicit_track_allows_descending_into_excluded_parent() {
+        let root_path = tempfile::tempdir().unwrap();
+        let root = RootConfig {
+            id: "sample".into(),
+            name: "sample".into(),
+            path: root_path.path().to_path_buf(),
+            include: vec!["**".into()],
+            exclude: vec!["ignored/**".into()],
+            explicit_track: vec!["ignored/keep.txt".into()],
+            explicit_untrack: Vec::new(),
+            follow_symlinks: false,
+            require_mount: false,
+            status: "active".into(),
+            degraded: None,
+            snapshot_mode: "default".into(),
+            pre_snapshot: None,
+            post_snapshot: None,
+            snapshot_source: None,
+            application_plugin: None,
+            large: None,
+            volatile: None,
+        };
+        let ignore = build_ignore(&root).unwrap();
+        assert!(root_dir_allows_descend(
+            &root,
+            &ignore,
+            Path::new("ignored")
+        ));
+        assert!(root_record_is_managed(
+            &root,
+            &ignore,
+            Path::new("ignored/keep.txt"),
+            false
+        ));
     }
 }

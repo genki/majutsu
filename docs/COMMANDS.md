@@ -43,6 +43,8 @@ mj state 03:40 -r home-notes --diff
 mj state op-123456789abc -g
 mj state --deleted
 mj state --status A,M
+mj track path/to/file
+mj untrack path/to/file
 ```
 
 Markers:
@@ -77,6 +79,21 @@ mj state --deleted -r home-notes
 mj state --status D
 mj state --status A,M
 mj state -s A -s D
+```
+
+`mj track` and `mj untrack` separate deletion from management changes.
+Files that become managed remain managed when removed from the working tree;
+they appear as `D` and can be restored from a suitable snapshot or durable
+journal point. `mj untrack <path>` is the explicit operation for removing a
+path from future snapshots and backend retention. It does not delete the working
+file. `mj track <path>` explicitly brings a path back under management, including
+paths that would otherwise be excluded by root rules.
+
+```sh
+mj track notes/keep.md
+mj untrack tmp/local.db
+mj track -r home-notes excluded/keep.md
+mj untrack -r home-notes old/generated.bin
 ```
 
 ## History and operations

@@ -16,9 +16,8 @@ use crate::config::{Config, Paths, RootConfig};
 use crate::object_paths::prefer_canonical_remote_only;
 use crate::remote_store::RemoteStore;
 use crate::snapshot_rules::{
-    build_ignore, classify_large, effective_large_config, explicitly_included,
-    include_allows_descend, include_may_match_inside_dir, is_ignored, is_included,
-    is_volatile_excluded, looks_binary,
+    build_ignore, classify_large, effective_large_config, looks_binary, root_dir_allows_descend,
+    root_record_is_managed,
 };
 use crate::snapshot_state::{current_snapshot, load_root_tree_entries, load_snapshot_by_id};
 use crate::util::{blake3_hex, new_id, path_to_slash, stable_read, stable_read_in_root};
@@ -421,6 +420,11 @@ pub(crate) fn record_file_event(
     raw_backend: &str,
     detail: &str,
 ) -> Result<()> {
+    if matches!(event_kind, "create" | "modify")
+        && let Ok(conn) = crate::open_db(paths)
+    {
+        let _ = crate::root_state::mark_path_tracked(&conn, root_id, path);
+    }
     write_event_record(
         paths,
         EventJournalRecord::new_file_event(
@@ -466,6 +470,9 @@ pub(crate) fn enqueue_live_diff_event_journals(
             let Some(event_kind) = live_diff_event_kind(snapshot_record, live_record) else {
                 continue;
             };
+            if matches!(event_kind, "create" | "modify") {
+                crate::root_state::mark_path_tracked(&crate::open_db(paths)?, &root.id, &rel_path)?;
+            }
             if live_diff_event_already_covered(
                 &existing,
                 &root.id,
@@ -592,16 +599,7 @@ fn scan_live_root_for_journal(
             let Ok(rel) = entry.path().strip_prefix(scan_base) else {
                 return true;
             };
-            if entry.file_type().is_dir() && !include_allows_descend(&root.include, rel) {
-                return false;
-            }
-            if entry.file_type().is_dir() && is_volatile_excluded(root, rel) {
-                return false;
-            }
-            if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
-                return true;
-            }
-            !entry.file_type().is_dir() || include_may_match_inside_dir(&root.include, rel)
+            !entry.file_type().is_dir() || root_dir_allows_descend(root, &ignore, rel)
         });
     for entry in walker {
         let entry = entry?;
@@ -609,15 +607,7 @@ fn scan_live_root_for_journal(
             continue;
         }
         let rel = entry.path().strip_prefix(scan_base)?.to_path_buf();
-        if !is_included(&root.include, &rel) {
-            continue;
-        }
-        if is_volatile_excluded(root, &rel) {
-            continue;
-        }
-        if is_ignored(&ignore, &rel, entry.file_type().is_dir())
-            && !explicitly_included(&root.include, &rel)
-        {
+        if !root_record_is_managed(root, &ignore, &rel, entry.file_type().is_dir()) {
             continue;
         }
         let rel_s = path_to_slash(&rel);

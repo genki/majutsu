@@ -42,10 +42,9 @@ use crate::queue_runtime::{
     upload_queue_stats,
 };
 use crate::remote_store::open_remote;
-use crate::root_state::roots;
+use crate::root_state::{roots, tracked_paths_for_root};
 use crate::snapshot_rules::{
-    build_ignore, explicitly_included, include_allows_descend, include_may_match_inside_dir,
-    is_ignored, is_included, is_volatile, is_volatile_excluded,
+    build_ignore, is_volatile, root_dir_allows_descend, root_record_is_managed,
 };
 use crate::snapshot_state::{
     current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id,
@@ -2388,10 +2387,33 @@ fn state_stream_live_file_changes_for_root(
     mut emit: impl FnMut(FileChange, Vec<String>) -> Result<()>,
 ) -> Result<()> {
     let mut from_files = root_file_map_by_snapshot_id(paths, snapshot_id, &root.id)?;
+    let conn = crate::open_db(paths)?;
+    for path in tracked_paths_for_root(&conn, &root.id)? {
+        from_files
+            .entry(path.clone())
+            .or_insert_with(|| tracked_tombstone_record(root, path));
+    }
     scan_live_root_for_state_each(root, false, |path, live| {
         let display_path = state_display_path(root, &path, local_paths);
         match from_files.remove(&path) {
             None => {
+                if !options.filter.allows("A") {
+                    return Ok(());
+                }
+                let diff = state_live_change_diff(
+                    paths,
+                    root,
+                    &path,
+                    None,
+                    Some(&live),
+                    options.show_diff,
+                )?;
+                emit(
+                    FileChange::from_record("A", display_path, Some(root), &path, Some(&live)),
+                    diff,
+                )?
+            }
+            Some(previous) if previous.kind == "tombstone" => {
                 if !options.filter.allows("A") {
                     return Ok(());
                 }
@@ -2474,6 +2496,21 @@ fn state_stream_live_file_changes_for_root(
         )?;
     }
     Ok(())
+}
+
+fn tracked_tombstone_record(root: &RootConfig, path: String) -> FileRecord {
+    FileRecord {
+        root_id: root.id.clone(),
+        path,
+        kind: "tombstone".into(),
+        size: 0,
+        mode: 0,
+        modified: None,
+        uid: None,
+        gid: None,
+        xattrs: BTreeMap::new(),
+        payload: Payload::Directory,
+    }
 }
 
 fn state_display_path(root: &RootConfig, path: &str, local_paths: bool) -> String {
@@ -2675,16 +2712,7 @@ fn scan_live_root_for_state_each(
             let Ok(rel) = entry.path().strip_prefix(&root.path) else {
                 return true;
             };
-            if entry.file_type().is_dir() && !include_allows_descend(&root.include, rel) {
-                return false;
-            }
-            if entry.file_type().is_dir() && is_volatile_excluded(root, rel) {
-                return false;
-            }
-            if !is_ignored(&ignore, rel, entry.file_type().is_dir()) {
-                return true;
-            }
-            !entry.file_type().is_dir() || include_may_match_inside_dir(&root.include, rel)
+            !entry.file_type().is_dir() || root_dir_allows_descend(root, &ignore, rel)
         });
     for entry in walker {
         let entry = entry?;
@@ -2692,15 +2720,7 @@ fn scan_live_root_for_state_each(
             continue;
         }
         let rel = entry.path().strip_prefix(&root.path)?.to_path_buf();
-        if !is_included(&root.include, &rel) {
-            continue;
-        }
-        if is_volatile_excluded(root, &rel) {
-            continue;
-        }
-        if is_ignored(&ignore, &rel, entry.file_type().is_dir())
-            && !explicitly_included(&root.include, &rel)
-        {
+        if !root_record_is_managed(root, &ignore, &rel, entry.file_type().is_dir()) {
             continue;
         }
         let rel_s = path_to_slash(&rel);

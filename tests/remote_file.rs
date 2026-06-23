@@ -15495,6 +15495,111 @@ fn status_reports_configured_root_state() {
 }
 
 #[test]
+fn track_untrack_separate_deleted_state_from_management_removal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--exclude")
+            .arg("ignored/**");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("empty baseline");
+        c
+    });
+
+    fs::write(source.join("short-lived.txt"), b"short\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("track")
+            .arg("-r")
+            .arg("sample")
+            .arg("short-lived.txt");
+        c
+    });
+    fs::remove_file(source.join("short-lived.txt")).unwrap();
+    let deleted = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--deleted");
+        c
+    });
+    assert_eq!(deleted, " D sample/short-lived.txt\n");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("short-lived.txt");
+        c
+    });
+    let deleted_after_untrack = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--deleted");
+        c
+    });
+    assert_eq!(deleted_after_untrack, "");
+
+    fs::create_dir_all(source.join("ignored")).unwrap();
+    fs::write(source.join("ignored/keep.txt"), b"keep\n").unwrap();
+    run({
+        let mut c = mj();
+        c.current_dir(&source)
+            .arg("--home")
+            .arg(&state)
+            .arg("track")
+            .arg("ignored/keep.txt");
+        c
+    });
+    let added = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--status")
+            .arg("A");
+        c
+    });
+    assert!(added.contains(" A sample/ignored/keep.txt"), "{added}");
+}
+
+#[test]
 fn state_reference_reports_file_changes_since_operation() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

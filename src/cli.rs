@@ -22,7 +22,7 @@ Remote recovery flow:
 
 Command groups:
   Setup: init, root
-  Daily use: status, health, state, log, diff, snapshot, commit
+  Daily use: status, health, state, log, diff, snapshot, commit, track, untrack
   History: branch, switch, op
   Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
   Remote: sync, remote, lifecycle
@@ -90,6 +90,8 @@ fn localize_command(mut command: ClapCommand) -> ClapCommand {
         .mut_subcommand("status", |cmd| cmd.about(text.status_about))
         .mut_subcommand("health", |cmd| cmd.about(text.health_about))
         .mut_subcommand("state", |cmd| cmd.about(text.state_about))
+        .mut_subcommand("track", |cmd| cmd.about(text.track_about))
+        .mut_subcommand("untrack", |cmd| cmd.about(text.untrack_about))
         .mut_subcommand("log", |cmd| cmd.about(text.log_about))
         .mut_subcommand("diff", |cmd| cmd.about(text.diff_about))
         .mut_subcommand("branch", |cmd| cmd.about(text.branch_about))
@@ -189,6 +191,8 @@ struct CliText {
     status_about: &'static str,
     health_about: &'static str,
     state_about: &'static str,
+    track_about: &'static str,
+    untrack_about: &'static str,
     log_about: &'static str,
     diff_about: &'static str,
     branch_about: &'static str,
@@ -241,6 +245,8 @@ static CLI_TEXT_EN: CliText = CliText {
     status_about: "Show roots, current snapshot, queues, and daemon state",
     health_about: "Report protection health for normal operation",
     state_about: "Show managed file changes against live roots",
+    track_about: "Explicitly track paths even when excluded by root rules",
+    untrack_about: "Stop tracking paths without deleting working files",
     log_about: "Show recent managed file changes",
     diff_about: "Show differences between snapshots or points in time",
     branch_about: "Create, list, switch, or delete logical history branches",
@@ -301,7 +307,7 @@ remote復旧フロー:
 
 コマンド分類:
   Setup: init, root
-  Daily use: status, health, state, log, diff, snapshot, commit
+  Daily use: status, health, state, log, diff, snapshot, commit, track, untrack
   History: branch, switch, op
   Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
   Remote: sync, remote, lifecycle
@@ -323,6 +329,8 @@ remote復旧フロー:
     status_about: "root、current snapshot、queue、daemon状態を表示します",
     health_about: "通常運用に必要な保護状態を診断します",
     state_about: "live rootに対する管理対象ファイル変更を表示します",
+    track_about: "root規則で除外されるpathも明示的に管理対象へ戻します",
+    untrack_about: "作業ファイルを削除せずにpathを管理対象から外します",
     log_about: "管理対象ファイルの最近の変更を表示します",
     diff_about: "snapshotや時点間の差分を表示します",
     branch_about: "論理履歴branchの作成、一覧、切替、削除を行います",
@@ -383,7 +391,7 @@ remote 恢复流程:
 
 命令分组:
   Setup: init, root
-  Daily use: status, health, state, log, diff, snapshot, commit
+  Daily use: status, health, state, log, diff, snapshot, commit, track, untrack
   History: branch, switch, op
   Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
   Remote: sync, remote, lifecycle
@@ -405,6 +413,8 @@ remote 恢复流程:
     status_about: "显示 root、current snapshot、queue 和 daemon 状态",
     health_about: "报告正常运行所需的保护健康状态",
     state_about: "显示相对于 live root 的受管文件变更",
+    track_about: "即使被 root 规则排除，也显式跟踪路径",
+    untrack_about: "停止跟踪路径但不删除工作文件",
     log_about: "显示最近的受管文件变更",
     diff_about: "显示 snapshot 或时间点之间的差异",
     branch_about: "创建、列出、切换或删除逻辑历史 branch",
@@ -465,7 +475,7 @@ Flujo de recuperación remota:
 
 Grupos de comandos:
   Setup: init, root
-  Daily use: status, health, state, log, diff, snapshot, commit
+  Daily use: status, health, state, log, diff, snapshot, commit, track, untrack
   History: branch, switch, op
   Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
   Remote: sync, remote, lifecycle
@@ -487,6 +497,8 @@ Para protección de sistema a nivel de host, usa `mj --system ...`; lee `/etc/ma
     status_about: "Muestra roots, current snapshot, queues y estado del daemon",
     health_about: "Informa la salud de protección para operación normal",
     state_about: "Muestra cambios de archivos gestionados contra roots vivos",
+    track_about: "Rastrea rutas explícitamente aunque las reglas del root las excluyan",
+    untrack_about: "Deja de rastrear rutas sin borrar archivos de trabajo",
     log_about: "Muestra cambios recientes en archivos gestionados",
     diff_about: "Muestra diferencias entre snapshots o puntos en el tiempo",
     branch_about: "Crea, lista, cambia o elimina branches lógicos de historial",
@@ -547,7 +559,7 @@ Flux de récupération remote:
 
 Groupes de commandes:
   Setup: init, root
-  Daily use: status, health, state, log, diff, snapshot, commit
+  Daily use: status, health, state, log, diff, snapshot, commit, track, untrack
   History: branch, switch, op
   Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
   Remote: sync, remote, lifecycle
@@ -569,6 +581,8 @@ Pour la protection système au niveau hôte, utilisez `mj --system ...`; cela li
     status_about: "Affiche roots, current snapshot, queues et état du daemon",
     health_about: "Rapporte la santé de protection pour l'exploitation normale",
     state_about: "Affiche les changements de fichiers suivis dans les roots actifs",
+    track_about: "Suit explicitement des chemins même exclus par les règles du root",
+    untrack_about: "Arrête de suivre des chemins sans supprimer les fichiers de travail",
     log_about: "Affiche les changements récents des fichiers gérés",
     diff_about: "Affiche les différences entre snapshots ou instants",
     branch_about: "Crée, liste, change ou supprime des branches logiques d'historique",
@@ -627,6 +641,10 @@ pub(crate) enum Command {
     Health(HealthArgs),
     #[command(about = "Show managed file changes against live roots")]
     State(StateArgs),
+    #[command(about = "Explicitly track paths even when excluded by root rules")]
+    Track(PathTrackArgs),
+    #[command(about = "Stop tracking paths without deleting working files")]
+    Untrack(PathTrackArgs),
     #[command(about = "Show recent managed file changes")]
     Log(LogArgs),
     #[command(about = "Show differences between snapshots or points in time")]
@@ -1002,6 +1020,23 @@ pub(crate) struct StateArgs {
         help = "Include metadata-only changes such as directory mtime, mode, owner, or xattrs"
     )]
     pub(crate) meta: bool,
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct PathTrackArgs {
+    #[arg(
+        short = 'r',
+        long = "root",
+        value_name = "ID",
+        help = "Apply the path operation within this root"
+    )]
+    pub(crate) root: Option<String>,
+    #[arg(
+        required = true,
+        value_name = "PATH",
+        help = "Path to track or untrack; relative paths are resolved from the current directory"
+    )]
+    pub(crate) paths: Vec<PathBuf>,
 }
 
 #[derive(Args)]

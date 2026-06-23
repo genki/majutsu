@@ -15,7 +15,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration as StdDuration;
 
-use crate::cli::{RootCommand, RootListArgs, RootSizeArgs};
+use crate::cli::{PathTrackArgs, RootCommand, RootListArgs, RootSizeArgs};
 use crate::config::{
     Paths, RootConfig, default_include, read_config, validate_large_chunking,
     validate_snapshot_mode,
@@ -27,13 +27,13 @@ use crate::root_size_summary::{
     RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, write_cached_root_size_summary,
 };
 use crate::root_state::{
-    root_by_id, root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
+    mark_path_tracked, mark_path_untracked, root_by_id, root_by_id_optional, roots, save_root,
+    sync_roots_to_config, update_root_status,
 };
 use crate::snapshot_rules::{
     apply_default_root_excludes, apply_root_large_set, apply_root_presets, apply_root_volatile_set,
-    build_ignore, dedup_patterns, explicitly_included, is_ignored, is_included,
-    is_volatile_excluded, root_large_override, root_volatile_override,
-    warn_sensitive_root_defaults,
+    build_ignore, dedup_patterns, root_large_override, root_record_is_managed,
+    root_volatile_override, warn_sensitive_root_defaults,
 };
 use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
 
@@ -83,6 +83,8 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
                     args.include
                 },
                 exclude,
+                explicit_track: Vec::new(),
+                explicit_untrack: Vec::new(),
                 follow_symlinks: args.follow_symlinks,
                 require_mount: args.require_mount,
                 status: "active".into(),
@@ -235,6 +237,147 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn track_cmd(paths: &Paths, args: PathTrackArgs) -> Result<()> {
+    update_explicit_tracking(paths, args, true)
+}
+
+pub(crate) fn untrack_cmd(paths: &Paths, args: PathTrackArgs) -> Result<()> {
+    update_explicit_tracking(paths, args, false)
+}
+
+fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> Result<()> {
+    crate::ensure_ready(paths)?;
+    let conn = crate::open_db(paths)?;
+    let configured_roots = roots(&conn)?;
+    let mut changed = BTreeMap::<String, RootConfig>::new();
+    for input in &args.paths {
+        let (root, rel) =
+            resolve_path_tracking_target(&configured_roots, args.root.as_deref(), input)?;
+        let root = changed
+            .entry(root.id.clone())
+            .or_insert_with(|| root.clone());
+        if track {
+            remove_pattern(&mut root.explicit_untrack, &rel);
+            push_pattern(&mut root.explicit_track, rel.clone());
+            mark_path_tracked(&conn, &root.id, &rel)?;
+            println!("tracked {}:{}", root.id, rel);
+        } else {
+            remove_pattern(&mut root.explicit_track, &rel);
+            push_pattern(&mut root.explicit_untrack, rel.clone());
+            mark_path_untracked(&conn, &root.id, &rel)?;
+            println!("untracked {}:{}", root.id, rel);
+        }
+    }
+    for root in changed.values() {
+        if !track {
+            let forgotten = forget_unmanaged_root_history(paths, &conn, root)?;
+            if forgotten.records > 0 {
+                let removed = crate::prune_runtime::prune_unreferenced_metadata(paths, &conn)?;
+                println!("forgotten_unmanaged_records {}", forgotten.records);
+                println!("rewritten_snapshots {}", forgotten.snapshots);
+                println!("removed_blob_metadata {}", removed.blobs);
+                println!("removed_large_metadata {}", removed.large_objects);
+                println!("removed_chunk_metadata {}", removed.chunks);
+                println!("removed_pack_metadata {}", removed.packs);
+            }
+        }
+        save_root(&conn, root)?;
+    }
+    sync_roots_to_config(paths, &conn)?;
+    record_op(
+        &conn,
+        if track {
+            "path-tracked"
+        } else {
+            "path-untracked"
+        },
+        None,
+        None,
+        args.root.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn resolve_path_tracking_target<'a>(
+    roots: &'a [RootConfig],
+    root_id: Option<&str>,
+    input: &Path,
+) -> Result<(&'a RootConfig, String)> {
+    let candidates = roots
+        .iter()
+        .filter(|root| root.status == "active")
+        .filter(|root| root_id.is_none_or(|id| id == root.id))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        bail!(
+            "no active root matches {}",
+            root_id.unwrap_or("(current path)")
+        );
+    }
+    if let Some(id) = root_id {
+        let root = candidates
+            .into_iter()
+            .find(|root| root.id == id)
+            .ok_or_else(|| anyhow!("unknown root: {id}"))?;
+        let rel = if input.is_absolute() {
+            input
+                .strip_prefix(&root.path)
+                .with_context(|| {
+                    format!(
+                        "path {} is not inside root {} ({})",
+                        input.display(),
+                        root.id,
+                        root.path.display()
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            input.to_path_buf()
+        };
+        return Ok((root, normalize_tracking_path(&rel)?));
+    }
+    let abs = crate::absolutize(input)?;
+    let mut matches = candidates
+        .into_iter()
+        .filter_map(|root| {
+            abs.strip_prefix(&root.path)
+                .ok()
+                .map(|rel| (root, rel.to_path_buf()))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(root, _)| std::cmp::Reverse(root.path.components().count()));
+    let Some((root, rel)) = matches.into_iter().next() else {
+        bail!(
+            "path {} is not inside a configured root; use -r/--root for root-relative paths",
+            input.display()
+        );
+    };
+    Ok((root, normalize_tracking_path(&rel)?))
+}
+
+fn normalize_tracking_path(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        bail!("cannot track or untrack a root directory itself");
+    }
+    let rel = crate::util::path_to_slash(path);
+    let rel = rel.trim_matches('/').to_string();
+    if rel.is_empty() || rel == "." || rel.split('/').any(|part| part == "..") {
+        bail!("invalid root-relative path: {}", path.display());
+    }
+    Ok(rel)
+}
+
+fn push_pattern(patterns: &mut Vec<String>, path: String) {
+    if !patterns.iter().any(|existing| existing == &path) {
+        patterns.push(path);
+    }
+    dedup_patterns(patterns);
+}
+
+fn remove_pattern(patterns: &mut Vec<String>, path: &str) {
+    patterns.retain(|existing| existing != path);
+}
+
 #[derive(Default)]
 struct ForgetUnmanagedStats {
     snapshots: usize,
@@ -288,7 +431,14 @@ fn forget_unmanaged_root_history(
         let before = entries.len();
         let kept = entries
             .into_values()
-            .filter(|record| root_record_is_managed(root, &ignore, record))
+            .filter(|record| {
+                root_record_is_managed(
+                    root,
+                    &ignore,
+                    Path::new(&record.path),
+                    record.kind == "directory",
+                )
+            })
             .collect::<Vec<_>>();
         let removed = before.saturating_sub(kept.len());
         if removed == 0 {
@@ -329,21 +479,6 @@ fn forget_unmanaged_root_history(
         crate::insert_snapshot_payload_index(conn, &manifest)?;
     }
     Ok(stats)
-}
-
-fn root_record_is_managed(
-    root: &RootConfig,
-    ignore: &ignore::gitignore::Gitignore,
-    record: &FileRecord,
-) -> bool {
-    let rel = Path::new(&record.path);
-    if !is_included(&root.include, rel) {
-        return false;
-    }
-    if is_volatile_excluded(root, rel) {
-        return false;
-    }
-    !is_ignored(ignore, rel, record.kind == "directory") || explicitly_included(&root.include, rel)
 }
 
 #[derive(Serialize)]
