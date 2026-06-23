@@ -59,7 +59,8 @@ minimal local flow is:
 mj init
 mj root add notes ~/notes
 mj snapshot --message 'first snapshot'
-mj state 1d -r notes --diff
+mj state -r notes --diff
+mj state --deleted -r notes
 mj log
 mj restore plan --ago 2h --root notes --to /tmp/majutsu-restore
 ```
@@ -106,9 +107,11 @@ mj --home /tmp/recovered restore apply --to /tmp/restore
 Inspect managed changes since a point in time:
 
 ```sh
+mj state
 mj state 1d
 mj state 03:40 -r notes --diff
 mj state op-123456789abc -g
+mj state --deleted
 ```
 
 Sync, check, and inspect remote state:

@@ -29,14 +29,19 @@ sync; snapshots are durable timeline checkpoints and compaction boundaries.
 
 ## State and diff inspection
 
-`mj state <ref>` prints a Git `status -s`-style view of managed file changes
-since a snapshot, operation id, absolute time, or relative time.
+`mj state` prints a Git `status -s`-style view of managed file changes.
+Without a reference it compares the first snapshot with the live filesystem, so
+every file that became added, modified, or deleted since the root entered
+Majutsu is visible. Passing a reference narrows the basis to a snapshot,
+operation id, absolute time, or relative time.
 
 ```sh
+mj state
 mj state 1d
 mj state 1d -r home-notes
 mj state 03:40 -r home-notes --diff
 mj state op-123456789abc -g
+mj state --deleted
 ```
 
 Markers:
@@ -59,6 +64,14 @@ mj state 1d -r home-notes --meta
 `--diff` appends colored unified-diff-style lines after each changed text file.
 Binary, special, and files larger than 1 MiB keep the status row but omit the
 diff body.
+
+Use `--deleted` to list only paths that are still managed in the basis snapshot
+but no longer exist in the live root:
+
+```sh
+mj state --deleted
+mj state --deleted -r home-notes
+```
 
 ## History and operations
 

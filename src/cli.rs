@@ -240,7 +240,7 @@ static CLI_TEXT_EN: CliText = CliText {
     snapshot_about: "Create a commit-like checkpoint of configured roots",
     status_about: "Show roots, current snapshot, queues, and daemon state",
     health_about: "Report protection health for normal operation",
-    state_about: "Inspect state home paths, refs, branches, and metadata",
+    state_about: "Show managed file changes against live roots",
     log_about: "Show recent managed file changes",
     diff_about: "Show differences between snapshots or points in time",
     branch_about: "Create, list, switch, or delete logical history branches",
@@ -322,7 +322,7 @@ remote復旧フロー:
     snapshot_about: "設定済みrootのcommit相当のcheckpointを作成します",
     status_about: "root、current snapshot、queue、daemon状態を表示します",
     health_about: "通常運用に必要な保護状態を診断します",
-    state_about: "状態ディレクトリ、ref、branch、metadataを確認します",
+    state_about: "live rootに対する管理対象ファイル変更を表示します",
     log_about: "管理対象ファイルの最近の変更を表示します",
     diff_about: "snapshotや時点間の差分を表示します",
     branch_about: "論理履歴branchの作成、一覧、切替、削除を行います",
@@ -404,7 +404,7 @@ remote 恢复流程:
     snapshot_about: "为已配置 root 创建类似 commit 的检查点",
     status_about: "显示 root、current snapshot、queue 和 daemon 状态",
     health_about: "报告正常运行所需的保护健康状态",
-    state_about: "检查状态目录、ref、branch 和 metadata",
+    state_about: "显示相对于 live root 的受管文件变更",
     log_about: "显示最近的受管文件变更",
     diff_about: "显示 snapshot 或时间点之间的差异",
     branch_about: "创建、列出、切换或删除逻辑历史 branch",
@@ -486,7 +486,7 @@ Para protección de sistema a nivel de host, usa `mj --system ...`; lee `/etc/ma
     snapshot_about: "Crea un checkpoint tipo commit de los roots configurados",
     status_about: "Muestra roots, current snapshot, queues y estado del daemon",
     health_about: "Informa la salud de protección para operación normal",
-    state_about: "Inspecciona rutas de estado, refs, branches y metadata",
+    state_about: "Muestra cambios de archivos gestionados contra roots vivos",
     log_about: "Muestra cambios recientes en archivos gestionados",
     diff_about: "Muestra diferencias entre snapshots o puntos en el tiempo",
     branch_about: "Crea, lista, cambia o elimina branches lógicos de historial",
@@ -568,7 +568,7 @@ Pour la protection système au niveau hôte, utilisez `mj --system ...`; cela li
     snapshot_about: "Crée un checkpoint de type commit des roots configurés",
     status_about: "Affiche roots, current snapshot, queues et état du daemon",
     health_about: "Rapporte la santé de protection pour l'exploitation normale",
-    state_about: "Inspecte les chemins d'état, refs, branches et metadata",
+    state_about: "Affiche les changements de fichiers suivis dans les roots actifs",
     log_about: "Affiche les changements récents des fichiers gérés",
     diff_about: "Affiche les différences entre snapshots ou instants",
     branch_about: "Crée, liste, change ou supprime des branches logiques d'historique",
@@ -625,7 +625,7 @@ pub(crate) enum Command {
     Status(StatusArgs),
     #[command(about = "Report protection health for normal operation")]
     Health(HealthArgs),
-    #[command(about = "Inspect state home paths, refs, branches, and metadata")]
+    #[command(about = "Show managed file changes against live roots")]
     State(StateArgs),
     #[command(about = "Show recent managed file changes")]
     Log(LogArgs),
@@ -953,14 +953,14 @@ pub(crate) struct HealthArgs {
 pub(crate) struct StateArgs {
     #[arg(
         value_name = "REF",
-        help = "Show managed file changes since a reference such as 1h, 03:40, op-..., or snap-..."
+        help = "Show managed file changes since a reference such as 1h, 03:40, op-..., or snap-...; omitted means since the first snapshot"
     )]
     pub(crate) reference: Option<String>,
     #[arg(
         short = 'j',
         long,
         default_value_t = false,
-        help = "Emit machine-readable JSON instead of the terminal summary"
+        help = "Emit machine-readable JSON"
     )]
     pub(crate) json: bool,
     #[arg(
@@ -983,6 +983,12 @@ pub(crate) struct StateArgs {
         help = "Show colored line diffs after changed file lines"
     )]
     pub(crate) diff: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Show only paths that are managed in the basis snapshot but missing from the live root"
+    )]
+    pub(crate) deleted: bool,
     #[arg(
         long,
         default_value_t = false,

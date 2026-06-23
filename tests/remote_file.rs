@@ -15588,6 +15588,20 @@ fn state_reference_reports_file_changes_since_operation() {
             " M sample/modified.txt",
         ]
     );
+    let default_state_output = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("state");
+        c
+    });
+    let mut default_state_lines = default_state_output.lines().collect::<Vec<_>>();
+    default_state_lines.sort();
+    assert_eq!(default_state_lines, state_lines);
+    let deleted_output = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("state").arg("--deleted");
+        c
+    });
+    assert_eq!(deleted_output, " D sample/deleted.txt\n");
     assert!(!state_output.contains("m sample/memo"), "{state_output}");
     let root_filtered_output = output({
         let mut c = mj();

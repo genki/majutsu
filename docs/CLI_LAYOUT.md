@@ -83,13 +83,17 @@ and remote sync path; a snapshot is a durable checkpoint in the host timeline.
 
 ## State inspection
 
-`mj state <ref>` is the Git `status -s`-like command for a point in time.
+`mj state` is the Git `status -s`-like command for managed files. Without a
+reference it compares the first snapshot with the live filesystem. With a
+reference it compares that point in time with the live filesystem.
 
 ```sh
+mj state
 mj state 1d
 mj state 1d -r moon
 mj state 03:40 -r moon --diff
 mj state op-123456789abc -g
+mj state --deleted
 ```
 
 Markers:
@@ -104,6 +108,7 @@ m  metadata-only change; shown only with --meta
 `--diff` prints colored unified-diff-style text hunks after file rows.
 `--meta` includes metadata-only changes such as directory mtime, mode, owner,
 or xattrs.
+`--deleted` filters the output to `D` rows.
 
 ## Restore view namespace
 

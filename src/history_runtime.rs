@@ -1348,13 +1348,29 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let current = current_snapshot(&conn)?;
     let configured_roots = roots(&conn)?;
     let state_scope = resolve_state_scope(&configured_roots, &args)?;
-    let basis = args
-        .reference
-        .as_deref()
-        .map(|reference| resolve_state_basis(paths, &conn, reference))
-        .transpose()?;
+    let filter = StateChangeFilter {
+        deleted_only: args.deleted,
+    };
+    let basis = if let Some(reference) = args.reference.as_deref() {
+        Some(resolve_state_basis(paths, &conn, reference)?)
+    } else {
+        earliest_state_basis(paths, &conn)?
+    };
     if let Some(basis) = basis.as_ref().filter(|_| !args.json) {
-        stream_state_short_changes(paths, &conn, basis, &state_scope, args.diff, args.meta)?;
+        stream_state_short_changes(
+            paths,
+            &conn,
+            basis,
+            &state_scope,
+            StateChangeOptions {
+                show_diff: args.diff,
+                include_meta: args.meta,
+                filter,
+            },
+        )?;
+        return Ok(());
+    }
+    if basis.is_none() && !args.json {
         return Ok(());
     }
     let active_branch = ref_value_for_state(&conn, "current-branch")?;
@@ -1377,6 +1393,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
         Some(state_change_report(
             state_live_file_changes(paths, &from, &state_scope.roots, false, args.meta)?,
             current.as_deref().unwrap_or("(none)").to_string(),
+            filter,
         ))
     } else {
         None
@@ -1997,12 +2014,37 @@ struct StateFileChange {
     path: String,
 }
 
-fn state_change_report(changes: Vec<FileChange>, current_snapshot: String) -> StateChangeReport {
+#[derive(Clone, Copy)]
+struct StateChangeFilter {
+    deleted_only: bool,
+}
+
+impl StateChangeFilter {
+    fn allows(self, status: &str) -> bool {
+        !self.deleted_only || status == "D"
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StateChangeOptions {
+    show_diff: bool,
+    include_meta: bool,
+    filter: StateChangeFilter,
+}
+
+fn state_change_report(
+    changes: Vec<FileChange>,
+    current_snapshot: String,
+    filter: StateChangeFilter,
+) -> StateChangeReport {
     let mut files = Vec::with_capacity(changes.len());
     let mut added = 0usize;
     let mut modified = 0usize;
     let mut deleted = 0usize;
     for change in changes {
+        if !filter.allows(change.status) {
+            continue;
+        }
         match change.status {
             "A" => added += 1,
             "M" => modified += 1,
@@ -2031,8 +2073,7 @@ fn stream_state_short_changes(
     conn: &Connection,
     basis: &StateBasis,
     scope: &StateScope,
-    show_diff: bool,
-    include_meta: bool,
+    options: StateChangeOptions,
 ) -> Result<()> {
     let _ = conn;
     let snapshot_id = basis.snapshot.clone();
@@ -2053,8 +2094,7 @@ fn stream_state_short_changes(
                     &snapshot_id,
                     &root,
                     local_paths,
-                    show_diff,
-                    include_meta,
+                    options,
                     |change, diff_lines| {
                         let line = format!(
                             " {} {}{}",
@@ -2317,8 +2357,7 @@ fn state_stream_live_file_changes_for_root(
     snapshot_id: &str,
     root: &RootConfig,
     local_paths: bool,
-    show_diff: bool,
-    include_meta: bool,
+    options: StateChangeOptions,
     mut emit: impl FnMut(FileChange, Vec<String>) -> Result<()>,
 ) -> Result<()> {
     let mut from_files = root_file_map_by_snapshot_id(paths, snapshot_id, &root.id)?;
@@ -2326,8 +2365,17 @@ fn state_stream_live_file_changes_for_root(
         let display_path = state_display_path(root, &path, local_paths);
         match from_files.remove(&path) {
             None => {
-                let diff =
-                    state_live_change_diff(paths, root, &path, None, Some(&live), show_diff)?;
+                if !options.filter.allows("A") {
+                    return Ok(());
+                }
+                let diff = state_live_change_diff(
+                    paths,
+                    root,
+                    &path,
+                    None,
+                    Some(&live),
+                    options.show_diff,
+                )?;
                 emit(
                     FileChange::from_record("A", display_path, Some(root), &path, Some(&live)),
                     diff,
@@ -2339,13 +2387,16 @@ fn state_stream_live_file_changes_for_root(
                     || (fast_status != Some("M")
                         && state_stream_payload_changed(root, &path, &previous)?);
                 if content_changed {
+                    if !options.filter.allows("M") {
+                        return Ok(());
+                    }
                     let diff = state_live_change_diff(
                         paths,
                         root,
                         &path,
                         Some(&previous),
                         Some(&live),
-                        show_diff,
+                        options.show_diff,
                     )?;
                     emit(
                         FileChange::from_records(
@@ -2358,7 +2409,10 @@ fn state_stream_live_file_changes_for_root(
                         ),
                         diff,
                     )?
-                } else if fast_status == Some("m") && include_meta {
+                } else if fast_status == Some("m")
+                    && options.include_meta
+                    && options.filter.allows("m")
+                {
                     emit(
                         FileChange::from_records(
                             "m",
@@ -2376,7 +2430,11 @@ fn state_stream_live_file_changes_for_root(
         Ok(())
     })?;
     for (path, previous) in &from_files {
-        let diff = state_live_change_diff(paths, root, path, Some(previous), None, show_diff)?;
+        if !options.filter.allows("D") {
+            continue;
+        }
+        let diff =
+            state_live_change_diff(paths, root, path, Some(previous), None, options.show_diff)?;
         emit(
             FileChange::from_record(
                 "D",
@@ -2811,6 +2869,29 @@ fn resolve_state_basis(paths: &Paths, conn: &Connection, input: &str) -> Result<
         None,
         Some(resolved_at),
     )
+}
+
+fn earliest_state_basis(paths: &Paths, conn: &Connection) -> Result<Option<StateBasis>> {
+    let snapshot = conn
+        .query_row(
+            "select id from snapshots order by created_at asc, id asc limit 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    snapshot
+        .map(|snapshot| {
+            state_basis_from_snapshot(
+                paths,
+                conn,
+                "init",
+                "initial-snapshot",
+                snapshot,
+                None,
+                None,
+            )
+        })
+        .transpose()
 }
 
 fn resolve_state_operation_basis(

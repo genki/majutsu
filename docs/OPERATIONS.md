@@ -4,7 +4,6 @@
 
 ```sh
 mj status
-mj state
 mj sync status
 mj fsck --quick
 mj remote check
@@ -13,23 +12,26 @@ mj daemon status
 mj daemon metrics
 ```
 
-`mj status` は運用上の要点確認、`mj state` は state home の paths、refs、
-branch heads、metadata 件数を確認する用途で使い分ける。自動確認では
-`mj state --json` を使う。
+`mj status` は運用上の要点確認に使う。`mj state` は Git の `status -s` に近い
+管理対象ファイル差分の確認に使う。
 
-指定時点からの管理対象ファイル差分は `mj state <ref>` を使う。root を絞る場合は
+`mj state` を引数なしで実行すると、初回 snapshot から現在の live filesystem までの
+全変更を表示する。指定時点からの差分は `mj state <ref>` を使う。root を絞る場合は
 `-r/--root`、全root表示を明示する場合は `-g/--global` を使う。
 
 ```sh
+mj state
 mj state 1d -r moon
 mj state 03:40 -r moon --diff
 mj state op-123456789abc -g
+mj state --deleted
 ```
 
 通常表示は `A/M/D` のファイル変更だけを出す。directory mtime、mode、owner、xattrs など
 metadata-only の変更は既定では隠し、必要な場合だけ `--meta` で小文字 `m` として表示する。
 `--diff` は text file の変更行を `@@` / `-` / `+` の色付き diff 形式で file row の直後に表示する。
 binary、special file、1 MiB 超のファイルは status row のみ表示し、diff body は省略する。
+実体が削除済みの管理対象だけを確認する場合は `--deleted` を使う。
 
 `mj status` の先頭には remote head の同期状態が表示される。`Remote head synced (cached)`
 なら local current snapshot が最後に確認した remote current ref と一致している。

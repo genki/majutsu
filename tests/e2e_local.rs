@@ -953,13 +953,13 @@ fn state_reports_paths_refs_branches_and_json() {
         "feature snapshot",
     );
 
+    let status_text = successful_stdout(run_mj(&home, ["status"]), "status text");
+    assert!(status_text.contains("Status"), "{status_text}");
+    assert!(status_text.contains("Roots"), "{status_text}");
+    assert!(status_text.contains("workspace"), "{status_text}");
+
     let text = successful_stdout(run_mj(&home, ["state"]), "state text");
-    assert!(text.contains("State"), "{text}");
-    assert!(text.contains("Branches"), "{text}");
-    assert!(text.contains("Refs"), "{text}");
-    assert!(text.contains("current-branch"), "{text}");
-    assert!(text.contains("feature"), "{text}");
-    assert!(text.contains(home.to_str().unwrap()), "{text}");
+    assert_eq!(text, " M workspace/note.txt\n");
 
     let json = successful_stdout(run_mj(&home, ["state", "--json"]), "state json");
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -983,6 +983,9 @@ fn state_reports_paths_refs_branches_and_json() {
             .any(|reference| reference["name"] == "current-branch"
                 && reference["value"] == "feature")
     );
+    assert_eq!(value["basis"]["kind"], "initial-snapshot");
+    assert_eq!(value["changes"]["total"], 1);
+    assert_eq!(value["changes"]["modified"], 1);
 }
 
 #[test]
