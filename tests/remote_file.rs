@@ -15620,6 +15620,113 @@ fn track_untrack_separate_deleted_state_from_management_removal() {
 }
 
 #[test]
+fn untrack_supports_path_files_summary_and_excluded_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let path_file = tmp.path().join("paths.txt");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--no-default-excludes");
+        c
+    });
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(source.join("skip.tmp"), b"tmp\n").unwrap();
+    fs::write(source.join("tmp_runtime.1"), b"tmp\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
+            .arg("--exclude")
+            .arg("*.tmp")
+            .arg("--exclude")
+            .arg("tmp_*");
+        c
+    });
+
+    let dry_run = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("--excluded")
+            .arg("--dry-run")
+            .arg("--summary");
+        c
+    });
+    assert!(dry_run.contains("requested 2"), "{dry_run}");
+    assert!(dry_run.contains("would_untrack 2"), "{dry_run}");
+
+    fs::write(&path_file, "skip.tmp\ntmp_runtime.1\n").unwrap();
+    let summary = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("--path-file")
+            .arg(&path_file)
+            .arg("--summary");
+        c
+    });
+    assert!(summary.contains("requested 2"), "{summary}");
+    assert!(summary.contains("untracked 2"), "{summary}");
+
+    let deleted = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--status")
+            .arg("A,D");
+        c
+    });
+    assert!(!deleted.contains("skip.tmp"), "{deleted}");
+    assert!(!deleted.contains("tmp_runtime.1"), "{deleted}");
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("keep.txt")
+            .arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["requested"], 1);
+    assert_eq!(value["untracked"], 1);
+}
+
+#[test]
 fn state_reference_reports_file_changes_since_operation() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

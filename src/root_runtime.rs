@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -27,8 +27,8 @@ use crate::root_size_summary::{
     RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, write_cached_root_size_summary,
 };
 use crate::root_state::{
-    mark_path_tracked, mark_path_untracked, root_by_id, root_by_id_optional, roots, save_root,
-    sync_roots_to_config, update_root_status,
+    all_tracked_paths, mark_path_tracked, mark_path_untracked, root_by_id, root_by_id_optional,
+    roots, save_root, sync_roots_to_config, update_root_status,
 };
 use crate::snapshot_rules::{
     apply_default_root_excludes, apply_root_large_set, apply_root_presets, apply_root_volatile_set,
@@ -187,11 +187,26 @@ pub(crate) fn root_cmd(paths: &Paths, command: RootCommand) -> Result<()> {
             }
             apply_root_large_set(&mut root, &args)?;
             apply_root_volatile_set(&mut root, &args)?;
-            let forgotten = forget_unmanaged_root_history(paths, &conn, &root)?;
+            let forgotten = if args.skip_history_rewrite {
+                ForgetUnmanagedStats::default()
+            } else {
+                with_sqlite_storage_context(paths, "apply root config cleanup", || {
+                    forget_unmanaged_root_history(paths, &conn, &root)
+                })?
+            };
             save_root(&conn, &root)?;
             sync_roots_to_config(paths, &conn)?;
-            if forgotten.records > 0 {
-                let removed = crate::prune_runtime::prune_unreferenced_metadata(paths, &conn)?;
+            if args.skip_history_rewrite {
+                println!(
+                    "history_rewrite skipped; run `mj untrack -r {} --excluded` or `mj root set {} --exclude ...` without --skip-history-rewrite after repairing history",
+                    root.id, root.id
+                );
+            } else if forgotten.records > 0 {
+                let removed = with_sqlite_storage_context(
+                    paths,
+                    "prune root config cleanup metadata",
+                    || crate::prune_runtime::prune_unreferenced_metadata(paths, &conn),
+                )?;
                 println!("forgotten_unmanaged_records {}", forgotten.records);
                 println!("rewritten_snapshots {}", forgotten.snapshots);
                 println!("removed_blob_metadata {}", removed.blobs);
@@ -249,10 +264,32 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
     let configured_roots = roots(&conn)?;
+    if track && (args.excluded || args.dry_run || args.summary || args.quiet || args.json) {
+        bail!("track does not support --excluded, --dry-run, --summary, --quiet, or --json");
+    }
+    if args.excluded && args.root.is_none() {
+        bail!("--excluded requires -r/--root");
+    }
+    let input_paths = collect_path_tracking_inputs(&args, &configured_roots, &conn)?;
+    if input_paths.is_empty() {
+        bail!("no paths supplied");
+    }
     let mut changed = BTreeMap::<String, RootConfig>::new();
-    for input in &args.paths {
-        let (root, rel) =
-            resolve_path_tracking_target(&configured_roots, args.root.as_deref(), input)?;
+    let mut summary = UntrackSummary {
+        requested: input_paths.len(),
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    for input in &input_paths {
+        let resolved = resolve_path_tracking_target(&configured_roots, args.root.as_deref(), input);
+        let (root, rel) = match resolved {
+            Ok(value) => value,
+            Err(err) => {
+                summary.failed += 1;
+                failures.push(format!("{}: {err:#}", input.display()));
+                continue;
+            }
+        };
         let root = changed
             .entry(root.id.clone())
             .or_insert_with(|| root.clone());
@@ -262,40 +299,262 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
             mark_path_tracked(&conn, &root.id, &rel)?;
             println!("tracked {}:{}", root.id, rel);
         } else {
+            if args.dry_run {
+                summary.would_untrack += 1;
+                if !args.quiet && !args.summary && !args.json {
+                    println!("would untrack {}:{}", root.id, rel);
+                }
+                continue;
+            }
             remove_pattern(&mut root.explicit_track, &rel);
             push_pattern(&mut root.explicit_untrack, rel.clone());
             mark_path_untracked(&conn, &root.id, &rel)?;
-            println!("untracked {}:{}", root.id, rel);
+            summary.untracked += 1;
+            if !args.quiet && !args.summary && !args.json {
+                println!("untracked {}:{}", root.id, rel);
+            }
+        }
+    }
+    if !failures.is_empty() && !args.json {
+        for failure in &failures {
+            eprintln!("untrack error: {failure}");
         }
     }
     for root in changed.values() {
         if !track {
-            let forgotten = forget_unmanaged_root_history(paths, &conn, root)?;
+            if args.dry_run {
+                continue;
+            }
+            let forgotten = match with_sqlite_storage_context(
+                paths,
+                "forget unmanaged root history",
+                || forget_unmanaged_root_history(paths, &conn, root),
+            ) {
+                Ok(stats) => stats,
+                Err(err) if args.continue_on_history_error => {
+                    eprintln!(
+                        "warning: tracking metadata updated but historical cleanup failed: {err:#}"
+                    );
+                    eprintln!(
+                        "next: run `mj fsck`; then rerun `mj untrack -r {} --excluded`",
+                        root.id
+                    );
+                    ForgetUnmanagedStats::default()
+                }
+                Err(err) => return Err(err),
+            };
             if forgotten.records > 0 {
-                let removed = crate::prune_runtime::prune_unreferenced_metadata(paths, &conn)?;
-                println!("forgotten_unmanaged_records {}", forgotten.records);
-                println!("rewritten_snapshots {}", forgotten.snapshots);
-                println!("removed_blob_metadata {}", removed.blobs);
-                println!("removed_large_metadata {}", removed.large_objects);
-                println!("removed_chunk_metadata {}", removed.chunks);
-                println!("removed_pack_metadata {}", removed.packs);
+                let removed =
+                    with_sqlite_storage_context(paths, "prune unreferenced metadata", || {
+                        crate::prune_runtime::prune_unreferenced_metadata(paths, &conn)
+                    })?;
+                if !args.quiet && !args.json {
+                    println!("forgotten_unmanaged_records {}", forgotten.records);
+                    println!("rewritten_snapshots {}", forgotten.snapshots);
+                    println!("removed_blob_metadata {}", removed.blobs);
+                    println!("removed_large_metadata {}", removed.large_objects);
+                    println!("removed_chunk_metadata {}", removed.chunks);
+                    println!("removed_pack_metadata {}", removed.packs);
+                }
             }
         }
-        save_root(&conn, root)?;
+        if !args.dry_run {
+            save_root(&conn, root)?;
+        }
     }
-    sync_roots_to_config(paths, &conn)?;
-    record_op(
-        &conn,
-        if track {
-            "path-tracked"
-        } else {
-            "path-untracked"
-        },
-        None,
-        None,
-        args.root.as_deref(),
-    )?;
+    if !args.dry_run {
+        sync_roots_to_config(paths, &conn)?;
+        record_op(
+            &conn,
+            if track {
+                "path-tracked"
+            } else {
+                "path-untracked"
+            },
+            None,
+            None,
+            args.root.as_deref(),
+        )?;
+    }
+    if !track && (args.summary || args.quiet || args.json || args.dry_run) {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else if !args.quiet || args.summary {
+            println!("requested {}", summary.requested);
+            if args.dry_run {
+                println!("would_untrack {}", summary.would_untrack);
+            } else {
+                println!("untracked {}", summary.untracked);
+            }
+            println!("failed {}", summary.failed);
+            if !args.dry_run && summary.untracked > 0 {
+                println!("hint run `mj snapshot` and `mj sync --wait` to publish cleanup metadata");
+            }
+        }
+    }
+    if summary.failed > 0 {
+        bail!("{} path operation(s) failed", summary.failed);
+    }
     Ok(())
+}
+
+#[derive(Default, Serialize)]
+struct UntrackSummary {
+    requested: usize,
+    untracked: usize,
+    would_untrack: usize,
+    failed: usize,
+}
+
+fn collect_path_tracking_inputs(
+    args: &PathTrackArgs,
+    roots: &[RootConfig],
+    conn: &Connection,
+) -> Result<Vec<PathBuf>> {
+    let mut inputs = args.paths.clone();
+    if let Some(path_file) = &args.path_file {
+        let content = fs::read_to_string(path_file)
+            .with_context(|| format!("read path file {}", path_file.display()))?;
+        inputs.extend(lines_to_paths(&content));
+    }
+    if args.stdin {
+        let mut content = String::new();
+        io::stdin().read_to_string(&mut content)?;
+        inputs.extend(lines_to_paths(&content));
+    }
+    if args.excluded {
+        let root_id = args.root.as_deref().expect("--excluded requires root");
+        let root = roots
+            .iter()
+            .find(|root| root.id == root_id && root.status == "active")
+            .ok_or_else(|| anyhow!("unknown active root: {root_id}"))?;
+        let ignore = build_ignore(root)?;
+        for rel in all_tracked_paths(conn, &root.id)? {
+            let rel_path = PathBuf::from(&rel);
+            let is_dir = root.path.join(&rel).is_dir();
+            if !root_record_is_managed(root, &ignore, &rel_path, is_dir) {
+                inputs.push(rel_path);
+            }
+        }
+    }
+    inputs.sort();
+    inputs.dedup();
+    Ok(inputs)
+}
+
+fn lines_to_paths(content: &str) -> Vec<PathBuf> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn with_sqlite_storage_context<T, F>(paths: &Paths, operation: &str, action: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    match action() {
+        Ok(value) => Ok(value),
+        Err(err) if looks_like_sqlite_full(&err) => {
+            Err(err).with_context(|| sqlite_storage_diagnostics(paths, operation))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn looks_like_sqlite_full(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("database or disk is full")
+        || message.contains("sqlite_full")
+        || message.contains("error code 13")
+}
+
+fn sqlite_storage_diagnostics(paths: &Paths, operation: &str) -> String {
+    let temp_dir = env::var_os("SQLITE_TMPDIR")
+        .or_else(|| env::var_os("TMPDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    let db_stats = sqlite_page_stats(paths).unwrap_or_else(|err| format!("unavailable: {err:#}"));
+    format!(
+        "SQLite storage diagnostic while {operation}\n\
+         state_home: {}\n\
+         state_db: {}\n\
+         sqlite_temp_dir: {}\n\
+         state_fs: {}\n\
+         temp_fs: {}\n\
+         sqlite_pages: {}\n\
+         transaction: failed operation was rolled back by SQLite/command error handling\n\
+         next: run `mj fsck`; if remote is configured, run `mj sync status --deep` and `mj remote fsck --objects`",
+        paths.home.display(),
+        paths.db.display(),
+        temp_dir.display(),
+        fs_capacity_summary(&paths.home),
+        fs_capacity_summary(&temp_dir),
+        db_stats
+    )
+}
+
+fn sqlite_page_stats(paths: &Paths) -> Result<String> {
+    let conn = Connection::open(&paths.db)?;
+    let page_count: i64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let max_page_count: i64 = conn.pragma_query_value(None, "max_page_count", |row| row.get(0))?;
+    let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    Ok(format!(
+        "page_count={page_count} max_page_count={max_page_count} page_size={page_size}"
+    ))
+}
+
+#[cfg(unix)]
+fn fs_capacity_summary(path: &Path) -> String {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let existing = nearest_existing_path(path);
+    let Ok(c_path) = CString::new(existing.as_os_str().as_bytes()) else {
+        return format!("{} unavailable: interior nul byte", existing.display());
+    };
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: c_path is a valid nul-terminated path and stats points to writable memory.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return format!(
+            "{} unavailable: {}",
+            existing.display(),
+            io::Error::last_os_error()
+        );
+    }
+    // SAFETY: statvfs returned success and initialized stats.
+    let stats = unsafe { stats.assume_init() };
+    let free_bytes = stats.f_bavail as u128 * stats.f_frsize as u128;
+    format!(
+        "{} free_bytes={} free_inodes={}",
+        existing.display(),
+        free_bytes,
+        stats.f_favail
+    )
+}
+
+#[cfg(not(unix))]
+fn fs_capacity_summary(path: &Path) -> String {
+    format!(
+        "{} capacity details unavailable on this platform",
+        nearest_existing_path(path).display()
+    )
+}
+
+fn nearest_existing_path(path: &Path) -> PathBuf {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return current.to_path_buf();
+        }
+        let Some(parent) = current.parent() else {
+            return PathBuf::from(".");
+        };
+        current = parent;
+    }
 }
 
 fn resolve_path_tracking_target<'a>(

@@ -61,6 +61,28 @@ mj track -r moon excluded/keep.md
 mj untrack -r moon old/generated.bin
 ```
 
+大量の tracked path を整理する場合は、shell で小分けにせず `--path-file` または
+`--stdin` を使う。root の exclude を締めた後に「現在のroot rulesでは管理対象外になるはずの
+既存 tracked path」を監査・除去するには `--excluded` を使う。これは作業treeのファイルを
+削除せず、tracking metadata だけを更新する。
+
+```sh
+mj untrack -r moon --path-file paths.txt --summary
+find . -name '*.tmp' -print | mj untrack -r moon --stdin --summary
+mj untrack -r moon --excluded --dry-run --summary
+mj untrack -r moon --excluded --summary
+```
+
+古い履歴objectが壊れていて cleanup rewrite まで完了できない場合でも、current metadata を
+先に直す逃げ道として `mj root set --skip-history-rewrite` と
+`mj untrack --continue-on-history-error` を使える。これは通常運用の既定ではなく、`mj fsck` /
+`mj remote fsck --objects` で履歴を修復するまでの復旧用モードである。
+
+```sh
+mj root set moon --exclude '*.tmp' --skip-history-rewrite
+mj untrack -r moon --excluded --continue-on-history-error --summary
+```
+
 `mj status` の先頭には remote head の同期状態が表示される。`Remote head synced (cached)`
 なら local current snapshot が最後に確認した remote current ref と一致している。
 これは quick signal であり、全 object の存在確認ではない。`lagging (cached)`、

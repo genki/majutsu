@@ -94,6 +94,9 @@ mj track notes/keep.md
 mj untrack tmp/local.db
 mj track -r home-notes excluded/keep.md
 mj untrack -r home-notes old/generated.bin
+mj untrack -r home-notes --path-file paths.txt --summary
+mj untrack -r home-notes --excluded --dry-run --summary
+mj untrack -r home-notes --excluded --summary
 ```
 
 ## History and operations
@@ -276,7 +279,13 @@ Existing root settings can be changed without removing the root:
 mj root set photos --exclude '**/.cache/**'
 mj root set photos --clear-exclude --exclude '**/.DS_Store'
 mj root set photos --large-min-size 8388608 --large-always '*.heic'
+mj root set photos --exclude '*.tmp' --skip-history-rewrite
 ```
+
+`--skip-history-rewrite` is a recovery option for installations with unreadable
+old history objects. It applies the current root metadata/configuration change
+without rewriting older snapshots. After repairing history, rerun the cleanup
+without this option or use `mj untrack -r <root> --excluded`.
 
 High-frequency files can be marked volatile. The default `checkpoint` mode
 suppresses watch-triggered immediate snapshots for matching paths, while manual

@@ -192,6 +192,10 @@ pub(crate) fn tracked_paths_for_root(conn: &Connection, root_id: &str) -> Result
     Ok(paths)
 }
 
+pub(crate) fn all_tracked_paths(conn: &Connection, root_id: &str) -> Result<BTreeSet<String>> {
+    tracked_paths_for_root(conn, root_id)
+}
+
 pub(crate) fn save_root(conn: &Connection, root: &RootConfig) -> Result<()> {
     conn.execute(
         "update roots set data_json=?2 where id=?1",

@@ -126,6 +126,10 @@ pub fn default_root_excludes() -> Vec<String> {
         "tmp/**",
         "/tmp/**",
         "**/tmp/**",
+        "*.tmp",
+        "**/*.tmp",
+        "tmp_*",
+        "**/tmp_*",
         "temp/**",
         "/temp/**",
         "**/temp/**",
@@ -761,6 +765,10 @@ mod moon_root_tests {
             "node_modules",
             "target",
             ".venv",
+            "state.json.123.abc.tmp",
+            "work/state.json.123.abc.tmp",
+            "tmp_runtime.1",
+            "work/tmp_runtime.1",
         ] {
             assert!(
                 exclude_covers_path(&excludes, path),

@@ -1041,11 +1041,54 @@ pub(crate) struct PathTrackArgs {
     )]
     pub(crate) root: Option<String>,
     #[arg(
-        required = true,
         value_name = "PATH",
         help = "Path to track or untrack; relative paths are resolved from the current directory"
     )]
     pub(crate) paths: Vec<PathBuf>,
+    #[arg(
+        long = "path-file",
+        value_name = "FILE",
+        help = "Read newline-delimited root-relative paths from a file"
+    )]
+    pub(crate) path_file: Option<PathBuf>,
+    #[arg(
+        long = "stdin",
+        default_value_t = false,
+        help = "Read newline-delimited root-relative paths from stdin"
+    )]
+    pub(crate) stdin: bool,
+    #[arg(
+        long = "excluded",
+        default_value_t = false,
+        help = "Operate on currently tracked paths that no longer match current root rules"
+    )]
+    pub(crate) excluded: bool,
+    #[arg(
+        long = "dry-run",
+        default_value_t = false,
+        help = "Report what would change without updating tracking metadata"
+    )]
+    pub(crate) dry_run: bool,
+    #[arg(
+        long = "summary",
+        default_value_t = false,
+        help = "Print a concise summary instead of one line per path"
+    )]
+    pub(crate) summary: bool,
+    #[arg(
+        long = "quiet",
+        default_value_t = false,
+        help = "Suppress per-path output"
+    )]
+    pub(crate) quiet: bool,
+    #[arg(long = "json", default_value_t = false, help = "Print JSON summary")]
+    pub(crate) json: bool,
+    #[arg(
+        long = "continue-on-history-error",
+        default_value_t = false,
+        help = "Keep tracking metadata changes even if historical cleanup fails"
+    )]
+    pub(crate) continue_on_history_error: bool,
 }
 
 #[derive(Args, Clone)]
@@ -1231,6 +1274,13 @@ pub(crate) struct RootSetArgs {
     pub(crate) presets: Vec<String>,
     #[arg(long, default_value_t = false)]
     pub(crate) clear_exclude: bool,
+    #[arg(
+        long = "skip-history-rewrite",
+        alias = "metadata-only",
+        default_value_t = false,
+        help = "Update root metadata without rewriting old snapshots that are no longer managed"
+    )]
+    pub(crate) skip_history_rewrite: bool,
     #[arg(long, default_value_t = false)]
     pub(crate) follow_symlinks: bool,
     #[arg(long, default_value_t = false)]
