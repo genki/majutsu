@@ -49,6 +49,13 @@ pub fn default_watch_backend() -> String {
     default_daemon_backend().into()
 }
 
+pub(crate) fn default_watch_max_rss_mib() -> u64 {
+    std::env::var("MAJUTSU_WATCH_MAX_RSS_MIB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2048)
+}
+
 pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
@@ -66,6 +73,7 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
                 buffer_max_ms: args.buffer_max_ms,
                 buffer_max_events: args.buffer_max_events,
                 periodic_rescan_secs: args.periodic_rescan_secs,
+                max_rss_mib: args.max_rss_mib,
             },
         )?;
         println!("started daemon pid {pid}");
@@ -156,19 +164,22 @@ fn watch_fanotify(
         paths,
         "watch-start",
         &format!(
-            "backend=fanotify mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={}",
+            "backend=fanotify mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={} max_rss_mib={}",
             args.mode,
             args.debounce_ms,
             args.settle_ms,
             args.buffer_max_ms,
             args.buffer_max_events,
-            args.periodic_rescan_secs
+            args.periodic_rescan_secs,
+            args.max_rss_mib
         ),
     )?;
     record_health(paths);
+    enforce_watch_memory_guard(paths, args.max_rss_mib)?;
     if replay_pending_journal_events(paths)? {
         sync_current_external(paths)?;
         record_health(paths);
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
             record_event(
                 paths,
@@ -179,6 +190,7 @@ fn watch_fanotify(
         }
     }
     loop {
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         let Some(event) = fanotify.recv(args.periodic_rescan_secs)? else {
             notify_stalled_pending_journal(paths)?;
             record_event(
@@ -194,6 +206,7 @@ fn watch_fanotify(
                 },
             )?;
             record_health(paths);
+            enforce_watch_memory_guard(paths, args.max_rss_mib)?;
             if args.once {
                 break;
             }
@@ -244,6 +257,7 @@ fn watch_fanotify(
             },
         )?;
         record_health(paths);
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
             break;
         }
@@ -264,6 +278,7 @@ fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedW
         buffer_max_ms: args.buffer_max_ms.unwrap_or(config.buffer_max),
         buffer_max_events: args.buffer_max_events.unwrap_or(config.buffer_max_events),
         periodic_rescan_secs: args.periodic_rescan_secs.unwrap_or(config.periodic_rescan),
+        max_rss_mib: args.max_rss_mib.unwrap_or_else(default_watch_max_rss_mib),
         backend: args.backend.unwrap_or_else(|| config.backend.clone()),
         once: args.once,
     })
@@ -274,11 +289,12 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
         paths,
         "watch-start",
         &format!(
-            "backend=poll mode={} interval_secs={}",
-            args.mode, args.interval_secs
+            "backend=poll mode={} interval_secs={} max_rss_mib={}",
+            args.mode, args.interval_secs, args.max_rss_mib
         ),
     )?;
     loop {
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         snapshot_and_maybe_sync(
             paths,
             SnapshotArgs {
@@ -287,6 +303,7 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
             },
         )?;
         record_health(paths);
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
             break;
         }
@@ -309,14 +326,15 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
         paths,
         "watch-start",
         &format!(
-            "backend={} mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={}",
+            "backend={} mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={} max_rss_mib={}",
             backend_label,
             args.mode,
             args.debounce_ms,
             args.settle_ms,
             args.buffer_max_ms,
             args.buffer_max_events,
-            args.periodic_rescan_secs
+            args.periodic_rescan_secs,
+            args.max_rss_mib
         ),
     )?;
     let (tx, rx) = mpsc::channel();
@@ -634,9 +652,11 @@ fn watch_notify_loop<W: Watcher>(
         bail!("no active roots could be watched");
     }
     record_health(paths);
+    enforce_watch_memory_guard(paths, args.max_rss_mib)?;
     if replay_pending_journal_events(paths)? {
         sync_current_external(paths)?;
         record_health(paths);
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
             record_event(
                 paths,
@@ -647,6 +667,7 @@ fn watch_notify_loop<W: Watcher>(
         }
     }
     loop {
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         let event = match recv_watch_event(&rx, args.periodic_rescan_secs) {
             Ok(Some(event)) => event,
             Ok(None) => {
@@ -667,6 +688,7 @@ fn watch_notify_loop<W: Watcher>(
                     },
                 )?;
                 record_health(paths);
+                enforce_watch_memory_guard(paths, args.max_rss_mib)?;
                 if args.once {
                     break;
                 }
@@ -705,6 +727,7 @@ fn watch_notify_loop<W: Watcher>(
             settle: Duration::ZERO,
             max_latency: Duration::from_millis(args.buffer_max_ms.max(1)),
             max_events: args.buffer_max_events.max(1),
+            max_rss_mib: args.max_rss_mib,
         };
         let outcome = drain_watch_event_buffer(paths, &rx, buffer, backend_label, &watched_roots)?;
         record_event(
@@ -726,6 +749,7 @@ fn watch_notify_loop<W: Watcher>(
             },
         )?;
         record_health(paths);
+        enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
             break;
         }
@@ -1138,6 +1162,7 @@ struct WatchEventBufferConfig {
     settle: Duration,
     max_latency: Duration,
     max_events: usize,
+    max_rss_mib: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1165,6 +1190,7 @@ fn drain_watch_event_buffer(
         active_roots,
     };
     loop {
+        enforce_watch_memory_guard(paths, config.max_rss_mib)?;
         if events >= config.max_events {
             return settle_before_flush(&context, started, events, "max-events");
         }
@@ -1236,6 +1262,7 @@ fn settle_before_flush(
             &format!("settle_ms={}", config.settle.as_millis()),
         )?;
         loop {
+            enforce_watch_memory_guard(paths, config.max_rss_mib)?;
             if events >= config.max_events {
                 return Ok(buffer_outcome(started, events, "max-events"));
             }
@@ -1278,6 +1305,35 @@ fn buffer_outcome(
         events,
         elapsed_ms: started.elapsed().as_millis(),
     }
+}
+
+fn enforce_watch_memory_guard(paths: &Paths, max_rss_mib: u64) -> Result<()> {
+    if max_rss_mib == 0 {
+        return Ok(());
+    }
+    let rss_kib = self_proc_status_kib("VmRSS").unwrap_or(0);
+    if rss_kib == 0 {
+        return Ok(());
+    }
+    let limit_kib = max_rss_mib.saturating_mul(1024);
+    if rss_kib <= limit_kib {
+        return Ok(());
+    }
+    record_event(
+        paths,
+        "watch-memory-limit",
+        &format!("rss_kib={rss_kib} max_rss_mib={max_rss_mib}"),
+    )?;
+    bail!("watch daemon RSS exceeded limit: {rss_kib} KiB > {limit_kib} KiB");
+}
+
+fn self_proc_status_kib(field: &str) -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix(field)?.trim_start();
+        let rest = rest.strip_prefix(':')?.trim_start();
+        rest.split_whitespace().next()?.parse().ok()
+    })
 }
 
 fn record_watch_error(
@@ -1441,6 +1497,7 @@ mod tests {
                 settle: Duration::ZERO,
                 max_latency: Duration::from_millis(1_000),
                 max_events: 100,
+                max_rss_mib: 0,
             },
             "test",
             &[],
@@ -1470,6 +1527,7 @@ mod tests {
                 settle: Duration::ZERO,
                 max_latency: Duration::from_secs(5),
                 max_events: 2,
+                max_rss_mib: 0,
             },
             "test",
             &[],
@@ -1505,6 +1563,7 @@ mod tests {
                 settle: Duration::ZERO,
                 max_latency: Duration::from_millis(70),
                 max_events: 100,
+                max_rss_mib: 0,
             },
             "test",
             &[],

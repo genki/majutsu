@@ -22,6 +22,7 @@ use crate::process_runtime::{pid_alive, read_pid};
 use crate::queue_runtime::{event_journal_records, upload_queue_stats};
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
+use crate::watch_runtime::default_watch_max_rss_mib;
 use crate::watch_runtime::normalize_watch_backend;
 use crate::{open_db, resolve_paths};
 
@@ -137,6 +138,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             buffer_max_ms,
             buffer_max_events,
             periodic_rescan_secs,
+            max_rss_mib,
         } => {
             let configured_backend = backend.unwrap_or_else(|| config.watch.backend.clone());
             let backend = normalize_watch_backend(&configured_backend)?;
@@ -154,6 +156,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                     buffer_max_events: buffer_max_events.unwrap_or(config.watch.buffer_max_events),
                     periodic_rescan_secs: periodic_rescan_secs
                         .unwrap_or(config.watch.periodic_rescan),
+                    max_rss_mib: max_rss_mib.unwrap_or_else(default_watch_max_rss_mib),
                 },
             )?;
             println!("started daemon pid {pid}");
@@ -188,6 +191,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                     buffer_max_ms: config.watch.buffer_max,
                     buffer_max_events: config.watch.buffer_max_events,
                     periodic_rescan_secs: config.watch.periodic_rescan,
+                    max_rss_mib: default_watch_max_rss_mib(),
                 },
             )?;
             println!("started daemon pid {pid}");
@@ -221,6 +225,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 buffer_max_ms: config.watch.buffer_max,
                 buffer_max_events: config.watch.buffer_max_events,
                 periodic_rescan_secs: config.watch.periodic_rescan,
+                max_rss_mib: default_watch_max_rss_mib(),
             })
             .map_err(anyhow::Error::msg)?;
             print!("{service}");
@@ -455,6 +460,7 @@ pub(crate) fn ensure_daemon_running(paths: &Paths) -> Result<Option<u32>> {
             buffer_max_ms: config.watch.buffer_max,
             buffer_max_events: config.watch.buffer_max_events,
             periodic_rescan_secs: config.watch.periodic_rescan,
+            max_rss_mib: default_watch_max_rss_mib(),
         },
     )
     .map(Some)
@@ -487,6 +493,7 @@ pub(crate) struct WatchDaemonLaunchConfig {
     pub(crate) buffer_max_ms: u64,
     pub(crate) buffer_max_events: usize,
     pub(crate) periodic_rescan_secs: u64,
+    pub(crate) max_rss_mib: u64,
 }
 
 pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig) -> Result<u32> {
@@ -535,6 +542,8 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
             .arg(config.buffer_max_events.to_string())
             .arg("--periodic-rescan-secs")
             .arg(config.periodic_rescan_secs.to_string())
+            .arg("--max-rss-mib")
+            .arg(config.max_rss_mib.to_string())
             .stdin(Stdio::null());
         command
             .stdout(Stdio::from(log.try_clone()?))
@@ -561,14 +570,15 @@ fn write_daemon_pid_and_log(
     append_daemon_log(
         paths,
         &format!(
-            "daemon-launch pid={pid} backend={} mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={}",
+            "daemon-launch pid={pid} backend={} mode={} debounce_ms={} settle_ms={} buffer_max_ms={} buffer_max_events={} periodic_rescan_secs={} max_rss_mib={}",
             config.backend,
             config.mode,
             config.debounce_ms,
             config.settle_ms,
             config.buffer_max_ms,
             config.buffer_max_events,
-            config.periodic_rescan_secs
+            config.periodic_rescan_secs,
+            config.max_rss_mib
         ),
     );
     Ok(())
@@ -599,6 +609,8 @@ fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -
         config.buffer_max_events.to_string(),
         "--periodic-rescan-secs".to_string(),
         config.periodic_rescan_secs.to_string(),
+        "--max-rss-mib".to_string(),
+        config.max_rss_mib.to_string(),
     ];
     let quoted_args = args
         .iter()

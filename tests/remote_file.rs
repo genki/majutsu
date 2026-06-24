@@ -18488,6 +18488,8 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(systemd.contains("EnvironmentFile="));
     assert!(systemd.contains("/daemon.env"));
     assert!(systemd.contains("/s3.env"));
+    assert!(systemd.contains("MemoryMax=2048M"));
+    assert!(systemd.contains("OOMPolicy=stop"));
     assert!(systemd.contains("Restart=on-failure"));
     assert!(systemd.contains("WantedBy=default.target"));
 
@@ -18519,6 +18521,51 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(launchd.contains("<string>--home</string>"));
     assert!(launchd.contains(&format!("<string>{}</string>", state.display())));
     assert!(launchd.contains("<key>KeepAlive</key>"));
+}
+
+#[test]
+fn watch_memory_guard_stops_before_host_oom() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), b"memory guard\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("watch")
+            .arg("--foreground")
+            .arg("true")
+            .arg("--backend")
+            .arg("poll")
+            .arg("--once")
+            .arg("--max-rss-mib")
+            .arg("1");
+        c
+    });
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("watch-memory-limit"), "{events}");
 }
 
 #[cfg(unix)]

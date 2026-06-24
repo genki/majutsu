@@ -1793,6 +1793,11 @@ pub(crate) struct WatchArgs {
     pub(crate) buffer_max_events: Option<usize>,
     #[arg(long)]
     pub(crate) periodic_rescan_secs: Option<u64>,
+    #[arg(
+        long = "max-rss-mib",
+        help = "Stop the watch daemon when resident memory exceeds this MiB value; 0 disables the guard"
+    )]
+    pub(crate) max_rss_mib: Option<u64>,
     #[arg(long)]
     pub(crate) backend: Option<String>,
     #[arg(long, default_value_t = false)]
@@ -1809,6 +1814,7 @@ pub(crate) struct ResolvedWatchArgs {
     pub(crate) buffer_max_ms: u64,
     pub(crate) buffer_max_events: usize,
     pub(crate) periodic_rescan_secs: u64,
+    pub(crate) max_rss_mib: u64,
     pub(crate) backend: String,
     pub(crate) once: bool,
 }
@@ -1845,6 +1851,11 @@ pub(crate) enum DaemonCommand {
         buffer_max_events: Option<usize>,
         #[arg(long)]
         periodic_rescan_secs: Option<u64>,
+        #[arg(
+            long = "max-rss-mib",
+            help = "Stop the watch daemon when resident memory exceeds this MiB value; 0 disables the guard"
+        )]
+        max_rss_mib: Option<u64>,
     },
     #[command(about = "Restart the watch daemon, cleaning stale runtime files if needed")]
     Restart {

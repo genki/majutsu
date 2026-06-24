@@ -27,6 +27,7 @@ pub struct DaemonServiceConfig<'a> {
     pub buffer_max_ms: u64,
     pub buffer_max_events: usize,
     pub periodic_rescan_secs: u64,
+    pub max_rss_mib: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,8 @@ fn daemon_watch_args(config: &DaemonServiceConfig<'_>) -> Vec<String> {
         config.buffer_max_events.to_string(),
         "--periodic-rescan-secs".into(),
         config.periodic_rescan_secs.to_string(),
+        "--max-rss-mib".into(),
+        config.max_rss_mib.to_string(),
     ]
 }
 
@@ -146,6 +149,11 @@ fn render_systemd_service(config: &DaemonServiceConfig<'_>) -> String {
         DaemonServiceScope::User => "",
         DaemonServiceScope::System => "User=root\nUMask=0077\n",
     };
+    let memory_limit = if config.max_rss_mib == 0 {
+        String::new()
+    } else {
+        format!("MemoryMax={}M\nOOMPolicy=stop\n", config.max_rss_mib)
+    };
     format!(
         "[Unit]\n\
          Description=Majutsu watch daemon\n\
@@ -158,6 +166,7 @@ fn render_systemd_service(config: &DaemonServiceConfig<'_>) -> String {
          ExecStart={args}\n\
          {stop_and_pid}\
          {service_scope}\
+         {memory_limit}\
          Restart=on-failure\n\
          RestartSec=10s\n\n\
          [Install]\n\
@@ -304,6 +313,7 @@ mod tests {
             buffer_max_ms: 60000,
             buffer_max_events: 1000,
             periodic_rescan_secs: 3600,
+            max_rss_mib: 2048,
         })
         .unwrap();
 
@@ -314,6 +324,8 @@ mod tests {
         assert!(service.contains("/home/alice/.majutsu%%prod/s3.env"));
         assert!(service.contains("\"/opt/Majutsu Bin/mj\""));
         assert!(service.contains("/home/alice/.majutsu%%prod"));
+        assert!(service.contains("MemoryMax=2048M"));
+        assert!(service.contains("OOMPolicy=stop"));
         assert!(service.contains("Restart=on-failure"));
         assert!(service.contains("WantedBy=default.target"));
         assert!(!service.contains("User=root"));
@@ -335,6 +347,7 @@ mod tests {
             buffer_max_ms: 60000,
             buffer_max_events: 1000,
             periodic_rescan_secs: 3600,
+            max_rss_mib: 2048,
         })
         .unwrap();
 
@@ -360,6 +373,7 @@ mod tests {
             buffer_max_ms: 60000,
             buffer_max_events: 1000,
             periodic_rescan_secs: 3600,
+            max_rss_mib: 2048,
         })
         .unwrap();
 
@@ -391,6 +405,7 @@ mod tests {
             buffer_max_ms: 1000,
             buffer_max_events: 20,
             periodic_rescan_secs: 0,
+            max_rss_mib: 2048,
         })
         .unwrap();
 
@@ -417,6 +432,7 @@ mod tests {
                 buffer_max_ms: 60000,
                 buffer_max_events: 1000,
                 periodic_rescan_secs: 3600,
+                max_rss_mib: 2048,
             })
             .is_err()
         );

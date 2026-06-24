@@ -99,6 +99,26 @@ mj status --no-pager
 mj status --pager
 ```
 
+## watch daemon memory guardrails
+
+watch daemon はホストのデータ喪失を防ぐための補助プロセスなので、host-wide OOM の原因に
+ならないことを優先する。`mj watch` / `mj daemon start` は既定で RSS 2048 MiB を上限とし、
+超過時は `watch-memory-limit` event を記録して明示的に停止する。環境に合わせて
+`--max-rss-mib` または `MAJUTSU_WATCH_MAX_RSS_MIB` で調整できる。`0` は guard 無効化であり、
+通常運用では推奨しない。
+
+```sh
+mj daemon start --max-rss-mib 1024
+MAJUTSU_WATCH_MAX_RSS_MIB=1024 mj watch --foreground true
+mj daemon metrics | grep majutsu_daemon_rss_kib
+```
+
+systemd service 生成では同じ上限から `MemoryMax=` と `OOMPolicy=stop` を出力する。
+高頻度に更新される cache、session、runtime state、log directory は、realtime watch root
+として広く追加する前に `--exclude`、volatile exclude、または periodic snapshot 運用を検討する。
+user inotify backend では実変更者 pid attribution が得られない場合があり、root-owned system
+fanotify backend の方が attribution と監査には向いている。
+
 `Local Storage` は apparent size と disk usage を分けて表示する。小ファイル多数の
 event journal や queue では、apparent size が小さくても disk usage が大きくなることがある。
 
