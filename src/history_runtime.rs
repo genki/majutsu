@@ -5540,6 +5540,7 @@ fn root_file_map(
     if let Some(records) = snapshot.roots.get(root_id) {
         return Ok(records
             .iter()
+            .filter(|record| state_record_path_is_file_relative(&record.path))
             .map(|record| (record.path.clone(), record.clone()))
             .collect());
     }
@@ -5548,7 +5549,9 @@ fn root_file_map(
     };
     let mut records = BTreeMap::new();
     visit_tree_records(paths, root_tree, |record| {
-        records.insert(record.path.clone(), record.clone());
+        if state_record_path_is_file_relative(&record.path) {
+            records.insert(record.path.clone(), record.clone());
+        }
         Ok(())
     })?;
     Ok(records)
@@ -5564,6 +5567,7 @@ fn root_file_map_by_snapshot_id(
     if let Some(records) = snapshot.roots.get(root_id) {
         return Ok(records
             .iter()
+            .filter(|record| state_record_path_is_file_relative(&record.path))
             .map(|record| (record.path.clone(), record.clone()))
             .collect());
     }
@@ -5572,10 +5576,16 @@ fn root_file_map_by_snapshot_id(
     };
     let mut records = BTreeMap::new();
     visit_tree_records(paths, root_tree, |record| {
-        records.insert(record.path.clone(), record.clone());
+        if state_record_path_is_file_relative(&record.path) {
+            records.insert(record.path.clone(), record.clone());
+        }
         Ok(())
     })?;
     Ok(records)
+}
+
+fn state_record_path_is_file_relative(path: &str) -> bool {
+    !path.is_empty() && path != "."
 }
 
 fn summarize_changes(changes: &[FileChange]) -> String {
