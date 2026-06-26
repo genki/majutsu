@@ -9,3 +9,9 @@ pub const VERSION: &str = env!("MAJUTSU_VERSION");
 
 /// Numeric majutsu build number embedded at compile time.
 pub const BUILD_NUMBER: &str = env!("MAJUTSU_BUILD_NUMBER");
+
+/// Git commit used for the local build, or `unknown` when built from a source package.
+pub const GIT_COMMIT: &str = match option_env!("MAJUTSU_GIT_COMMIT") {
+    Some(value) => value,
+    None => "unknown",
+};

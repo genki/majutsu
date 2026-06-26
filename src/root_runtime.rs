@@ -1,6 +1,6 @@
 use crate::majutsu_core::{
-    FileRecord, LargeManifest, Payload, SnapshotManifest, TreeManifest, TreeNodeManifest,
-    payload_blob_ref, payload_large_ref,
+    FileRecord, LargeManifest, Payload, SnapshotExport, SnapshotManifest, TreeManifest,
+    TreeNodeManifest, payload_blob_ref, payload_large_ref,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -17,14 +17,17 @@ use std::time::Duration as StdDuration;
 
 use crate::cli::{PathTrackArgs, RootCommand, RootListArgs, RootSizeArgs};
 use crate::config::{
-    Paths, RootConfig, default_include, read_config, validate_large_chunking,
-    validate_snapshot_mode,
+    Config, MetadataExport, Paths, RootConfig, default_include, read_config,
+    validate_large_chunking, validate_snapshot_mode,
 };
 use crate::daemon_runtime::ensure_daemon_running;
+use crate::majutsu_store::remote_host_label;
 use crate::operation_log::record_op;
+use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteObjectStat, RemoteStore, open_remote};
 use crate::root_size_summary::{
-    RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, write_cached_root_size_summary,
+    RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, decode_root_size_summary,
+    root_size_summary_key, write_cached_root_size_summary,
 };
 use crate::root_state::{
     all_tracked_paths, mark_path_tracked, mark_path_untracked, root_by_id, root_by_id_optional,
@@ -272,6 +275,23 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
     }
     let input_paths = collect_path_tracking_inputs(&args, &configured_roots, &conn)?;
     if input_paths.is_empty() {
+        if args.excluded {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&UntrackSummary::default())?
+                );
+            } else if !args.quiet || args.summary || args.dry_run {
+                println!("requested 0");
+                if args.dry_run {
+                    println!("would_untrack 0");
+                } else {
+                    println!("untracked 0");
+                }
+                println!("failed 0");
+            }
+            return Ok(());
+        }
         bail!("no paths supplied");
     }
     let mut changed = BTreeMap::<String, RootConfig>::new();
@@ -280,6 +300,7 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
         ..Default::default()
     };
     let mut failures = Vec::new();
+    let mut untracked_by_root = BTreeMap::<String, BTreeSet<String>>::new();
     for input in &input_paths {
         let resolved = resolve_path_tracking_target(&configured_roots, args.root.as_deref(), input);
         let (root, rel) = match resolved {
@@ -307,12 +328,28 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
                 continue;
             }
             remove_pattern(&mut root.explicit_track, &rel);
-            push_pattern(&mut root.explicit_untrack, rel.clone());
+            if !args.excluded {
+                push_pattern(&mut root.explicit_untrack, rel.clone());
+            }
             mark_path_untracked(&conn, &root.id, &rel)?;
+            untracked_by_root
+                .entry(root.id.clone())
+                .or_default()
+                .insert(rel.clone());
             summary.untracked += 1;
             if !args.quiet && !args.summary && !args.json {
                 println!("untracked {}:{}", root.id, rel);
             }
+        }
+    }
+    if args.excluded && !args.dry_run {
+        for (root_id, paths) in &untracked_by_root {
+            if let Some(root) = changed.get_mut(root_id) {
+                bulk_remove_patterns(&mut root.explicit_untrack, paths);
+            }
+        }
+        for root in changed.values_mut() {
+            prune_redundant_excluded_untrack_patterns(root)?;
         }
     }
     if !failures.is_empty() && !args.json {
@@ -637,6 +674,28 @@ fn remove_pattern(patterns: &mut Vec<String>, path: &str) {
     patterns.retain(|existing| existing != path);
 }
 
+fn bulk_remove_patterns(patterns: &mut Vec<String>, paths: &BTreeSet<String>) {
+    if paths.is_empty() || patterns.is_empty() {
+        return;
+    }
+    patterns.retain(|existing| !paths.contains(existing));
+}
+
+fn prune_redundant_excluded_untrack_patterns(root: &mut RootConfig) -> Result<()> {
+    if root.explicit_untrack.is_empty() {
+        return Ok(());
+    }
+    let mut root_without_explicit_untrack = root.clone();
+    root_without_explicit_untrack.explicit_untrack.clear();
+    let ignore = build_ignore(&root_without_explicit_untrack)?;
+    root.explicit_untrack.retain(|pattern| {
+        let rel = Path::new(pattern);
+        let is_dir = root.path.join(rel).is_dir();
+        root_record_is_managed(&root_without_explicit_untrack, &ignore, rel, is_dir)
+    });
+    Ok(())
+}
+
 #[derive(Default)]
 struct ForgetUnmanagedStats {
     snapshots: usize,
@@ -856,8 +915,46 @@ struct RootSizeRow {
 struct RootSizeReport<'a> {
     roots: &'a [RootSizeRow],
     totals: RootSizeTotals,
+    host_summaries: Vec<RootSizeHostSummary>,
+    remote_breakdown: Vec<RootSizeRemoteBreakdownRow>,
+    current_host_cleanup: RootSizeHostCleanupSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     history: Option<&'a RootSizeHistoryReport>,
+}
+
+#[derive(Clone, Serialize)]
+struct RootSizeHostSummary {
+    host_id: String,
+    host_name: String,
+    snapshot_id: Option<String>,
+    generated_at: Option<String>,
+    available: bool,
+    current: bool,
+    used_bytes: Option<u64>,
+    backend_bytes: Option<u64>,
+    client_bytes: Option<u64>,
+    objects: Option<usize>,
+    root_count: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct RootSizeRemoteBreakdownRow {
+    category: String,
+    bytes: u64,
+    objects: usize,
+    note: String,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct RootSizeHostCleanupSummary {
+    host_id: String,
+    host_name: String,
+    unreferenced_candidate_bytes: u64,
+    unreferenced_candidate_objects: usize,
+    cross_host_unreferenced_bytes: u64,
+    cross_host_unreferenced_objects: usize,
+    note: String,
 }
 
 #[derive(Serialize)]
@@ -951,6 +1048,7 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         )
         .with_context(|| format!("read snapshot timestamp for {current}"))?;
     let config = read_config(paths)?;
+    let host_prefix = remote_host_label(&config.host.name);
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
     let is_s3_remote = matches!(remote, Some(RemoteStore::S3(_)));
     let remote_sizes_task = remote.as_ref().map(|remote| {
@@ -1018,9 +1116,18 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
     let mut unique_packed_payload_oids = BTreeSet::new();
     let mut unique_packed_slice_bytes = 0u64;
     for (root, stat) in stats {
-        let payload_keys = resolve_remote_keys(&stat.payload_keys, &remote_size_map, is_s3_remote);
-        let metadata_keys =
-            resolve_remote_keys(&stat.metadata_keys, &remote_size_map, is_s3_remote);
+        let payload_keys = resolve_remote_keys(
+            &stat.payload_keys,
+            &remote_size_map,
+            is_s3_remote,
+            &host_prefix,
+        );
+        let metadata_keys = resolve_remote_keys(
+            &stat.metadata_keys,
+            &remote_size_map,
+            is_s3_remote,
+            &host_prefix,
+        );
         let all_keys = payload_keys
             .found
             .union(&metadata_keys.found)
@@ -1031,8 +1138,12 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         unique_metadata_keys.extend(metadata_keys.found.iter().cloned());
         let payload_bytes = sum_remote_keys(&remote_size_map, &payload_keys.found);
         let metadata_bytes = sum_remote_keys(&remote_size_map, &metadata_keys.found);
-        let packed_payload_keys =
-            resolve_remote_keys(&stat.packed_payload_keys, &remote_size_map, is_s3_remote);
+        let packed_payload_keys = resolve_remote_keys(
+            &stat.packed_payload_keys,
+            &remote_size_map,
+            is_s3_remote,
+            &host_prefix,
+        );
         unique_packed_payload_keys.extend(packed_payload_keys.found.iter().cloned());
         for oid in &stat.packed_payload_oids {
             if unique_packed_payload_oids.insert(oid.clone())
@@ -1070,6 +1181,21 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         unique_packed_slice_bytes,
         rows: &rows,
     });
+    let remote_breakdown = root_size_remote_breakdown(RootSizeRemoteBreakdownInput {
+        paths,
+        conn,
+        config: &config,
+        remote: remote.as_ref(),
+        remote_objects: &remote_objects,
+        remote_size_map: &remote_size_map,
+        current_keys: &unique_keys,
+        is_s3_remote,
+    });
+    let current_host_cleanup = root_size_current_host_cleanup_summary(
+        &config.host.id,
+        &config.host.name,
+        &remote_breakdown,
+    );
     let summary = root_size_summary_from_scan(
         &config.host.id,
         &current,
@@ -1091,12 +1217,22 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
     } else {
         None
     };
+    let host_summaries = root_size_host_summaries(
+        paths,
+        remote.as_ref(),
+        &config.host.id,
+        &config.host.name,
+        &summary,
+    );
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&RootSizeReport {
                 roots: &rows,
                 totals,
+                host_summaries,
+                remote_breakdown,
+                current_host_cleanup,
                 history: history.as_ref(),
             })?
         );
@@ -1109,6 +1245,9 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
             println!();
         }
         print_root_size_table(&rows, &totals);
+        print_root_size_remote_breakdown(&remote_breakdown);
+        print_root_size_current_host_cleanup(&current_host_cleanup);
+        print_root_size_host_summaries(&host_summaries);
         if let Some(history) = &history {
             println!();
             print_root_size_history(history);
@@ -1638,23 +1777,64 @@ fn read_metadata_manifest<T: for<'de> serde::Deserialize<'de>>(
     remote: Option<&RemoteStore>,
     key: &str,
 ) -> Result<T> {
-    if let Ok(bytes) = fs::read(paths.home.join(key)) {
-        let decoded = crate::decode_object(paths, &bytes)?;
-        if let Ok(value) = serde_json::from_slice(&decoded) {
-            return Ok(value);
+    let mut local_error = None;
+    match fs::read(paths.home.join(key)) {
+        Ok(bytes) => match decode_local_metadata_manifest(paths, key, &bytes) {
+            Ok(value) => return Ok(value),
+            Err(err) => local_error = Some(err),
+        },
+        Err(err) if err.kind() != io::ErrorKind::NotFound => {
+            local_error = Some(err.into());
         }
-        if let Ok(decompressed) =
-            zstd_decode_all_limited(decoded.as_slice(), REMOTE_METADATA_DECODE_LIMIT, key)
-            && let Ok(value) = serde_cbor::from_slice(&decompressed)
-        {
-            return Ok(value);
+        Err(_) => {}
+    }
+    let Some(remote) = remote else {
+        if let Some(err) = local_error {
+            return Err(err).with_context(|| format!("read cached metadata object {key}"));
+        }
+        bail!("metadata object is not cached locally: {key}");
+    };
+    let mut remote_key =
+        crate::majutsu_store::canonical_remote_alias(key).unwrap_or_else(|| key.to_string());
+    if matches!(remote, RemoteStore::S3(_)) {
+        let config = read_config(paths)?;
+        let host_prefix = remote_host_label(&config.host.name);
+        remote_key = crate::majutsu_store::host_remote_key(&host_prefix, &remote_key);
+    }
+    match remote
+        .get(&remote_key)
+        .and_then(|bytes| crate::decode_canonical_remote_export(paths, &bytes))
+    {
+        Ok(value) => Ok(value),
+        Err(remote_error) => {
+            if let Some(err) = local_error {
+                return Err(remote_error).with_context(|| {
+                    format!(
+                        "read remote metadata object {remote_key} after local cache failed: {err:#}"
+                    )
+                });
+            }
+            Err(remote_error).with_context(|| format!("read remote metadata object {remote_key}"))
         }
     }
-    let remote = remote.ok_or_else(|| anyhow!("metadata object is not cached locally: {key}"))?;
-    let remote_key =
-        crate::majutsu_store::canonical_remote_alias(key).unwrap_or_else(|| key.to_string());
-    let bytes = remote.get(&remote_key)?;
-    crate::decode_canonical_remote_export(paths, &bytes)
+}
+
+fn decode_local_metadata_manifest<T: for<'de> serde::Deserialize<'de>>(
+    paths: &Paths,
+    key: &str,
+    bytes: &[u8],
+) -> Result<T> {
+    let decoded = crate::decode_object(paths, bytes)?;
+    if let Ok(value) = serde_json::from_slice(&decoded) {
+        return Ok(value);
+    }
+    if let Ok(decompressed) =
+        zstd_decode_all_limited(decoded.as_slice(), REMOTE_METADATA_DECODE_LIMIT, key)
+        && let Ok(value) = serde_cbor::from_slice(&decompressed)
+    {
+        return Ok(value);
+    }
+    bail!("cached metadata object has an unsupported format: {key}");
 }
 
 fn root_size_tree_entries(
@@ -1695,11 +1875,12 @@ fn resolve_remote_keys(
     keys: &BTreeSet<String>,
     remote_size_map: &BTreeMap<String, u64>,
     is_s3_remote: bool,
+    host_id: &str,
 ) -> ResolvedRemoteKeys {
     let mut found = BTreeSet::new();
     let mut missing = 0usize;
     for key in keys {
-        let candidates = remote_key_candidates(key, is_s3_remote);
+        let candidates = remote_key_candidates(key, is_s3_remote, host_id);
         if let Some(candidate) = candidates
             .into_iter()
             .find(|candidate| remote_size_map.contains_key(candidate))
@@ -1712,10 +1893,14 @@ fn resolve_remote_keys(
     ResolvedRemoteKeys { found, missing }
 }
 
-fn remote_key_candidates(key: &str, is_s3_remote: bool) -> Vec<String> {
+fn remote_key_candidates(key: &str, is_s3_remote: bool, host_id: &str) -> Vec<String> {
     let alias = crate::majutsu_store::canonical_remote_alias(key).filter(|alias| alias != key);
     match (is_s3_remote, alias) {
-        (true, Some(alias)) => vec![alias, key.to_string()],
+        (true, Some(alias)) => vec![
+            crate::majutsu_store::host_remote_key(host_id, &alias),
+            crate::majutsu_store::host_remote_key(host_id, key),
+        ],
+        (true, None) => vec![crate::majutsu_store::host_remote_key(host_id, key)],
         (_, Some(alias)) => vec![key.to_string(), alias],
         (_, None) => vec![key.to_string()],
     }
@@ -1758,6 +1943,541 @@ fn root_size_totals(input: RootSizeTotalsInput<'_>) -> RootSizeTotals {
         backend_prefix_exact: input.remote_objects.exact,
         backend_prefix_scope: input.remote_objects.scope.clone(),
     }
+}
+
+fn root_size_host_summaries(
+    paths: &Paths,
+    remote: Option<&RemoteStore>,
+    current_host_id: &str,
+    current_host_name: &str,
+    current_summary: &RootSizeSummary,
+) -> Vec<RootSizeHostSummary> {
+    let Some(remote) = remote else {
+        return vec![root_size_host_summary_from_summary(
+            current_host_id,
+            current_host_name,
+            current_summary,
+            true,
+        )];
+    };
+    let Ok(index) = read_remote_host_index(remote) else {
+        return vec![root_size_host_summary_from_summary(
+            current_host_id,
+            current_host_name,
+            current_summary,
+            true,
+        )];
+    };
+    let mut summaries = Vec::new();
+    let mut saw_current = false;
+    for host in index.hosts {
+        if host.id == current_host_id {
+            saw_current = true;
+            summaries.push(root_size_host_summary_from_summary(
+                &host.id,
+                &host.name,
+                current_summary,
+                true,
+            ));
+            continue;
+        }
+        let host_prefix = remote_host_prefix_from_metadata_key(&host.metadata_key, &host.name);
+        let key = root_size_summary_key(&host_prefix);
+        match remote.get_optional(&key).and_then(|bytes| {
+            bytes
+                .map(|bytes| decode_root_size_summary(paths, &bytes))
+                .transpose()
+        }) {
+            Ok(Some(summary)) => summaries.push(root_size_host_summary_from_summary(
+                &host.id, &host.name, &summary, false,
+            )),
+            Ok(None) => summaries.push(root_size_missing_host_summary(
+                host.id,
+                host.name,
+                host.current_snapshot,
+                format!("missing {key}"),
+            )),
+            Err(err) => summaries.push(root_size_missing_host_summary(
+                host.id,
+                host.name,
+                host.current_snapshot,
+                format!("{err:#}"),
+            )),
+        }
+    }
+    if !saw_current {
+        summaries.push(root_size_host_summary_from_summary(
+            current_host_id,
+            current_host_name,
+            current_summary,
+            true,
+        ));
+    }
+    summaries.sort_by(|left, right| {
+        left.host_name
+            .cmp(&right.host_name)
+            .then(left.host_id.cmp(&right.host_id))
+    });
+    summaries
+}
+
+fn root_size_host_summary_from_summary(
+    host_id: &str,
+    host_name: &str,
+    summary: &RootSizeSummary,
+    current: bool,
+) -> RootSizeHostSummary {
+    RootSizeHostSummary {
+        host_id: host_id.to_string(),
+        host_name: host_name.to_string(),
+        snapshot_id: Some(summary.snapshot_id.clone()),
+        generated_at: Some(summary.generated_at.clone()),
+        available: true,
+        current,
+        used_bytes: Some(summary.totals.unique_used_bytes),
+        backend_bytes: Some(summary.totals.current_backend_bytes),
+        client_bytes: Some(summary.roots.iter().map(|root| root.client_bytes).sum()),
+        objects: Some(summary.totals.objects),
+        root_count: Some(summary.roots.len()),
+        error: None,
+    }
+}
+
+fn root_size_missing_host_summary(
+    host_id: String,
+    host_name: String,
+    snapshot_id: Option<String>,
+    error: String,
+) -> RootSizeHostSummary {
+    RootSizeHostSummary {
+        host_id,
+        host_name,
+        snapshot_id,
+        generated_at: None,
+        available: false,
+        current: false,
+        used_bytes: None,
+        backend_bytes: None,
+        client_bytes: None,
+        objects: None,
+        root_count: None,
+        error: Some(error),
+    }
+}
+
+struct RootSizeRemoteBreakdownInput<'a> {
+    paths: &'a Paths,
+    conn: &'a Connection,
+    config: &'a Config,
+    remote: Option<&'a RemoteStore>,
+    remote_objects: &'a RootSizeRemoteObjects,
+    remote_size_map: &'a BTreeMap<String, u64>,
+    current_keys: &'a BTreeSet<String>,
+    is_s3_remote: bool,
+}
+
+fn root_size_remote_breakdown(
+    input: RootSizeRemoteBreakdownInput<'_>,
+) -> Vec<RootSizeRemoteBreakdownRow> {
+    let local_history_keys =
+        local_history_remote_keys(input.paths, input.conn, input.config, input.is_s3_remote)
+            .unwrap_or_default()
+            .difference(input.current_keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+    let (all_host_current_keys, all_host_history_keys) = if root_size_cross_host_breakdown_enabled()
+    {
+        input
+            .remote
+            .and_then(|remote| {
+                remote_host_referenced_key_sets(
+                    input.paths,
+                    remote,
+                    input.remote_size_map,
+                    input.is_s3_remote,
+                )
+                .ok()
+            })
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let mut categories = BTreeMap::<String, (u64, usize, String)>::new();
+    for object in &input.remote_objects.objects {
+        let (category, note) = if input.current_keys.contains(&object.key) {
+            (
+                "local-current".to_string(),
+                "このhostのcurrent snapshotが参照するS3 object".to_string(),
+            )
+        } else if local_history_keys.contains(&object.key) {
+            (
+                "local-history".to_string(),
+                "このhostの保持履歴が参照するS3 object".to_string(),
+            )
+        } else if all_host_current_keys.contains(&object.key) {
+            (
+                "other-host-current".to_string(),
+                "他hostのcurrent snapshotが参照するS3 object".to_string(),
+            )
+        } else if all_host_history_keys.contains(&object.key) {
+            (
+                "other-host-history".to_string(),
+                "他hostの保持履歴が参照するS3 object".to_string(),
+            )
+        } else {
+            classify_remote_size_object(&object.key)
+        };
+        let entry = categories.entry(category).or_insert((0, 0, note));
+        entry.0 = entry.0.saturating_add(object.size);
+        entry.1 += 1;
+    }
+    categories
+        .into_iter()
+        .map(
+            |(category, (bytes, objects, note))| RootSizeRemoteBreakdownRow {
+                category,
+                bytes,
+                objects,
+                note,
+            },
+        )
+        .collect()
+}
+
+fn local_history_remote_keys(
+    paths: &Paths,
+    conn: &Connection,
+    config: &Config,
+    is_s3_remote: bool,
+) -> Result<BTreeSet<String>> {
+    let export = crate::export_metadata(paths, conn, config)?;
+    let keys = if is_s3_remote {
+        crate::object_paths::s3_remote_live_object_keys_for_local(paths, &export)?
+    } else {
+        crate::object_paths::remote_live_object_keys_for_local(paths, &export)?
+    };
+    if is_s3_remote {
+        let host_prefix = remote_host_label(&config.host.name);
+        Ok(keys
+            .into_iter()
+            .flat_map(|key| remote_key_candidates(&key, true, &host_prefix))
+            .collect())
+    } else {
+        Ok(keys.into_iter().collect())
+    }
+}
+
+fn root_size_cross_host_breakdown_enabled() -> bool {
+    env::var("MAJUTSU_ROOT_SIZE_CROSS_HOST_BREAKDOWN")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn remote_host_prefix_from_metadata_key(metadata_key: &str, host_name: &str) -> String {
+    metadata_key
+        .split_once('/')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| remote_host_label(host_name))
+}
+
+#[derive(Default)]
+struct RemoteHostReferencedKeys {
+    current: BTreeSet<String>,
+    history: BTreeSet<String>,
+}
+
+fn remote_host_referenced_key_sets(
+    paths: &Paths,
+    remote: &RemoteStore,
+    remote_size_map: &BTreeMap<String, u64>,
+    is_s3_remote: bool,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let index = read_remote_host_index(remote)?;
+    let mut keys = RemoteHostReferencedKeys::default();
+    for host in index.hosts {
+        let Some(bytes) = remote.get_optional(&host.metadata_key)? else {
+            continue;
+        };
+        let decoded = decode_remote_metadata_export_bytes(&host.metadata_key, &bytes)?;
+        let export: MetadataExport = serde_json::from_slice(&decoded)
+            .with_context(|| format!("parse remote host metadata {}", host.metadata_key))?;
+        let current_snapshot = export
+            .refs
+            .get("current")
+            .cloned()
+            .or(host.current_snapshot.clone());
+        let host_prefix = remote_host_prefix_from_metadata_key(&host.metadata_key, &host.name);
+        let all = remote_keys_for_export_snapshots(
+            paths,
+            remote,
+            &host_prefix,
+            &export,
+            None,
+            remote_size_map,
+            is_s3_remote,
+        )?;
+        keys.history.extend(all);
+        if let Some(current_snapshot) = current_snapshot {
+            let current = remote_keys_for_export_snapshots(
+                paths,
+                remote,
+                &host_prefix,
+                &export,
+                Some(&current_snapshot),
+                remote_size_map,
+                is_s3_remote,
+            )?;
+            keys.current.extend(current);
+        }
+    }
+    let history_only = keys
+        .history
+        .difference(&keys.current)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    Ok((keys.current, history_only))
+}
+
+fn decode_remote_metadata_export_bytes(key: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    if key.ends_with(".zst") {
+        return zstd_decode_all_limited(
+            bytes,
+            REMOTE_METADATA_DECODE_LIMIT,
+            &format!("compressed metadata {key}"),
+        );
+    }
+    Ok(bytes.to_vec())
+}
+
+fn remote_keys_for_export_snapshots(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+    export: &MetadataExport,
+    only_snapshot_id: Option<&str>,
+    remote_size_map: &BTreeMap<String, u64>,
+    is_s3_remote: bool,
+) -> Result<BTreeSet<String>> {
+    let local_keys =
+        local_object_keys_for_remote_export_snapshots(paths, remote, export, only_snapshot_id)?;
+    Ok(resolve_existing_remote_keys(
+        local_keys,
+        remote_size_map,
+        is_s3_remote,
+        host_id,
+    ))
+}
+
+fn local_object_keys_for_remote_export_snapshots(
+    paths: &Paths,
+    remote: &RemoteStore,
+    export: &MetadataExport,
+    only_snapshot_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    let mut referenced_blob_oids = BTreeSet::new();
+    for snapshot in export
+        .snapshots
+        .iter()
+        .filter(|snapshot| only_snapshot_id.map(|id| snapshot.id == id).unwrap_or(true))
+    {
+        keys.push(snapshot.manifest_key.clone());
+        let manifest = snapshot_manifest_for_remote_export(paths, remote, snapshot)?;
+        for root_tree in manifest.root_trees.values() {
+            keys.push(root_tree.tree_key.clone());
+            let tree: TreeManifest =
+                read_metadata_manifest(paths, Some(remote), &root_tree.tree_key)
+                    .with_context(|| format!("read remote root tree {}", root_tree.tree_key))?;
+            if let Some(root_node) = &tree.root_node {
+                keys.push(root_node.node_key.clone());
+                push_remote_child_tree_node_keys(paths, remote, &mut keys, &root_node.node_key)?;
+            }
+            for node in tree.subtree_nodes.values() {
+                keys.push(node.node_key.clone());
+                push_remote_child_tree_node_keys(paths, remote, &mut keys, &node.node_key)?;
+            }
+            for record in root_size_tree_entries(paths, Some(remote), tree)?.values() {
+                if let Some((oid, _object_key)) = payload_blob_ref(&record.payload) {
+                    referenced_blob_oids.insert(oid.to_string());
+                }
+                if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
+                    keys.push(manifest_key.to_string());
+                    if let Ok(large) =
+                        read_metadata_manifest::<LargeManifest>(paths, Some(remote), manifest_key)
+                    {
+                        for chunk in large.chunks {
+                            keys.push(chunk.object_key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for blob in export
+        .blobs
+        .iter()
+        .filter(|blob| referenced_blob_oids.contains(blob.oid.as_str()))
+    {
+        if blob.pack_id.is_none() {
+            keys.push(blob.object_key.clone());
+        }
+    }
+    let live_pack_ids = export
+        .blobs
+        .iter()
+        .filter(|blob| referenced_blob_oids.contains(blob.oid.as_str()))
+        .filter_map(|blob| blob.pack_id.as_ref())
+        .collect::<BTreeSet<_>>();
+    for pack in export
+        .packs
+        .iter()
+        .filter(|pack| live_pack_ids.contains(&pack.pack_id))
+    {
+        keys.push(pack.pack_key.clone());
+        keys.push(pack.index_key.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn snapshot_manifest_for_remote_export(
+    paths: &Paths,
+    remote: &RemoteStore,
+    snapshot: &SnapshotExport,
+) -> Result<SnapshotManifest> {
+    if !snapshot.manifest_json.trim().is_empty() {
+        return serde_json::from_str(&snapshot.manifest_json)
+            .with_context(|| format!("parse snapshot manifest json {}", snapshot.id));
+    }
+    read_metadata_manifest(paths, Some(remote), &snapshot.manifest_key)
+        .with_context(|| format!("read remote snapshot manifest {}", snapshot.manifest_key))
+}
+
+fn push_remote_child_tree_node_keys(
+    paths: &Paths,
+    remote: &RemoteStore,
+    keys: &mut Vec<String>,
+    node_key: &str,
+) -> Result<()> {
+    let node: TreeNodeManifest = read_metadata_manifest(paths, Some(remote), node_key)
+        .with_context(|| format!("read remote tree node {node_key}"))?;
+    for child in node.child_nodes.values() {
+        keys.push(child.node_key.clone());
+        push_remote_child_tree_node_keys(paths, remote, keys, &child.node_key)?;
+    }
+    Ok(())
+}
+
+fn resolve_existing_remote_keys(
+    keys: Vec<String>,
+    remote_size_map: &BTreeMap<String, u64>,
+    is_s3_remote: bool,
+    host_id: &str,
+) -> BTreeSet<String> {
+    keys.into_iter()
+        .filter_map(|key| {
+            remote_key_candidates(&key, is_s3_remote, host_id)
+                .into_iter()
+                .find(|candidate| remote_size_map.contains_key(candidate))
+        })
+        .collect()
+}
+
+fn classify_remote_size_object(key: &str) -> (String, String) {
+    if key.contains("/metadata/")
+        || key.contains("/refs/")
+        || key.contains("/ops/")
+        || key.contains("/snapshots/")
+        || key.contains("/journal/")
+        || key.contains("/root-size-summary")
+    {
+        return (
+            "host-metadata-journal".into(),
+            "metadata export、refs、journal、host summaryなど".into(),
+        );
+    }
+    if key.starts_with("gc/") {
+        return (
+            "gc-state".into(),
+            "GC mark/tombstoneなどremote cleanup用の管理object".into(),
+        );
+    }
+    if key.starts_with("lifecycle/") || key.contains("lifecycle") {
+        return (
+            "lifecycle-state".into(),
+            "backend lifecycle policy確認用object".into(),
+        );
+    }
+    if key.starts_with("metadata/") || key.starts_with("refs/") {
+        return (
+            "legacy-metadata".into(),
+            "旧形式または互換用metadata/ref object".into(),
+        );
+    }
+    if key.starts_with("blobs/")
+        || key.starts_with("large/")
+        || key.starts_with("packs/")
+        || key.starts_with("trees/")
+    {
+        return (
+            "unreferenced-payload-or-metadata".into(),
+            "現在hostのcurrent/historyから参照されない未回収payload/metadata候補".into(),
+        );
+    }
+    if key.starts_with("objects/") {
+        return (
+            "legacy-object-alias".into(),
+            "旧objects/形式alias、または互換用に残るobject".into(),
+        );
+    }
+    ("other".into(), "既知分類に該当しないremote object".into())
+}
+
+fn root_size_current_host_cleanup_summary(
+    host_id: &str,
+    host_name: &str,
+    breakdown: &[RootSizeRemoteBreakdownRow],
+) -> RootSizeHostCleanupSummary {
+    let mut summary = RootSizeHostCleanupSummary {
+        host_id: host_id.to_string(),
+        host_name: host_name.to_string(),
+        note: "現在hostのcurrent/historyから参照されないpayload/metadata候補。shared legacy layoutでは他host参照が混ざる可能性があります。MAJUTSU_ROOT_SIZE_CROSS_HOST_BREAKDOWN=1 の場合のみcross-host未参照候補も計算します。".into(),
+        ..Default::default()
+    };
+    for row in breakdown {
+        if current_host_cleanup_candidate_category(&row.category) {
+            summary.unreferenced_candidate_bytes = summary
+                .unreferenced_candidate_bytes
+                .saturating_add(row.bytes);
+            summary.unreferenced_candidate_objects += row.objects;
+        }
+        if globally_unreferenced_category(&row.category) {
+            summary.cross_host_unreferenced_bytes = summary
+                .cross_host_unreferenced_bytes
+                .saturating_add(row.bytes);
+            summary.cross_host_unreferenced_objects += row.objects;
+        }
+    }
+    summary
+}
+
+fn current_host_cleanup_candidate_category(category: &str) -> bool {
+    matches!(
+        category,
+        "other-host-current"
+            | "other-host-history"
+            | "unreferenced-payload-or-metadata"
+            | "legacy-object-alias"
+    )
+}
+
+fn globally_unreferenced_category(category: &str) -> bool {
+    root_size_cross_host_breakdown_enabled()
+        && matches!(
+            category,
+            "unreferenced-payload-or-metadata" | "legacy-object-alias"
+        )
 }
 
 fn root_size_should_stream_pending(
@@ -1830,7 +2550,7 @@ fn root_size_pending_table(stats: &BTreeMap<String, RootSizeStat>) -> String {
     )
     .ok();
     writeln!(out, "- remote集計: ...").ok();
-    writeln!(out, "- S3上の実サイズbackend prefix全体: ...").ok();
+    writeln!(out, "- S3上の実サイズ共有remote prefix全体: ...").ok();
     out
 }
 
@@ -1888,11 +2608,127 @@ fn print_root_size_table(rows: &[RootSizeRow], totals: &RootSizeTotals) {
     println!("  - metadata: {}", format_mib(totals.metadata_bytes));
     println!("  - objects: {}", format_count(totals.objects));
     println!(
-        "- S3上の実サイズbackend prefix全体: {}",
+        "- S3上の実サイズ共有remote prefix全体: {}",
         format_mib(totals.billed_bytes)
     );
+    println!("  - 注: 同じremote prefixを共有する全hostのobjectを含みます。");
     println!("  - objects: {}", format_count(totals.billed_objects));
     println!("  - exact: {}", totals.backend_prefix_exact);
+}
+
+fn print_root_size_remote_breakdown(rows: &[RootSizeRemoteBreakdownRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("S3実サイズ明細:");
+    let total_bytes = rows
+        .iter()
+        .fold(0u64, |sum, row| sum.saturating_add(row.bytes));
+    let total_objects = rows.iter().map(|row| row.objects).sum::<usize>();
+    let table_rows = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row.category.clone(),
+                format_mib(row.bytes),
+                format_count(row.objects),
+                row.note.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_aligned_table(
+        &["category", "size", "objects", "note"],
+        &[false, true, true, false],
+        &table_rows,
+    );
+    println!(
+        "  - 明細合計: {} / {} objects",
+        format_mib(total_bytes),
+        format_count(total_objects)
+    );
+    println!(
+        "  - unreferenced-* は現在hostのcurrent/historyから未参照の候補です。shared legacy layoutでは他host参照が混ざる可能性があります。"
+    );
+}
+
+fn print_root_size_current_host_cleanup(summary: &RootSizeHostCleanupSummary) {
+    println!();
+    println!("現在hostの未参照候補:");
+    println!(
+        "- host: {} {}",
+        summary.host_name,
+        short_host_id(&summary.host_id)
+    );
+    println!(
+        "- current/historyから未参照のpayload/metadata候補: {} / {} objects",
+        format_mib(summary.unreferenced_candidate_bytes),
+        format_count(summary.unreferenced_candidate_objects)
+    );
+    println!(
+        "- cross-host横断でも未参照のpayload/metadata候補: {} / {} objects",
+        format_mib(summary.cross_host_unreferenced_bytes),
+        format_count(summary.cross_host_unreferenced_objects)
+    );
+    println!("  - {}", summary.note);
+}
+
+fn print_root_size_host_summaries(hosts: &[RootSizeHostSummary]) {
+    if hosts.is_empty() {
+        return;
+    }
+    println!();
+    println!("環境別current snapshotサイズ:");
+    let rows = hosts
+        .iter()
+        .map(|host| {
+            vec![
+                if host.current {
+                    format!("{}*", host.host_name)
+                } else {
+                    host.host_name.clone()
+                },
+                short_host_id(&host.host_id),
+                host.root_count
+                    .map(format_count)
+                    .unwrap_or_else(|| "-".into()),
+                host.client_bytes
+                    .map(format_mib)
+                    .unwrap_or_else(|| "-".into()),
+                host.used_bytes
+                    .map(format_mib)
+                    .unwrap_or_else(|| "-".into()),
+                host.backend_bytes
+                    .map(format_mib)
+                    .unwrap_or_else(|| "-".into()),
+                host.objects.map(format_count).unwrap_or_else(|| "-".into()),
+                host.snapshot_id
+                    .as_deref()
+                    .map(short_snapshot_id)
+                    .unwrap_or("-")
+                    .to_string(),
+                host.error.clone().unwrap_or_default(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_aligned_table(
+        &[
+            "host", "id", "roots", "client", "used", "backend", "objects", "snapshot", "note",
+        ],
+        &[false, false, true, true, true, true, true, false, false],
+        &rows,
+    );
+    println!(
+        "  - `*` は現在のlocal host。used はpack内slice換算、backend はそのhostのcurrent snapshotが参照するremote object全体です。"
+    );
+}
+
+fn short_host_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn short_snapshot_id(id: &str) -> &str {
+    id.get(..13).unwrap_or(id)
 }
 
 fn terminal_width() -> usize {

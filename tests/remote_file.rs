@@ -95,6 +95,20 @@ fn top_level_help_groups_commands_without_hiding_maintenance_commands() {
     assert!(!help.contains("maintenance "), "{help}");
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_treats_broken_pipe_as_success() {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{} --help | head -n 1 >/dev/null",
+            env!("CARGO_BIN_EXE_mj")
+        ))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 #[test]
 fn root_list_supports_json_and_no_truncate() {
     let tmp = tempfile::tempdir().unwrap();
@@ -751,9 +765,36 @@ fn find_file_ending(root: &std::path::Path, suffix: &str) -> std::path::PathBuf 
 }
 
 fn host_metadata_export_path(remote: &std::path::Path) -> std::path::PathBuf {
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    remote.join(index["hosts"][0]["metadata_key"].as_str().unwrap())
+    walkdir::WalkDir::new(remote)
+        .min_depth(3)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .strip_prefix(remote)
+                    .ok()
+                    .and_then(|path| path.to_str())
+                    .is_some_and(|path| {
+                        path.ends_with("/metadata/export.json")
+                            || path.ends_with("/metadata/export.json.zst")
+                    })
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .unwrap_or_else(|| panic!("missing host metadata export under {}", remote.display()))
+}
+
+fn first_remote_host_dir(remote: &std::path::Path) -> std::path::PathBuf {
+    fs::read_dir(remote)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.join("metadata/export.json").exists()
+                || path.join("metadata/export.json.zst").exists()
+        })
+        .unwrap_or_else(|| panic!("missing remote host directory under {}", remote.display()))
 }
 
 fn first_blob_object_key(state: &std::path::Path) -> String {
@@ -870,18 +911,18 @@ fn write_test_remote_head(
         "current_snapshot": metadata["refs"]["current"].as_str(),
         "last_synced": metadata["refs"]["last-synced"].as_str(),
         "root_acks": root_acks,
-        "metadata_key": format!("hosts/{host_id}/metadata/export.json"),
-        "host_index_key": "hosts/index.json",
-        "gc_mark_key": format!("gc/marks/{host_id}.json"),
+        "metadata_key": format!("{host_id}/metadata/export.json"),
+        "host_index_key": null,
+        "gc_mark_key": format!("{host_id}/gc/mark.json"),
         "latest_snapshot_key": metadata["refs"]["current"]
             .as_str()
-            .map(|snapshot| format!("hosts/{host_id}/snapshots/{snapshot}.cbor.zst.enc")),
+            .map(|snapshot| format!("{host_id}/snapshots/{snapshot}.cbor.zst.enc")),
         "latest_operation_key": null,
         "updated_at": Utc::now().to_rfc3339(),
     });
     let cbor = serde_cbor::to_vec(&head).unwrap();
     let compressed = zstd::stream::encode_all(cbor.as_slice(), 3).unwrap();
-    let head_path = remote.join(format!("hosts/{host_id}/head.cbor.zst.enc"));
+    let head_path = remote.join(format!("{host_id}/head.cbor.zst.enc"));
     fs::create_dir_all(head_path.parent().unwrap()).unwrap();
     fs::write(head_path, compressed).unwrap();
 }
@@ -1049,15 +1090,9 @@ fn file_remote_clone_restores_normal_and_large_files() {
         c
     });
     assert!(sync_status.contains("remote_last_synced "));
-    let current_ref_name = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.join("refs/current").exists())
-        .map(|path| {
-            let host_id = path.file_name().unwrap().to_string_lossy();
-            format!("hosts/{host_id}/refs/current")
-        })
-        .unwrap();
+    let host_dir = first_remote_host_dir(&remote);
+    let host_id = host_dir.file_name().unwrap().to_string_lossy();
+    let current_ref_name = format!("{host_id}/refs/current");
     assert_eq!(
         db_remote_ref_value(&state, &current_ref_name),
         db_ref(&state, "current")
@@ -2301,7 +2336,7 @@ fn remote_fsck_detects_unexpected_canonical_host_ref() {
 }
 
 #[test]
-fn remote_check_accepts_host_index_metadata() {
+fn remote_check_accepts_direct_host_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let remote = tmp.path().join("remote");
@@ -2347,17 +2382,18 @@ fn remote_check_accepts_host_index_metadata() {
         c
     });
     assert!(check.contains("metadata ok"));
-    assert!(check.contains("metadata_key hosts/index.json"));
+    assert!(check.contains("/metadata/export.json"), "{check}");
+    assert!(!check.contains("hosts/index.json"), "{check}");
     assert!(check.contains("range_get 1"));
 
-    fs::remove_file(remote.join("metadata/export.json")).unwrap();
     let check = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("remote").arg("check");
         c
     });
     assert!(check.contains("metadata ok"));
-    assert!(check.contains("metadata_key hosts/index.json"));
+    assert!(check.contains("/metadata/export.json"), "{check}");
+    assert!(!check.contains("hosts/index.json"), "{check}");
     assert!(check.contains("range_get 1"));
 }
 
@@ -2489,7 +2525,7 @@ fn remote_hosts_can_browse_multi_host_timeline() {
     assert!(hosts.contains("hosts 2"), "{hosts}");
     assert!(hosts.contains("\talpha-host\t"), "{hosts}");
     assert!(hosts.contains("\tbeta-host\t"), "{hosts}");
-    assert!(hosts.contains("hosts/"), "{hosts}");
+    assert!(!hosts.contains("hosts/"), "{hosts}");
     assert!(hosts.contains("/metadata/export.json"), "{hosts}");
 
     let beta = output({
@@ -3648,12 +3684,8 @@ fn remote_fsck_detects_missing_canonical_host_export() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    assert!(find_file_ending(&remote.join("gc/marks"), ".json").exists());
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.join("refs/current").exists())
-        .unwrap();
+    assert!(find_file_ending(&first_remote_host_dir(&remote).join("gc"), ".json").exists());
+    let host_dir = first_remote_host_dir(&remote);
     let canonical_snapshot = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -3710,7 +3742,7 @@ fn remote_fsck_detects_corrupt_gc_mark() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let mark = find_file_ending(&remote.join("gc/marks"), ".json");
+    let mark = find_file_ending(&first_remote_host_dir(&remote).join("gc"), ".json");
     fs::write(mark, b"{not valid json").unwrap();
 
     fails({
@@ -3763,7 +3795,7 @@ fn remote_fsck_detects_unexpected_gc_mark_object() {
         c
     });
 
-    let mark_path = find_file_ending(&remote.join("gc/marks"), ".json");
+    let mark_path = find_file_ending(&first_remote_host_dir(&remote).join("gc"), ".json");
     let mut mark: serde_json::Value =
         serde_json::from_slice(&fs::read(&mark_path).unwrap()).unwrap();
     mark["object_keys"]
@@ -3823,7 +3855,7 @@ fn clone_rejects_unexpected_gc_mark_object_without_creating_home() {
         c
     });
 
-    let mark_path = find_file_ending(&remote.join("gc/marks"), ".json");
+    let mark_path = find_file_ending(&first_remote_host_dir(&remote).join("gc"), ".json");
     let mut mark: serde_json::Value =
         serde_json::from_slice(&fs::read(&mark_path).unwrap()).unwrap();
     mark["object_keys"]
@@ -4265,11 +4297,7 @@ fn remote_fsck_detects_corrupt_canonical_host_snapshot_export() {
         c
     });
 
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.join("refs/current").exists())
-        .unwrap();
+    let host_dir = first_remote_host_dir(&remote);
     let canonical_snapshot = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -5590,6 +5618,7 @@ fn tree_format_v2_omits_flat_entries_and_restores_from_root_node() {
         let mut c = mj();
         c.env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0")
             .env("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE", "0")
+            .env("MAJUTSU_SYNC_WAIT_DEEP_REPAIR", "1")
             .arg("--home")
             .arg(&state)
             .arg("sync")
@@ -5642,6 +5671,155 @@ fn tree_format_v2_omits_flat_entries_and_restores_from_root_node() {
     });
     assert!(diff.contains("M\tsample/nested/beta.txt"), "{diff}");
     assert!(!diff.contains("sample/alpha.txt"), "{diff}");
+}
+
+#[test]
+fn root_set_uses_remote_tree_metadata_when_local_cache_is_unreadable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(source.join("generated.dat"), b"generated\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_TREE_FORMAT", "v2")
+            .arg("--home")
+            .arg(&state)
+            .arg("snapshot");
+        c
+    });
+    let manifest = local_snapshot_manifest(&state, "asc");
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE", "0")
+            .arg("--home")
+            .arg(&state)
+            .arg("sync");
+        c
+    });
+
+    fs::write(state.join(&tree_key), b"not valid metadata").unwrap();
+
+    let root_set = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
+            .arg("--exclude")
+            .arg("*.dat");
+        c
+    });
+    assert!(
+        root_set.contains("forgotten_unmanaged_records"),
+        "root set should rewrite history using remote metadata:\n{root_set}"
+    );
+}
+
+#[test]
+fn log_folds_change_when_historical_tree_metadata_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_TREE_FORMAT", "v2")
+            .arg("--home")
+            .arg(&state)
+            .arg("snapshot");
+        c
+    });
+    let first = local_snapshot_manifest(&state, "asc");
+    let first_tree_key = first["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::write(source.join("note.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.env("MAJUTSU_TREE_FORMAT", "v2")
+            .arg("--home")
+            .arg(&state)
+            .arg("snapshot");
+        c
+    });
+    let _ = remove_remote_payload_aliases(&remote, &first_tree_key);
+    let _ = fs::remove_file(state.join(&first_tree_key));
+
+    let log = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("10")
+            .arg("--full");
+        c
+    });
+    assert!(
+        log.contains("sample/** (tree metadata unavailable"),
+        "log should fold unavailable tree detail:\n{log}"
+    );
+    assert!(
+        log.contains("[metadata-unavailable]"),
+        "log should mark folded metadata issue:\n{log}"
+    );
 }
 
 #[test]
@@ -8421,6 +8599,129 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
 }
 
 #[test]
+fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let first = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    let old_blob = first_blob_object_key(&state);
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    let second = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    assert_ne!(first, second);
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let removed = remove_remote_payload_aliases(&remote, &old_blob);
+    assert!(
+        !removed.is_empty(),
+        "expected old blob aliases to be removed"
+    );
+
+    let dry_run = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run")
+            .arg("--keep-daily")
+            .arg("90")
+            .arg("--keep-monthly")
+            .arg("36")
+            .arg("--drop-missing-remote-history");
+        c
+    });
+    assert!(dry_run.contains("dry_run true"), "{dry_run}");
+    assert!(
+        dry_run.contains("missing_remote_history_snapshots 1"),
+        "{dry_run}"
+    );
+    assert!(
+        dry_run.contains(&format!("missing_remote_history_snapshot {first}")),
+        "{dry_run}"
+    );
+
+    let prune = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("90")
+            .arg("--keep-monthly")
+            .arg("36")
+            .arg("--drop-missing-remote-history");
+        c
+    });
+    assert!(prune.contains("deleted_snapshots 1"), "{prune}");
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&first)
+            .arg("--to")
+            .arg(tmp.path().join("restore-old"));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&second)
+            .arg("--to")
+            .arg(tmp.path().join("restore-current"));
+        c
+    });
+}
+
+#[test]
 fn sync_prunes_stale_remote_host_exports_after_prune() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -8464,11 +8765,7 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.join("metadata/export.json").exists())
-        .unwrap();
+    let host_dir = first_remote_host_dir(&remote);
     let before = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .filter_map(Result::ok)
@@ -8514,7 +8811,13 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         })
         .count();
     assert_eq!(after, 2);
-    assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
+    assert!(
+        find_file_ending(
+            &first_remote_host_dir(&remote).join("gc/tombstones"),
+            ".json"
+        )
+        .exists()
+    );
 }
 
 #[test]
@@ -8561,11 +8864,7 @@ fn prune_remote_cleanup_prunes_stale_remote_exports_immediately() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.join("metadata/export.json").exists())
-        .unwrap();
+    let host_dir = first_remote_host_dir(&remote);
     let before = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .filter_map(Result::ok)
@@ -8586,7 +8885,13 @@ fn prune_remote_cleanup_prunes_stale_remote_exports_immediately() {
     });
     assert!(prune.contains("remote_cleanup true"));
     assert!(prune.contains("pruned_remote_exports "));
-    assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
+    assert!(
+        find_file_ending(
+            &first_remote_host_dir(&remote).join("gc/tombstones"),
+            ".json"
+        )
+        .exists()
+    );
 }
 
 #[test]
@@ -8653,7 +8958,10 @@ fn remote_fsck_detects_corrupt_gc_tombstone() {
             .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
-    let tombstone = find_file_ending(&remote.join("gc/tombstones"), ".json");
+    let tombstone = find_file_ending(
+        &first_remote_host_dir(&remote).join("gc/tombstones"),
+        ".json",
+    );
     fs::write(tombstone, b"{not valid json").unwrap();
 
     fails({
@@ -8706,7 +9014,7 @@ fn remote_fsck_detects_unknown_host_gc_mark() {
         c
     });
 
-    fs::create_dir_all(remote.join("gc/marks")).unwrap();
+    fs::create_dir_all(first_remote_host_dir(&remote).join("gc")).unwrap();
     fs::write(
         remote.join("gc/marks/ghost-host.json"),
         serde_json::json!({
@@ -8912,7 +9220,10 @@ fn clone_rejects_corrupt_gc_tombstone_without_creating_home() {
             .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
-    let tombstone = find_file_ending(&remote.join("gc/tombstones"), ".json");
+    let tombstone = find_file_ending(
+        &first_remote_host_dir(&remote).join("gc/tombstones"),
+        ".json",
+    );
     fs::write(tombstone, b"{not valid json").unwrap();
 
     fails({
@@ -8993,7 +9304,13 @@ fn clone_accepts_valid_gc_tombstone_after_remote_prune() {
             .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
-    assert!(find_file_ending(&remote.join("gc/tombstones"), ".json").exists());
+    assert!(
+        find_file_ending(
+            &first_remote_host_dir(&remote).join("gc/tombstones"),
+            ".json"
+        )
+        .exists()
+    );
 
     run({
         let mut c = mj();
@@ -9297,6 +9614,77 @@ fn sync_prunes_local_loose_blobs_after_auto_pack() {
 }
 
 #[test]
+fn sync_auto_pack_ignores_missing_unreferenced_loose_blob_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let missing_key = "objects/blobs/ff/missing-auto-pack-test";
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.execute(
+        "insert into blobs(oid, size, object_key) values (?1, ?2, ?3)",
+        rusqlite::params!["missing-auto-pack-test", 7_i64, missing_key],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(!state.join(missing_key).exists());
+
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS", "1");
+        c
+    });
+    assert!(
+        sync.contains("skipped_missing_loose_blobs 1"),
+        "sync should not fail on stale loose blob metadata:\n{sync}"
+    );
+    assert!(
+        sync.contains("removed_missing_unreferenced_blobs 1"),
+        "sync should clean unreferenced stale loose blob metadata:\n{sync}"
+    );
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "select count(*) from blobs where oid='missing-auto-pack-test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
 fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -9339,7 +9727,7 @@ fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
             .env("MAJUTSU_SYNC_AUTO_PACK", "0");
         c
     });
-    fs::create_dir_all(remote.join("gc/marks")).unwrap();
+    fs::create_dir_all(first_remote_host_dir(&remote).join("gc")).unwrap();
     fs::write(
         remote.join("gc/marks/other-host.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -13866,7 +14254,10 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(sizes.contains("- root別used集計合計:"));
     assert!(sizes.contains("- current snapshotのユニークused推定:"));
     assert!(sizes.contains("- current snapshotが参照するremote object全体:"));
-    assert!(sizes.contains("- S3上の実サイズbackend prefix全体:"));
+    assert!(sizes.contains("- S3上の実サイズ共有remote prefix全体:"));
+    assert!(sizes.contains("S3実サイズ明細:"));
+    assert!(sizes.contains("local-current"));
+    assert!(sizes.contains("環境別current snapshotサイズ:"));
     assert!(!sizes.contains("not scanned"));
 
     let json = output({
@@ -13901,6 +14292,24 @@ fn root_size_reports_client_and_backend_totals() {
     assert!(report["totals"]["backend_prefix_objects"].as_u64().unwrap() > 0);
     assert_eq!(report["totals"]["backend_prefix_exact"], true);
     assert!(report["totals"]["backend_prefix_scope"].as_str().is_some());
+    assert_eq!(report["host_summaries"].as_array().unwrap().len(), 1);
+    assert_eq!(report["host_summaries"][0]["host_name"], "vagrant");
+    assert_eq!(report["host_summaries"][0]["current"], true);
+    assert!(report["host_summaries"][0]["used_bytes"].as_u64().unwrap() > 0);
+    let breakdown = report["remote_breakdown"].as_array().unwrap();
+    assert!(
+        breakdown
+            .iter()
+            .any(|row| row["category"] == "local-current")
+    );
+    let breakdown_total = breakdown
+        .iter()
+        .map(|row| row["bytes"].as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(
+        breakdown_total,
+        report["totals"]["backend_prefix_bytes"].as_u64().unwrap()
+    );
 }
 
 #[test]
@@ -13957,7 +14366,7 @@ fn root_size_streams_local_scan_before_uncached_remote_listing() {
     let mut stdout = child.stdout.take().unwrap();
     let mut buf = Vec::new();
     let mut byte = [0_u8; 1];
-    while !String::from_utf8_lossy(&buf).contains("- S3上の実サイズbackend prefix全体: ...")
+    while !String::from_utf8_lossy(&buf).contains("- S3上の実サイズ共有remote prefix全体: ...")
     {
         stdout.read_exact(&mut byte).unwrap();
         buf.push(byte[0]);
@@ -13973,7 +14382,7 @@ fn root_size_streams_local_scan_before_uncached_remote_listing() {
     assert!(streamed.contains("sample"));
     assert!(streamed.contains("0.00 MiB"));
     assert!(streamed.contains("- remote集計: ..."));
-    assert!(streamed.contains("- S3上の実サイズbackend prefix全体: ..."));
+    assert!(streamed.contains("- S3上の実サイズ共有remote prefix全体: ..."));
 }
 
 #[test]
@@ -14178,7 +14587,7 @@ fn root_size_falls_back_when_remote_summary_is_corrupt() {
         c
     });
     assert!(sizes.contains("sample"));
-    assert!(sizes.contains("- S3上の実サイズbackend prefix全体:"));
+    assert!(sizes.contains("- S3上の実サイズ共有remote prefix全体:"));
     assert!(!sizes.contains("not scanned"));
 }
 
@@ -14235,7 +14644,7 @@ fn root_size_reports_full_totals_when_remote_summary_is_missing() {
         c
     });
     assert!(sizes.contains("sample"));
-    assert!(sizes.contains("- S3上の実サイズbackend prefix全体:"));
+    assert!(sizes.contains("- S3上の実サイズ共有remote prefix全体:"));
     assert!(!sizes.contains("not scanned"));
 }
 
@@ -15644,6 +16053,7 @@ fn untrack_supports_path_files_summary_and_excluded_cleanup() {
         c
     });
     fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(source.join("manual.txt"), b"manual\n").unwrap();
     fs::write(source.join("skip.tmp"), b"tmp\n").unwrap();
     fs::write(source.join("tmp_runtime.1"), b"tmp\n").unwrap();
     run({
@@ -15680,7 +16090,6 @@ fn untrack_supports_path_files_summary_and_excluded_cleanup() {
     assert!(dry_run.contains("requested 2"), "{dry_run}");
     assert!(dry_run.contains("would_untrack 2"), "{dry_run}");
 
-    fs::write(&path_file, "skip.tmp\ntmp_runtime.1\n").unwrap();
     let summary = output({
         let mut c = mj();
         c.arg("--home")
@@ -15688,13 +16097,17 @@ fn untrack_supports_path_files_summary_and_excluded_cleanup() {
             .arg("untrack")
             .arg("-r")
             .arg("sample")
-            .arg("--path-file")
-            .arg(&path_file)
+            .arg("--excluded")
             .arg("--summary");
         c
     });
     assert!(summary.contains("requested 2"), "{summary}");
     assert!(summary.contains("untracked 2"), "{summary}");
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    assert!(
+        !config.contains("skip.tmp") && !config.contains("tmp_runtime.1"),
+        "--excluded cleanup should not persist one explicit_untrack pattern per excluded path\n{config}"
+    );
 
     let deleted = output({
         let mut c = mj();
@@ -15709,6 +16122,46 @@ fn untrack_supports_path_files_summary_and_excluded_cleanup() {
     });
     assert!(!deleted.contains("skip.tmp"), "{deleted}");
     assert!(!deleted.contains("tmp_runtime.1"), "{deleted}");
+
+    let empty_excluded = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("--excluded")
+            .arg("--dry-run")
+            .arg("--summary");
+        c
+    });
+    assert!(empty_excluded.contains("requested 0"), "{empty_excluded}");
+    assert!(
+        empty_excluded.contains("would_untrack 0"),
+        "{empty_excluded}"
+    );
+
+    fs::write(&path_file, "manual.txt\n").unwrap();
+    let path_file_summary = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("--path-file")
+            .arg(&path_file)
+            .arg("--summary");
+        c
+    });
+    assert!(
+        path_file_summary.contains("requested 1"),
+        "{path_file_summary}"
+    );
+    assert!(
+        path_file_summary.contains("untracked 1"),
+        "{path_file_summary}"
+    );
 
     let json = output({
         let mut c = mj();
@@ -15828,6 +16281,34 @@ fn state_reference_reports_file_changes_since_operation() {
     let mut default_state_lines = default_state_output.lines().collect::<Vec<_>>();
     default_state_lines.sort();
     assert_eq!(default_state_lines, state_lines);
+    let before_first_snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("state").arg("3650d");
+        c
+    });
+    let mut before_first_lines = before_first_snapshot.lines().collect::<Vec<_>>();
+    before_first_lines.sort();
+    assert_eq!(before_first_lines, state_lines);
+    let local_relative_state_output = output({
+        let mut c = mj();
+        c.current_dir(&source)
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("1h");
+        c
+    });
+    let mut local_relative_lines = local_relative_state_output.lines().collect::<Vec<_>>();
+    local_relative_lines.sort();
+    assert_eq!(
+        local_relative_lines,
+        vec![
+            " A added.txt",
+            " A memo/new.md",
+            " D deleted.txt",
+            " M modified.txt",
+        ]
+    );
     let deleted_output = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("state").arg("--deleted");
@@ -16745,7 +17226,7 @@ fn sync_live_diff_preserves_unsnapshotted_change_without_watch_event() {
 }
 
 #[test]
-fn remote_init_seeds_empty_file_remote_host_index() {
+fn remote_init_validates_empty_file_remote_root() {
     let tmp = tempfile::tempdir().unwrap();
     let remote = tmp.path().join("remote");
     let state = tmp.path().join("state");
@@ -16764,11 +17245,9 @@ fn remote_init_seeds_empty_file_remote_host_index() {
         c.arg("--home").arg(&state).arg("remote").arg("init");
         c
     });
-    assert!(init.contains("initialized hosts/index.json"), "{init}");
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    assert_eq!(index["version"], 1);
-    assert_eq!(index["hosts"].as_array().unwrap().len(), 0);
+    assert!(init.contains("initialized remote root"), "{init}");
+    assert!(init.contains("hosts 0"), "{init}");
+    assert!(!remote.join("hosts/index.json").exists());
 }
 
 #[test]
@@ -16826,6 +17305,7 @@ fn sync_wait_repairs_missing_remote_object_when_local_copy_exists() {
         let mut c = mj();
         c.env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0")
             .env("MAJUTSU_SYNC_LOCAL_OBJECT_PRUNE", "0")
+            .env("MAJUTSU_SYNC_WAIT_DEEP_REPAIR", "1")
             .arg("--home")
             .arg(&state)
             .arg("sync")
@@ -18441,15 +18921,9 @@ fn notify_watch_replay_syncs_current_snapshot_when_remote_is_configured() {
     assert!(db_ref(&state, "last-synced").is_some());
     assert!(remote.join("hosts/index.json").exists());
     assert!(host_metadata_export_path(&remote).exists());
-    let current_ref_name = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.join("refs/current").exists())
-        .map(|path| {
-            let host_id = path.file_name().unwrap().to_string_lossy();
-            format!("hosts/{host_id}/refs/current")
-        })
-        .unwrap();
+    let host_dir = first_remote_host_dir(&remote);
+    let host_id = host_dir.file_name().unwrap().to_string_lossy();
+    let current_ref_name = format!("{host_id}/refs/current");
     assert_eq!(
         db_remote_ref_value(&state, &current_ref_name),
         db_ref(&state, "current")
@@ -19005,6 +19479,91 @@ fn sync_reuploads_compacted_snapshot_manifest_payloads() {
         compact_remote_len < full_remote_len / 2,
         "remote snapshot manifest should be overwritten with compact payload: full={full_remote_len} compact={compact_remote_len}"
     );
+}
+
+#[test]
+fn prune_drop_missing_remote_history_unblocks_sync_after_compacted_tree_loss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+
+    let old_manifest = local_snapshot_manifest(&state, "asc");
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let manifest_key: String = conn
+        .query_row(
+            "select manifest_key from snapshots order by created_at asc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tree_key = old_manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+
+    fs::remove_file(state.join(&tree_key)).unwrap();
+    let _ = fs::remove_file(remote.join(&tree_key));
+    let _ = fs::remove_file(remote.join(&manifest_key));
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--drop-missing-remote-history");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(!remote.join(&manifest_key).exists());
 }
 
 #[cfg(unix)]

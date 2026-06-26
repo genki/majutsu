@@ -669,8 +669,7 @@ fn validate_remote_root_ack_ref(
 }
 
 pub fn parse_canonical_host_ref_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix("hosts/")?;
-    let (host_id, rest) = rest.split_once("/refs/")?;
+    let (host_id, rest) = name.split_once("/refs/")?;
     if host_id.is_empty() || rest.is_empty() || rest.contains('/') {
         return None;
     }
@@ -678,8 +677,7 @@ pub fn parse_canonical_host_ref_name(name: &str) -> Option<(&str, &str)> {
 }
 
 pub fn parse_canonical_host_root_ack_ref_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix("hosts/")?;
-    let (host_id, rest) = rest.split_once("/roots/")?;
+    let (host_id, rest) = name.split_once("/roots/")?;
     let root_id = rest.strip_suffix("/ack")?;
     if host_id.is_empty() || root_id.is_empty() || root_id.contains('/') {
         return None;
@@ -1069,19 +1067,19 @@ mod tests {
             [
                 (
                     "".to_string(),
-                    "hosts/other/refs/current".to_string(),
+                    "other/refs/current".to_string(),
                     "missing-snap".to_string(),
                     "not-time".to_string(),
                 ),
                 (
                     "file://remote".to_string(),
-                    "hosts/host-a/refs/last-synced".to_string(),
+                    "host-a/refs/last-synced".to_string(),
                     "bad-time".to_string(),
                     "2026-06-07T00:00:00Z".to_string(),
                 ),
                 (
                     "file://remote".to_string(),
-                    "hosts/host-a/refs/legacy".to_string(),
+                    "host-a/refs/legacy".to_string(),
                     "value".to_string(),
                     "2026-06-07T00:00:00Z".to_string(),
                 ),
@@ -1100,10 +1098,10 @@ mod tests {
             issues,
             vec![
                 RemoteRefIssue::EmptyRemote {
-                    name: "hosts/other/refs/current".into(),
+                    name: "other/refs/current".into(),
                 },
                 RemoteRefIssue::InvalidObservedAt {
-                    name: "hosts/other/refs/current".into(),
+                    name: "other/refs/current".into(),
                     value: "not-time".into(),
                     error: "premature end of input".into(),
                 },
@@ -1112,16 +1110,16 @@ mod tests {
                     config_host_id: "host-a".into(),
                 },
                 RemoteRefIssue::MissingSnapshot {
-                    name: "hosts/other/refs/current".into(),
+                    name: "other/refs/current".into(),
                     value: "missing-snap".into(),
                 },
                 RemoteRefIssue::InvalidLastSynced {
-                    name: "hosts/host-a/refs/last-synced".into(),
+                    name: "host-a/refs/last-synced".into(),
                     value: "bad-time".into(),
                     error: "premature end of input".into(),
                 },
                 RemoteRefIssue::UnsupportedRefName {
-                    name: "hosts/host-a/refs/legacy".into(),
+                    name: "host-a/refs/legacy".into(),
                 },
                 RemoteRefIssue::UnsupportedName {
                     name: "legacy/current".into(),
@@ -1153,13 +1151,13 @@ mod tests {
             [
                 (
                     "s3://remote".to_string(),
-                    "hosts/host-a/roots/docs/ack".to_string(),
+                    "host-a/roots/docs/ack".to_string(),
                     valid_ack,
                     "2026-06-07T00:00:00Z".to_string(),
                 ),
                 (
                     "s3://remote".to_string(),
-                    "hosts/host-a/roots/projects/ack".to_string(),
+                    "host-a/roots/projects/ack".to_string(),
                     invalid_ack,
                     "2026-06-07T00:00:00Z".to_string(),
                 ),
@@ -1172,15 +1170,15 @@ mod tests {
             issues,
             vec![
                 RemoteRefIssue::InvalidRootAckSnapshot {
-                    name: "hosts/host-a/roots/projects/ack".into(),
+                    name: "host-a/roots/projects/ack".into(),
                     value: "missing-snap".into(),
                 },
                 RemoteRefIssue::InvalidRootAck {
-                    name: "hosts/host-a/roots/projects/ack".into(),
+                    name: "host-a/roots/projects/ack".into(),
                     error: "empty tree_id or tree_key".into(),
                 },
                 RemoteRefIssue::InvalidRootAckSyncedAt {
-                    name: "hosts/host-a/roots/projects/ack".into(),
+                    name: "host-a/roots/projects/ack".into(),
                     value: "bad-time".into(),
                     error: "premature end of input".into(),
                 },
@@ -1192,19 +1190,19 @@ mod tests {
     fn remote_ref_issue_messages_are_stable() {
         assert_eq!(
             RemoteRefIssue::EmptyRemote {
-                name: "hosts/host-a/refs/current".into(),
+                name: "host-a/refs/current".into(),
             }
             .message(),
-            "remote ref has empty remote for hosts/host-a/refs/current"
+            "remote ref has empty remote for host-a/refs/current"
         );
         assert_eq!(
             RemoteRefIssue::InvalidObservedAt {
-                name: "hosts/host-a/refs/current".into(),
+                name: "host-a/refs/current".into(),
                 value: "bad-time".into(),
                 error: "premature end of input".into(),
             }
             .message(),
-            "remote ref hosts/host-a/refs/current has invalid observed_at bad-time: premature end of input"
+            "remote ref host-a/refs/current has invalid observed_at bad-time: premature end of input"
         );
         assert_eq!(
             RemoteRefIssue::UnsupportedName {
@@ -1223,27 +1221,27 @@ mod tests {
         );
         assert_eq!(
             RemoteRefIssue::MissingSnapshot {
-                name: "hosts/host-a/refs/current".into(),
+                name: "host-a/refs/current".into(),
                 value: "missing-snap".into(),
             }
             .message(),
-            "remote ref hosts/host-a/refs/current points to missing snapshot missing-snap"
+            "remote ref host-a/refs/current points to missing snapshot missing-snap"
         );
         assert_eq!(
             RemoteRefIssue::InvalidLastSynced {
-                name: "hosts/host-a/refs/last-synced".into(),
+                name: "host-a/refs/last-synced".into(),
                 value: "bad-time".into(),
                 error: "premature end of input".into(),
             }
             .message(),
-            "remote ref hosts/host-a/refs/last-synced has invalid last-synced bad-time: premature end of input"
+            "remote ref host-a/refs/last-synced has invalid last-synced bad-time: premature end of input"
         );
         assert_eq!(
             RemoteRefIssue::UnsupportedRefName {
-                name: "hosts/host-a/refs/legacy".into(),
+                name: "host-a/refs/legacy".into(),
             }
             .message(),
-            "remote ref has unsupported ref name hosts/host-a/refs/legacy"
+            "remote ref has unsupported ref name host-a/refs/legacy"
         );
     }
 }

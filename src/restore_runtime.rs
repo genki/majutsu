@@ -32,8 +32,8 @@ use crate::{HydrateStats, pack_entry_payload};
 use crate::{
     build_restore_job, decode_object, download_local_object_from_remote,
     hydrate_local_objects_from_remote, hydrate_restore_job_objects, query_blobs, read_blob_payload,
-    read_large_chunk, read_object, remote_available_key, remote_object_available,
-    request_archive_restore_for_job, write_large_chunks_atomic,
+    read_large_chunk, read_object, remote_available_key_for_paths,
+    remote_object_available_for_paths, request_archive_restore_for_job, write_large_chunks_atomic,
 };
 
 #[cfg(unix)]
@@ -227,7 +227,7 @@ fn hydrate_restore_job_snapshot_manifest(paths: &Paths, job: &RestoreQueueItem) 
         return Ok(());
     };
     let remote = open_remote(remote_config)?;
-    if !remote_object_available(&remote, &manifest_key)? {
+    if !remote_object_available_for_paths(paths, &remote, &manifest_key)? {
         return Ok(());
     }
     let bytes = download_local_object_from_remote(paths, &remote, &manifest_key)?;
@@ -520,7 +520,7 @@ fn restore_object_stats_with_mode(
         }
         let available_remote = remote
             .as_ref()
-            .map(|remote| remote_object_available(remote, key))
+            .map(|remote| remote_object_available_for_paths(paths, remote, key))
             .transpose()?
             .unwrap_or(false);
         if available_remote {
@@ -538,7 +538,7 @@ fn restore_object_stats_with_mode(
         if paths.home.join(key).exists() {
             local_chunks += 1;
             if let Some(remote) = remote.as_ref()
-                && remote_object_available(remote, key)?
+                && remote_object_available_for_paths(paths, remote, key)?
             {
                 remote_chunks += 1;
             }
@@ -546,7 +546,7 @@ fn restore_object_stats_with_mode(
         }
         let available_remote = remote
             .as_ref()
-            .map(|remote| remote_object_available(remote, key))
+            .map(|remote| remote_object_available_for_paths(paths, remote, key))
             .transpose()?
             .unwrap_or(false);
         if available_remote {
@@ -561,7 +561,7 @@ fn restore_object_stats_with_mode(
             .iter()
             .filter(|key| paths.home.join(key).exists())
         {
-            if remote_object_available(remote, key)? {
+            if remote_object_available_for_paths(paths, remote, key)? {
                 remote_objects += 1;
             }
         }
@@ -858,7 +858,7 @@ fn prefetch_packed_blob_ranges_for_plan(
         let remote_pack_key = if let Some(key) = remote_pack_keys.get(&task.pack_key) {
             key.clone()
         } else {
-            let key = remote_available_key(&remote, &task.pack_key)?;
+            let key = remote_available_key_for_paths(paths, &remote, &task.pack_key)?;
             remote_pack_keys.insert(task.pack_key.clone(), key.clone());
             key
         };

@@ -28,10 +28,20 @@ fn pack_loose_blobs(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
     let mut conn = open_db(paths)?;
-    let blobs = query_blobs(&conn)?
+    let loose_blobs = query_blobs(&conn)?
         .into_iter()
         .filter(|blob| blob.pack_id.is_none())
         .collect::<Vec<_>>();
+    let (blobs, missing_blobs): (Vec<_>, Vec<_>) = loose_blobs
+        .into_iter()
+        .partition(|blob| paths.home.join(&blob.object_key).is_file());
+    if !missing_blobs.is_empty() {
+        let removed = remove_unreferenced_missing_loose_blobs(&mut conn, &missing_blobs)?;
+        println!("skipped_missing_loose_blobs {}", missing_blobs.len());
+        if removed > 0 {
+            println!("removed_missing_unreferenced_blobs {removed}");
+        }
+    }
     if blobs.is_empty() {
         println!("packed 0 objects");
         return Ok(());
@@ -53,6 +63,29 @@ fn pack_loose_blobs(paths: &Paths) -> Result<()> {
         packed.len()
     );
     Ok(())
+}
+
+fn remove_unreferenced_missing_loose_blobs(
+    conn: &mut Connection,
+    missing_blobs: &[BlobExport],
+) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let mut removed = 0;
+    for blob in missing_blobs {
+        removed += tx.execute(
+            "delete from blobs
+             where oid=?1
+               and pack_id is null
+               and not exists (
+                 select 1 from snapshot_payloads
+                 where snapshot_payloads.kind='blob'
+                   and snapshot_payloads.oid=blobs.oid
+               )",
+            params![blob.oid.as_str()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed)
 }
 
 fn write_blob_packs<F>(

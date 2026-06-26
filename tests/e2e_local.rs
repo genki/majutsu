@@ -464,7 +464,11 @@ fn cache_prune_evicts_synced_payload_cache_and_restore_hydrates() {
         run_mj(&home, ["snapshot", "--message", "cache prune source"]),
         "snapshot",
     );
-    let sync = run_mj(&home, ["sync"]);
+    let sync = run_mj_with_env(
+        &home,
+        ["sync"],
+        &[("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "1".into())],
+    );
     if !sync.status.success() {
         panic!(
             "sync が失敗しました\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -606,6 +610,20 @@ fn default_excludes_hide_reproducible_directory_entries() {
     fs::create_dir_all(repo.join(".git/objects")).unwrap();
     fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
     fs::create_dir_all(repo.join("target/debug")).unwrap();
+    fs::create_dir_all(repo.join("build-device-check/out")).unwrap();
+    fs::create_dir_all(repo.join(".config/coc/extensions/node_modules/pkg")).unwrap();
+    fs::create_dir_all(repo.join(".config/gcloud/virtenv/bin")).unwrap();
+    fs::create_dir_all(repo.join("logs")).unwrap();
+    fs::create_dir_all(repo.join("cache")).unwrap();
+    fs::create_dir_all(repo.join("DerivedData/App")).unwrap();
+    fs::create_dir_all(repo.join(".majutsu/queue/events")).unwrap();
+    fs::create_dir_all(repo.join("AppData/Local/Temp/mj-smoke/home")).unwrap();
+    fs::create_dir_all(
+        repo.join("AppData/Local/Packages/MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy/AC/INetCache/5HLB4PUV"),
+    )
+    .unwrap();
+    fs::create_dir_all(repo.join(".vagrant.d/data/checkpoint_cache")).unwrap();
+    fs::create_dir_all(repo.join(".vagrant.d/insecure_private_keys")).unwrap();
     fs::write(repo.join(".git/config"), b"secret git config\n").unwrap();
     fs::write(
         repo.join("node_modules/pkg/index.js"),
@@ -613,6 +631,48 @@ fn default_excludes_hide_reproducible_directory_entries() {
     )
     .unwrap();
     fs::write(repo.join("target/debug/app"), b"generated build\n").unwrap();
+    fs::write(
+        repo.join("build-device-check/out/app"),
+        b"generated build\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".config/coc/extensions/node_modules/pkg/index.js"),
+        b"editor generated dependency\n",
+    )
+    .unwrap();
+    fs::write(repo.join(".config/gcloud/virtenv/bin/python"), b"venv\n").unwrap();
+    fs::write(repo.join("logs/app.log"), b"log\n").unwrap();
+    fs::write(repo.join("cache/model-recommendations.json"), b"cache\n").unwrap();
+    fs::write(repo.join("release.notarized.pkg"), b"generated package\n").unwrap();
+    fs::write(repo.join("DerivedData/App/cache"), b"xcode cache\n").unwrap();
+    fs::write(
+        repo.join(".majutsu/queue/events/event.json"),
+        b"self state\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("AppData/Local/Temp/mj-smoke/home/config.toml"),
+        b"temp state\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("AppData/Local/Packages/MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy/AC/INetCache/5HLB4PUV/wdgts_conf.json"),
+        b"web cache\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".vagrant.d/data/checkpoint_cache/foo"),
+        b"cache\n",
+    )
+    .unwrap();
+    fs::write(repo.join(".vagrant.d/data/index.lock"), b"lock\n").unwrap();
+    fs::write(repo.join(".vagrant.d/insecure_private_key"), b"known key\n").unwrap();
+    fs::write(
+        repo.join(".vagrant.d/insecure_private_keys/vagrant.key.rsa"),
+        b"known key\n",
+    )
+    .unwrap();
     fs::write(repo.join("src.txt"), b"tracked\n").unwrap();
 
     assert_success(
@@ -646,6 +706,58 @@ fn default_excludes_hide_reproducible_directory_entries() {
     assert!(
         !restore.join("repo/target").exists(),
         "build directory must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/build-device-check").exists(),
+        "build-* directory must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/.config/coc/extensions").exists(),
+        "editor extension cache must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/.config/gcloud/virtenv").exists(),
+        "gcloud virtualenv cache must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/logs").exists(),
+        "log directory must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/cache").exists(),
+        "cache directory must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/release.notarized.pkg").exists(),
+        "notarized build artifact must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/DerivedData").exists(),
+        "Xcode cache must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/.majutsu").exists(),
+        "majutsu state must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/AppData/Local/Temp").exists(),
+        "Windows temp cache must be excluded by default"
+    );
+    assert!(
+        !restore.join("repo/AppData/Local/Packages").exists(),
+        "Windows INetCache must be excluded by default"
+    );
+    assert!(
+        !restore
+            .join("repo/.vagrant.d/data/checkpoint_cache")
+            .exists(),
+        "Vagrant checkpoint cache must be excluded by default"
+    );
+    assert!(
+        !restore
+            .join("repo/.vagrant.d/insecure_private_key")
+            .exists(),
+        "Vagrant known insecure key must be excluded by default"
     );
 }
 
@@ -723,6 +835,25 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
     );
     assert_success(run_mj(&home, ["snapshot", "--message", "fsck"]), "snapshot");
     assert_success(run_mj(&home, ["sync"]), "sync");
+    let tree_key = first_tree_object_key(&home);
+    let tree_alias = canonical_remote_alias(&tree_key).expect("tree key has canonical alias");
+    let tree_alias_path = remote.join(&tree_alias);
+    assert!(
+        tree_alias_path.exists(),
+        "sync should upload canonical tree alias"
+    );
+    fs::remove_file(&tree_alias_path).unwrap();
+    let alias_repair = run_mj(&home, ["remote", "repair", "--canonical-aliases-only"]);
+    let alias_repair_stdout = String::from_utf8_lossy(&alias_repair.stdout).to_string();
+    assert_success(alias_repair, "remote repair canonical aliases only");
+    assert!(
+        alias_repair_stdout.contains("mode canonical_aliases"),
+        "canonical repair should use list-based alias mode\n{alias_repair_stdout}"
+    );
+    assert!(
+        tree_alias_path.exists(),
+        "canonical alias repair should restore missing alias"
+    );
     let quick = run_mj(&home, ["remote", "fsck"]);
     assert_success(quick, "remote fsck quick");
     assert_success(

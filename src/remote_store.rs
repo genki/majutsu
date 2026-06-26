@@ -1889,9 +1889,9 @@ fn encode_s3_object_tags(tags: &[(String, String)]) -> Result<String> {
 
 pub(crate) fn s3_object_class(key: &str) -> &'static str {
     let key = key.trim_start_matches('/');
-    if key.starts_with("hosts/")
-        || key.starts_with("metadata/")
+    if key.starts_with("metadata/")
         || key.ends_with("/metadata/export.json")
+        || key.ends_with("/metadata/export.json.zst")
     {
         "metadata"
     } else if key.starts_with("refs/") || key.contains("/refs/") || key.ends_with("current") {
@@ -2041,7 +2041,7 @@ aws_secret_access_key=backup-secret
             DEFAULT_METADATA_MULTIPART_PARALLELISM
         );
         assert_eq!(
-            remote.multipart_parallelism_for_key("hosts/host-id/metadata/export.json"),
+            remote.multipart_parallelism_for_key("host-id/metadata/export.json"),
             DEFAULT_METADATA_MULTIPART_PARALLELISM
         );
         assert_eq!(

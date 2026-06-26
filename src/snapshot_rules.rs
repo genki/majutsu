@@ -108,6 +108,9 @@ pub fn default_root_excludes() -> Vec<String> {
         ".jj/**",
         "/.jj/**",
         "**/.jj/**",
+        ".majutsu/**",
+        "/.majutsu/**",
+        "**/.majutsu/**",
         "node_modules/**",
         "/node_modules/**",
         "**/node_modules/**",
@@ -117,6 +120,10 @@ pub fn default_root_excludes() -> Vec<String> {
         "build/**",
         "/build/**",
         "**/build/**",
+        "build-*",
+        "build-*/**",
+        "/build-*/**",
+        "**/build-*/**",
         "dist/**",
         "/dist/**",
         "**/dist/**",
@@ -133,9 +140,53 @@ pub fn default_root_excludes() -> Vec<String> {
         "temp/**",
         "/temp/**",
         "**/temp/**",
+        "log/**",
+        "/log/**",
+        "**/log/**",
+        "logs/**",
+        "/logs/**",
+        "**/logs/**",
+        "*.log",
+        "**/*.log",
         ".cache/**",
         "/.cache/**",
         "**/.cache/**",
+        "cache/**",
+        "/cache/**",
+        "**/cache/**",
+        "Cache/**",
+        "/Cache/**",
+        "**/Cache/**",
+        "Caches/**",
+        "/Caches/**",
+        "**/Caches/**",
+        "AppData/Local/Temp/**",
+        "/AppData/Local/Temp/**",
+        "**/AppData/Local/Temp/**",
+        "AppData/Local/Microsoft/Windows/INetCache/**",
+        "/AppData/Local/Microsoft/Windows/INetCache/**",
+        "**/AppData/Local/Microsoft/Windows/INetCache/**",
+        "AppData/Local/Packages/**",
+        "/AppData/Local/Packages/**",
+        "**/AppData/Local/Packages/**",
+        "AppData/Local/Packages/**/INetCache/**",
+        "/AppData/Local/Packages/**/INetCache/**",
+        "**/AppData/Local/Packages/**/INetCache/**",
+        "AppData/Local/Packages/*/AC/INetCache/**",
+        "/AppData/Local/Packages/*/AC/INetCache/**",
+        "**/AppData/Local/Packages/*/AC/INetCache/**",
+        ".vagrant.d/data/checkpoint_cache/**",
+        "/.vagrant.d/data/checkpoint_cache/**",
+        "**/.vagrant.d/data/checkpoint_cache/**",
+        ".vagrant.d/data/*.lock",
+        "/.vagrant.d/data/*.lock",
+        "**/.vagrant.d/data/*.lock",
+        ".vagrant.d/insecure_private_key",
+        "/.vagrant.d/insecure_private_key",
+        "**/.vagrant.d/insecure_private_key",
+        ".vagrant.d/insecure_private_keys/**",
+        "/.vagrant.d/insecure_private_keys/**",
+        "**/.vagrant.d/insecure_private_keys/**",
         ".next/**",
         "/.next/**",
         "**/.next/**",
@@ -178,6 +229,35 @@ pub fn default_root_excludes() -> Vec<String> {
         "venv/**",
         "/venv/**",
         "**/venv/**",
+        ".config/coc/extensions/**",
+        "/.config/coc/extensions/**",
+        "**/.config/coc/extensions/**",
+        ".config/yarn/global/node_modules/**",
+        "/.config/yarn/global/node_modules/**",
+        "**/.config/yarn/global/node_modules/**",
+        ".config/yarn/global/.yarn*",
+        "/.config/yarn/global/.yarn*",
+        "**/.config/yarn/global/.yarn*",
+        ".config/gcloud/virtenv/**",
+        "/.config/gcloud/virtenv/**",
+        "**/.config/gcloud/virtenv/**",
+        "DerivedData/**",
+        "/DerivedData/**",
+        "**/DerivedData/**",
+        ".build/**",
+        "/.build/**",
+        "**/.build/**",
+        "SourcePackages/**",
+        "/SourcePackages/**",
+        "**/SourcePackages/**",
+        "*.xcarchive/**",
+        "**/*.xcarchive/**",
+        "*.dSYM/**",
+        "**/*.dSYM/**",
+        "*.notarized.pkg",
+        "**/*.notarized.pkg",
+        "*notarized*.zip",
+        "**/*notarized*.zip",
         ".DS_Store",
         "**/.DS_Store",
         "Thumbs.db",
@@ -264,17 +344,6 @@ pub fn is_included(patterns: &[String], rel: &Path) -> bool {
         .any(|pattern| path_pattern_match(pattern, &rel))
 }
 
-pub fn explicitly_included(patterns: &[String], rel: &Path) -> bool {
-    if patterns.is_empty() {
-        return false;
-    }
-    let rel = path_to_slash(rel);
-    patterns
-        .iter()
-        .filter(|pattern| !is_catch_all_include_pattern(pattern))
-        .any(|pattern| path_pattern_match(pattern, &rel))
-}
-
 pub fn include_may_match_inside_dir(patterns: &[String], rel: &Path) -> bool {
     if patterns.is_empty()
         || patterns
@@ -342,20 +411,18 @@ pub fn root_record_is_managed(
     if is_volatile_excluded(root, rel) {
         return false;
     }
-    !is_ignored(ignore, rel, is_dir) || explicitly_included(&root.include, rel)
+    !is_ignored(ignore, rel, is_dir)
 }
 
 pub fn root_dir_allows_descend(root: &RootConfig, ignore: &Gitignore, rel: &Path) -> bool {
     if explicitly_untracked(root, rel) {
         return false;
     }
-    if include_allows_descend(&root.include, rel) && !is_volatile_excluded(root, rel) {
-        if !is_ignored(ignore, rel, true) {
-            return true;
-        }
-        if include_may_match_inside_dir(&root.include, rel) {
-            return true;
-        }
+    if include_allows_descend(&root.include, rel)
+        && !is_volatile_excluded(root, rel)
+        && !is_ignored(ignore, rel, true)
+    {
+        return true;
     }
     explicit_track_may_match_inside_dir(root, rel) || !root.explicit_track.is_empty()
 }
@@ -762,8 +829,22 @@ mod moon_root_tests {
             ".hg",
             ".svn",
             ".jj",
+            ".majutsu/config.toml",
             "node_modules",
             "target",
+            "build-device-check",
+            "logs/app.log",
+            "cache/model-recommendations.json",
+            "AppData/Local/Temp/mj-smoke/home/config.toml",
+            "AppData/Local/Packages/MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy/AC/INetCache/5HLB4PUV/wdgts_conf.json",
+            ".vagrant.d/data/checkpoint_cache/foo",
+            ".vagrant.d/data/index.lock",
+            ".vagrant.d/insecure_private_key",
+            ".vagrant.d/insecure_private_keys/vagrant.key.rsa",
+            ".config/coc/extensions/node_modules/pkg/index.js",
+            ".config/gcloud/virtenv/bin/python",
+            "DerivedData/App/cache",
+            "release.notarized.pkg",
             ".venv",
             "state.json.123.abc.tmp",
             "work/state.json.123.abc.tmp",
@@ -782,6 +863,10 @@ mod moon_root_tests {
         assert!(
             !exclude_covers_path(&excludes, ".kubeconfig"),
             "default excludes must warn about credentials instead of dropping them"
+        );
+        assert!(
+            !exclude_covers_path(&excludes, "model-latest.tgz"),
+            "default excludes must not silently drop authored archives"
         );
     }
 
@@ -818,6 +903,49 @@ mod moon_root_tests {
             &root,
             &ignore,
             Path::new("ignored/keep.txt"),
+            false
+        ));
+    }
+
+    #[test]
+    fn exclude_wins_over_broad_include_patterns() {
+        let root_path = tempfile::tempdir().unwrap();
+        let root = RootConfig {
+            id: "sample".into(),
+            name: "sample".into(),
+            path: root_path.path().to_path_buf(),
+            include: vec!["*.json".into()],
+            exclude: vec!["AppData/**".into(), ".majutsu/**".into()],
+            explicit_track: Vec::new(),
+            explicit_untrack: Vec::new(),
+            follow_symlinks: false,
+            require_mount: false,
+            status: "active".into(),
+            degraded: None,
+            snapshot_mode: "default".into(),
+            pre_snapshot: None,
+            post_snapshot: None,
+            snapshot_source: None,
+            application_plugin: None,
+            large: None,
+            volatile: None,
+        };
+        let ignore = build_ignore(&root).unwrap();
+        assert!(!root_dir_allows_descend(
+            &root,
+            &ignore,
+            Path::new("AppData")
+        ));
+        assert!(!root_record_is_managed(
+            &root,
+            &ignore,
+            Path::new("AppData/Local/Temp/state.json"),
+            false
+        ));
+        assert!(!root_record_is_managed(
+            &root,
+            &ignore,
+            Path::new(".majutsu/config.toml"),
             false
         ));
     }

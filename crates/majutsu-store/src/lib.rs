@@ -57,33 +57,52 @@ impl RemoteCapabilities {
     }
 }
 
-pub const REMOTE_HOST_INDEX_KEY: &str = "hosts/index.json";
-pub const LEGACY_METADATA_EXPORT_KEY: &str = "metadata/export.json";
 pub const REMOTE_CHUNK_INDEX_SHARD_KEY: &str = "indexes/chunk-index/shard-0000.cbor.zst.enc";
 pub const DEFAULT_CHUNK_INDEX_SHARD: &str = "shard-0000";
 
 pub fn remote_gc_mark_key(host_id: &str) -> String {
-    format!("gc/marks/{host_id}.json")
+    format!("{host_id}/gc/mark.json")
 }
 
 pub fn remote_gc_tombstone_prefix(host_id: &str) -> String {
-    format!("gc/tombstones/{host_id}/")
+    format!("{host_id}/gc/tombstones/")
 }
 
 pub fn remote_gc_tombstone_key(host_id: &str, tombstone_id: &str) -> String {
     format!("{}{tombstone_id}.json", remote_gc_tombstone_prefix(host_id))
 }
 
+pub fn remote_host_label(host_name: &str) -> String {
+    let label = host_name
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['.', '-', '_'])
+        .to_string();
+    if label.is_empty() {
+        "unknown-host".into()
+    } else {
+        label
+    }
+}
+
 pub fn host_metadata_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/metadata/export.json")
+    format!("{host_id}/metadata/export.json")
 }
 
 pub fn host_legacy_current_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/current")
+    format!("{host_id}/current")
 }
 
 pub fn host_ref_key(host_id: &str, name: &str) -> String {
-    format!("hosts/{host_id}/refs/{name}")
+    format!("{host_id}/refs/{name}")
 }
 
 pub fn host_current_ref_key(host_id: &str) -> String {
@@ -95,43 +114,51 @@ pub fn host_last_synced_ref_key(host_id: &str) -> String {
 }
 
 pub fn host_root_ack_ref_key(host_id: &str, root_id: &str) -> String {
-    format!("hosts/{host_id}/roots/{root_id}/ack")
+    format!("{host_id}/roots/{root_id}/ack")
 }
 
 pub fn host_root_ack_ref_prefix(host_id: &str) -> String {
-    format!("hosts/{host_id}/roots/")
+    format!("{host_id}/roots/")
 }
 
 pub fn host_snapshot_key(host_id: &str, snapshot_id: &str) -> String {
-    format!("hosts/{host_id}/snapshots/{snapshot_id}.json")
+    format!("{host_id}/snapshots/{snapshot_id}.json")
 }
 
 pub fn host_snapshots_prefix(host_id: &str) -> String {
-    format!("hosts/{host_id}/snapshots/")
+    format!("{host_id}/snapshots/")
 }
 
 pub fn host_snapshot_canonical_key(host_id: &str, snapshot_id: &str) -> String {
-    format!("hosts/{host_id}/snapshots/{snapshot_id}.cbor.zst.enc")
+    format!("{host_id}/snapshots/{snapshot_id}.cbor.zst.enc")
 }
 
 pub fn host_operation_key(host_id: &str, op_id: &str) -> String {
-    format!("hosts/{host_id}/ops/{op_id}.json")
+    format!("{host_id}/ops/{op_id}.json")
 }
 
 pub fn host_ops_prefix(host_id: &str) -> String {
-    format!("hosts/{host_id}/ops/")
+    format!("{host_id}/ops/")
 }
 
 pub fn host_operation_canonical_key(host_id: &str, op_id: &str) -> String {
-    format!("hosts/{host_id}/ops/{op_id}.cbor.zst.enc")
+    format!("{host_id}/ops/{op_id}.cbor.zst.enc")
 }
 
 pub fn host_oplog_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/ops/local-oplog.cborl")
+    format!("{host_id}/ops/local-oplog.cborl")
 }
 
 pub fn host_oplog_canonical_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/ops/local-oplog.cborl.zst.enc")
+    format!("{host_id}/ops/local-oplog.cborl.zst.enc")
+}
+
+pub fn host_remote_key(host_id: &str, key: &str) -> String {
+    if key.starts_with(&format!("{host_id}/")) {
+        key.to_string()
+    } else {
+        format!("{host_id}/{key}")
+    }
 }
 
 pub fn archive_restore_status(key: &str, status: u16) -> Result<bool> {
@@ -437,7 +464,7 @@ pub fn select_remote_host(
     match by_id.len() {
         0 => {}
         1 => return Ok(by_id.remove(0)),
-        _ => bail!("remote host id is duplicated in hosts/index.json: {selector}"),
+        _ => bail!("remote host id is duplicated in remote metadata: {selector}"),
     }
     let mut by_name = hosts
         .into_iter()
@@ -679,41 +706,34 @@ mod tests {
 
     #[test]
     fn host_scoped_remote_keys_are_stable() {
-        assert_eq!(
-            host_metadata_key("host-a"),
-            "hosts/host-a/metadata/export.json"
-        );
-        assert_eq!(host_legacy_current_key("host-a"), "hosts/host-a/current");
-        assert_eq!(host_current_ref_key("host-a"), "hosts/host-a/refs/current");
+        assert_eq!(remote_host_label("mba22"), "mba22");
+        assert_eq!(remote_host_label("win vr/local"), "win-vr-local");
+        assert_eq!(host_metadata_key("host-a"), "host-a/metadata/export.json");
+        assert_eq!(host_legacy_current_key("host-a"), "host-a/current");
+        assert_eq!(host_current_ref_key("host-a"), "host-a/refs/current");
         assert_eq!(
             host_last_synced_ref_key("host-a"),
-            "hosts/host-a/refs/last-synced"
+            "host-a/refs/last-synced"
         );
         assert_eq!(
             host_snapshot_key("host-a", "snap-1"),
-            "hosts/host-a/snapshots/snap-1.json"
+            "host-a/snapshots/snap-1.json"
         );
-        assert_eq!(host_snapshots_prefix("host-a"), "hosts/host-a/snapshots/");
+        assert_eq!(host_snapshots_prefix("host-a"), "host-a/snapshots/");
         assert_eq!(
             host_snapshot_canonical_key("host-a", "snap-1"),
-            "hosts/host-a/snapshots/snap-1.cbor.zst.enc"
+            "host-a/snapshots/snap-1.cbor.zst.enc"
         );
-        assert_eq!(
-            host_operation_key("host-a", "op-1"),
-            "hosts/host-a/ops/op-1.json"
-        );
-        assert_eq!(host_ops_prefix("host-a"), "hosts/host-a/ops/");
+        assert_eq!(host_operation_key("host-a", "op-1"), "host-a/ops/op-1.json");
+        assert_eq!(host_ops_prefix("host-a"), "host-a/ops/");
         assert_eq!(
             host_operation_canonical_key("host-a", "op-1"),
-            "hosts/host-a/ops/op-1.cbor.zst.enc"
+            "host-a/ops/op-1.cbor.zst.enc"
         );
-        assert_eq!(
-            host_oplog_key("host-a"),
-            "hosts/host-a/ops/local-oplog.cborl"
-        );
+        assert_eq!(host_oplog_key("host-a"), "host-a/ops/local-oplog.cborl");
         assert_eq!(
             host_oplog_canonical_key("host-a"),
-            "hosts/host-a/ops/local-oplog.cborl.zst.enc"
+            "host-a/ops/local-oplog.cborl.zst.enc"
         );
     }
 
@@ -812,18 +832,9 @@ mod tests {
     fn remote_host_index_upserts_and_sorts_hosts() {
         let mut index = RemoteHostIndex::empty(DateTime::<Utc>::UNIX_EPOCH);
 
-        index.upsert_host(
-            host("b", "Beta", "hosts/b/metadata/export.json"),
-            Utc::now(),
-        );
-        index.upsert_host(
-            host("a", "Alpha", "hosts/a/metadata/export.json"),
-            Utc::now(),
-        );
-        index.upsert_host(
-            host("b", "Beta 2", "hosts/b/metadata/export.json"),
-            Utc::now(),
-        );
+        index.upsert_host(host("b", "Beta", "b/metadata/export.json"), Utc::now());
+        index.upsert_host(host("a", "Alpha", "a/metadata/export.json"), Utc::now());
+        index.upsert_host(host("b", "Beta 2", "b/metadata/export.json"), Utc::now());
 
         assert_eq!(index.hosts.len(), 2);
         assert_eq!(index.hosts[0].id, "a");
@@ -834,16 +845,16 @@ mod tests {
     fn remote_host_index_detects_duplicate_ids_and_metadata_keys() {
         let mut index = RemoteHostIndex::empty(DateTime::<Utc>::UNIX_EPOCH);
         index.hosts = vec![
-            host("a", "Alpha", "hosts/a/metadata/export.json"),
-            host("a", "Alpha copy", "hosts/a-copy/metadata/export.json"),
-            host("b", "Beta", "hosts/a/metadata/export.json"),
+            host("a", "Alpha", "a/metadata/export.json"),
+            host("a", "Alpha copy", "a-copy/metadata/export.json"),
+            host("b", "Beta", "a/metadata/export.json"),
         ];
 
         assert_eq!(
             index.duplicate_issues(),
             vec![
                 RemoteHostIndexIssue::DuplicateHostId("a".into()),
-                RemoteHostIndexIssue::DuplicateMetadataKey("hosts/a/metadata/export.json".into()),
+                RemoteHostIndexIssue::DuplicateMetadataKey("a/metadata/export.json".into()),
             ]
         );
     }
@@ -851,16 +862,16 @@ mod tests {
     #[test]
     fn remote_host_selection_prefers_unique_id_then_unique_name() {
         let hosts = vec![
-            host("host-a", "shared", "hosts/a/metadata/export.json"),
-            host("host-b", "shared", "hosts/b/metadata/export.json"),
-            host("host-c", "single", "hosts/c/metadata/export.json"),
+            host("host-a", "shared", "host-a/metadata/export.json"),
+            host("host-b", "shared", "host-b/metadata/export.json"),
+            host("host-c", "single", "host-c/metadata/export.json"),
         ];
 
         assert_eq!(
             select_remote_host(hosts.clone(), "host-b")
                 .unwrap()
                 .metadata_key,
-            "hosts/b/metadata/export.json"
+            "host-b/metadata/export.json"
         );
         assert_eq!(
             select_remote_host(hosts.clone(), "single").unwrap().id,
@@ -874,7 +885,7 @@ mod tests {
         let index = RemoteHostIndex {
             version: 1,
             updated_at: DateTime::<Utc>::UNIX_EPOCH,
-            hosts: vec![host("host-a", "Alpha", "hosts/a/metadata/export.json")],
+            hosts: vec![host("host-a", "Alpha", "host-a/metadata/export.json")],
         };
 
         let value = serde_json::to_value(index).unwrap();
@@ -883,7 +894,7 @@ mod tests {
         assert_eq!(value["hosts"][0]["id"], "host-a");
         assert_eq!(
             value["hosts"][0]["metadata_key"],
-            "hosts/a/metadata/export.json"
+            "host-a/metadata/export.json"
         );
     }
 
@@ -896,7 +907,7 @@ mod tests {
             vec!["objects/b".into(), "objects/a".into(), "objects/a".into()],
         );
 
-        assert_eq!(remote_gc_mark_key("host-a"), "gc/marks/host-a.json");
+        assert_eq!(remote_gc_mark_key("host-a"), "host-a/gc/mark.json");
         assert_eq!(mark.version, 1);
         assert_eq!(mark.object_keys, vec!["objects/a", "objects/b"]);
         assert!(!mark.has_duplicate_object_keys());
@@ -948,31 +959,31 @@ mod tests {
     #[test]
     fn remote_gc_mark_issue_messages_are_stable() {
         assert_eq!(
-            RemoteGcMarkIssue::UnsupportedVersion.message("gc/marks/host-a.json", "host-a"),
-            "unsupported remote gc mark version gc/marks/host-a.json"
+            RemoteGcMarkIssue::UnsupportedVersion.message("host-a/gc/mark.json", "host-a"),
+            "unsupported remote gc mark version host-a/gc/mark.json"
         );
         assert_eq!(
             RemoteGcMarkIssue::HostMismatch("wrong-host".into())
-                .message("gc/marks/host-a.json", "host-a"),
+                .message("host-a/gc/mark.json", "host-a"),
             "remote gc mark host id wrong-host does not match host-a"
         );
         assert_eq!(
-            RemoteGcMarkIssue::CurrentSnapshotMismatch.message("gc/marks/host-a.json", "host-a"),
-            "remote gc mark current snapshot does not match metadata gc/marks/host-a.json"
+            RemoteGcMarkIssue::CurrentSnapshotMismatch.message("host-a/gc/mark.json", "host-a"),
+            "remote gc mark current snapshot does not match metadata host-a/gc/mark.json"
         );
         assert_eq!(
-            RemoteGcMarkIssue::DuplicateObjectKeys.message("gc/marks/host-a.json", "host-a"),
-            "remote gc mark contains duplicate object keys gc/marks/host-a.json"
+            RemoteGcMarkIssue::DuplicateObjectKeys.message("host-a/gc/mark.json", "host-a"),
+            "remote gc mark contains duplicate object keys host-a/gc/mark.json"
         );
         assert_eq!(
             RemoteGcMarkIssue::MissingLiveObject("objects/a".into())
-                .message("gc/marks/host-a.json", "host-a"),
-            "remote gc mark is missing live object gc/marks/host-a.json objects/a"
+                .message("host-a/gc/mark.json", "host-a"),
+            "remote gc mark is missing live object host-a/gc/mark.json objects/a"
         );
         assert_eq!(
             RemoteGcMarkIssue::UnexpectedObjectKey("objects/extra".into())
-                .message("gc/marks/host-a.json", "host-a"),
-            "remote gc mark contains unexpected object gc/marks/host-a.json objects/extra"
+                .message("host-a/gc/mark.json", "host-a"),
+            "remote gc mark contains unexpected object host-a/gc/mark.json objects/extra"
         );
     }
 
@@ -999,16 +1010,16 @@ mod tests {
         let tombstone = RemoteGcTombstone::new(
             "host-a".into(),
             DateTime::<Utc>::UNIX_EPOCH,
-            "hosts/host-a/ops/op-1.json".into(),
+            "host-a/ops/op-1.json".into(),
         );
 
         assert_eq!(
             remote_gc_tombstone_prefix("host-a"),
-            "gc/tombstones/host-a/"
+            "host-a/gc/tombstones/"
         );
         assert_eq!(
             remote_gc_tombstone_key("host-a", "tombstone-1"),
-            "gc/tombstones/host-a/tombstone-1.json"
+            "host-a/gc/tombstones/tombstone-1.json"
         );
         assert_eq!(tombstone.version, 1);
         assert!(tombstone.has_valid_deleted_key());
@@ -1045,18 +1056,18 @@ mod tests {
     fn remote_gc_tombstone_issue_messages_are_stable() {
         assert_eq!(
             RemoteGcTombstoneIssue::UnsupportedVersion
-                .message("gc/tombstones/host-a/tombstone-1.json", "host-a"),
-            "unsupported remote gc tombstone version gc/tombstones/host-a/tombstone-1.json"
+                .message("host-a/gc/tombstones/tombstone-1.json", "host-a"),
+            "unsupported remote gc tombstone version host-a/gc/tombstones/tombstone-1.json"
         );
         assert_eq!(
             RemoteGcTombstoneIssue::HostMismatch("wrong-host".into())
-                .message("gc/tombstones/host-a/tombstone-1.json", "host-a"),
+                .message("host-a/gc/tombstones/tombstone-1.json", "host-a"),
             "remote gc tombstone host id wrong-host does not match host-a"
         );
         assert_eq!(
             RemoteGcTombstoneIssue::InvalidDeletedKey
-                .message("gc/tombstones/host-a/tombstone-1.json", "host-a"),
-            "remote gc tombstone has invalid deleted key gc/tombstones/host-a/tombstone-1.json"
+                .message("host-a/gc/tombstones/tombstone-1.json", "host-a"),
+            "remote gc tombstone has invalid deleted key host-a/gc/tombstones/tombstone-1.json"
         );
     }
 

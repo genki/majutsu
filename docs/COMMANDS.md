@@ -17,7 +17,7 @@ Remote: sync, remote, lifecycle
 Service: watch, daemon
 Security: key
 Storage maintenance: large, cache, pack, prune, gc, fsck
-Advanced/debug: event
+Advanced/debug: version, event
 ```
 
 `mj commit` is a visible alias for `mj snapshot`, intended for users familiar
@@ -26,6 +26,15 @@ Majutsu first preserves changes through the daemon/event journal and remote
 sync; snapshots are durable timeline checkpoints and compaction boundaries.
 
 `mj switch` is a top-level alias for `mj branch switch`.
+
+`mj version` prints the installed binary identity, target platform, build
+number, git commit when available, and a capability list. Use it instead of
+`mj --version` when comparing installs across Linux, macOS, and Windows:
+
+```sh
+mj version
+mj version --json
+```
 
 ## State and diff inspection
 
@@ -218,6 +227,41 @@ remote-side data. `backend` is the full remote object set required to restore
 the root, while `used` is the pack-slice-adjusted amount actually used by that
 root.
 
+When multiple hosts share the same bucket, the remote URL path is the Majutsu
+remote root. The intended layout is one host/environment directory directly
+under that remote root. The final `S3 backend prefix total` line is the
+physical object total for the configured remote root. Existing pre-migration
+repositories may still include every host in that total; the host summary table
+shows per-host current snapshot totals so the local environment can be
+distinguished from other environments:
+
+```text
+host      id        roots      client        used     backend  objects  snapshot
+--------  --------  -----  ----------  ----------  ----------  -------  -------------
+vagrant*  c071a4f3     18  720.92 MiB  242.87 MiB  337.12 MiB    5,459  snap-e0a015ff
+winvr     0a88f6e2      8    7.58 MiB   16.55 MiB  246.74 MiB      152  snap-25457225
+```
+
+`*` marks the current local host. Other host rows are read from the last
+published root-size summary in the shared remote; if an older host has not
+published a summary yet, the row remains visible with an availability note.
+
+The `S3 physical size breakdown` section explains the remote root total as a
+sum of object categories. `local-current` is the current host's current
+snapshot restore set. `local-history` is the current host's retained historical
+restore data. Host metadata, journal, GC state, legacy aliases, and
+`other-payload-or-metadata` account for the remaining physical objects.
+`other-payload-or-metadata` can include other hosts' current/history data and
+objects that remote cleanup has not reclaimed yet, so it is the first place to
+look when the shared prefix is much larger than host current totals.
+
+The long-term remote layout is host-scoped: a bucket may be shared, but durable
+payload, metadata, journal, and GC objects should live directly under a
+`<host-id>/` directory below the configured remote root and should not be
+physically shared across host boundaries. If the bucket is also used for other
+purposes, pass a path in the S3 URL such as `s3://bucket/path-to-mj`; Majutsu
+then treats `path-to-mj/` as the remote root.
+
 Pause and resume roots:
 
 ```sh
@@ -352,11 +396,19 @@ Prune old snapshot metadata:
 ```sh
 mj prune --dry-run --keep-daily 90 --keep-monthly 36
 mj prune --dry-run=false --keep-daily 90 --keep-monthly 36
+mj prune --dry-run --drop-missing-remote-history
 ```
 
 The current snapshot is always kept. Non-dry-run prune removes unkept snapshot
 metadata and drops blob/large/chunk metadata no longer referenced by remaining
 snapshots.
+
+Use `--drop-missing-remote-history` when `mj health --deep --history` reports
+missing remote objects for old history, while current health remains protected.
+The option scans retained, unprotected history snapshots against the remote
+payload index and adds snapshots with missing remote objects to the prune
+candidate set. The current snapshot and snapshots protected by refs or branches
+remain protected.
 
 Pack normal blob objects:
 

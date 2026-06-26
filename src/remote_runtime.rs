@@ -1,8 +1,7 @@
 use crate::majutsu_store::{
-    LEGACY_METADATA_EXPORT_KEY, REMOTE_HOST_INDEX_KEY, RemoteGcMark as GcMarkExport,
-    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostSummary,
-    host_current_ref_key, host_last_synced_ref_key, host_metadata_key, remote_gc_mark_key,
-    remote_gc_tombstone_prefix, select_remote_host,
+    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex,
+    RemoteHostSummary, host_current_ref_key, host_last_synced_ref_key, host_metadata_key,
+    host_remote_key, remote_gc_mark_key, remote_gc_tombstone_prefix, select_remote_host,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -10,9 +9,12 @@ use chrono::Utc;
 use crate::cli::RemoteCommand;
 use crate::config::{MetadataExport, Paths, read_config};
 use crate::fsck_runtime::{RemoteFsckOptions, remote_fsck_with_options};
-use crate::majutsu_core::SnapshotManifest;
+use crate::majutsu_core::{
+    LargeManifest, SnapshotExport, SnapshotManifest, TreeManifest, TreeNodeManifest,
+    payload_blob_ref, payload_large_ref,
+};
 use crate::majutsu_store::canonical_remote_alias;
-use crate::object_paths::local_object_keys;
+use crate::object_paths::{canonical_alias_for_legacy_key, local_object_keys};
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy, remote_config_diagnostics};
 use crate::snapshot_state::current_snapshot;
@@ -21,7 +23,8 @@ use crate::util::{
     zstd_decode_all_limited,
 };
 use crate::{
-    decode_object, ensure_ready, export_metadata, open_db, remote_object_available, remote_ref,
+    decode_object, ensure_ready, export_metadata, open_db, read_object,
+    remote_object_available_for_paths, remote_ref,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -51,15 +54,15 @@ struct RemoteRootAck {
 }
 
 fn remote_head_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/head.cbor.zst.enc")
+    format!("{host_id}/head.cbor.zst.enc")
 }
 
 fn read_remote_head(
     paths: &Paths,
     remote: &RemoteStore,
-    host_id: &str,
+    host_prefix: &str,
 ) -> Result<Option<RemoteHeadExport>> {
-    let Some(bytes) = remote.get_optional(&remote_head_key(host_id))? else {
+    let Some(bytes) = remote.get_optional(&remote_head_key(host_prefix))? else {
         return Ok(None);
     };
     let decoded = decode_object(paths, &bytes)?;
@@ -88,40 +91,35 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
     match command {
         RemoteCommand::Init { force } => {
             let existing_objects = remote.list("")?;
-            let has_host_index = remote.exists(REMOTE_HOST_INDEX_KEY)?;
-            if !force && has_host_index {
-                bail!("remote is already initialized: {REMOTE_HOST_INDEX_KEY}");
-            }
-            if !force && !existing_objects.is_empty() && !has_host_index {
+            if !force && !existing_objects.is_empty() {
                 bail!(
-                    "remote is not empty and has no majutsu host index; rerun with --force only if this prefix is dedicated to majutsu"
+                    "remote root is not empty; rerun with --force only if this path is dedicated to majutsu"
                 );
             }
-            let index = RemoteHostIndex::empty(Utc::now());
-            remote.put(REMOTE_HOST_INDEX_KEY, &serde_json::to_vec_pretty(&index)?)?;
             println!("remote {}", remote.describe());
-            println!("initialized {REMOTE_HOST_INDEX_KEY}");
+            println!("initialized remote root");
             println!("hosts 0");
         }
         RemoteCommand::Check => {
             let keys = remote.list("")?;
             println!("remote {}", remote.describe());
             println!("objects {}", keys.len());
-            let metadata_key = if remote.exists(REMOTE_HOST_INDEX_KEY)? {
-                REMOTE_HOST_INDEX_KEY
-            } else if remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-                LEGACY_METADATA_EXPORT_KEY
-            } else {
-                bail!(
-                    "remote metadata is missing: metadata/export.json and hosts/index.json not found"
-                );
+            let index = read_remote_host_index(&remote)?;
+            println!("hosts {}", index.hosts.len());
+            let Some(host) = index
+                .hosts
+                .iter()
+                .find(|host| host.id == config.host.id)
+                .or_else(|| index.hosts.first())
+            else {
+                bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
             };
-            if remote.exists(metadata_key)? {
-                println!("metadata ok");
-                println!("metadata_key {metadata_key}");
-                let first = remote.get_range(metadata_key, 0, 1)?;
-                println!("range_get {}", first.len());
-            }
+            println!("metadata ok");
+            println!("host_id {}", host.id);
+            println!("host_name {}", host.name);
+            println!("metadata_key {}", host.metadata_key);
+            let first = remote.get_range(&host.metadata_key, 0, 1)?;
+            println!("range_get {}", first.len());
         }
         RemoteCommand::Fsck {
             objects,
@@ -173,6 +171,7 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         }
         RemoteCommand::Repair {
             dry_run,
+            canonical_aliases_only,
             parallelism,
             sample,
             timeout_secs,
@@ -186,6 +185,7 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                     timeout: timeout_secs.map(Duration::from_secs),
                 },
                 dry_run,
+                canonical_aliases_only,
             )?;
             let conn = open_db(paths)?;
             let current = current_snapshot(&conn)?;
@@ -200,6 +200,9 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                     "re-uploaded missing remote objects"
                 }),
             )?;
+        }
+        RemoteCommand::Explain { key } => {
+            remote_explain_object(paths, &key)?;
         }
         RemoteCommand::Capabilities => {
             let capabilities = remote.capabilities();
@@ -216,7 +219,7 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             println!("conditional_put {}", capabilities.conditional_put);
         }
         RemoteCommand::Hosts => {
-            let index = remote_host_index_with_legacy(&remote)?;
+            let index = read_remote_host_index(&remote)?;
             println!("remote {}", remote.describe());
             println!("hosts {}", index.hosts.len());
             for host in index.hosts {
@@ -235,7 +238,7 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             snapshots,
             operations,
         } => {
-            let index = remote_host_index_with_legacy(&remote)?;
+            let index = read_remote_host_index(&remote)?;
             let host = select_remote_host(index.hosts, &id)?;
             let metadata_bytes = remote.get(&host.metadata_key)?;
             let export: MetadataExport = serde_json::from_slice(&decode_remote_metadata_bytes(
@@ -285,25 +288,25 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     let start = std::time::Instant::now();
     let mut missing = 0usize;
     let mut checked_metadata = 0usize;
-    let index = remote_host_index_with_legacy(remote)?;
+    let index = read_remote_host_index(remote)?;
     if index.hosts.is_empty() {
-        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
     }
     for issue in index.duplicate_issues() {
         missing += 1;
-        eprintln!("remote host index issue: {issue:?}");
+        eprintln!("remote host metadata issue: {issue:?}");
     }
     for host in &index.hosts {
         checked_metadata += 1;
-        let expected_metadata_key = host_metadata_key(&host.id);
+        let host_prefix = remote_host_prefix(host);
+        let expected_metadata_key = host_metadata_key(&host_prefix);
         let expected_compressed_metadata_key = compressed_metadata_key(&expected_metadata_key);
         if host.metadata_key != expected_metadata_key
             && host.metadata_key != expected_compressed_metadata_key
-            && host.metadata_key != LEGACY_METADATA_EXPORT_KEY
         {
             missing += 1;
             eprintln!(
-                "host index metadata_key {} does not match canonical key {}",
+                "remote host metadata_key {} does not match canonical key {}",
                 host.metadata_key, expected_metadata_key
             );
         }
@@ -367,24 +370,25 @@ fn validate_quick_host_metadata(
     if export.config.host.id != host.id {
         *missing += 1;
         eprintln!(
-            "host index id {} does not match metadata host id {}",
+            "remote host id {} does not match metadata host id {}",
             host.id, export.config.host.id
         );
     }
     if export.config.host.name != host.name {
         *missing += 1;
         eprintln!(
-            "host index name {} does not match metadata host name {}",
+            "remote host name {} does not match metadata host name {}",
             host.name, export.config.host.name
         );
     }
-    let head = read_remote_head(paths, remote, &host.id)?;
+    let host_prefix = remote_host_prefix(host);
+    let head = read_remote_head(paths, remote, &host_prefix)?;
     let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
     let current = export.refs.get("current");
     if host.current_snapshot.as_ref() != current && !compact_head_authoritative {
         *missing += 1;
         eprintln!(
-            "host index current snapshot does not match metadata for {}",
+            "remote host current snapshot does not match metadata for {}",
             host.id
         );
     }
@@ -393,7 +397,7 @@ fn validate_quick_host_metadata(
             *missing += 1;
             eprintln!(
                 "unsupported remote head version {}",
-                remote_head_key(&host.id)
+                remote_head_key(&host_prefix)
             );
         }
         if head.host_id != host.id {
@@ -413,7 +417,7 @@ fn validate_quick_host_metadata(
         if head.metadata_key != host.metadata_key {
             *missing += 1;
             eprintln!(
-                "remote head metadata key does not match host index for {}",
+                "remote head metadata key does not match host metadata for {}",
                 host.id
             );
         }
@@ -427,7 +431,7 @@ fn validate_quick_host_metadata(
         validate_remote_head_root_acks(paths, remote, export, head, missing)?;
     }
     if let Some(current) = current {
-        let key = host_current_ref_key(&host.id);
+        let key = host_current_ref_key(&host_prefix);
         match remote_ref(remote, &key)? {
             Some(value) if value == *current => {}
             Some(value) => {
@@ -450,7 +454,7 @@ fn validate_quick_host_metadata(
             Ok(value) => {
                 *missing += 1;
                 eprintln!(
-                    "host index last_synced_at {} does not match metadata last-synced {} for {}",
+                    "remote host last_synced_at {} does not match metadata last-synced {} for {}",
                     host.last_synced_at.to_rfc3339(),
                     value.to_rfc3339(),
                     host.id
@@ -461,7 +465,7 @@ fn validate_quick_host_metadata(
                 eprintln!("invalid metadata last-synced for {}: {err}", host.id);
             }
         }
-        let key = host_last_synced_ref_key(&host.id);
+        let key = host_last_synced_ref_key(&host_prefix);
         if let Some(head) = head.as_ref()
             && head.last_synced.as_ref() != Some(last_synced)
         {
@@ -487,7 +491,14 @@ fn validate_quick_host_metadata(
             }
         }
     }
-    validate_quick_gc_records(remote, &host.id, current, head.as_ref(), missing)
+    validate_quick_gc_records(remote, &host_prefix, current, head.as_ref(), missing)
+}
+
+fn remote_host_prefix(host: &RemoteHostSummary) -> String {
+    host.metadata_key
+        .split_once('/')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| host.name.clone())
 }
 
 fn validate_remote_head_root_acks(
@@ -670,7 +681,7 @@ fn remote_fsck_objects(
     options: RemoteObjectScanOptions,
 ) -> Result<()> {
     let keys = referenced_local_object_keys(paths)?;
-    let scan = scan_remote_object_availability(remote, keys, options)?;
+    let scan = scan_remote_object_availability(paths, remote, keys, options)?;
     for key in &scan.missing {
         eprintln!("missing remote object {key}");
     }
@@ -707,12 +718,13 @@ fn referenced_local_object_keys(paths: &Paths) -> Result<Vec<String>> {
 }
 
 fn scan_remote_object_availability(
+    paths: &Paths,
     remote: &RemoteStore,
     mut keys: Vec<String>,
     options: RemoteObjectScanOptions,
 ) -> Result<RemoteObjectScan> {
-    if !remote.exists(REMOTE_HOST_INDEX_KEY)? && !remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    if read_remote_host_index(remote)?.hosts.is_empty() {
+        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
     }
     if let Some(sample) = options.sample {
         keys.truncate(sample);
@@ -737,7 +749,7 @@ fn scan_remote_object_availability(
                         timed_out = true;
                         break;
                     }
-                    match remote_object_available(remote, key) {
+                    match remote_object_available_for_paths(paths, remote, key) {
                         Ok(true) => {}
                         Ok(false) => missing.push(key.clone()),
                         Err(err) => {
@@ -821,8 +833,13 @@ fn remote_repair(
     remote: &RemoteStore,
     options: RemoteObjectScanOptions,
     dry_run: bool,
+    canonical_aliases_only: bool,
 ) -> Result<()> {
-    let summary = remote_repair_summary(paths, remote, options, dry_run, true)?;
+    let summary = if canonical_aliases_only {
+        remote_repair_canonical_aliases(paths, remote, dry_run, true)?
+    } else {
+        remote_repair_summary(paths, remote, options, dry_run, true)?
+    };
     if summary.missing_local > 0 {
         bail!(
             "remote repair could not repair {} object(s) because local copies are missing",
@@ -856,8 +873,10 @@ fn remote_repair_summary(
     let mut repaired = 0usize;
     let mut missing_local = 0usize;
     let mut still_missing = BTreeSet::new();
+    let host_id = read_config(paths)?.host.id;
     for key in &scan.missing {
-        let Some((source, remote_key)) = repair_source_and_remote_key(paths, remote, key) else {
+        let Some((source, remote_key)) = repair_source_and_remote_key(paths, remote, &host_id, key)
+        else {
             missing_local += 1;
             still_missing.insert(key.clone());
             eprintln!("cannot repair {key}: local object is missing");
@@ -931,6 +950,145 @@ fn remote_repair_summary(
     })
 }
 
+fn remote_repair_canonical_aliases(
+    paths: &Paths,
+    remote: &RemoteStore,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<RepairSummary> {
+    if read_remote_host_index(remote)?.hosts.is_empty() {
+        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
+    }
+
+    let mut skipped_local_missing = 0usize;
+    let alias_candidates = referenced_local_object_keys(paths)?
+        .into_iter()
+        .filter_map(|key| canonical_alias_for_legacy_key(&key).map(|alias| (key, alias)))
+        .filter(|(key, _)| {
+            let exists = paths.home.join(key).exists();
+            if !exists {
+                skipped_local_missing += 1;
+            }
+            exists
+        })
+        .collect::<Vec<_>>();
+    let host_id = read_config(paths)?.host.id;
+    let remote_keys =
+        list_remote_alias_candidate_keys(remote, &host_id, &alias_candidates, verbose)
+            .context("list remote keys for canonical alias repair")?;
+    let mut checked = 0usize;
+    let mut missing = 0usize;
+    let mut repaired = 0usize;
+    let missing_local = 0usize;
+
+    for (key, alias) in alias_candidates {
+        checked += 1;
+        let remote_alias = if matches!(remote, RemoteStore::S3(_)) {
+            host_remote_key(&host_id, &alias)
+        } else {
+            alias.clone()
+        };
+        if remote_keys.contains(&remote_alias) {
+            continue;
+        }
+        missing += 1;
+        let source = paths.home.join(&key);
+        if dry_run {
+            if verbose {
+                println!("repair_candidate {key} -> {remote_alias}");
+            }
+            continue;
+        }
+        if remote.put_file_if_absent(&remote_alias, &source)? {
+            repaired += 1;
+            if verbose {
+                println!("repaired {key} -> {remote_alias}");
+            }
+        } else if verbose {
+            println!("already_present {key} -> {remote_alias}");
+        }
+    }
+
+    if verbose {
+        println!("remote repair complete");
+        println!("mode canonical_aliases");
+        println!("checked_objects {checked}");
+        println!("total_objects {checked}");
+        println!("missing_objects {missing}");
+        println!("repaired_objects {repaired}");
+        println!("missing_local_objects {missing_local}");
+        println!("skipped_local_missing_objects {skipped_local_missing}");
+        println!("dry_run {dry_run}");
+    }
+
+    Ok(RepairSummary {
+        checked,
+        total: checked,
+        missing,
+        repaired,
+        missing_local,
+    })
+}
+
+fn list_remote_alias_candidate_keys(
+    remote: &RemoteStore,
+    host_id: &str,
+    alias_candidates: &[(String, String)],
+    verbose: bool,
+) -> Result<BTreeSet<String>> {
+    let prefixes = alias_candidates
+        .iter()
+        .filter_map(|(_, alias)| canonical_alias_listing_prefix(alias))
+        .collect::<BTreeSet<_>>();
+    let mut keys = BTreeSet::new();
+    if verbose {
+        eprintln!(
+            "canonical alias repair: listing {} remote prefix(es) for {} alias candidate(s)",
+            prefixes.len(),
+            alias_candidates.len()
+        );
+    }
+    for prefix in prefixes {
+        let started = Instant::now();
+        let list_prefix = if matches!(remote, RemoteStore::S3(_)) {
+            host_remote_key(host_id, &prefix)
+        } else {
+            prefix.clone()
+        };
+        let listed = remote
+            .list(&list_prefix)
+            .with_context(|| format!("list remote prefix {list_prefix}"))?;
+        let listed_len = listed.len();
+        keys.extend(listed);
+        if verbose {
+            eprintln!(
+                "canonical alias repair: listed prefix {prefix} objects={} elapsed_secs={}",
+                listed_len,
+                started.elapsed().as_secs()
+            );
+        }
+    }
+    Ok(keys)
+}
+
+fn canonical_alias_listing_prefix(alias: &str) -> Option<String> {
+    for prefix in [
+        "trees/",
+        "blobs/loose/",
+        "packs/small/",
+        "packs/normal/",
+        "indexes/pack-index/",
+        "large/manifests/",
+        "large/chunks/fixed-8m/",
+        "large/chunks/fastcdc/",
+    ] {
+        if alias.starts_with(prefix) {
+            return Some(prefix.to_string());
+        }
+    }
+    None
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct RepairSession {
     version: u32,
@@ -947,8 +1105,8 @@ fn scan_remote_object_availability_for_repair(
     keys: Vec<String>,
     options: RemoteObjectScanOptions,
 ) -> Result<RemoteObjectScan> {
-    if !remote.exists(REMOTE_HOST_INDEX_KEY)? && !remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
+    if read_remote_host_index(remote)?.hosts.is_empty() {
+        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
     }
     let total = keys.len();
     let start = Instant::now();
@@ -988,7 +1146,7 @@ fn scan_remote_object_availability_for_repair(
             for key in batch {
                 let tx = tx.clone();
                 scope.spawn(move || {
-                    let result = remote_object_available(remote, key)
+                    let result = crate::remote_object_available_for_paths(paths, remote, key)
                         .with_context(|| format!("check remote object {key}"));
                     let _ = tx.send((key.clone(), result));
                 });
@@ -1067,6 +1225,7 @@ fn repair_key_fingerprint(
 fn repair_source_and_remote_key(
     paths: &Paths,
     remote: &RemoteStore,
+    host_id: &str,
     key: &str,
 ) -> Option<(PathBuf, String)> {
     let source = paths.home.join(key);
@@ -1074,36 +1233,283 @@ fn repair_source_and_remote_key(
         return None;
     }
     let remote_key = if matches!(remote, RemoteStore::S3(_)) {
-        canonical_remote_alias(key).unwrap_or_else(|| key.to_string())
+        host_remote_key(
+            host_id,
+            &canonical_remote_alias(key).unwrap_or_else(|| key.to_string()),
+        )
     } else {
         key.to_string()
     };
     Some((source, remote_key))
 }
 
-pub(crate) fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
-    if let Some(bytes) = remote.get_optional(REMOTE_HOST_INDEX_KEY)? {
-        let mut index: RemoteHostIndex = serde_json::from_slice(&bytes)?;
-        index.sort_hosts();
-        return Ok(index);
+fn remote_explain_object(paths: &Paths, key: &str) -> Result<()> {
+    let conn = open_db(paths)?;
+    let config = read_config(paths)?;
+    let export = export_metadata(paths, &conn, &config)?;
+    let mut hits = Vec::<String>::new();
+    let local_path = paths.home.join(key);
+    println!("object {key}");
+    println!("local_present {}", local_path.exists());
+
+    let mut skipped = 0usize;
+    for snapshot in &export.snapshots {
+        if snapshot.manifest_key == key {
+            hits.push(format!("snapshot {} manifest", snapshot.id));
+        }
+        match snapshot_manifest_for_explain(paths, snapshot) {
+            Ok(manifest) => explain_snapshot_manifest(paths, &manifest, key, &mut hits),
+            Err(err) => {
+                skipped += 1;
+                eprintln!("warning: skipped snapshot {}: {err:#}", snapshot.id);
+            }
+        }
     }
-    Ok(RemoteHostIndex::empty(Utc::now()))
+    for large in &export.large_objects {
+        if large.manifest_key == key {
+            hits.push(format!(
+                "large_object oid={} manifest {}",
+                large.oid, large.manifest_key
+            ));
+        }
+        if let Ok(manifest) = read_large_manifest_for_explain(paths, &large.manifest_key) {
+            for chunk in manifest.chunks {
+                if chunk.object_key == key {
+                    hits.push(format!(
+                        "large_object oid={} chunk offset={} size={}",
+                        large.oid, chunk.offset, chunk.len
+                    ));
+                }
+            }
+        }
+    }
+    for blob in &export.blobs {
+        if blob.object_key == key {
+            hits.push(format!(
+                "blob oid={} size={} pack={}",
+                blob.oid,
+                blob.size,
+                blob.pack_id.as_deref().unwrap_or("(none)")
+            ));
+        }
+    }
+    for pack in &export.packs {
+        if pack.pack_key == key {
+            hits.push(format!("pack {} object", pack.pack_id));
+        }
+        if pack.index_key == key {
+            hits.push(format!("pack {} index", pack.pack_id));
+        }
+    }
+
+    println!("references {}", hits.len());
+    println!("skipped_snapshots {skipped}");
+    for hit in hits {
+        println!("ref {hit}");
+    }
+    Ok(())
 }
 
-pub(crate) fn remote_host_index_with_legacy(remote: &RemoteStore) -> Result<RemoteHostIndex> {
-    let mut index = read_remote_host_index(remote)?;
-    if index.hosts.is_empty()
-        && let Some(bytes) = remote.get_optional(LEGACY_METADATA_EXPORT_KEY)?
+fn snapshot_manifest_for_explain(
+    paths: &Paths,
+    snapshot: &SnapshotExport,
+) -> Result<SnapshotManifest> {
+    if !snapshot.manifest_json.trim().is_empty() {
+        return serde_json::from_str(&snapshot.manifest_json)
+            .with_context(|| format!("parse snapshot manifest {}", snapshot.id));
+    }
+    let bytes = read_object(paths, &snapshot.manifest_key)
+        .with_context(|| format!("read snapshot manifest {}", snapshot.manifest_key))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse snapshot manifest {}", snapshot.manifest_key))
+}
+
+fn explain_snapshot_manifest(
+    paths: &Paths,
+    manifest: &SnapshotManifest,
+    key: &str,
+    hits: &mut Vec<String>,
+) {
+    for (root_id, root_tree) in &manifest.root_trees {
+        if root_tree.tree_key == key {
+            hits.push(format!(
+                "snapshot {} root {root_id} root_tree tree_id={} files={}",
+                manifest.snapshot_id, root_tree.tree_id, root_tree.file_count
+            ));
+        }
+        if let Ok(tree) = read_tree_manifest_for_explain(paths, &root_tree.tree_key) {
+            explain_tree_manifest(paths, &manifest.snapshot_id, root_id, &tree, key, hits);
+        }
+    }
+}
+
+fn explain_tree_manifest(
+    paths: &Paths,
+    snapshot_id: &str,
+    root_id: &str,
+    tree: &TreeManifest,
+    key: &str,
+    hits: &mut Vec<String>,
+) {
+    if tree
+        .root_node
+        .as_ref()
+        .is_some_and(|node| node.node_key == key)
     {
-        let export: MetadataExport = serde_json::from_slice(&bytes)?;
+        hits.push(format!(
+            "snapshot {snapshot_id} root {root_id} tree {} root_node",
+            tree.tree_id
+        ));
+    }
+    for (name, node) in &tree.subtree_nodes {
+        if node.node_key == key {
+            hits.push(format!(
+                "snapshot {snapshot_id} root {root_id} tree {} subtree {name}",
+                tree.tree_id
+            ));
+        }
+    }
+    for record in tree.entries.values() {
+        explain_file_record(snapshot_id, root_id, &record.path, record, key, hits);
+    }
+    if let Some(root_node) = &tree.root_node {
+        explain_tree_node(
+            paths,
+            snapshot_id,
+            root_id,
+            "",
+            &root_node.node_key,
+            key,
+            hits,
+        );
+    }
+    for (name, node) in &tree.subtree_nodes {
+        explain_tree_node(paths, snapshot_id, root_id, name, &node.node_key, key, hits);
+    }
+}
+
+fn explain_tree_node(
+    paths: &Paths,
+    snapshot_id: &str,
+    root_id: &str,
+    prefix: &str,
+    node_key: &str,
+    key: &str,
+    hits: &mut Vec<String>,
+) {
+    let Ok(node) = read_tree_node_for_explain(paths, node_key) else {
+        return;
+    };
+    for (name, child) in &node.child_nodes {
+        let child_path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if child.node_key == key {
+            hits.push(format!(
+                "snapshot {snapshot_id} root {root_id} node {node_key} child {child_path}"
+            ));
+        }
+        explain_tree_node(
+            paths,
+            snapshot_id,
+            root_id,
+            &child_path,
+            &child.node_key,
+            key,
+            hits,
+        );
+    }
+    for record in node.entries.values() {
+        explain_file_record(snapshot_id, root_id, &record.path, record, key, hits);
+    }
+}
+
+fn explain_file_record(
+    snapshot_id: &str,
+    root_id: &str,
+    path: &str,
+    record: &crate::majutsu_core::FileRecord,
+    key: &str,
+    hits: &mut Vec<String>,
+) {
+    if let Some((oid, object_key)) = payload_blob_ref(&record.payload)
+        && object_key == key
+    {
+        hits.push(format!(
+            "snapshot {snapshot_id} root {root_id} file {path} blob {oid}"
+        ));
+    }
+    if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload)
+        && manifest_key == key
+    {
+        hits.push(format!(
+            "snapshot {snapshot_id} root {root_id} file {path} large_manifest {oid}"
+        ));
+    }
+}
+
+fn read_tree_manifest_for_explain(paths: &Paths, key: &str) -> Result<TreeManifest> {
+    let bytes = read_object(paths, key).with_context(|| format!("read tree manifest {key}"))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse tree manifest {key}"))
+}
+
+fn read_tree_node_for_explain(paths: &Paths, key: &str) -> Result<TreeNodeManifest> {
+    let bytes = read_object(paths, key).with_context(|| format!("read tree node {key}"))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse tree node {key}"))
+}
+
+fn read_large_manifest_for_explain(paths: &Paths, key: &str) -> Result<LargeManifest> {
+    let bytes = read_object(paths, key).with_context(|| format!("read large manifest {key}"))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse large manifest {key}"))
+}
+
+pub(crate) fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
+    let mut index = RemoteHostIndex::empty(Utc::now());
+    let keys = remote.list("")?;
+    let mut host_ids = BTreeSet::new();
+    for key in keys {
+        let Some((host_id, rest)) = key.split_once('/') else {
+            continue;
+        };
+        if rest == "metadata/export.json.zst" || rest == "metadata/export.json" {
+            host_ids.insert(host_id.to_string());
+        }
+    }
+    for host_id in host_ids {
+        let compressed_key = format!("{host_id}/metadata/export.json.zst");
+        let plain_key = format!("{host_id}/metadata/export.json");
+        let Some((metadata_key, bytes)) = remote
+            .get_optional(&compressed_key)?
+            .map(|bytes| (compressed_key.clone(), bytes))
+            .or_else(|| {
+                remote
+                    .get_optional(&plain_key)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| (plain_key.clone(), bytes))
+            })
+        else {
+            continue;
+        };
+        let metadata_bytes = decode_remote_metadata_bytes(&metadata_key, &bytes)?;
+        let export: MetadataExport = serde_json::from_slice(&metadata_bytes)
+            .with_context(|| format!("parse remote host metadata {metadata_key}"))?;
+        let last_synced_at = export
+            .refs
+            .get("last-synced")
+            .and_then(|value| parse_db_time(value).ok())
+            .unwrap_or(export.exported_at);
         index.hosts.push(RemoteHostSummary {
             id: export.config.host.id.clone(),
             name: export.config.host.name.clone(),
-            last_synced_at: export.exported_at,
+            last_synced_at,
             current_snapshot: export.refs.get("current").cloned(),
-            metadata_key: LEGACY_METADATA_EXPORT_KEY.into(),
+            metadata_key,
         });
     }
+    index.sort_hosts();
     Ok(index)
 }
 

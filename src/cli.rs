@@ -29,7 +29,7 @@ Command groups:
   Service: watch, daemon
   Security: key
   Storage maintenance: large, cache, pack, prune, gc, fsck
-  Advanced/debug: event
+  Advanced/debug: version, event
 
 State home is resolved in this order: `--home`, `MAJUTSU_HOME`, XDG config, then `$HOME/.majutsu`.
 For host-level system protection, use `mj --system ...`; that reads `/etc/majutsu/config.toml` and falls back to `/var/lib/majutsu`."#;
@@ -85,6 +85,7 @@ fn localize_command(mut command: ClapCommand) -> ClapCommand {
         });
     command
         .mut_subcommand("init", |cmd| cmd.about(text.init_about))
+        .mut_subcommand("version", |cmd| cmd.about(text.version_about))
         .mut_subcommand("root", |cmd| cmd.about(text.root_about))
         .mut_subcommand("snapshot", |cmd| cmd.about(text.snapshot_about))
         .mut_subcommand("status", |cmd| cmd.about(text.status_about))
@@ -136,6 +137,9 @@ fn localize_command(mut command: ClapCommand) -> ClapCommand {
         .mut_subcommand("gc", |cmd| cmd.about(text.gc_about))
         .mut_subcommand("fsck", |cmd| cmd.about(text.fsck_about))
         .mut_subcommand("event", |cmd| cmd.about(text.event_about))
+        .mut_subcommand("db", |cmd| {
+            cmd.about("Compact or inspect the local SQLite metadata database")
+        })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,6 +191,7 @@ struct CliText {
     system_help: &'static str,
     system_long_help: &'static str,
     init_about: &'static str,
+    version_about: &'static str,
     root_about: &'static str,
     snapshot_about: &'static str,
     status_about: &'static str,
@@ -242,6 +247,7 @@ static CLI_TEXT_EN: CliText = CliText {
     system_help: "Use the system majutsu instance",
     system_long_help: "Use the system majutsu instance intended for root-owned host configuration such as /etc and systemd units. If --home is not also provided, majutsu checks /etc/majutsu/config.toml and then falls back to /var/lib/majutsu.",
     init_about: "Initialize the majutsu state directory",
+    version_about: "Show build identity and supported feature capabilities",
     root_about: "Add, update, list, or pause snapshot roots",
     snapshot_about: "Create a commit-like checkpoint of configured roots",
     status_about: "Show roots, current snapshot, queues, and daemon state",
@@ -317,7 +323,7 @@ remote復旧フロー:
   Service: watch, daemon
   Security: key
   Storage maintenance: large, cache, pack, prune, gc, fsck
-  Advanced/debug: event
+  Advanced/debug: version, event
 
 状態ディレクトリは `--home`、`MAJUTSU_HOME`、XDG config、`$HOME/.majutsu` の順に解決されます。
 ホスト単位のsystem保護には `mj --system ...` を使います。これは `/etc/majutsu/config.toml` を読み、なければ `/var/lib/majutsu` にフォールバックします。"#,
@@ -327,6 +333,7 @@ remote復旧フロー:
     system_help: "system用のmajutsuインスタンスを使います",
     system_long_help: "/etc や systemd unit などroot所有のホスト設定を保護するためのsystem用majutsuインスタンスを使います。--homeを同時指定しない場合は /etc/majutsu/config.toml を確認し、その後 /var/lib/majutsu にフォールバックします。",
     init_about: "majutsu状態ディレクトリを初期化します",
+    version_about: "build同一性と対応機能を表示します",
     root_about: "snapshot rootの追加、更新、一覧表示、一時停止を行います",
     snapshot_about: "設定済みrootのcommit相当のcheckpointを作成します",
     status_about: "root、current snapshot、queue、daemon状態を表示します",
@@ -402,7 +409,7 @@ remote 恢复流程:
   Service: watch, daemon
   Security: key
   Storage maintenance: large, cache, pack, prune, gc, fsck
-  Advanced/debug: event
+  Advanced/debug: version, event
 
 状态目录按 `--home`、`MAJUTSU_HOME`、XDG config、`$HOME/.majutsu` 的顺序解析。
 主机级系统保护请使用 `mj --system ...`；它会读取 `/etc/majutsu/config.toml`，然后回退到 `/var/lib/majutsu`。"#,
@@ -412,6 +419,7 @@ remote 恢复流程:
     system_help: "使用系统级 majutsu 实例",
     system_long_help: "使用面向 /etc 和 systemd unit 等 root 拥有的主机配置的系统级 majutsu 实例。若未同时指定 --home，则先检查 /etc/majutsu/config.toml，再回退到 /var/lib/majutsu。",
     init_about: "初始化 majutsu 状态目录",
+    version_about: "显示构建标识和支持的功能",
     root_about: "添加、更新、列出或暂停 snapshot root",
     snapshot_about: "为已配置 root 创建类似 commit 的检查点",
     status_about: "显示 root、current snapshot、queue 和 daemon 状态",
@@ -487,7 +495,7 @@ Grupos de comandos:
   Service: watch, daemon
   Security: key
   Storage maintenance: large, cache, pack, prune, gc, fsck
-  Advanced/debug: event
+  Advanced/debug: version, event
 
 El directorio de estado se resuelve en este orden: `--home`, `MAJUTSU_HOME`, XDG config y `$HOME/.majutsu`.
 Para protección de sistema a nivel de host, usa `mj --system ...`; lee `/etc/majutsu/config.toml` y luego usa `/var/lib/majutsu`."#,
@@ -497,6 +505,7 @@ Para protección de sistema a nivel de host, usa `mj --system ...`; lee `/etc/ma
     system_help: "Usa la instancia de majutsu del sistema",
     system_long_help: "Usa la instancia de majutsu del sistema para configuración del host propiedad de root, como /etc y unidades systemd. Si no se indica --home, revisa /etc/majutsu/config.toml y luego usa /var/lib/majutsu.",
     init_about: "Inicializa el directorio de estado de majutsu",
+    version_about: "Muestra la identidad de build y las capacidades soportadas",
     root_about: "Agrega, actualiza, lista o pausa snapshot roots",
     snapshot_about: "Crea un checkpoint tipo commit de los roots configurados",
     status_about: "Muestra roots, current snapshot, queues y estado del daemon",
@@ -572,7 +581,7 @@ Groupes de commandes:
   Service: watch, daemon
   Security: key
   Storage maintenance: large, cache, pack, prune, gc, fsck
-  Advanced/debug: event
+  Advanced/debug: version, event
 
 Le répertoire d'état est résolu dans l'ordre suivant: `--home`, `MAJUTSU_HOME`, config XDG puis `$HOME/.majutsu`.
 Pour la protection système au niveau hôte, utilisez `mj --system ...`; cela lit `/etc/majutsu/config.toml` puis utilise `/var/lib/majutsu`."#,
@@ -582,6 +591,7 @@ Pour la protection système au niveau hôte, utilisez `mj --system ...`; cela li
     system_help: "Utilise l'instance majutsu système",
     system_long_help: "Utilise l'instance majutsu système destinée à la configuration hôte appartenant à root, comme /etc et les unités systemd. Si --home n'est pas fourni, majutsu vérifie /etc/majutsu/config.toml puis utilise /var/lib/majutsu.",
     init_about: "Initialise le répertoire d'état majutsu",
+    version_about: "Affiche l'identité du build et les capacités prises en charge",
     root_about: "Ajoute, met à jour, liste ou met en pause les snapshot roots",
     snapshot_about: "Crée un checkpoint de type commit des roots configurés",
     status_about: "Affiche roots, current snapshot, queues et état du daemon",
@@ -632,6 +642,8 @@ Pour la protection système au niveau hôte, utilisez `mj --system ...`; cela li
 pub(crate) enum Command {
     #[command(about = "Initialize the majutsu state directory")]
     Init(InitArgs),
+    #[command(about = "Show build identity, target, and supported feature capabilities")]
+    Version(VersionArgs),
     #[command(about = "Add, update, list, or pause snapshot roots")]
     Root {
         #[command(subcommand)]
@@ -727,6 +739,17 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: EventCommand,
     },
+    #[command(about = "Compact or inspect the local SQLite metadata database")]
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
+}
+
+#[derive(Args)]
+pub(crate) struct VersionArgs {
+    #[arg(long, default_value_t = false, help = "Print machine-readable JSON")]
+    pub(crate) json: bool,
 }
 
 #[derive(Args)]
@@ -959,7 +982,7 @@ pub(crate) struct StatusArgs {
     pub(crate) pager: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub(crate) struct HealthArgs {
     #[arg(
         long,
@@ -974,6 +997,33 @@ pub(crate) struct HealthArgs {
         help = "Include per-root health details in text output"
     )]
     pub(crate) verbose: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Check referenced remote objects and report missing payloads"
+    )]
+    pub(crate) deep: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "deep",
+        help = "Limit --deep object availability checks to the first N local objects"
+    )]
+    pub(crate) sample: Option<usize>,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "deep",
+        help = "Stop --deep object availability checks after this many seconds"
+    )]
+    pub(crate) timeout_secs: Option<u64>,
+    #[arg(
+        long,
+        requires = "deep",
+        default_value_t = false,
+        help = "With --deep, include all retained history instead of only the current snapshot"
+    )]
+    pub(crate) history: bool,
 }
 
 #[derive(Args)]
@@ -1519,6 +1569,19 @@ pub(crate) enum EventCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum DbCommand {
+    #[command(about = "Checkpoint the SQLite WAL and optionally VACUUM the database")]
+    Compact {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Run VACUUM after checkpointing the WAL"
+        )]
+        vacuum: bool,
+    },
+}
+
 #[derive(Args)]
 pub(crate) struct CachePruneArgs {
     #[arg(
@@ -1604,12 +1667,12 @@ pub(crate) struct LargeUnpinArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum RemoteCommand {
-    #[command(about = "Initialize an empty remote with majutsu host index metadata")]
+    #[command(about = "Validate an empty remote root for majutsu host directories")]
     Init {
         #[arg(
             long,
             default_value_t = false,
-            help = "Overwrite an existing empty or host index object"
+            help = "Accept an existing non-empty remote root"
         )]
         force: bool,
     },
@@ -1665,6 +1728,12 @@ pub(crate) enum RemoteCommand {
         dry_run: bool,
         #[arg(
             long,
+            default_value_t = false,
+            help = "Only repair missing canonical S3 object aliases from local objects"
+        )]
+        canonical_aliases_only: bool,
+        #[arg(
+            long,
             default_value_t = 16,
             value_name = "N",
             help = "Parallel remote probes before repair"
@@ -1682,6 +1751,11 @@ pub(crate) enum RemoteCommand {
             help = "Stop scanning after this many seconds and repair only discovered missing objects"
         )]
         timeout_secs: Option<u64>,
+    },
+    #[command(about = "Explain where a referenced object key is used locally")]
+    Explain {
+        #[arg(help = "Object key such as objects/trees/... or blobs/loose/...")]
+        key: String,
     },
     #[command(about = "Show the remote backend capability matrix")]
     Capabilities,
@@ -1984,6 +2058,12 @@ pub(crate) struct PruneArgs {
         help = "After deleting snapshots, sync metadata and prune remote objects that became unreachable"
     )]
     pub(crate) remote_cleanup: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Also delete unprotected history snapshots whose referenced remote objects are already missing"
+    )]
+    pub(crate) drop_missing_remote_history: bool,
 }
 
 #[derive(Args)]

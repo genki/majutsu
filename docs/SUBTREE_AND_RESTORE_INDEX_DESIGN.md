@@ -112,7 +112,7 @@ restore / diff / fsck は次のように node traversal を直接使う。
 path 指定 restore 向けに、任意の restore index を書く案がある。
 
 ```text
-hosts/<host>/restore-index/<snapshot>.cbor.zst.enc
+<host>/restore-index/<snapshot>.cbor.zst.enc
 ```
 
 これは `root/path-prefix -> required manifest/chunk keys` の mapping を持つ。`mj restore --root X --path Y` の小 object GET fanout を減らせる可能性がある。

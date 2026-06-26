@@ -19,8 +19,12 @@ pub enum StorageTier {
 }
 
 pub fn is_hot_metadata_prefix(prefix: &str) -> bool {
-    prefix.starts_with("hosts/")
-        || prefix.starts_with("metadata/")
+    prefix.starts_with("metadata/")
+        || prefix.contains("/metadata/")
+        || prefix.contains("/refs/")
+        || prefix.contains("/journal/")
+        || prefix.contains("/ops/")
+        || prefix.contains("/snapshots/")
         || prefix.starts_with("trees/")
         || prefix.starts_with("large/manifests/")
         || prefix.starts_with("indexes/")
@@ -94,12 +98,6 @@ pub struct PolicyRule {
 
 pub fn default_tiering_rules() -> Vec<PolicyRule> {
     vec![
-        PolicyRule {
-            name: "keep-host-metadata-hot".into(),
-            prefix: "hosts/".into(),
-            after: None,
-            storage: Some("standard".into()),
-        },
         PolicyRule {
             name: "keep-bootstrap-metadata-hot".into(),
             prefix: "metadata/".into(),
@@ -345,11 +343,7 @@ mod tests {
     fn default_rules_keep_metadata_hot_and_tier_large_payloads() {
         let rules = default_tiering_rules();
 
-        assert!(
-            rules
-                .iter()
-                .any(|rule| rule.prefix == "hosts/" && rule.after.is_none())
-        );
+        assert!(!rules.iter().any(|rule| rule.prefix == "hosts/"));
         assert!(
             rules.iter().any(|rule| rule.prefix == "large/manifests/"
                 && rule.storage.as_deref() == Some("standard"))
@@ -394,8 +388,8 @@ mod tests {
             enabled: true,
             rules: vec![
                 PolicyRule {
-                    name: "bad-hosts-to-archive".into(),
-                    prefix: "hosts/".into(),
+                    name: "bad-host-metadata-to-archive".into(),
+                    prefix: "host-a/metadata/".into(),
                     after: Some("1d".into()),
                     storage: Some("archive".into()),
                 },

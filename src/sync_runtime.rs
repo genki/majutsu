@@ -4,15 +4,14 @@ use crate::majutsu_core::{
 };
 use crate::majutsu_pack::PackIndex;
 use crate::majutsu_store::{
-    REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY, RemoteChunkIndexEntry as ChunkIndexEntry,
+    REMOTE_CHUNK_INDEX_SHARD_KEY, RemoteChunkIndexEntry as ChunkIndexEntry,
     RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
-    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, RemoteHostSummary,
-    canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
-    host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
+    RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex, canonical_remote_alias,
+    canonical_remote_aliases, host_current_ref_key, host_last_synced_ref_key, host_metadata_key,
     host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
-    host_ops_prefix, host_root_ack_ref_key, host_snapshot_canonical_key, host_snapshot_key,
-    host_snapshots_prefix, is_content_addressed_remote_key, remote_gc_mark_key,
-    remote_gc_tombstone_key,
+    host_ops_prefix, host_remote_key, host_root_ack_ref_key, host_snapshot_canonical_key,
+    host_snapshot_key, host_snapshots_prefix, is_content_addressed_remote_key, remote_gc_mark_key,
+    remote_gc_tombstone_key, remote_host_label,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -25,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cache_runtime::{
     prune_synced_metadata_cache, prune_synced_payload_cache, remote_payload_index_contains,
-    remote_payload_key_index,
+    remote_payload_key_index_for_host,
 };
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
@@ -43,9 +42,9 @@ use crate::queue_runtime::{
     acknowledge_remote_event_journal_uploads, drain_upload_queue, enqueue_file_upload,
     enqueue_file_upload_overwrite, enqueue_inline_upload, enqueue_inline_upload_overwrite,
     enqueue_live_diff_event_journals, enqueue_remote_event_journal_uploads, event_journal_records,
-    upload_queue_stats,
+    upload_queue_contains_key, upload_queue_stats,
 };
-use crate::remote_runtime::{read_remote_host_index, repair_missing_referenced_objects};
+use crate::remote_runtime::repair_missing_referenced_objects;
 use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
 use crate::root_size_summary::{
     RootSizeSummary, build_root_size_summary, encode_root_size_summary, root_size_summary_key,
@@ -53,19 +52,15 @@ use crate::root_size_summary::{
 };
 use crate::root_state::roots;
 use crate::snapshot_state::{current_snapshot, load_snapshot_by_id};
-use crate::util::{
-    REMOTE_HEAD_DECODE_LIMIT, blake3_hex, new_id, parse_db_time, zstd_decode_all_limited,
-};
+use crate::util::{REMOTE_HEAD_DECODE_LIMIT, blake3_hex, new_id, zstd_decode_all_limited};
 use crate::{
     decode_object, encode_object, ensure_ready, export_metadata, open_db, read_object,
-    remote_object_available, remote_ref,
+    remote_object_available_for_paths, remote_ref,
 };
 
-const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v8";
-const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
-const CLONE_BOOTSTRAP_VERSION: u32 = 2;
+const REMOTE_SYNC_CACHE_VERSION: u32 = 2;
+const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v9-host-scoped";
 const REMOTE_HEAD_VERSION: u32 = 1;
-const S3_LEGACY_METADATA_PRESENT_FINGERPRINT: &str = "present-v1:s3-legacy-metadata";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteHeadExport {
@@ -94,23 +89,24 @@ struct RemoteRootAck {
 }
 
 fn remote_head_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/head.cbor.zst.enc")
+    format!("{host_id}/head.cbor.zst.enc")
 }
 
 fn build_remote_head_export(
     paths: &Paths,
     config: &Config,
+    host_label: &str,
     export: &MetadataExport,
     metadata_key: &str,
 ) -> Result<RemoteHeadExport> {
     let current_snapshot = export.refs.get("current").cloned();
     let latest_snapshot_key = current_snapshot
         .as_ref()
-        .map(|snapshot_id| host_snapshot_canonical_key(&config.host.id, snapshot_id));
+        .map(|snapshot_id| host_snapshot_canonical_key(host_label, snapshot_id));
     let latest_operation_key = export
         .operations
         .last()
-        .map(|operation| host_operation_canonical_key(&config.host.id, &operation.id));
+        .map(|operation| host_operation_canonical_key(host_label, &operation.id));
     let root_acks = build_remote_root_acks(paths, export)?;
     Ok(RemoteHeadExport {
         version: REMOTE_HEAD_VERSION,
@@ -120,8 +116,8 @@ fn build_remote_head_export(
         last_synced: export.refs.get("last-synced").cloned(),
         root_acks,
         metadata_key: metadata_key.to_string(),
-        host_index_key: REMOTE_HOST_INDEX_KEY.to_string(),
-        gc_mark_key: remote_gc_mark_key(&config.host.id),
+        host_index_key: host_metadata_key(host_label),
+        gc_mark_key: remote_gc_mark_key(host_label),
         latest_snapshot_key,
         latest_operation_key,
         updated_at: Utc::now().to_rfc3339(),
@@ -251,6 +247,7 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
                 &remote,
                 &target_current,
                 args.timeout_secs,
+                Some(pid),
             );
         }
         println!("sync already running pid {pid}");
@@ -267,6 +264,7 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
             &remote,
             &target_current,
             args.timeout_secs,
+            Some(std::process::id()),
         )?;
     }
     Ok(())
@@ -333,9 +331,15 @@ fn sync_configured_remote(
     let remote_export = metadata_export_for_remote(paths, remote, export)?;
     trace.mark("prepare remote metadata");
     let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
+    let host_label = remote_host_label(&config.host.name);
     trace.mark("state fingerprint");
-    let enqueued_remote_journal =
-        enqueue_remote_event_journal_uploads(paths, config, &config.host.id, &configured_roots)?;
+    let enqueued_remote_journal = enqueue_remote_event_journal_uploads(
+        paths,
+        config,
+        &host_label,
+        &configured_roots,
+        current_manifest.as_ref(),
+    )?;
     trace.mark("enqueue remote journal");
     let upload_stats = upload_queue_stats(paths)?;
     trace.mark("upload queue stats");
@@ -459,10 +463,10 @@ struct SyncWaitStatus {
 }
 
 impl SyncWaitStatus {
-    fn is_caught_up(&self) -> bool {
+    fn is_caught_up_ignoring_lock(&self, allowed_lock_pid: Option<u32>) -> bool {
         self.local_current == self.remote_current
             && self.queued_uploads == 0
-            && self.sync_lock_pid.is_none()
+            && (self.sync_lock_pid.is_none() || self.sync_lock_pid == allowed_lock_pid)
     }
 }
 
@@ -473,20 +477,17 @@ fn sync_wait_status(
 ) -> Result<SyncWaitStatus> {
     let local_current = current_snapshot(conn)?.unwrap_or_else(|| "(none)".into());
     let config = read_config(paths)?;
-    let (remote_current, remote_last_synced) =
-        match read_remote_head(paths, remote, &config.host.id)? {
-            Some(head) => (head.current_snapshot, head.last_synced),
-            None => {
-                let canonical_current = host_current_ref_key(&config.host.id);
-                let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
-                let mut remote_current = remote_ref(remote, &canonical_current)?;
-                if remote_current.is_none() {
-                    remote_current = remote_ref(remote, "hosts/current")?;
-                }
-                let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
-                (remote_current, remote_last_synced)
-            }
-        };
+    let host_label = remote_host_label(&config.host.name);
+    let (remote_current, remote_last_synced) = match read_remote_head(paths, remote, &host_label)? {
+        Some(head) => (head.current_snapshot, head.last_synced),
+        None => {
+            let canonical_current = host_current_ref_key(&host_label);
+            let canonical_last_synced = host_last_synced_ref_key(&host_label);
+            let remote_current = remote_ref(remote, &canonical_current)?;
+            let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
+            (remote_current, remote_last_synced)
+        }
+    };
     let upload_stats = upload_queue_stats(paths)?;
     let sync_lock_pid = process_lock_owner(&paths.sync_lock).ok().flatten();
     Ok(SyncWaitStatus {
@@ -545,6 +546,7 @@ fn wait_for_sync_catchup(
     remote: &RemoteStore,
     target_current: &str,
     timeout_secs: u64,
+    allowed_lock_pid: Option<u32>,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut target_current = target_current.to_string();
@@ -559,31 +561,41 @@ fn wait_for_sync_catchup(
             target_current = latest_current;
         }
         let status = sync_wait_status(paths, conn, remote)?;
-        if status.is_caught_up() {
-            let repair = repair_missing_referenced_objects(paths, remote)?;
-            if repair.missing > 0 || repair.repaired > 0 {
-                println!("wait_remote_repair_checked {}", repair.checked);
-                println!("wait_remote_repair_total {}", repair.total);
-                println!("wait_remote_repair_missing {}", repair.missing);
-                println!("wait_remote_repair_repaired {}", repair.repaired);
-                println!("wait_remote_repair_missing_local {}", repair.missing_local);
-            }
-            if repair.missing_local > 0 {
-                bail!(
-                    "remote is caught up but {} referenced local object(s) are unavailable for repair",
-                    repair.missing_local
-                );
+        if status.is_caught_up_ignoring_lock(allowed_lock_pid.or(Some(std::process::id()))) {
+            if sync_wait_deep_repair_enabled() {
+                let repair = repair_missing_referenced_objects(paths, remote)?;
+                if repair.missing > 0 || repair.repaired > 0 {
+                    println!("wait_remote_repair_checked {}", repair.checked);
+                    println!("wait_remote_repair_total {}", repair.total);
+                    println!("wait_remote_repair_missing {}", repair.missing);
+                    println!("wait_remote_repair_repaired {}", repair.repaired);
+                    println!("wait_remote_repair_missing_local {}", repair.missing_local);
+                }
+                if repair.missing_local > 0 {
+                    bail!(
+                        "remote is caught up but {} referenced local object(s) are unavailable for repair",
+                        repair.missing_local
+                    );
+                }
             }
             print_sync_wait_status(&status);
             println!("wait_target_current {}", target_current);
             println!("status_mode quick");
             return Ok(());
         }
-        if status.sync_lock_pid.is_none()
+        let allowed_lock_pid = allowed_lock_pid.or(Some(std::process::id()));
+        let lock_is_allowed = status
+            .sync_lock_pid
+            .zip(allowed_lock_pid)
+            .is_some_and(|(lock_pid, allowed_pid)| lock_pid == allowed_pid);
+        if (status.sync_lock_pid.is_none() || lock_is_allowed)
             && status.queued_uploads == 0
             && status.local_current != status.remote_current
         {
             println!("wait_resync {}", status.local_current);
+            if lock_is_allowed {
+                let _ = fs::remove_file(&paths.sync_lock);
+            }
             sync_configured_remote(paths, conn, config, remote)?;
             continue;
         }
@@ -645,7 +657,8 @@ fn enqueue_and_drain_sync(
     trace.mark("remote export");
     let sync_cache = read_remote_sync_cache(paths, remote)?;
     trace.mark("read sync cache 2");
-    let mut sync_fingerprints = build_remote_sync_fingerprints(&config.host.id, &remote_export)?;
+    let host_label = remote_host_label(&config.host.name);
+    let mut sync_fingerprints = build_remote_sync_fingerprints(&host_label, &remote_export)?;
     trace.mark("metadata fingerprints");
     let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
     trace.mark("state fingerprint 2");
@@ -653,40 +666,26 @@ fn enqueue_and_drain_sync(
         sync_remote_prune_enabled() && remote_prune_due(paths, remote, &state_fingerprint)?;
     let remote_metadata_json = metadata_export_json_for_remote(remote, &remote_export)?;
     trace.mark("metadata json");
-    let legacy_metadata = "metadata/export.json";
-    let host_metadata_plain = host_metadata_key(&config.host.id);
-    let host_metadata = enqueue_metadata_uploads(
-        paths,
-        remote,
-        &sync_cache,
-        &mut sync_fingerprints,
-        legacy_metadata,
-        &host_metadata_plain,
-        &remote_metadata_json,
-    )?;
+    let host_metadata_plain = host_metadata_key(&host_label);
+    let host_metadata =
+        enqueue_metadata_uploads(paths, remote, &host_metadata_plain, &remote_metadata_json)?;
     for snapshot in &remote_export.snapshots {
-        enqueue_snapshot_uploads_if_needed(paths, remote, &sync_cache, &config.host.id, snapshot)?;
+        enqueue_snapshot_uploads_if_needed(paths, remote, &sync_cache, &host_label, snapshot)?;
     }
     for operation in &remote_export.operations {
-        enqueue_operation_uploads_if_needed(
-            paths,
-            remote,
-            &sync_cache,
-            &config.host.id,
-            operation,
-        )?;
+        enqueue_operation_uploads_if_needed(paths, remote, &sync_cache, &host_label, operation)?;
     }
     if matches!(remote, RemoteStore::File(_)) {
         enqueue_inline_upload(
             paths,
-            &host_oplog_key(&config.host.id),
+            &host_oplog_key(&host_label),
             crate::majutsu_core::encode_operation_log(&remote_export.operations)?,
         )?;
     }
     if should_upload_full_remote_oplog(remote) {
         enqueue_inline_upload(
             paths,
-            &host_oplog_canonical_key(&config.host.id),
+            &host_oplog_canonical_key(&host_label),
             encode_canonical_remote_oplog(paths, &remote_export.operations)?,
         )?;
     }
@@ -694,51 +693,42 @@ fn enqueue_and_drain_sync(
         paths,
         &sync_cache,
         &mut sync_fingerprints,
-        "config.toml",
+        &host_remote_key(&host_label, "config.toml"),
         toml::to_string_pretty(config)?.into_bytes(),
     )?;
     enqueue_cached_inline_upload(
         paths,
         &sync_cache,
         &mut sync_fingerprints,
-        "host.toml",
+        &host_remote_key(&host_label, "host.toml"),
         toml::to_string_pretty(&config.host)?.into_bytes(),
     )?;
     if should_upload_remote_ref_objects(remote) {
         if let Some(current) = remote_export.refs.get("current") {
-            if should_upload_legacy_current_refs(remote) {
-                enqueue_inline_upload(paths, "hosts/current", current.as_bytes().to_vec())?;
-                enqueue_inline_upload(
-                    paths,
-                    &host_legacy_current_key(&config.host.id),
-                    current.as_bytes().to_vec(),
-                )?;
-            }
             enqueue_inline_upload(
                 paths,
-                &host_current_ref_key(&config.host.id),
+                &host_current_ref_key(&host_label),
                 current.as_bytes().to_vec(),
             )?;
         }
         if let Some(last_synced) = remote_export.refs.get("last-synced") {
             enqueue_inline_upload(
                 paths,
-                &host_last_synced_ref_key(&config.host.id),
+                &host_last_synced_ref_key(&host_label),
                 last_synced.as_bytes().to_vec(),
             )?;
         }
     }
-    let (host_index, host_index_changed) =
-        update_remote_host_index(remote, config, &remote_export, &host_metadata)?;
-    trace.mark("host index");
-    if host_index_changed {
-        enqueue_inline_upload(
-            paths,
-            REMOTE_HOST_INDEX_KEY,
-            serde_json::to_vec_pretty(&host_index)?,
-        )?;
-    }
-    enqueue_remote_head_if_supported(paths, remote, config, &remote_export, &host_metadata)?;
+    let (host_index, host_index_changed) = (RemoteHostIndex::empty(Utc::now()), false);
+    trace.mark("host metadata discovery");
+    enqueue_remote_head_if_supported(
+        paths,
+        remote,
+        config,
+        &host_label,
+        &remote_export,
+        &host_metadata,
+    )?;
     enqueue_clone_bootstrap_if_supported(
         paths,
         remote,
@@ -754,14 +744,14 @@ fn enqueue_and_drain_sync(
             paths,
             &sync_cache,
             &mut sync_fingerprints,
-            "keys/recipients.toml",
+            &host_remote_key(&host_label, "keys/recipients.toml"),
             fs::read(&recipients)?,
         )?;
     }
     if !remote_export.chunks.is_empty() {
         enqueue_inline_upload(
             paths,
-            REMOTE_CHUNK_INDEX_SHARD_KEY,
+            &host_remote_key(&host_label, REMOTE_CHUNK_INDEX_SHARD_KEY),
             encode_canonical_remote_export(paths, &build_chunk_index_shard(&remote_export))?,
         )?;
     }
@@ -785,20 +775,27 @@ fn enqueue_and_drain_sync(
         .collect::<BTreeSet<_>>();
     let existing_canonical_aliases =
         if remote_prefers_canonical_only(remote) && sync_verify_cached_remote_aliases() {
-            Some(list_remote_canonical_content_aliases(remote)?)
+            Some(list_remote_canonical_content_aliases(remote, &host_label)?)
         } else {
             None
         };
     for key in content_keys {
         let local = paths.home.join(&key);
+        if !local.exists() && !crate::hydrate_local_object_from_remote(paths, &key)? {
+            bail!(
+                "cannot sync referenced object {key}: local object is missing and remote hydration failed"
+            );
+        }
         if local.exists() {
             let canonical_only =
                 remote_prefers_canonical_only(remote) && s3_prefers_canonical_remote_only(&key);
             if !canonical_only {
                 let force = snapshot_manifest_keys.contains(key.as_str());
-                enqueue_file_upload_if_needed(paths, remote, &key, &local, force)?;
+                let upload_key = remote_upload_key(remote, &host_label, &key);
+                enqueue_file_upload_if_needed(paths, remote, &upload_key, &local, force)?;
             }
             for alias in canonical_remote_aliases(&key) {
+                let upload_alias = remote_upload_key(remote, &host_label, &alias);
                 let snapshot_manifest = snapshot_manifest_keys.contains(&key);
                 let mut structured_bytes = None;
                 let fingerprint = if snapshot_manifest {
@@ -806,11 +803,11 @@ fn enqueue_and_drain_sync(
                 } else {
                     content_object_fingerprint(&alias)
                 };
-                sync_fingerprints.insert(alias.clone(), fingerprint.clone());
+                sync_fingerprints.insert(upload_alias.clone(), fingerprint.clone());
                 let alias_exists = existing_canonical_aliases
                     .as_ref()
-                    .is_some_and(|keys| keys.contains(&alias));
-                if cache_matches(&sync_cache, &alias, &fingerprint)
+                    .is_some_and(|keys| keys.contains(&upload_alias));
+                if cache_matches(&sync_cache, &upload_alias, &fingerprint)
                     && (existing_canonical_aliases.is_none() || alias_exists)
                 {
                     continue;
@@ -823,20 +820,20 @@ fn enqueue_and_drain_sync(
                     )?);
                 }
                 if let Some(bytes) = structured_bytes {
-                    enqueue_inline_upload_overwrite(paths, &alias, bytes)?;
+                    enqueue_inline_upload_overwrite(paths, &upload_alias, bytes)?;
                 } else {
-                    enqueue_file_upload(paths, &alias, &local)?;
+                    enqueue_file_upload(paths, &upload_alias, &local)?;
                 }
             }
         }
     }
     trace.mark("content queue");
-    enqueue_gc_mark_if_needed(paths, remote, config, &content_export)?;
+    enqueue_gc_mark_if_needed(paths, remote, &host_label, config, &content_export)?;
     trace.mark("gc mark");
     let mut root_size_summary_cache = None::<RootSizeSummary>;
     match build_root_size_summary(paths, config, &remote_export) {
         Ok(Some(summary)) => {
-            let key = root_size_summary_key(&config.host.id);
+            let key = root_size_summary_key(&host_label);
             let fingerprint = payload_fingerprint(&serde_json::to_vec(&summary)?);
             sync_fingerprints.insert(key.clone(), fingerprint.clone());
             if !cache_matches(&sync_cache, &key, &fingerprint) {
@@ -853,7 +850,8 @@ fn enqueue_and_drain_sync(
     }
     let upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     let acknowledged_remote_journal =
-        acknowledge_remote_event_journal_uploads(paths, remote, &config.host.id)?;
+        acknowledge_remote_event_journal_uploads(paths, remote, &host_label)?;
+    let compacted_event_journal = crate::queue_runtime::compact_event_journal_force(paths)?;
     if let Some(summary) = &root_size_summary_cache
         && let Err(err) = write_cached_root_size_summary(paths, summary)
     {
@@ -865,21 +863,22 @@ fn enqueue_and_drain_sync(
     let (pruned_remote_exports, pruned_remote_objects, pruned_remote_journals) =
         if should_prune_remote {
             let pruned_remote_exports =
-                prune_remote_host_exports(remote, &config.host.id, &remote_export)?;
+                prune_remote_host_exports(remote, &host_label, &remote_export)?;
             let pruned_remote_journals = prune_remote_stale_event_journals(
                 paths,
                 remote,
-                &config.host.id,
+                &host_label,
                 config.large.max_parallel_uploads,
             )?;
             let pruned_remote_objects = prune_remote_unreferenced_content_objects(
                 paths,
                 remote,
-                &config.host.id,
+                &host_label,
                 &content_export,
                 config.large.max_parallel_uploads,
             )? + prune_remote_legacy_canonical_objects(
                 remote,
+                &host_label,
                 config.large.max_parallel_uploads,
             )?;
             write_remote_prune_state(paths, remote, &state_fingerprint)?;
@@ -907,12 +906,7 @@ fn enqueue_and_drain_sync(
         invalidate_root_size_remote_object_cache(paths)?;
     }
     trace.mark("local prune");
-    persist_export_remote_refs(
-        conn,
-        &remote.describe(),
-        &config.host.id,
-        &remote_export.refs,
-    )?;
+    persist_export_remote_refs(conn, &remote.describe(), &host_label, &remote_export.refs)?;
     if matches!(remote, RemoteStore::S3(_)) {
         persist_remote_root_acks(
             conn,
@@ -935,6 +929,7 @@ fn enqueue_and_drain_sync(
         "durable_journal_acknowledged {}",
         acknowledged_remote_journal
     );
+    println!("event_journal_compacted {}", compacted_event_journal);
     println!("pruned_remote_exports {}", pruned_remote_exports);
     println!("pruned_remote_objects {}", pruned_remote_objects);
     println!("pruned_remote_journals {}", pruned_remote_journals);
@@ -962,6 +957,14 @@ fn remote_prefers_canonical_only(remote: &RemoteStore) -> bool {
     matches!(remote, RemoteStore::S3(_))
 }
 
+fn remote_upload_key(remote: &RemoteStore, host_id: &str, key: &str) -> String {
+    if matches!(remote, RemoteStore::S3(_)) {
+        host_remote_key(host_id, key)
+    } else {
+        key.to_string()
+    }
+}
+
 fn s3_prefers_canonical_remote_only(key: &str) -> bool {
     prefer_s3_canonical_remote_only(key)
 }
@@ -983,6 +986,7 @@ fn sync_content_local_object_keys(
         return local_object_keys(paths, export);
     }
     let mut keys = Vec::new();
+    let mut referenced_blob_oids = BTreeSet::new();
     if let Some(current) = export.refs.get("current")
         && let Some(snapshot) = export
             .snapshots
@@ -1003,30 +1007,48 @@ fn sync_content_local_object_keys(
                         push_child_tree_node_keys(paths, &mut keys, &node.node_key)?;
                     }
                     for record in tree_entries_for_object_keys(paths, &tree)?.values() {
+                        if let Some((oid, _object_key)) =
+                            crate::majutsu_core::payload_blob_ref(&record.payload)
+                        {
+                            referenced_blob_oids.insert(oid.to_string());
+                        }
                         if let Some((_, manifest_key, _)) =
                             crate::majutsu_core::payload_large_ref(&record.payload)
                         {
                             keys.push(manifest_key.to_string());
+                            if let Ok(large) = large_manifest_for_object_keys(paths, manifest_key) {
+                                for chunk in large.chunks {
+                                    keys.push(chunk.object_key);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
-    for blob in &export.blobs {
+    for blob in export
+        .blobs
+        .iter()
+        .filter(|blob| referenced_blob_oids.contains(blob.oid.as_str()))
+    {
         if blob.pack_id.is_none() {
             keys.push(blob.object_key.clone());
         }
     }
-    for pack in &export.packs {
+    let live_pack_ids = export
+        .blobs
+        .iter()
+        .filter(|blob| referenced_blob_oids.contains(blob.oid.as_str()))
+        .filter_map(|blob| blob.pack_id.as_ref())
+        .collect::<BTreeSet<_>>();
+    for pack in export
+        .packs
+        .iter()
+        .filter(|pack| live_pack_ids.contains(&pack.pack_id))
+    {
         keys.push(pack.pack_key.clone());
         keys.push(pack.index_key.clone());
-    }
-    for large in &export.large_objects {
-        keys.push(large.manifest_key.clone());
-    }
-    for chunk in &export.chunks {
-        keys.push(chunk.object_key.clone());
     }
     keys.sort();
     keys.dedup();
@@ -1048,6 +1070,13 @@ fn current_snapshot_manifest_for_object_keys(
 
 fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeManifest> {
     let bytes = fs::read(paths.home.join(tree_key))?;
+    Ok(serde_json::from_slice(&crate::decode_object(
+        paths, &bytes,
+    )?)?)
+}
+
+fn large_manifest_for_object_keys(paths: &Paths, manifest_key: &str) -> Result<LargeManifest> {
+    let bytes = fs::read(paths.home.join(manifest_key))?;
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
     )?)?)
@@ -1098,8 +1127,14 @@ fn sync_verify_cached_remote_aliases() -> bool {
 
 fn sync_remote_prune_enabled() -> bool {
     std::env::var("MAJUTSU_SYNC_REMOTE_PRUNE")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn sync_wait_deep_repair_enabled() -> bool {
+    std::env::var("MAJUTSU_SYNC_WAIT_DEEP_REPAIR")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1186,17 +1221,10 @@ fn invalidate_root_size_remote_object_cache(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn sync_gc_mark_every_time() -> bool {
-    sync_remote_prune_enabled()
-        || std::env::var("MAJUTSU_SYNC_GC_MARK_EVERY_TIME")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
-}
-
 fn sync_local_payload_cache_prune_enabled() -> bool {
     std::env::var("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn sync_local_metadata_cache_prune_enabled() -> bool {
@@ -1288,28 +1316,14 @@ fn compact_snapshot_manifest_value(value: &mut serde_json::Value) {
 fn enqueue_metadata_uploads(
     paths: &Paths,
     remote: &RemoteStore,
-    cache: &RemoteSyncCache,
-    fingerprints: &mut BTreeMap<String, String>,
-    legacy_key: &str,
     host_key: &str,
     metadata_json: &[u8],
 ) -> Result<String> {
     if !matches!(remote, RemoteStore::S3(_)) {
-        enqueue_inline_upload(paths, legacy_key, metadata_json.to_vec())?;
         enqueue_inline_upload(paths, host_key, metadata_json.to_vec())?;
         return Ok(host_key.to_string());
     }
     let compressed = zstd::stream::encode_all(metadata_json, 3)?;
-    let legacy_compressed_key = compressed_metadata_key(legacy_key);
-    if should_seed_s3_legacy_metadata(
-        cache,
-        fingerprints,
-        remote,
-        legacy_key,
-        &legacy_compressed_key,
-    )? {
-        enqueue_inline_upload(paths, &legacy_compressed_key, compressed.clone())?;
-    }
     enqueue_inline_upload(paths, &compressed_metadata_key(host_key), compressed)?;
     Ok(compressed_metadata_key(host_key))
 }
@@ -1318,33 +1332,8 @@ fn compressed_metadata_key(key: &str) -> String {
     format!("{key}.zst")
 }
 
-fn should_seed_s3_legacy_metadata(
-    cache: &RemoteSyncCache,
-    fingerprints: &mut BTreeMap<String, String>,
-    remote: &RemoteStore,
-    legacy_key: &str,
-    compressed_key: &str,
-) -> Result<bool> {
-    let fingerprint = S3_LEGACY_METADATA_PRESENT_FINGERPRINT.to_string();
-    fingerprints.insert(compressed_key.to_string(), fingerprint.clone());
-    if env::var("MAJUTSU_SYNC_S3_LEGACY_METADATA_EVERY_TIME").as_deref() == Ok("1") {
-        return Ok(true);
-    }
-    if cache_matches(cache, compressed_key, &fingerprint) {
-        return Ok(false);
-    }
-    Ok(!remote.exists(legacy_key)? && !remote.exists(compressed_key)?)
-}
-
 fn should_upload_full_remote_oplog(remote: &RemoteStore) -> bool {
     if env::var("MAJUTSU_SYNC_FULL_REMOTE_OPLOG").as_deref() == Ok("1") {
-        return true;
-    }
-    !matches!(remote, RemoteStore::S3(_))
-}
-
-fn should_upload_legacy_current_refs(remote: &RemoteStore) -> bool {
-    if env::var("MAJUTSU_SYNC_LEGACY_CURRENT_REFS").as_deref() == Ok("1") {
         return true;
     }
     !matches!(remote, RemoteStore::S3(_))
@@ -1357,24 +1346,19 @@ fn should_upload_remote_ref_objects(remote: &RemoteStore) -> bool {
     !matches!(remote, RemoteStore::S3(_))
 }
 
-#[derive(Debug, Serialize)]
-struct CloneBootstrapExport {
-    version: u32,
-    host_index: RemoteHostIndex,
-}
-
 fn enqueue_remote_head_if_supported(
     paths: &Paths,
     remote: &RemoteStore,
     config: &Config,
+    host_label: &str,
     export: &MetadataExport,
     metadata_key: &str,
 ) -> Result<()> {
     if !matches!(remote, RemoteStore::S3(_)) {
         return Ok(());
     }
-    let key = remote_head_key(&config.host.id);
-    let head = build_remote_head_export(paths, config, export, metadata_key)?;
+    let key = remote_head_key(host_label);
+    let head = build_remote_head_export(paths, config, host_label, export, metadata_key)?;
     enqueue_inline_upload(paths, &key, encode_canonical_remote_export(paths, &head)?)
 }
 
@@ -1386,33 +1370,8 @@ fn enqueue_clone_bootstrap_if_supported(
     host_index: RemoteHostIndex,
     force: bool,
 ) -> Result<()> {
-    if !matches!(remote, RemoteStore::S3(_)) {
-        return Ok(());
-    }
-    let bootstrap = CloneBootstrapExport {
-        version: CLONE_BOOTSTRAP_VERSION,
-        host_index,
-    };
-    let json = serde_json::to_vec(&bootstrap)?;
-    let compressed = zstd::stream::encode_all(json.as_slice(), 3)?;
-    let fingerprint = payload_fingerprint(&compressed);
-    fingerprints.insert(CLONE_BOOTSTRAP_KEY.to_string(), fingerprint.clone());
-    let force_upload = force || sync_s3_bootstrap_every_time();
-    if !force_upload && cache_matches(cache, CLONE_BOOTSTRAP_KEY, &fingerprint) {
-        return Ok(());
-    }
-    if !force_upload && !should_upload_s3_clone_bootstrap(remote)? {
-        return Ok(());
-    }
-    enqueue_inline_upload(paths, CLONE_BOOTSTRAP_KEY, compressed)
-}
-
-fn should_upload_s3_clone_bootstrap(remote: &RemoteStore) -> Result<bool> {
-    Ok(!remote.exists(CLONE_BOOTSTRAP_KEY)?)
-}
-
-fn sync_s3_bootstrap_every_time() -> bool {
-    env::var("MAJUTSU_SYNC_S3_BOOTSTRAP_EVERY_TIME").as_deref() == Ok("1")
+    let _ = (paths, remote, cache, fingerprints, host_index, force);
+    Ok(())
 }
 
 fn enqueue_cached_inline_upload(
@@ -1453,7 +1412,8 @@ fn enqueue_snapshot_uploads_if_needed(
     if cache_matches(cache, &canonical_key, &fingerprint) {
         return Ok(());
     }
-    if remote_key_exists(remote, &canonical_key) {
+    if upload_queue_contains_key(paths, &canonical_key) || remote_key_exists(remote, &canonical_key)
+    {
         return Ok(());
     }
     enqueue_inline_upload(paths, &canonical_key, canonical_bytes)
@@ -1478,7 +1438,8 @@ fn enqueue_operation_uploads_if_needed(
     if cache_matches(cache, &canonical_key, &fingerprint) {
         return Ok(());
     }
-    if remote_key_exists(remote, &canonical_key) {
+    if upload_queue_contains_key(paths, &canonical_key) || remote_key_exists(remote, &canonical_key)
+    {
         return Ok(());
     }
     enqueue_inline_upload(paths, &canonical_key, canonical_bytes)
@@ -1491,7 +1452,7 @@ fn enqueue_file_upload_if_needed(
     source: &std::path::Path,
     force: bool,
 ) -> Result<()> {
-    if !force && remote_key_can_be_skipped(remote, key) {
+    if !force && remote_key_can_be_skipped(paths, remote, key) {
         return Ok(());
     }
     if force {
@@ -1501,9 +1462,12 @@ fn enqueue_file_upload_if_needed(
     }
 }
 
-fn remote_key_can_be_skipped(remote: &RemoteStore, key: &str) -> bool {
+fn remote_key_can_be_skipped(paths: &Paths, remote: &RemoteStore, key: &str) -> bool {
     if !is_content_addressed_remote_key(key) {
         return false;
+    }
+    if upload_queue_contains_key(paths, key) {
+        return true;
     }
     remote_key_exists(remote, key)
 }
@@ -1531,7 +1495,7 @@ fn read_remote_sync_cache(paths: &Paths, remote: &RemoteStore) -> Result<RemoteS
         return Ok(empty_remote_sync_cache(remote));
     }
     let cache: RemoteSyncCache = serde_json::from_slice(&fs::read(path)?)?;
-    if cache.version == 1 && cache.remote == remote.describe() {
+    if cache.version == REMOTE_SYNC_CACHE_VERSION && cache.remote == remote.describe() {
         Ok(cache)
     } else {
         Ok(empty_remote_sync_cache(remote))
@@ -1540,7 +1504,7 @@ fn read_remote_sync_cache(paths: &Paths, remote: &RemoteStore) -> Result<RemoteS
 
 fn empty_remote_sync_cache(remote: &RemoteStore) -> RemoteSyncCache {
     RemoteSyncCache {
-        version: 1,
+        version: REMOTE_SYNC_CACHE_VERSION,
         remote: remote.describe(),
         state_fingerprint: None,
         entries: BTreeMap::new(),
@@ -1559,7 +1523,7 @@ fn write_remote_sync_cache(
     }
     let tmp = path.with_extension("tmp");
     let cache = RemoteSyncCache {
-        version: 1,
+        version: REMOTE_SYNC_CACHE_VERSION,
         remote: remote.describe(),
         state_fingerprint: Some(state_fingerprint),
         entries,
@@ -1665,6 +1629,7 @@ struct SyncStatusDeepOptions {
     deadline: Option<Instant>,
     progress: bool,
     started: Instant,
+    current_only: bool,
 }
 
 impl SyncStatusDeepOptions {
@@ -1676,6 +1641,7 @@ impl SyncStatusDeepOptions {
                 .map(|timeout| Instant::now() + Duration::from_secs(timeout)),
             progress: args.progress,
             started: Instant::now(),
+            current_only: false,
         }
     }
 
@@ -1717,6 +1683,42 @@ struct SyncStatusSnapshot {
     upload_queue_backpressure: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SyncDeepHealthSummary {
+    pub(crate) local_objects: usize,
+    pub(crate) checked: usize,
+    pub(crate) missing: usize,
+    pub(crate) limited: bool,
+    pub(crate) source: String,
+    pub(crate) scope: &'static str,
+}
+
+pub(crate) fn sync_deep_health_summary(
+    paths: &Paths,
+    conn: &Connection,
+    remote: &RemoteStore,
+    sample: Option<usize>,
+    timeout_secs: Option<u64>,
+    current_only: bool,
+) -> Result<SyncDeepHealthSummary> {
+    let options = SyncStatusDeepOptions {
+        sample,
+        deadline: timeout_secs.map(|timeout| Instant::now() + Duration::from_secs(timeout)),
+        progress: false,
+        started: Instant::now(),
+        current_only,
+    };
+    let status = sync_status_snapshot(paths, conn, remote, &options)?;
+    Ok(SyncDeepHealthSummary {
+        local_objects: status.local_objects,
+        checked: status.remote_objects_checked,
+        missing: status.missing_remote_objects,
+        limited: status.missing_remote_objects_limited,
+        source: status.remote_object_check_source,
+        scope: if current_only { "current" } else { "history" },
+    })
+}
+
 fn sync_status_snapshot(
     paths: &Paths,
     conn: &Connection,
@@ -1725,16 +1727,14 @@ fn sync_status_snapshot(
 ) -> Result<SyncStatusSnapshot> {
     let local_current = current_snapshot(conn)?;
     let config = read_config(paths)?;
-    let canonical_current = host_current_ref_key(&config.host.id);
-    let canonical_last_synced = host_last_synced_ref_key(&config.host.id);
+    let host_label = remote_host_label(&config.host.name);
+    let canonical_current = host_current_ref_key(&host_label);
+    let canonical_last_synced = host_last_synced_ref_key(&host_label);
     let (remote_current, remote_last_synced, remote_root_acks) =
-        match read_remote_head(paths, remote, &config.host.id)? {
+        match read_remote_head(paths, remote, &host_label)? {
             Some(head) => (head.current_snapshot, head.last_synced, head.root_acks),
             None => {
-                let mut remote_current = remote_ref(remote, &canonical_current)?;
-                if remote_current.is_none() {
-                    remote_current = remote_ref(remote, "hosts/current")?;
-                }
+                let remote_current = remote_ref(remote, &canonical_current)?;
                 let remote_last_synced = remote_ref(remote, &canonical_last_synced)?;
                 (remote_current, remote_last_synced, BTreeMap::new())
             }
@@ -1746,7 +1746,12 @@ fn sync_status_snapshot(
         set_remote_ref_value(conn, &remote.describe(), &canonical_last_synced, value)?;
     }
     persist_remote_root_acks(conn, &remote.describe(), &config.host.id, &remote_root_acks)?;
-    let export = export_metadata(paths, conn, &read_config(paths)?)?;
+    let mut export = export_metadata(paths, conn, &read_config(paths)?)?;
+    if options.current_only
+        && let Some(current) = local_current.as_deref()
+    {
+        export.snapshots.retain(|snapshot| snapshot.id == current);
+    }
     let local_keys = local_object_keys(paths, &export)?;
     let total_local_objects = local_keys.len();
     let check_limit = options
@@ -1764,7 +1769,7 @@ fn sync_status_snapshot(
     let remote_keys = if options.prefer_head_checks() {
         None
     } else {
-        match remote_payload_key_index(remote) {
+        match remote_payload_key_index_for_host(remote, &host_label) {
             Ok(keys) => Some(keys),
             Err(err) => {
                 eprintln!(
@@ -1785,7 +1790,7 @@ fn sync_status_snapshot(
         let available = if let Some(remote_keys) = remote_keys.as_ref() {
             remote_payload_index_contains(remote_keys, key)
         } else {
-            remote_object_available(remote, key)?
+            remote_object_available_for_paths(paths, remote, key)?
         };
         if !available {
             missing_remote += 1;
@@ -1961,15 +1966,23 @@ fn build_chunk_index_shard(export: &MetadataExport) -> ChunkIndexShard {
 
 fn build_gc_mark_export(
     paths: &Paths,
+    host_label: &str,
     config: &Config,
     remote: &RemoteStore,
     export: &MetadataExport,
 ) -> Result<GcMarkExport> {
-    let object_keys = if remote_prefers_canonical_only(remote) {
+    let mut object_keys = if remote_prefers_canonical_only(remote) {
         s3_remote_live_object_keys_for_local(paths, export)?
     } else {
         remote_live_object_keys_for_local(paths, export)?
     };
+    object_keys.extend(durable_journal_live_keys(paths)?);
+    if matches!(remote, RemoteStore::S3(_)) {
+        object_keys = object_keys
+            .into_iter()
+            .map(|key| host_remote_key(host_label, &key))
+            .collect();
+    }
     Ok(GcMarkExport::new(
         config.host.id.clone(),
         Utc::now(),
@@ -1981,20 +1994,17 @@ fn build_gc_mark_export(
 fn enqueue_gc_mark_if_needed(
     paths: &Paths,
     remote: &RemoteStore,
+    host_label: &str,
     config: &Config,
     export: &MetadataExport,
 ) -> Result<()> {
-    let key = remote_gc_mark_key(&config.host.id);
-    let should_publish = !remote_prefers_canonical_only(remote)
-        || sync_gc_mark_every_time()
-        || !remote.exists(&key)?;
-    if !should_publish {
-        return Ok(());
-    }
+    let key = remote_gc_mark_key(host_label);
     enqueue_inline_upload(
         paths,
         &key,
-        serde_json::to_vec_pretty(&build_gc_mark_export(paths, config, remote, export)?)?,
+        serde_json::to_vec_pretty(&build_gc_mark_export(
+            paths, host_label, config, remote, export,
+        )?)?,
     )
 }
 
@@ -2035,67 +2045,6 @@ fn canonical_alias_uses_structured_encoding(key: &str) -> bool {
         || key.starts_with("objects/trees/")
         || key.starts_with("objects/indexes/pack/")
         || key.starts_with("objects/large/manifests/")
-}
-
-fn update_remote_host_index(
-    remote: &RemoteStore,
-    config: &Config,
-    export: &MetadataExport,
-    metadata_key: &str,
-) -> Result<(RemoteHostIndex, bool)> {
-    let mut index = read_remote_host_index(remote)?;
-    let last_synced_at = export
-        .refs
-        .get("last-synced")
-        .map(|value| parse_db_time(value))
-        .transpose()?
-        .unwrap_or(export.exported_at);
-    let summary = RemoteHostSummary {
-        id: config.host.id.clone(),
-        name: config.host.name.clone(),
-        last_synced_at,
-        current_snapshot: export.refs.get("current").cloned(),
-        metadata_key: metadata_key.to_string(),
-    };
-    if matches!(remote, RemoteStore::S3(_)) && !sync_s3_host_index_every_time() {
-        let (summary, changed) = compact_s3_host_index_summary(
-            index.hosts.iter().find(|host| host.id == config.host.id),
-            summary,
-        );
-        if changed {
-            index.upsert_host(summary, Utc::now());
-        }
-        return Ok((index, changed));
-    }
-    index.upsert_host(summary, Utc::now());
-    Ok((index, true))
-}
-
-fn sync_s3_host_index_every_time() -> bool {
-    env::var("MAJUTSU_SYNC_S3_HOST_INDEX_EVERY_TIME")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-fn compact_s3_host_index_summary(
-    existing: Option<&RemoteHostSummary>,
-    desired: RemoteHostSummary,
-) -> (RemoteHostSummary, bool) {
-    let Some(existing) = existing else {
-        return (desired, true);
-    };
-    let changed = existing.name != desired.name || existing.metadata_key != desired.metadata_key;
-    if changed {
-        return (desired, true);
-    }
-    let summary = RemoteHostSummary {
-        id: desired.id,
-        name: desired.name,
-        last_synced_at: existing.last_synced_at,
-        current_snapshot: existing.current_snapshot.clone(),
-        metadata_key: desired.metadata_key,
-    };
-    (summary, false)
 }
 
 fn prune_remote_host_exports(
@@ -2150,7 +2099,7 @@ fn prune_remote_host_exports(
 fn prune_remote_unreferenced_content_objects(
     paths: &Paths,
     remote: &RemoteStore,
-    _host_id: &str,
+    host_id: &str,
     export: &MetadataExport,
     max_parallel_deletes: usize,
 ) -> Result<usize> {
@@ -2164,9 +2113,15 @@ fn prune_remote_unreferenced_content_objects(
     }
     .into_iter()
     .collect::<BTreeSet<_>>();
-    live.extend(remote_gc_mark_live_keys(remote)?);
     live.extend(durable_journal_live_keys(paths)?);
-    let delete_keys = remote_content_object_keys(remote)?
+    if matches!(remote, RemoteStore::S3(_)) {
+        live = live
+            .into_iter()
+            .map(|key| host_remote_key(host_id, &key))
+            .collect();
+    }
+    live.extend(remote_gc_mark_live_keys(remote, host_id)?);
+    let delete_keys = remote_content_object_keys(remote, host_id)?
         .into_iter()
         .filter(|key| !live.contains(key))
         .collect::<Vec<_>>();
@@ -2187,7 +2142,7 @@ fn prune_remote_stale_event_journals(
         .into_iter()
         .filter_map(|record| record.remote_journal_key)
         .collect::<BTreeSet<_>>();
-    let prefix = format!("hosts/{host_id}/journal/");
+    let prefix = format!("{host_id}/journal/");
     let delete_keys = remote
         .list(&prefix)?
         .into_iter()
@@ -2200,7 +2155,7 @@ fn prune_remote_stale_event_journals(
 fn durable_journal_live_keys(paths: &Paths) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for record in event_journal_records(paths)? {
-        if record.remote_journal_synced_at.is_none() {
+        if record.remote_journal_synced_at.is_none() && record.remote_journal_key.is_none() {
             continue;
         }
         if let Some(manifest_key) = record.durable_large_manifest_key.as_deref() {
@@ -2224,7 +2179,7 @@ fn durable_journal_live_keys(paths: &Paths) -> Result<BTreeSet<String>> {
     Ok(keys)
 }
 
-fn remote_content_object_keys(remote: &RemoteStore) -> Result<BTreeSet<String>> {
+fn remote_content_object_keys(remote: &RemoteStore, host_id: &str) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for prefix in [
         "blobs/loose/",
@@ -2243,13 +2198,19 @@ fn remote_content_object_keys(remote: &RemoteStore) -> Result<BTreeSet<String>> 
         "objects/large/chunks/fixed/",
         "objects/large/chunks/fastcdc/",
     ] {
-        keys.extend(remote.list(prefix)?);
+        let prefix = if matches!(remote, RemoteStore::S3(_)) {
+            host_remote_key(host_id, prefix)
+        } else {
+            prefix.to_string()
+        };
+        keys.extend(remote.list(&prefix)?);
     }
     Ok(keys)
 }
 
 fn prune_remote_legacy_canonical_objects(
     remote: &RemoteStore,
+    host_id: &str,
     max_parallel_deletes: usize,
 ) -> Result<usize> {
     if !remote_prefers_canonical_only(remote) {
@@ -2258,8 +2219,8 @@ fn prune_remote_legacy_canonical_objects(
     if env::var("MAJUTSU_SYNC_REMOTE_LEGACY_OBJECT_PRUNE").as_deref() == Ok("0") {
         return Ok(0);
     }
-    let protected = remote_gc_mark_live_keys(remote)?;
-    let canonical_keys = list_remote_canonical_content_aliases(remote)?;
+    let protected = remote_gc_mark_live_keys(remote, host_id)?;
+    let canonical_keys = list_remote_canonical_content_aliases(remote, host_id)?;
     let mut candidates = BTreeSet::new();
     for prefix in [
         "objects/blobs/",
@@ -2287,7 +2248,10 @@ fn prune_remote_legacy_canonical_objects(
     Ok(delete_keys.len())
 }
 
-fn list_remote_canonical_content_aliases(remote: &RemoteStore) -> Result<BTreeSet<String>> {
+fn list_remote_canonical_content_aliases(
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for prefix in [
         "blobs/loose/",
@@ -2299,7 +2263,7 @@ fn list_remote_canonical_content_aliases(remote: &RemoteStore) -> Result<BTreeSe
         "large/chunks/fixed-8m/",
         "large/chunks/fastcdc/",
     ] {
-        keys.extend(remote.list(prefix)?);
+        keys.extend(remote.list(&host_remote_key(host_id, prefix))?);
     }
     Ok(keys)
 }
@@ -2382,12 +2346,10 @@ fn delete_remote_keys(
     Ok(())
 }
 
-fn remote_gc_mark_live_keys(remote: &RemoteStore) -> Result<BTreeSet<String>> {
+fn remote_gc_mark_live_keys(remote: &RemoteStore, host_id: &str) -> Result<BTreeSet<String>> {
     let mut live = BTreeSet::new();
-    for key in remote.list("gc/marks/")? {
-        if !key.ends_with(".json") {
-            continue;
-        }
+    let key = remote_gc_mark_key(host_id);
+    if remote.exists(&key)? {
         let mark: GcMarkExport = serde_json::from_slice(&remote.get(&key)?)
             .with_context(|| format!("decode remote gc mark {key}"))?;
         live.extend(mark.object_keys);
@@ -2401,153 +2363,4 @@ fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> 
         &remote_gc_tombstone_key(host_id, &new_id("tombstone")),
         &serde_json::to_vec_pretty(&tombstone)?,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        RemoteHostSummary, S3_LEGACY_METADATA_PRESENT_FINGERPRINT, compact_s3_host_index_summary,
-        empty_remote_sync_cache, should_seed_s3_legacy_metadata,
-    };
-    use chrono::{DateTime, Utc};
-    use std::collections::BTreeMap;
-    use std::fs;
-
-    use crate::remote_store::{FileRemote, RemoteStore};
-
-    fn host_summary(name: &str, current: Option<&str>, metadata_key: &str) -> RemoteHostSummary {
-        RemoteHostSummary {
-            id: "host-a".into(),
-            name: name.into(),
-            last_synced_at: DateTime::<Utc>::UNIX_EPOCH,
-            current_snapshot: current.map(str::to_string),
-            metadata_key: metadata_key.into(),
-        }
-    }
-
-    #[test]
-    fn compact_s3_host_index_keeps_identity_stable_across_snapshot_changes() {
-        let existing = host_summary(
-            "workstation",
-            Some("snap-old"),
-            "hosts/host-a/metadata/export.json.zst",
-        );
-        let desired = RemoteHostSummary {
-            last_synced_at: Utc::now(),
-            current_snapshot: Some("snap-new".into()),
-            ..host_summary(
-                "workstation",
-                Some("snap-new"),
-                "hosts/host-a/metadata/export.json.zst",
-            )
-        };
-
-        let (summary, changed) = compact_s3_host_index_summary(Some(&existing), desired);
-
-        assert!(!changed);
-        assert_eq!(summary.current_snapshot.as_deref(), Some("snap-old"));
-        assert_eq!(summary.last_synced_at, DateTime::<Utc>::UNIX_EPOCH);
-    }
-
-    #[test]
-    fn compact_s3_host_index_updates_when_discovery_identity_changes() {
-        let existing = host_summary(
-            "old-name",
-            Some("snap-old"),
-            "hosts/host-a/metadata/export.json.zst",
-        );
-        let desired = host_summary(
-            "new-name",
-            Some("snap-new"),
-            "hosts/host-a/metadata/export.json.zst",
-        );
-
-        let (summary, changed) = compact_s3_host_index_summary(Some(&existing), desired);
-
-        assert!(changed);
-        assert_eq!(summary.name, "new-name");
-        assert_eq!(summary.current_snapshot.as_deref(), Some("snap-new"));
-    }
-
-    #[test]
-    fn s3_legacy_metadata_seed_cache_skips_remote_probe() {
-        let temp = tempfile::tempdir().unwrap();
-        let remote = RemoteStore::File(FileRemote {
-            root: temp.path().join("remote"),
-        });
-        fs::create_dir_all(temp.path().join("remote")).unwrap();
-        let mut cache = empty_remote_sync_cache(&remote);
-        cache.entries.insert(
-            "metadata/export.json.zst".into(),
-            S3_LEGACY_METADATA_PRESENT_FINGERPRINT.into(),
-        );
-        let mut fingerprints = BTreeMap::new();
-
-        let seed = should_seed_s3_legacy_metadata(
-            &cache,
-            &mut fingerprints,
-            &remote,
-            "metadata/export.json",
-            "metadata/export.json.zst",
-        )
-        .unwrap();
-
-        assert!(!seed);
-        assert_eq!(
-            fingerprints
-                .get("metadata/export.json.zst")
-                .map(String::as_str),
-            Some(S3_LEGACY_METADATA_PRESENT_FINGERPRINT)
-        );
-    }
-
-    #[test]
-    fn s3_legacy_metadata_seed_detects_missing_remote_seed() {
-        let temp = tempfile::tempdir().unwrap();
-        let remote = RemoteStore::File(FileRemote {
-            root: temp.path().join("remote"),
-        });
-        fs::create_dir_all(temp.path().join("remote")).unwrap();
-        let cache = empty_remote_sync_cache(&remote);
-        let mut fingerprints = BTreeMap::new();
-
-        let seed = should_seed_s3_legacy_metadata(
-            &cache,
-            &mut fingerprints,
-            &remote,
-            "metadata/export.json",
-            "metadata/export.json.zst",
-        )
-        .unwrap();
-
-        assert!(seed);
-    }
-
-    #[test]
-    fn s3_legacy_metadata_seed_records_existing_remote_seed() {
-        let temp = tempfile::tempdir().unwrap();
-        let remote_root = temp.path().join("remote");
-        fs::create_dir_all(remote_root.join("metadata")).unwrap();
-        fs::write(remote_root.join("metadata/export.json.zst"), b"seed").unwrap();
-        let remote = RemoteStore::File(FileRemote { root: remote_root });
-        let cache = empty_remote_sync_cache(&remote);
-        let mut fingerprints = BTreeMap::new();
-
-        let seed = should_seed_s3_legacy_metadata(
-            &cache,
-            &mut fingerprints,
-            &remote,
-            "metadata/export.json",
-            "metadata/export.json.zst",
-        )
-        .unwrap();
-
-        assert!(!seed);
-        assert_eq!(
-            fingerprints
-                .get("metadata/export.json.zst")
-                .map(String::as_str),
-            Some(S3_LEGACY_METADATA_PRESENT_FINGERPRINT)
-        );
-    }
 }

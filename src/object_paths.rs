@@ -1,6 +1,8 @@
-use crate::majutsu_core::{FileRecord, TreeManifest, TreeNodeManifest, payload_large_ref};
+use crate::majutsu_core::{
+    FileRecord, LargeManifest, TreeManifest, TreeNodeManifest, payload_blob_ref, payload_large_ref,
+};
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -10,7 +12,7 @@ use crate::util::path_to_slash;
 use std::fs;
 
 pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<String>> {
-    local_object_keys_inner(paths, export, None)
+    local_object_keys_inner(paths, export, None, None)
 }
 
 pub(crate) fn local_object_keys_with_progress(
@@ -18,17 +20,32 @@ pub(crate) fn local_object_keys_with_progress(
     export: &MetadataExport,
     phase: &str,
 ) -> Result<Vec<String>> {
-    local_object_keys_inner(paths, export, Some(phase))
+    local_object_keys_inner(paths, export, Some(phase), None)
+}
+
+pub(crate) fn local_object_keys_for_snapshot(
+    paths: &Paths,
+    export: &MetadataExport,
+    snapshot_id: &str,
+) -> Result<Vec<String>> {
+    local_object_keys_inner(paths, export, None, Some(snapshot_id))
 }
 
 fn local_object_keys_inner(
     paths: &Paths,
     export: &MetadataExport,
     progress_phase: Option<&str>,
+    only_snapshot_id: Option<&str>,
 ) -> Result<Vec<String>> {
     let mut keys = Vec::new();
-    let snapshot_total = export.snapshots.len();
-    for (index, snapshot) in export.snapshots.iter().enumerate() {
+    let mut referenced_blob_oids = BTreeSet::new();
+    let snapshots = export
+        .snapshots
+        .iter()
+        .filter(|snapshot| only_snapshot_id.map(|id| snapshot.id == id).unwrap_or(true))
+        .collect::<Vec<_>>();
+    let snapshot_total = snapshots.len();
+    for (index, snapshot) in snapshots.iter().enumerate() {
         keys.push(snapshot.manifest_key.clone());
         if let Ok(manifest) = snapshot_manifest_for_object_keys(paths, snapshot) {
             for root_tree in manifest.root_trees.values() {
@@ -43,8 +60,16 @@ fn local_object_keys_inner(
                         push_child_tree_node_keys(paths, &mut keys, &node.node_key)?;
                     }
                     for record in tree_entries_for_object_keys(paths, &tree)?.values() {
+                        if let Some((oid, _object_key)) = payload_blob_ref(&record.payload) {
+                            referenced_blob_oids.insert(oid.to_string());
+                        }
                         if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
                             keys.push(manifest_key.to_string());
+                            if let Ok(large) = large_manifest_for_object_keys(paths, manifest_key) {
+                                for chunk in large.chunks {
+                                    keys.push(chunk.object_key);
+                                }
+                            }
                         }
                     }
                 }
@@ -60,7 +85,11 @@ fn local_object_keys_inner(
             );
         }
     }
-    for blob in &export.blobs {
+    for blob in export
+        .blobs
+        .iter()
+        .filter(|blob| referenced_blob_oids.contains(blob.oid.as_str()))
+    {
         if blob.pack_id.is_none() {
             keys.push(blob.object_key.clone());
         }
@@ -68,8 +97,9 @@ fn local_object_keys_inner(
     let live_pack_ids = export
         .blobs
         .iter()
+        .filter(|blob| referenced_blob_oids.contains(blob.oid.as_str()))
         .filter_map(|blob| blob.pack_id.as_ref())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     for pack in export
         .packs
         .iter()
@@ -77,12 +107,6 @@ fn local_object_keys_inner(
     {
         keys.push(pack.pack_key.clone());
         keys.push(pack.index_key.clone());
-    }
-    for large in &export.large_objects {
-        keys.push(large.manifest_key.clone());
-    }
-    for chunk in &export.chunks {
-        keys.push(chunk.object_key.clone());
     }
     keys.sort();
     keys.dedup();
@@ -104,6 +128,13 @@ fn snapshot_manifest_for_object_keys(
 
 fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeManifest> {
     let bytes = fs::read(paths.home.join(tree_key))?;
+    Ok(serde_json::from_slice(&crate::decode_object(
+        paths, &bytes,
+    )?)?)
+}
+
+fn large_manifest_for_object_keys(paths: &Paths, manifest_key: &str) -> Result<LargeManifest> {
+    let bytes = fs::read(paths.home.join(manifest_key))?;
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
     )?)?)

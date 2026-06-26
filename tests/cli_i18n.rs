@@ -47,3 +47,40 @@ fn restore_help_localizes_command_and_option_descriptions() {
     assert!(output.contains("このoperation idまたはprefixが作った状態を復元します"));
     assert!(output.contains("2hなどの相対時間以前の最新snapshotを復元します"));
 }
+
+#[test]
+fn version_reports_build_identity_without_state_home() {
+    let output = mj_output(
+        "C",
+        &[
+            "--home",
+            "/tmp/majutsu-version-test-not-initialized",
+            "version",
+        ],
+    );
+    assert!(output.contains("mj "));
+    assert!(output.contains("build_number "));
+    assert!(output.contains("git_commit "));
+    assert!(output.contains("remote-explain"));
+    assert!(output.contains("remote-repair-canonical-aliases"));
+
+    let json = mj_output(
+        "C",
+        &[
+            "--home",
+            "/tmp/majutsu-version-test-not-initialized",
+            "version",
+            "--json",
+        ],
+    );
+    let value: serde_json::Value = serde_json::from_str(&json).expect("version json");
+    assert_eq!(value["binary"], "mj");
+    assert_eq!(value["package_version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        value["capabilities"]
+            .as_array()
+            .expect("capabilities array")
+            .iter()
+            .any(|capability| capability == "health-deep")
+    );
+}

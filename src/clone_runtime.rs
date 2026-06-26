@@ -1,8 +1,5 @@
-use crate::majutsu_store::{
-    LEGACY_METADATA_EXPORT_KEY, RemoteHostIndex, RemoteHostSummary, select_remote_host,
-};
+use crate::majutsu_store::{RemoteHostSummary, remote_host_label, select_remote_host};
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +15,7 @@ use crate::config::{
 use crate::db_refs::persist_export_remote_refs;
 use crate::object_paths::local_object_keys;
 use crate::queue_runtime::import_remote_event_journals;
-use crate::remote_runtime::{read_remote_host_index, remote_host_index_with_legacy};
+use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, open_remote};
 use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
 
@@ -121,14 +118,15 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         trace.mark("materialize objects");
         let mut conn = crate::open_db(&staging_paths)?;
         crate::import_metadata(&mut conn, &export)?;
-        persist_export_remote_refs(
-            &conn,
-            &remote.describe(),
-            &export.config.host.id,
-            &export.refs,
-        )?;
+        let host_prefix = loaded
+            .selection
+            .host
+            .as_ref()
+            .map(remote_host_prefix_from_summary)
+            .unwrap_or_else(|| remote_host_label(&export.config.host.name));
+        persist_export_remote_refs(&conn, &remote.describe(), &host_prefix, &export.refs)?;
         let imported_journals =
-            import_remote_event_journals(&staging_paths, &remote, &export.config.host.id)?;
+            import_remote_event_journals(&staging_paths, &remote, &host_prefix)?;
         if imported_journals > 0 {
             println!("imported_durable_journals {imported_journals}");
         }
@@ -253,6 +251,13 @@ struct CloneMetadataSelection {
     host_index: bool,
 }
 
+fn remote_host_prefix_from_summary(host: &RemoteHostSummary) -> String {
+    host.metadata_key
+        .split_once('/')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| remote_host_label(&host.name))
+}
+
 fn refresh_s3_bootstrap_host_summary(
     remote: &RemoteStore,
     loaded: &mut CloneLoadedMetadata,
@@ -278,83 +283,11 @@ fn refresh_s3_bootstrap_host_summary(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CloneBootstrapExport {
-    version: u32,
-    host_index: RemoteHostIndex,
-    #[serde(default)]
-    metadata: Option<MetadataExport>,
-}
-
-const CLONE_BOOTSTRAP_KEY: &str = "metadata/bootstrap.json.zst";
-const CLONE_BOOTSTRAP_VERSION: u32 = 2;
-
 fn clone_loaded_metadata(remote: &RemoteStore, host: Option<&str>) -> Result<CloneLoadedMetadata> {
-    if let Some(loaded) = clone_loaded_metadata_from_bootstrap(remote, host)? {
-        return Ok(loaded);
-    }
     Ok(CloneLoadedMetadata {
         selection: clone_metadata_selection(remote, host)?,
         export: None,
     })
-}
-
-fn clone_loaded_metadata_from_bootstrap(
-    remote: &RemoteStore,
-    host: Option<&str>,
-) -> Result<Option<CloneLoadedMetadata>> {
-    if !matches!(remote, RemoteStore::S3(_)) {
-        return Ok(None);
-    }
-    let Some(bytes) = remote
-        .get_optional(CLONE_BOOTSTRAP_KEY)
-        .with_context(|| format!("read clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?
-    else {
-        return Ok(None);
-    };
-    let decoded = zstd_decode_all_limited(
-        bytes.as_slice(),
-        REMOTE_METADATA_DECODE_LIMIT,
-        &format!("clone bootstrap {CLONE_BOOTSTRAP_KEY}"),
-    )?;
-    let bootstrap: CloneBootstrapExport = serde_json::from_slice(&decoded)
-        .with_context(|| format!("parse clone bootstrap {CLONE_BOOTSTRAP_KEY}"))?;
-    if bootstrap.version != 1 && bootstrap.version != CLONE_BOOTSTRAP_VERSION {
-        return Ok(None);
-    }
-    let mut index = bootstrap.host_index;
-    index.sort_hosts();
-    let selected = match host {
-        Some(host_id) => select_remote_host(index.hosts, host_id).ok(),
-        None => match index.hosts.as_slice() {
-            [host] => Some(host.clone()),
-            _ => None,
-        },
-    };
-    let Some(host) = selected else {
-        return Ok(None);
-    };
-    if let Some(metadata) = bootstrap.metadata {
-        if host.id != metadata.config.host.id {
-            return Ok(None);
-        }
-        return Ok(Some(CloneLoadedMetadata {
-            selection: CloneMetadataSelection {
-                key: host.metadata_key.clone(),
-                host: Some(host),
-                host_index: true,
-            },
-            export: Some(metadata),
-        }));
-    }
-    Ok(Some(CloneLoadedMetadata {
-        selection: CloneMetadataSelection {
-            key: host.metadata_key.clone(),
-            host: Some(host),
-            host_index: true,
-        },
-        export: None,
-    }))
 }
 
 fn clone_metadata_selection(
@@ -363,20 +296,11 @@ fn clone_metadata_selection(
 ) -> Result<CloneMetadataSelection> {
     if let Some(host_id) = host {
         let index = read_remote_host_index(remote)?;
-        if !index.hosts.is_empty() {
-            let host = select_remote_host(index.hosts, host_id)?;
-            return Ok(CloneMetadataSelection {
-                key: host.metadata_key.clone(),
-                host: Some(host),
-                host_index: true,
-            });
-        }
-        let index = remote_host_index_with_legacy(remote)?;
         let host = select_remote_host(index.hosts, host_id)?;
         return Ok(CloneMetadataSelection {
             key: host.metadata_key.clone(),
             host: Some(host),
-            host_index: false,
+            host_index: true,
         });
     }
     let index = read_remote_host_index(remote)?;
@@ -386,14 +310,7 @@ fn clone_metadata_selection(
             host: Some(host.clone()),
             host_index: true,
         }),
-        [] if remote.exists(LEGACY_METADATA_EXPORT_KEY)? => Ok(CloneMetadataSelection {
-            key: LEGACY_METADATA_EXPORT_KEY.into(),
-            host: None,
-            host_index: false,
-        }),
-        [] => {
-            bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found")
-        }
+        [] => bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found"),
         _ => bail!("remote contains multiple hosts; rerun clone with --host"),
     }
 }

@@ -5,6 +5,7 @@ use rusqlite::{Connection, params};
 use std::collections::BTreeSet;
 use std::fs;
 
+use crate::cache_runtime::{remote_payload_index_contains, remote_payload_key_index};
 use crate::cli::PruneArgs;
 use crate::config::{Paths, read_config};
 use crate::object_paths::{all_local_object_keys, local_object_keys_with_progress};
@@ -17,13 +18,22 @@ use crate::{ensure_ready, export_metadata, open_db, open_remote, read_object};
 pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     ensure_ready(paths)?;
     let conn = open_db(paths)?;
-    let plan = build_prune_plan(&conn, &args)?;
+    let plan = build_prune_plan(paths, &conn, &args)?;
     let total = plan.keep.len() + plan.delete.len();
     println!("snapshots {total}");
     println!("keep_daily {}", args.keep_daily);
     println!("keep_monthly {}", args.keep_monthly);
     println!("keep_snapshots {}", plan.keep.len());
     println!("candidate_snapshots {}", plan.delete.len());
+    if args.drop_missing_remote_history {
+        println!(
+            "missing_remote_history_snapshots {}",
+            plan.missing_remote_history.len()
+        );
+        for (snapshot, missing) in &plan.missing_remote_history {
+            println!("missing_remote_history_snapshot {snapshot} missing_objects {missing}");
+        }
+    }
     if args.dry_run {
         println!("dry_run true");
     } else {
@@ -71,6 +81,12 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     Ok(())
 }
 
+struct PrunePlan {
+    keep: Vec<String>,
+    delete: Vec<String>,
+    missing_remote_history: Vec<(String, usize)>,
+}
+
 pub(crate) struct PrunedMetadata {
     pub(crate) blobs: usize,
     pub(crate) large_objects: usize,
@@ -81,7 +97,7 @@ pub(crate) struct PrunedMetadata {
     pub(crate) large_pins: usize,
 }
 
-fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrunePlan> {
+fn build_prune_plan(paths: &Paths, conn: &Connection, args: &PruneArgs) -> Result<PrunePlan> {
     let current = current_snapshot(conn)?;
     let mut stmt = conn.prepare("select id, created_at from snapshots order by created_at desc")?;
     let rows = stmt.query_map([], |row| {
@@ -97,7 +113,7 @@ fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrune
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut plan = build_snapshot_prune_plan(
+    let mut plan: SnapshotPrunePlan = build_snapshot_prune_plan(
         &snapshots,
         current.as_deref(),
         args.keep_daily,
@@ -115,7 +131,28 @@ fn build_prune_plan(conn: &Connection, args: &PruneArgs) -> Result<SnapshotPrune
     plan.keep.sort();
     plan.keep.dedup();
     plan.delete = still_delete;
-    Ok(plan)
+    let mut missing_remote_history = Vec::new();
+    if args.drop_missing_remote_history {
+        let missing =
+            missing_remote_history_snapshots(paths, conn, &protected, current.as_deref())?;
+        for (snapshot_id, missing_count) in missing {
+            if plan.keep.binary_search(&snapshot_id).is_ok() {
+                plan.keep.retain(|id| id != &snapshot_id);
+            }
+            if !plan.delete.contains(&snapshot_id) {
+                plan.delete.push(snapshot_id.clone());
+            }
+            missing_remote_history.push((snapshot_id, missing_count));
+        }
+        plan.delete.sort();
+        plan.delete.dedup();
+        missing_remote_history.sort();
+    }
+    Ok(PrunePlan {
+        keep: plan.keep,
+        delete: plan.delete,
+        missing_remote_history,
+    })
 }
 
 fn protected_ref_snapshots(
@@ -136,6 +173,37 @@ fn protected_ref_snapshots(
         }
     }
     Ok(protected)
+}
+
+fn missing_remote_history_snapshots(
+    paths: &Paths,
+    conn: &Connection,
+    protected: &BTreeSet<String>,
+    current: Option<&str>,
+) -> Result<Vec<(String, usize)>> {
+    let config = read_config(paths)?;
+    let Some(remote_config) = config.remote.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let remote = open_remote(remote_config)?;
+    let remote_keys = remote_payload_key_index(&remote)?;
+    let export = export_metadata(paths, conn, &config)?;
+    let mut missing = Vec::new();
+    for snapshot in &export.snapshots {
+        if current == Some(snapshot.id.as_str()) || protected.contains(&snapshot.id) {
+            continue;
+        }
+        let keys =
+            crate::object_paths::local_object_keys_for_snapshot(paths, &export, &snapshot.id)?;
+        let missing_count = keys
+            .iter()
+            .filter(|key| !remote_payload_index_contains(&remote_keys, key))
+            .count();
+        if missing_count > 0 {
+            missing.push((snapshot.id.clone(), missing_count));
+        }
+    }
+    Ok(missing)
 }
 
 pub(crate) fn prune_unreferenced_metadata(

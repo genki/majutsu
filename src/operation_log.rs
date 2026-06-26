@@ -80,6 +80,7 @@ pub(crate) struct OperationOriginOverride {
     pub(crate) confidence: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn origin_override_from_pid(
     pid: u32,
     label: Option<String>,
@@ -431,11 +432,6 @@ fn process_exe_string(pid: u32) -> Option<String> {
     fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_exe_string(_pid: u32) -> Option<String> {
-    None
 }
 
 fn process_path(pid: u32) -> Vec<u32> {

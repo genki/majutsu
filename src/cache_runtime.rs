@@ -1,4 +1,4 @@
-use crate::majutsu_store::canonical_remote_alias;
+use crate::majutsu_store::{canonical_remote_alias, host_remote_key, remote_host_label};
 use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeSet;
 use std::fs;
@@ -8,7 +8,7 @@ use crate::config::{MetadataExport, Paths, read_config};
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote};
 use crate::snapshot_state::current_snapshot;
-use crate::{ensure_ready, export_metadata, open_db, remote_object_available};
+use crate::{ensure_ready, export_metadata, open_db, remote_object_available_for_paths};
 
 #[derive(Debug, Default)]
 struct CachePrunePlan {
@@ -194,15 +194,17 @@ pub(crate) fn prune_synced_metadata_cache(
             metadata: true,
         });
     }
+    let config = read_config(paths)?;
     let mut plan = if local_candidates.is_empty() {
         CachePrunePlan {
             local_missing,
             ..CachePrunePlan::default()
         }
     } else if local_candidates.len() <= 64 {
-        filter_remote_available_by_head(remote, local_candidates)?
+        filter_remote_available_by_head(paths, remote, local_candidates)?
     } else {
-        let remote_keys = remote_payload_key_index(remote)?;
+        let remote_keys =
+            remote_payload_key_index_for_host(remote, &remote_host_label(&config.host.name))?;
         filter_remote_available_from_index(&remote_keys, local_candidates)
     };
     plan.local_missing = local_missing;
@@ -282,10 +284,12 @@ fn build_cache_prune_plan(
             ..CachePrunePlan::default()
         });
     }
+    let config = read_config(paths)?;
     let mut plan = if local_candidates.len() <= 64 {
-        filter_remote_available_by_head(remote, local_candidates)?
+        filter_remote_available_by_head(paths, remote, local_candidates)?
     } else {
-        let remote_keys = remote_payload_key_index(remote)?;
+        let remote_keys =
+            remote_payload_key_index_for_host(remote, &remote_host_label(&config.host.name))?;
         filter_remote_available_from_index(&remote_keys, local_candidates)
     };
     plan.local_missing = local_missing;
@@ -294,12 +298,13 @@ fn build_cache_prune_plan(
 }
 
 fn filter_remote_available_by_head(
+    paths: &Paths,
     remote: &RemoteStore,
     candidates: Vec<CachePruneCandidate>,
 ) -> Result<CachePrunePlan> {
     let mut plan = CachePrunePlan::default();
     for candidate in candidates {
-        if remote_object_available(remote, &candidate.key)? {
+        if remote_object_available_for_paths(paths, remote, &candidate.key)? {
             plan.candidates.push(candidate);
         } else {
             plan.remote_missing += 1;
@@ -328,6 +333,20 @@ fn filter_remote_available_from_index(
 }
 
 pub(crate) fn remote_payload_key_index(remote: &RemoteStore) -> Result<BTreeSet<String>> {
+    remote_payload_key_index_with_host(remote, None)
+}
+
+pub(crate) fn remote_payload_key_index_for_host(
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<BTreeSet<String>> {
+    remote_payload_key_index_with_host(remote, Some(host_id))
+}
+
+fn remote_payload_key_index_with_host(
+    remote: &RemoteStore,
+    host_id: Option<&str>,
+) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for prefix in [
         "objects/blobs/",
@@ -343,7 +362,19 @@ pub(crate) fn remote_payload_key_index(remote: &RemoteStore) -> Result<BTreeSet<
         "objects/trees/",
         "trees/",
     ] {
-        keys.extend(remote.list(prefix)?);
+        let remote_prefix = host_id
+            .map(|host_id| host_remote_key(host_id, prefix))
+            .unwrap_or_else(|| prefix.to_string());
+        for key in remote.list(&remote_prefix)? {
+            if let Some(host_id) = host_id {
+                let Some(stripped) = key.strip_prefix(&format!("{host_id}/")) else {
+                    continue;
+                };
+                keys.insert(stripped.to_string());
+            } else {
+                keys.insert(key);
+            }
+        }
     }
     Ok(keys)
 }

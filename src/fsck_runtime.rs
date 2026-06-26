@@ -20,15 +20,14 @@ use crate::majutsu_pack::{
 };
 use crate::majutsu_restore::{RestoreQueueItem, validate_relative_filter_path};
 use crate::majutsu_store::{
-    BlobExport, LEGACY_METADATA_EXPORT_KEY, REMOTE_CHUNK_INDEX_SHARD_KEY, REMOTE_HOST_INDEX_KEY,
-    RemoteChunkIndexEntry as ChunkIndexEntry, RemoteChunkIndexIssue,
-    RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
+    BlobExport, REMOTE_CHUNK_INDEX_SHARD_KEY, RemoteChunkIndexEntry as ChunkIndexEntry,
+    RemoteChunkIndexIssue, RemoteChunkIndexShard as ChunkIndexShard, RemoteGcMark as GcMarkExport,
     RemoteGcTombstone as GcTombstoneExport, RemoteHostIndexIssue, RemoteObjectAvailabilityIssue,
     canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
-    host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
-    host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
-    host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
-    remote_gc_mark_key, remote_gc_tombstone_prefix, remote_object_availability_issues,
+    host_last_synced_ref_key, host_metadata_key, host_operation_canonical_key, host_operation_key,
+    host_oplog_canonical_key, host_oplog_key, host_ops_prefix, host_remote_key,
+    host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix, remote_gc_mark_key,
+    remote_gc_tombstone_prefix, remote_host_label, remote_object_availability_issues,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -41,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache_runtime::{
     payload_cache_key_set, prune_synced_metadata_cache, prune_synced_payload_cache,
-    remote_payload_index_contains, remote_payload_key_index,
+    remote_payload_index_contains, remote_payload_key_index_for_host,
 };
 use crate::cli::FsckArgs;
 use crate::config::{
@@ -62,7 +61,7 @@ use crate::util::{
 use crate::{
     decode_canonical_remote_export, decode_canonical_remote_oplog, decode_large_chunk_stored_bytes,
     decode_object, export_metadata, open_db, packed_blob_metadata, read_blob_payload,
-    read_large_chunk, read_object, remote_local_object_variants, remote_object_available,
+    read_large_chunk, read_object, remote_local_object_variants, remote_object_available_for_paths,
     remote_ref,
 };
 
@@ -88,15 +87,15 @@ struct RemoteRootAck {
 }
 
 fn remote_head_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/head.cbor.zst.enc")
+    format!("{host_id}/head.cbor.zst.enc")
 }
 
 fn read_remote_head(
     paths: &Paths,
     remote: &RemoteStore,
-    host_id: &str,
+    host_prefix: &str,
 ) -> Result<Option<RemoteHeadExport>> {
-    let Some(bytes) = remote.get_optional(&remote_head_key(host_id))? else {
+    let Some(bytes) = remote.get_optional(&remote_head_key(host_prefix))? else {
         return Ok(None);
     };
     let decoded = decode_object(paths, &bytes)?;
@@ -234,6 +233,7 @@ impl FsckScope {
 }
 
 struct PayloadValidationContext<'a> {
+    paths: &'a Paths,
     remote_payload_keys: Option<&'a BTreeSet<String>>,
     remote: Option<&'a RemoteStore>,
     payload_cache_keys: &'a BTreeSet<String>,
@@ -271,8 +271,9 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         options.phase("remote-payload-index")?;
     }
     let remote_payload_keys = if use_remote_payload_index {
-        Some(remote_payload_key_index(
+        Some(remote_payload_key_index_for_host(
             remote.as_ref().expect("remote exists"),
+            &remote_host_label(&config.host.name),
         )?)
     } else {
         None
@@ -290,6 +291,7 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         .map(|pack| (pack.pack_id.as_str(), pack.pack_key.as_str()))
         .collect::<BTreeMap<_, _>>();
     let payload_context = PayloadValidationContext {
+        paths,
         remote_payload_keys: remote_payload_keys.as_ref(),
         remote: remote.as_ref(),
         payload_cache_keys: &payload_cache_keys,
@@ -1095,7 +1097,7 @@ fn payload_cache_available_remotely(
         return Ok(false);
     };
     context.options.check_timeout()?;
-    remote_object_available(remote, key)
+    remote_object_available_for_paths(context.paths, remote, key)
 }
 
 fn validate_local_history_graph(export: &crate::MetadataExport, missing: &mut usize) -> Result<()> {
@@ -1198,7 +1200,8 @@ fn validate_remote_refs(conn: &Connection, config: &Config, missing: &mut usize)
         ))
     })?;
     let refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    for issue in remote_ref_issues(refs, &config.host.id, &snapshot_ids) {
+    let host_prefix = remote_host_label(&config.host.name);
+    for issue in remote_ref_issues(refs, &host_prefix, &snapshot_ids) {
         *missing += 1;
         eprintln!("{}", issue.message());
     }
@@ -2123,24 +2126,22 @@ pub(crate) fn validate_remote_chunk_index(
     if export.chunks.is_empty() {
         return Ok(());
     }
-    for key in remote.list("indexes/chunk-index/")? {
-        if key != REMOTE_CHUNK_INDEX_SHARD_KEY {
+    let host_id = remote_host_label(&export.config.host.name);
+    let shard_key = host_remote_key(&host_id, REMOTE_CHUNK_INDEX_SHARD_KEY);
+    let shard_prefix = host_remote_key(&host_id, "indexes/chunk-index/");
+    for key in remote.list(&shard_prefix)? {
+        if key != shard_key {
             *missing += 1;
             eprintln!("unexpected remote chunk index shard {key}");
         }
     }
-    if !remote.exists(REMOTE_CHUNK_INDEX_SHARD_KEY)? {
+    if !remote.exists(&shard_key)? {
         *missing += 1;
-        eprintln!("missing remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}");
+        eprintln!("missing remote chunk index shard {shard_key}");
         return Ok(());
     }
-    let shard: ChunkIndexShard = decode_canonical_remote_export(
-        paths,
-        &remote.get(REMOTE_CHUNK_INDEX_SHARD_KEY)?,
-    )
-    .map_err(|err| {
-        anyhow::anyhow!("parse remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}: {err}")
-    })?;
+    let shard: ChunkIndexShard = decode_canonical_remote_export(paths, &remote.get(&shard_key)?)
+        .map_err(|err| anyhow::anyhow!("parse remote chunk index shard {shard_key}: {err}"))?;
     let expected = export
         .chunks
         .iter()
@@ -2657,56 +2658,33 @@ pub(crate) fn remote_fsck_with_options(
         println!("payload_limited {}", payload_budget.limited());
         return Ok(());
     }
-    let has_legacy_export = remote.exists(LEGACY_METADATA_EXPORT_KEY)?;
-    let has_host_index = remote.exists(REMOTE_HOST_INDEX_KEY)?;
-
-    if has_legacy_export {
-        let export = remote_fsck_export(
-            paths,
-            remote,
-            LEGACY_METADATA_EXPORT_KEY,
-            None,
-            options,
-            &mut payload_budget,
-            &mut missing,
-        )?;
-        if let Some(current) = export.refs.get("current") {
-            let legacy_current = remote_ref(remote, "hosts/current")?;
-            if legacy_current.as_deref() != Some(current.as_str()) {
-                missing += 1;
-                eprintln!("legacy hosts/current does not match metadata current ref");
-            }
-        }
+    let index = read_remote_host_index(remote)?;
+    if index.hosts.is_empty() {
+        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
     }
-
-    if has_host_index {
-        let index = read_remote_host_index(remote)?;
-        let indexed_host_ids = index
-            .hosts
-            .iter()
-            .map(|host| host.id.clone())
-            .collect::<BTreeSet<_>>();
+    {
         for issue in index.duplicate_issues() {
             missing += 1;
             match issue {
                 RemoteHostIndexIssue::DuplicateHostId(id) => {
-                    eprintln!("duplicate host id in hosts/index.json: {id}");
+                    eprintln!("duplicate remote host metadata id: {id}");
                 }
                 RemoteHostIndexIssue::DuplicateMetadataKey(key) => {
-                    eprintln!("duplicate host metadata_key in hosts/index.json: {key}");
+                    eprintln!("duplicate remote host metadata_key: {key}");
                 }
             }
         }
         for host in &index.hosts {
             verified_hosts += 1;
-            let expected_metadata_key = host_metadata_key(&host.id);
+            let host_prefix = remote_host_prefix_from_metadata_key(&host.metadata_key, &host.name);
+            let expected_metadata_key = host_metadata_key(&host_prefix);
             let expected_compressed_metadata_key = compressed_metadata_key(&expected_metadata_key);
             if host.metadata_key != expected_metadata_key
                 && host.metadata_key != expected_compressed_metadata_key
             {
                 missing += 1;
                 eprintln!(
-                    "host index metadata_key {} does not match canonical key {}",
+                    "remote host metadata_key {} does not match canonical key {}",
                     host.metadata_key, expected_metadata_key
                 );
             }
@@ -2719,7 +2697,7 @@ pub(crate) fn remote_fsck_with_options(
                 paths,
                 remote,
                 &host.metadata_key,
-                Some(&host.id),
+                Some(&host_prefix),
                 options,
                 &mut payload_budget,
                 &mut missing,
@@ -2727,24 +2705,24 @@ pub(crate) fn remote_fsck_with_options(
             if export.config.host.id != host.id {
                 missing += 1;
                 eprintln!(
-                    "host index id {} does not match metadata host id {}",
+                    "remote host id {} does not match metadata host id {}",
                     host.id, export.config.host.id
                 );
             }
             if export.config.host.name != host.name {
                 missing += 1;
                 eprintln!(
-                    "host index name {} does not match metadata host name {}",
+                    "remote host name {} does not match metadata host name {}",
                     host.name, export.config.host.name
                 );
             }
-            let head = read_remote_head(paths, remote, &host.id)?;
+            let head = read_remote_head(paths, remote, &host_prefix)?;
             let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
             let current = export.refs.get("current");
             if host.current_snapshot.as_ref() != current && !compact_head_authoritative {
                 missing += 1;
                 eprintln!(
-                    "host index current snapshot does not match metadata for {}",
+                    "remote host current snapshot does not match metadata for {}",
                     host.id
                 );
             }
@@ -2753,7 +2731,7 @@ pub(crate) fn remote_fsck_with_options(
                     missing += 1;
                     eprintln!(
                         "unsupported remote head version {}",
-                        remote_head_key(&host.id)
+                        remote_head_key(&host_prefix)
                     );
                 }
                 if head.host_id != host.id {
@@ -2773,7 +2751,7 @@ pub(crate) fn remote_fsck_with_options(
                 if head.metadata_key != host.metadata_key {
                     missing += 1;
                     eprintln!(
-                        "remote head metadata key does not match host index for {}",
+                        "remote head metadata key does not match host metadata for {}",
                         host.id
                     );
                 }
@@ -2786,7 +2764,7 @@ pub(crate) fn remote_fsck_with_options(
                 }
                 validate_remote_head_root_acks(paths, remote, &export, head, &mut missing)?;
             }
-            let current_ref_key = host_current_ref_key(&host.id);
+            let current_ref_key = host_current_ref_key(&host_prefix);
             if let Some(current) = current {
                 match remote_ref(remote, &current_ref_key)? {
                     Some(remote_current) if remote_current == *current => {}
@@ -2805,15 +2783,6 @@ pub(crate) fn remote_fsck_with_options(
                         }
                     }
                 }
-                let legacy_current_key = host_legacy_current_key(&host.id);
-                if let Some(legacy_current) = remote_ref(remote, &legacy_current_key)?
-                    && legacy_current != *current
-                {
-                    missing += 1;
-                    eprintln!(
-                        "{legacy_current_key} points to {legacy_current}, expected {current}"
-                    );
-                }
             }
             if let Some(last_synced) = export.refs.get("last-synced") {
                 match parse_db_time(last_synced) {
@@ -2823,7 +2792,7 @@ pub(crate) fn remote_fsck_with_options(
                     Ok(metadata_last_synced) => {
                         missing += 1;
                         eprintln!(
-                            "host index last_synced_at {} does not match metadata last-synced {} for {}",
+                            "remote host last_synced_at {} does not match metadata last-synced {} for {}",
                             host.last_synced_at.to_rfc3339(),
                             metadata_last_synced.to_rfc3339(),
                             host.id
@@ -2834,7 +2803,7 @@ pub(crate) fn remote_fsck_with_options(
                         eprintln!("invalid metadata last-synced for {}: {err}", host.id);
                     }
                 }
-                let last_synced_ref_key = host_last_synced_ref_key(&host.id);
+                let last_synced_ref_key = host_last_synced_ref_key(&host_prefix);
                 if let Some(head) = head.as_ref()
                     && head.last_synced.as_ref() != Some(last_synced)
                 {
@@ -2862,34 +2831,29 @@ pub(crate) fn remote_fsck_with_options(
                     }
                 }
             }
-            validate_remote_host_ref_prefix(remote, &host.id, &mut missing)?;
+            validate_remote_host_ref_prefix(remote, &host_prefix, &mut missing)?;
             for snapshot in &export.snapshots {
-                let key = host_snapshot_canonical_key(&host.id, &snapshot.id);
+                let key = host_snapshot_canonical_key(&host_prefix, &snapshot.id);
                 if !remote.exists(&key)? {
                     missing += 1;
                     eprintln!("missing canonical host snapshot export {key}");
                 }
             }
             for operation in &export.operations {
-                let key = host_operation_canonical_key(&host.id, &operation.id);
+                let key = host_operation_canonical_key(&host_prefix, &operation.id);
                 if !remote.exists(&key)? {
                     missing += 1;
                     eprintln!("missing canonical host operation export {key}");
                 }
             }
-            validate_remote_gc_records(paths, remote, &host.id, &export, &mut missing)?;
+            validate_remote_gc_records(paths, remote, &host_prefix, &export, &mut missing)?;
         }
-        validate_remote_host_prefix_hosts(remote, &indexed_host_ids, &mut missing)?;
-        validate_remote_gc_prefix_hosts(remote, &indexed_host_ids, &mut missing)?;
     }
     validate_remote_lifecycle_artifacts(remote, &mut missing)?;
 
-    if !has_legacy_export && !has_host_index {
-        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
-    }
-    if has_host_index && verified_hosts == 0 {
+    if verified_hosts == 0 {
         missing += 1;
-        eprintln!("hosts/index.json contains no hosts");
+        eprintln!("remote contains no host metadata");
     }
     if missing > 0 {
         bail!("remote fsck found {missing} issue(s)");
@@ -2906,9 +2870,6 @@ pub(crate) fn remote_fsck_with_options(
         println!("payload_objects_checked {}", payload_budget.checked);
         println!("payload_limited {}", payload_budget.limited());
     }
-    if has_legacy_export {
-        println!("legacy_metadata ok");
-    }
     Ok(())
 }
 
@@ -2919,24 +2880,13 @@ fn remote_payload_fsck_current_host(
     payload_budget: &mut RemotePayloadFsckBudget,
 ) -> Result<()> {
     let config = read_config(paths)?;
-    let metadata_key = if remote.exists(REMOTE_HOST_INDEX_KEY)? {
-        let index = read_remote_host_index(remote)?;
-        index
-            .hosts
-            .iter()
-            .find(|host| host.id == config.host.id)
-            .map(|host| host.metadata_key.clone())
-            .with_context(|| {
-                format!(
-                    "host {} is not present in remote host index",
-                    config.host.id
-                )
-            })?
-    } else if remote.exists(LEGACY_METADATA_EXPORT_KEY)? {
-        LEGACY_METADATA_EXPORT_KEY.into()
-    } else {
-        bail!("remote metadata is missing: metadata/export.json and hosts/index.json not found");
-    };
+    let index = read_remote_host_index(remote)?;
+    let host = index
+        .hosts
+        .iter()
+        .find(|host| host.id == config.host.id)
+        .with_context(|| format!("host {} is not present in remote metadata", config.host.id))?;
+    let metadata_key = host.metadata_key.clone();
     let metadata_bytes = remote_metadata_bytes(remote, &metadata_key)?;
     let export: crate::MetadataExport = serde_json::from_slice(&metadata_bytes)
         .with_context(|| format!("parse remote metadata {metadata_key}"))?;
@@ -3090,6 +3040,13 @@ fn compressed_metadata_key(key: &str) -> String {
     format!("{key}.zst")
 }
 
+fn remote_host_prefix_from_metadata_key(metadata_key: &str, host_name: &str) -> String {
+    metadata_key
+        .split_once('/')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| remote_host_label(host_name))
+}
+
 fn remote_metadata_bytes(remote: &RemoteStore, metadata_key: &str) -> Result<Vec<u8>> {
     let bytes = remote.get(metadata_key)?;
     if metadata_key.ends_with(".zst") {
@@ -3100,86 +3057,6 @@ fn remote_metadata_bytes(remote: &RemoteStore, metadata_key: &str) -> Result<Vec
         );
     }
     Ok(bytes)
-}
-
-fn validate_remote_gc_prefix_hosts(
-    remote: &RemoteStore,
-    indexed_host_ids: &BTreeSet<String>,
-    missing: &mut usize,
-) -> Result<()> {
-    for key in remote.list("gc/marks/")? {
-        let Some(host_id) = key
-            .strip_prefix("gc/marks/")
-            .and_then(|rest| rest.strip_suffix(".json"))
-        else {
-            *missing += 1;
-            eprintln!("unexpected remote gc mark key {key}");
-            continue;
-        };
-        if host_id.is_empty() || host_id.contains('/') {
-            *missing += 1;
-            eprintln!("unexpected remote gc mark key {key}");
-        } else if !indexed_host_ids.contains(host_id) {
-            *missing += 1;
-            eprintln!("remote gc mark references unknown host {key}");
-        }
-    }
-
-    let mut reported_tombstone_hosts = BTreeSet::new();
-    for key in remote.list("gc/tombstones/")? {
-        let Some(rest) = key.strip_prefix("gc/tombstones/") else {
-            *missing += 1;
-            eprintln!("unexpected remote gc tombstone key {key}");
-            continue;
-        };
-        let Some((host_id, _)) = rest.split_once('/') else {
-            *missing += 1;
-            eprintln!("unexpected remote gc tombstone key {key}");
-            continue;
-        };
-        if host_id.is_empty() {
-            *missing += 1;
-            eprintln!("unexpected remote gc tombstone key {key}");
-        } else if !indexed_host_ids.contains(host_id)
-            && reported_tombstone_hosts.insert(host_id.to_string())
-        {
-            *missing += 1;
-            eprintln!("remote gc tombstones reference unknown host {host_id}");
-        }
-    }
-    Ok(())
-}
-
-fn validate_remote_host_prefix_hosts(
-    remote: &RemoteStore,
-    indexed_host_ids: &BTreeSet<String>,
-    missing: &mut usize,
-) -> Result<()> {
-    let mut reported_hosts = BTreeSet::new();
-    for key in remote.list("hosts/")? {
-        let Some(rest) = key.strip_prefix("hosts/") else {
-            *missing += 1;
-            eprintln!("unexpected remote host key {key}");
-            continue;
-        };
-        if matches!(rest, "index.json" | "current") {
-            continue;
-        }
-        let Some((host_id, _)) = rest.split_once('/') else {
-            *missing += 1;
-            eprintln!("unexpected remote host key {key}");
-            continue;
-        };
-        if host_id.is_empty() {
-            *missing += 1;
-            eprintln!("unexpected remote host key {key}");
-        } else if !indexed_host_ids.contains(host_id) && reported_hosts.insert(host_id.to_string())
-        {
-            *missing += 1;
-            eprintln!("remote hosts prefix references unknown host {host_id}");
-        }
-    }
-    Ok(())
 }
 
 fn validate_remote_head_root_acks(
@@ -3286,7 +3163,7 @@ fn validate_remote_host_ref_prefix(
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    for key in remote.list(&format!("hosts/{host_id}/refs/"))? {
+    for key in remote.list(&format!("{host_id}/refs/"))? {
         if !expected_ref_keys.contains(&key) {
             *missing += 1;
             eprintln!("unexpected remote host ref {key}");

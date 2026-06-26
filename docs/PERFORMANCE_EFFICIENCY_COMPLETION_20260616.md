@@ -7,7 +7,7 @@
 現在の設計では、S3/GCS 経路で compact head object を使い、legacy current ref や GC mark の毎回更新を避けている。今回の変更では、さらに次の bounded metadata object を追加した。
 
 ```text
-hosts/<host-id>/root-size-summary.cbor.zst.enc
+<host-id>/root-size-summary.cbor.zst.enc
 ```
 
 これは current snapshot の root 別集計で、`mj root size` の cold path が remote prefix 全体を list せずに表示できるようにするためのもの。

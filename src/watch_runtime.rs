@@ -18,11 +18,13 @@ use walkdir::WalkDir;
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{
-    ForegroundDaemonRuntime, WatchDaemonLaunchConfig, child_process_exe, start_daemon_ipc,
-    start_watch_daemon,
+    ForegroundDaemonRuntime, WatchDaemonLaunchConfig, child_process_exe, ensure_daemon_ipc,
+    start_daemon_ipc, start_watch_daemon,
 };
 use crate::history_runtime::refresh_runtime_health;
-use crate::operation_log::{OperationOriginOverride, origin_override_from_pid};
+use crate::operation_log::OperationOriginOverride;
+#[cfg(target_os = "linux")]
+use crate::operation_log::origin_override_from_pid;
 use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{
     event_journal_records, record_event, record_file_event, upload_queue_stats,
@@ -763,6 +765,9 @@ fn watch_notify_loop<W: Watcher>(
 }
 
 fn record_health(paths: &Paths) {
+    if let Err(err) = ensure_daemon_ipc(paths) {
+        let _ = record_event(paths, "daemon-ipc-recover-error", &format!("{err:#}"));
+    }
     if let Err(err) = refresh_runtime_health(paths) {
         let _ = record_event(paths, "health-record-error", &format!("{err:#}"));
     }
@@ -1124,17 +1129,31 @@ fn event_relevant_for_roots(active_roots: &[RootConfig], event: &notify::Event) 
 }
 
 fn event_path_for_roots(active_roots: &[RootConfig], path: &Path) -> Option<(String, String)> {
-    active_roots.iter().find_map(|root| {
-        path.strip_prefix(&root.path).ok().and_then(|relative| {
+    active_roots
+        .iter()
+        .filter_map(|root| {
+            path.strip_prefix(&root.path)
+                .ok()
+                .map(|relative| (root, relative))
+        })
+        .filter_map(|(root, relative)| {
             if relative.as_os_str().is_empty() {
-                return Some((root.id.clone(), ".".into()));
+                return Some((root, relative));
             }
             if root_ignores_relative_path(root, relative, path.is_dir()) {
                 return None;
             }
-            Some((root.id.clone(), slash_path(relative)))
+            Some((root, relative))
         })
-    })
+        .max_by_key(|(root, _)| root.path.components().count())
+        .map(|(root, relative)| {
+            let rel = if relative.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                slash_path(relative)
+            };
+            (root.id.clone(), rel)
+        })
 }
 
 fn root_ignores_relative_path(root: &RootConfig, relative: &Path, is_dir: bool) -> bool {
@@ -1603,7 +1622,7 @@ mod tests {
             "modify".into(),
             "inotify".into(),
         );
-        event.remote_journal_key = Some("hosts/host/journal/event-synced.json".into());
+        event.remote_journal_key = Some("host/journal/event-synced.json".into());
         event.remote_journal_synced_at = Some(Utc::now());
         std::fs::create_dir_all(&paths.event_queue).unwrap();
         std::fs::write(

@@ -69,9 +69,10 @@ type = "file"
 path = "/tmp/majutsu-remote"
 ```
 
-`mj remote init` seeds an empty remote prefix with `hosts/index.json`. It refuses
-to initialize a non-empty prefix without `--force`, so first-run S3/GCS setup can
-distinguish an empty Majutsu backend from an accidental shared prefix.
+`mj remote init` validates that the configured remote root is ready for Majutsu.
+It refuses to initialize a non-empty remote root without `--force`, so first-run
+S3/GCS setup can distinguish an empty Majutsu backend from an accidental shared
+path.
 
 `mj sync --wait` waits for the current snapshot and upload queue to catch up. As
 a final guard it verifies referenced payload objects and re-uploads missing
@@ -80,24 +81,33 @@ it reports the missing-local count and asks for explicit repair/recovery work.
 
 ## Shared bucket design
 
-Majutsu can use one S3/GCS bucket for multiple environments. Each state has a
-host id, and host-scoped metadata is stored under paths such as:
+Majutsu can use one S3/GCS bucket for multiple environments. The S3 URL path is
+the Majutsu remote root. Directories directly below that remote root are host
+ids, and durable objects do not cross that boundary:
 
 ```text
-hosts/<host-id>/metadata/export.json
-hosts/<host-id>/refs/current
-hosts/<host-id>/refs/last-synced
-hosts/<host-id>/snapshots/...
-hosts/<host-id>/ops/...
+<host-id>/metadata/export.json.zst
+<host-id>/refs/current
+<host-id>/refs/last-synced
+<host-id>/snapshots/...
+<host-id>/ops/...
+<host-id>/objects/...
+<host-id>/blobs/...
+<host-id>/trees/...
+<host-id>/packs/...
+<host-id>/large/...
 ```
 
-Payload objects are content-addressed and may be reused when identical content
-appears across histories. This lets several hosts share one bucket/prefix while
-remaining selectable by host:
+The bucket can still be shared. If the bucket is also used for other data, pass
+a path in the remote URL, for example `s3://bucket/path-to-mj`. Majutsu then
+treats `path-to-mj/` as the remote root and stores hosts as
+`path-to-mj/<host-id>/...`.
+
+Hosts are selected by host id or a host name discovered from host metadata:
 
 ```sh
 mj remote hosts
-mj --home /tmp/recovered clone --remote s3://bucket/prefix --host workstation-a
+mj --home /tmp/recovered clone --remote s3://bucket/path-to-mj --host workstation-a
 ```
 
 Use separate prefixes for unrelated projects, trust domains, or retention
@@ -111,13 +121,17 @@ s3://bucket/majutsu/system
 
 ## Remote object layout
 
-Majutsu publishes canonical remote-layout aliases for trees, blobs, packs,
-indexes, large manifests/chunks, and host operation logs. It also keeps
-backward-compatible metadata where needed for clone and restore compatibility.
+Majutsu publishes host-scoped remote objects for trees, blobs, packs, indexes,
+large manifests/chunks, and host operation logs. For S3/GCS compatible remotes,
+the remote URL path is the Majutsu remote root and every durable object belongs
+under one direct child `<host-id>/...`. There is no `hosts/` wrapper, no global
+host registry, and no payload sharing across host-id boundaries.
 
-`mj remote fsck` verifies canonical `hosts/index.json`, each host metadata
-export, canonical per-host refs, snapshot/operation exports, aggregate
-operation logs, and every referenced object through canonical or legacy keys.
+`mj remote fsck` verifies each host metadata export, per-host refs,
+snapshot/operation exports, aggregate operation logs, and every referenced
+object under that host id. Old pre-migration prefixes are not fallback inputs;
+after a host has synced with the current layout, old prefixes can be removed
+from the remote.
 
 To rebuild an empty state directory from remote:
 
@@ -128,7 +142,7 @@ mj --home /tmp/recovered-majutsu fsck
 mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 ```
 
-When `hosts/index.json` contains multiple hosts, clone requires `--host`. If a
+When the remote root contains multiple host ids, clone requires `--host`. If a
 host name matches multiple entries, use the host id shown by `mj remote hosts`.
 Duplicate host ids or metadata keys are treated as remote metadata corruption.
 

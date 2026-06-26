@@ -231,9 +231,16 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             print!("{service}");
         }
         DaemonCommand::Stop => {
-            let pid =
-                read_pid(&paths.daemon_pid)?.ok_or_else(|| anyhow!("daemon pid file not found"))?;
+            let pid = read_pid(&paths.daemon_pid)?
+                .or(discover_running_watch_daemon(paths)?)
+                .ok_or_else(|| anyhow!("daemon pid file not found"))?;
             stop_daemon_process(pid)?;
+            if let Some(extra_pid) = discover_running_watch_daemon(paths)?
+                && extra_pid != pid
+            {
+                stop_daemon_process(extra_pid)?;
+                println!("stopped daemon pid {extra_pid}");
+            }
             cleanup_daemon_runtime(paths);
             println!("stopped daemon pid {pid}");
         }
@@ -417,6 +424,14 @@ pub(crate) fn daemon_health(paths: &Paths) -> Result<DaemonHealth> {
         });
     };
     if !pid_alive(pid) {
+        if let Some(live_pid) = discover_running_watch_daemon(paths)? {
+            let _ = fs::write(&paths.daemon_pid, live_pid.to_string());
+            return Ok(DaemonHealth {
+                state: DaemonHealthState::Running,
+                pid: Some(live_pid),
+                ipc_available: daemon_ipc_request(paths, "status").is_ok(),
+            });
+        }
         return Ok(DaemonHealth {
             state: DaemonHealthState::Stale,
             pid: Some(pid),
@@ -428,6 +443,50 @@ pub(crate) fn daemon_health(paths: &Paths) -> Result<DaemonHealth> {
         pid: Some(pid),
         ipc_available: daemon_ipc_request(paths, "status").is_ok(),
     })
+}
+
+#[cfg(unix)]
+fn discover_running_watch_daemon(paths: &Paths) -> Result<Option<u32>> {
+    let output = ProcessCommand::new("ps")
+        .args(["-eo", "pid=,command="])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let home = paths.home.to_string_lossy();
+    let exe_name = env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "mj".into());
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim_start();
+        let Some((pid_s, command)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_s.trim().parse::<u32>() else {
+            continue;
+        };
+        if !pid_alive(pid) {
+            continue;
+        }
+        if command.contains(&exe_name)
+            && command.contains("--home")
+            && command.contains(home.as_ref())
+            && command.contains(" watch ")
+            && command.contains("--foreground")
+        {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+fn discover_running_watch_daemon(_paths: &Paths) -> Result<Option<u32>> {
+    Ok(None)
 }
 
 pub(crate) fn ensure_daemon_running(paths: &Paths) -> Result<Option<u32>> {
@@ -444,6 +503,9 @@ pub(crate) fn ensure_daemon_running(paths: &Paths) -> Result<Option<u32>> {
         return Ok(None);
     }
     if health.state == DaemonHealthState::Stale {
+        if discover_running_watch_daemon(paths)?.is_some() {
+            return Ok(None);
+        }
         cleanup_daemon_runtime(paths);
     }
     let config = read_config(paths)?;
@@ -501,6 +563,10 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
         if pid_alive(pid) {
             bail!("daemon already running with pid {pid}");
         }
+        if let Some(live_pid) = discover_running_watch_daemon(paths)? {
+            fs::write(&paths.daemon_pid, live_pid.to_string())?;
+            return Ok(live_pid);
+        }
         cleanup_daemon_runtime(paths);
     }
     fs::create_dir_all(&paths.runtime)?;
@@ -508,8 +574,9 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
 
     #[cfg(windows)]
     {
-        let pid = start_watch_daemon_windows(paths, &config)?;
-        write_daemon_pid_and_log(paths, pid, &config)?;
+        start_watch_daemon_windows(paths, &config)?;
+        let pid = wait_for_daemon_registered_pid(paths, 0)?;
+        append_daemon_launch_log(paths, pid, &config);
         Ok(pid)
     }
 
@@ -555,18 +622,33 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
         configure_background_command(&mut command);
         detach_daemon_process(&mut command);
         let child = command.spawn()?;
-        let pid = child.id();
-        write_daemon_pid_and_log(paths, pid, &config)?;
+        let pid = wait_for_daemon_registered_pid(paths, child.id())?;
+        append_daemon_launch_log(paths, pid, &config);
         Ok(pid)
     }
 }
 
-fn write_daemon_pid_and_log(
-    paths: &Paths,
-    pid: u32,
-    config: &WatchDaemonLaunchConfig,
-) -> Result<()> {
-    fs::write(&paths.daemon_pid, pid.to_string())?;
+fn wait_for_daemon_registered_pid(paths: &Paths, fallback_pid: u32) -> Result<u32> {
+    #[cfg(windows)]
+    let attempts = 300;
+    #[cfg(not(windows))]
+    let attempts = 50;
+    for _ in 0..attempts {
+        if let Some(pid) = read_pid(&paths.daemon_pid)?
+            && pid_alive(pid)
+        {
+            return Ok(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if fallback_pid == 0 {
+        bail!("daemon did not register a live pid before startup timeout");
+    }
+    fs::write(&paths.daemon_pid, fallback_pid.to_string())?;
+    Ok(fallback_pid)
+}
+
+fn append_daemon_launch_log(paths: &Paths, pid: u32, config: &WatchDaemonLaunchConfig) {
     append_daemon_log(
         paths,
         &format!(
@@ -581,12 +663,13 @@ fn write_daemon_pid_and_log(
             config.max_rss_mib
         ),
     );
-    Ok(())
 }
 
 #[cfg(windows)]
-fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -> Result<u32> {
+fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -> Result<()> {
     let exe = env::current_exe()?;
+    let stdout_log = daemon_log_path(paths);
+    let stderr_log = paths.logs.join("majutsu.err.log");
     let args = vec![
         "--home".to_string(),
         paths.home.display().to_string(),
@@ -618,41 +701,66 @@ fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut script = String::from("$ErrorActionPreference = 'Stop'\n");
+    let mut runner = String::from("$ErrorActionPreference = 'Stop'\n");
     for key in DAEMON_ATTRIBUTION_ENV_KEYS {
-        let _ = writeln!(script, "$env:{key} = $null");
+        let _ = writeln!(runner, "$env:{key} = $null");
     }
-    script.push_str("$env:MAJUTSU_DAEMON = '1'\n");
+    runner.push_str("$env:MAJUTSU_DAEMON = '1'\n");
     for (key, value) in daemon_env(paths)? {
-        let _ = writeln!(script, "$env:{key} = '{}'", powershell_single_quote(&value));
+        let _ = writeln!(runner, "$env:{key} = '{}'", powershell_single_quote(&value));
     }
+    let _ = writeln!(runner, "$daemonArgs = @({quoted_args})");
     let _ = writeln!(
-        script,
-        "$p = Start-Process -FilePath '{}' -ArgumentList @({quoted_args}) -WindowStyle Hidden -PassThru",
-        powershell_single_quote(&exe.display().to_string())
+        runner,
+        "& '{}' @daemonArgs >> '{}' 2>> '{}'",
+        powershell_single_quote(&exe.display().to_string()),
+        powershell_single_quote(&stdout_log.display().to_string()),
+        powershell_single_quote(&stderr_log.display().to_string())
     );
-    script.push_str("[Console]::Out.WriteLine($p.Id)\n");
 
-    let script_path = paths.runtime.join("launch-daemon.ps1");
-    fs::write(&script_path, script)?;
-    let output = ProcessCommand::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&script_path)
+    let runner_path = paths.runtime.join("run-daemon.ps1");
+    fs::write(&runner_path, runner)?;
+
+    let task_name = format!("MajutsuWatchLaunch-{}", Utc::now().timestamp_millis());
+    let task_command = format!(
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+        runner_path.display()
+    );
+    let create = ProcessCommand::new("schtasks.exe")
+        .args([
+            "/Create",
+            "/TN",
+            &task_name,
+            "/SC",
+            "ONCE",
+            "/ST",
+            "23:59",
+            "/TR",
+            &task_command,
+            "/F",
+        ])
         .output()?;
-    if !output.status.success() {
+    if !create.status.success() {
         bail!(
-            "failed to launch Windows daemon\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "failed to create Windows daemon launch task\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&create.stdout),
+            String::from_utf8_lossy(&create.stderr)
         );
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .map_err(|err| anyhow!("failed to parse Windows daemon pid: {err}"))
+    let run = ProcessCommand::new("schtasks.exe")
+        .args(["/Run", "/TN", &task_name])
+        .output()?;
+    let _ = ProcessCommand::new("schtasks.exe")
+        .args(["/Delete", "/TN", &task_name, "/F"])
+        .output();
+    if !run.status.success() {
+        bail!(
+            "failed to run Windows daemon launch task\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -860,6 +968,20 @@ pub(crate) fn start_daemon_ipc(paths: &Paths) -> Result<()> {
             }
         }
     });
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) fn ensure_daemon_ipc(paths: &Paths) -> Result<()> {
+    let sock = paths.runtime.join("daemon.sock");
+    if sock.exists() && daemon_ipc_request(paths, "status").is_ok() {
+        return Ok(());
+    }
+    start_daemon_ipc(paths)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn ensure_daemon_ipc(_: &Paths) -> Result<()> {
     Ok(())
 }
 

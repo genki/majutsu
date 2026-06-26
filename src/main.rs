@@ -54,12 +54,12 @@ use crate::majutsu_restore::{
 };
 use crate::majutsu_store::{
     BlobExport, REMOTE_CHUNK_INDEX_SHARD_KEY, RemoteChunkIndexShard as ChunkIndexShard,
-    RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostSummary,
-    canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
-    host_last_synced_ref_key, host_legacy_current_key, host_metadata_key,
-    host_operation_canonical_key, host_operation_key, host_oplog_canonical_key, host_oplog_key,
-    host_ops_prefix, host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix,
-    remote_gc_mark_key, remote_gc_tombstone_prefix,
+    RemoteGcMark as GcMarkExport, RemoteGcMarkIssue, RemoteGcTombstone as GcTombstoneExport,
+    RemoteHostSummary, canonical_remote_alias, canonical_remote_aliases, host_current_ref_key,
+    host_last_synced_ref_key, host_metadata_key, host_operation_canonical_key, host_operation_key,
+    host_oplog_canonical_key, host_oplog_key, host_ops_prefix, host_remote_key,
+    host_snapshot_canonical_key, host_snapshot_key, host_snapshots_prefix, remote_gc_mark_key,
+    remote_gc_tombstone_prefix, remote_host_label,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -72,7 +72,9 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::panic;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use uuid::Uuid;
@@ -164,7 +166,7 @@ use branch_runtime::branch_cmd;
 use cache_runtime::{cache_cmd, prune_synced_metadata_cache, prune_synced_payload_cache};
 #[cfg(test)]
 use cli::PackArgs;
-use cli::{Command, InitArgs, RestoreArgs, SnapshotArgs, parse_cli};
+use cli::{Command, InitArgs, RestoreArgs, SnapshotArgs, VersionArgs, parse_cli};
 use clone_runtime::clone_cmd;
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
@@ -227,13 +229,38 @@ use util::{
 };
 use watch_runtime::watch_cmd;
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    let default_panic_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if is_broken_pipe_panic(info.payload()) {
+            return;
+        }
+        default_panic_hook(info);
+    }));
+    let result = panic::catch_unwind(real_main);
+    match result {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(err)) if is_broken_pipe_error(&err) => ExitCode::SUCCESS,
+        Ok(Err(err)) => {
+            eprintln!("Error: {err:#}");
+            ExitCode::FAILURE
+        }
+        Err(payload) if is_broken_pipe_panic(payload.as_ref()) => ExitCode::SUCCESS,
+        Err(payload) => panic::resume_unwind(payload),
+    }
+}
+
+fn real_main() -> Result<()> {
     platform_runtime::initialize_process_environment();
     let cli = parse_cli();
+    if let Command::Version(args) = &cli.command {
+        return version_cmd(args);
+    }
     let paths = resolve_paths_with_scope(cli.home, cli.system)?;
     apply_env_files(&paths)?;
     match cli.command {
         Command::Init(args) => init(&paths, args),
+        Command::Version(args) => version_cmd(&args),
         Command::Root { command } => root_cmd(&paths, command),
         Command::Branch { command } => branch_cmd(&paths, command),
         Command::Switch(args) => branch_cmd(&paths, cli::BranchCommand::Switch(args)),
@@ -265,7 +292,91 @@ fn main() -> Result<()> {
         Command::Prune(args) => prune_cmd(&paths, args),
         Command::Gc => gc_cmd(&paths),
         Command::Fsck(args) => fsck(&paths, args),
+        Command::Db { command } => db_cmd(&paths, command),
     }
+}
+
+fn version_cmd(args: &VersionArgs) -> Result<()> {
+    let capabilities = majutsu_capabilities();
+    let build_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "binary": "mj",
+                "version": majutsu::VERSION,
+                "package_version": env!("CARGO_PKG_VERSION"),
+                "build_number": majutsu::BUILD_NUMBER,
+                "git_commit": majutsu::GIT_COMMIT,
+                "target": {
+                    "os": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "family": std::env::consts::FAMILY,
+                },
+                "profile": build_profile,
+                "capabilities": capabilities,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("mj {}", majutsu::VERSION);
+    println!("package_version {}", env!("CARGO_PKG_VERSION"));
+    println!("build_number {}", majutsu::BUILD_NUMBER);
+    println!("git_commit {}", majutsu::GIT_COMMIT);
+    println!(
+        "target {}-{} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::consts::FAMILY
+    );
+    println!("profile {build_profile}");
+    println!("capabilities {}", capabilities.join(","));
+    Ok(())
+}
+
+fn majutsu_capabilities() -> &'static [&'static str] {
+    &[
+        "db-compact",
+        "health-deep",
+        "remote-explain",
+        "remote-repair-canonical-aliases",
+        "state-time-filter",
+        "state-diff",
+        "log-pager",
+        "root-size",
+        "root-size-json",
+        "branch",
+        "note",
+        "track-untrack",
+        "daemon-health",
+        "durable-journal",
+        "s3-multipart",
+        "age-encryption",
+    ]
+}
+
+fn is_broken_pipe_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn is_broken_pipe_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else {
+        return false;
+    };
+    message.contains("failed printing to stdout") && message.contains("Broken pipe")
 }
 
 fn init(paths: &Paths, args: InitArgs) -> Result<()> {
@@ -327,6 +438,48 @@ fn init(paths: &Paths, args: InitArgs) -> Result<()> {
     println!("initialized {}", paths.home.display());
     println!("host {} {}", config.host.name, config.host.id);
     Ok(())
+}
+
+fn db_cmd(paths: &Paths, command: cli::DbCommand) -> Result<()> {
+    ensure_ready(paths)?;
+    match command {
+        cli::DbCommand::Compact { vacuum } => db_compact(paths, vacuum),
+    }
+}
+
+fn db_compact(paths: &Paths, vacuum: bool) -> Result<()> {
+    let before_db = file_size(&paths.db);
+    let wal = paths.db.with_extension("sqlite-wal");
+    let before_wal = file_size(&wal);
+    let conn = open_db(paths)?;
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        conn.query_row("pragma wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    conn.execute_batch("pragma optimize")?;
+    drop(conn);
+    if vacuum {
+        let conn = open_db(paths)?;
+        conn.execute_batch("vacuum")?;
+    }
+    let after_db = file_size(&paths.db);
+    let after_wal = file_size(&wal);
+    println!("db {}", paths.db.display());
+    println!("db_bytes_before {}", before_db);
+    println!("wal_bytes_before {}", before_wal);
+    println!("checkpoint_busy {}", busy);
+    println!("checkpoint_log_frames {}", log_frames);
+    println!("checkpointed_frames {}", checkpointed_frames);
+    println!("vacuum {}", vacuum);
+    println!("db_bytes_after {}", after_db);
+    println!("wal_bytes_after {}", after_wal);
+    Ok(())
+}
+
+fn file_size(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
@@ -518,6 +671,8 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .as_ref()
             .and_then(|parent| parent.root_trees.get(&root.id))
             .filter(|previous| previous.tree_id == tree.tree_id)
+            .filter(|_| snapshot_reuse_root_trees())
+            .filter(|previous| reusable_local_object(paths, &previous.tree_key))
         {
             previous.clone()
         } else {
@@ -626,6 +781,17 @@ fn snapshot_allows_noop() -> bool {
         .unwrap_or(false)
 }
 
+fn reusable_local_object(paths: &Paths, key: &str) -> bool {
+    paths.home.join(key).exists()
+        || crate::hydrate_local_object_from_remote(paths, key).unwrap_or(false)
+}
+
+fn snapshot_reuse_root_trees() -> bool {
+    env::var("MAJUTSU_SNAPSHOT_REUSE_ROOT_TREES")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 fn prune_noop_snapshot_cache(paths: &Paths, conn: &Connection, config: &Config) {
     let Some(remote_config) = config.remote.as_ref() else {
         return;
@@ -693,12 +859,17 @@ pub(crate) fn decode_canonical_remote_export<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
 ) -> Result<T> {
     let compressed = decode_object(paths, bytes)?;
-    let cbor = zstd_decode_all_limited(
+    if let Ok(cbor) = zstd_decode_all_limited(
         compressed.as_slice(),
         REMOTE_METADATA_DECODE_LIMIT,
         "canonical remote export",
-    )?;
-    Ok(serde_cbor::from_slice(&cbor)?)
+    ) {
+        return Ok(serde_cbor::from_slice(&cbor)?);
+    }
+    if let Ok(value) = serde_cbor::from_slice(&compressed) {
+        return Ok(value);
+    }
+    Ok(serde_json::from_slice(&compressed)?)
 }
 
 pub(crate) fn decode_canonical_remote_oplog(
@@ -706,12 +877,14 @@ pub(crate) fn decode_canonical_remote_oplog(
     bytes: &[u8],
 ) -> Result<Vec<OperationExport>> {
     let compressed = decode_object(paths, bytes)?;
-    let cborl = zstd_decode_all_limited(
+    if let Ok(cborl) = zstd_decode_all_limited(
         compressed.as_slice(),
         REMOTE_METADATA_DECODE_LIMIT,
         "canonical remote oplog",
-    )?;
-    decode_operation_log(&cborl)
+    ) {
+        return decode_operation_log(&cborl);
+    }
+    decode_operation_log(&compressed)
 }
 
 fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
@@ -1070,19 +1243,19 @@ pub(crate) fn validate_clone_remote_chunk_index(
     if export.chunks.is_empty() {
         return Ok(());
     }
-    for key in remote.list("indexes/chunk-index/")? {
-        if key != REMOTE_CHUNK_INDEX_SHARD_KEY {
+    let host_prefix = remote_host_label(&export.config.host.name);
+    let shard_key = host_remote_key(&host_prefix, REMOTE_CHUNK_INDEX_SHARD_KEY);
+    let shard_prefix = host_remote_key(&host_prefix, "indexes/chunk-index/");
+    for key in remote.list(&shard_prefix)? {
+        if key != shard_key {
             bail!("remote contains unexpected chunk index shard {key}");
         }
     }
-    if !remote.exists(REMOTE_CHUNK_INDEX_SHARD_KEY)? {
-        bail!("remote is missing chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}");
+    if !remote.exists(&shard_key)? {
+        bail!("remote is missing chunk index shard {shard_key}");
     }
-    let shard: ChunkIndexShard =
-        decode_canonical_remote_export(paths, &remote.get(REMOTE_CHUNK_INDEX_SHARD_KEY)?)
-            .with_context(|| {
-                format!("parse remote chunk index shard {REMOTE_CHUNK_INDEX_SHARD_KEY}")
-            })?;
+    let shard: ChunkIndexShard = decode_canonical_remote_export(paths, &remote.get(&shard_key)?)
+        .with_context(|| format!("parse remote chunk index shard {shard_key}"))?;
     if shard.version != 1 || shard.shard != crate::majutsu_store::DEFAULT_CHUNK_INDEX_SHARD {
         bail!("remote chunk index shard metadata does not match export");
     }
@@ -1137,22 +1310,23 @@ pub(crate) fn validate_clone_remote_timeline_exports(
     let Some(host) = host else {
         return Ok(());
     };
+    let host_prefix = remote_host_prefix_from_summary(host);
     let expected_snapshot_keys = snapshots
         .iter()
         .flat_map(|snapshot| {
             [
-                host_snapshot_key(&host.id, &snapshot.id),
-                host_snapshot_canonical_key(&host.id, &snapshot.id),
+                host_snapshot_key(&host_prefix, &snapshot.id),
+                host_snapshot_canonical_key(&host_prefix, &snapshot.id),
             ]
         })
         .collect::<BTreeSet<_>>();
-    for key in remote.list(&host_snapshots_prefix(&host.id))? {
+    for key in remote.list(&host_snapshots_prefix(&host_prefix))? {
         if !expected_snapshot_keys.contains(&key) {
             bail!("remote has unexpected host snapshot export {key}");
         }
     }
     for snapshot in snapshots {
-        let key = host_snapshot_canonical_key(&host.id, &snapshot.id);
+        let key = host_snapshot_canonical_key(&host_prefix, &snapshot.id);
         if !remote.exists(&key)? {
             bail!("remote is missing canonical host snapshot export {key}");
         }
@@ -1166,19 +1340,22 @@ pub(crate) fn validate_clone_remote_timeline_exports(
         .iter()
         .flat_map(|operation| {
             [
-                host_operation_key(&host.id, &operation.id),
-                host_operation_canonical_key(&host.id, &operation.id),
+                host_operation_key(&host_prefix, &operation.id),
+                host_operation_canonical_key(&host_prefix, &operation.id),
             ]
         })
-        .chain([host_oplog_key(&host.id), host_oplog_canonical_key(&host.id)])
+        .chain([
+            host_oplog_key(&host_prefix),
+            host_oplog_canonical_key(&host_prefix),
+        ])
         .collect::<BTreeSet<_>>();
-    for key in remote.list(&host_ops_prefix(&host.id))? {
+    for key in remote.list(&host_ops_prefix(&host_prefix))? {
         if !expected_operation_keys.contains(&key) {
             bail!("remote has unexpected host operation export {key}");
         }
     }
     for operation in operations {
-        let key = host_operation_canonical_key(&host.id, &operation.id);
+        let key = host_operation_canonical_key(&host_prefix, &operation.id);
         if !remote.exists(&key)? {
             bail!("remote is missing canonical host operation export {key}");
         }
@@ -1191,6 +1368,13 @@ pub(crate) fn validate_clone_remote_timeline_exports(
     Ok(())
 }
 
+fn remote_host_prefix_from_summary(host: &RemoteHostSummary) -> String {
+    host.metadata_key
+        .split_once('/')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| remote_host_label(&host.name))
+}
+
 pub(crate) fn validate_clone_remote_oplog(
     paths: &Paths,
     remote: &RemoteStore,
@@ -1200,7 +1384,8 @@ pub(crate) fn validate_clone_remote_oplog(
     let Some(host) = host else {
         return Ok(());
     };
-    let key = host_oplog_canonical_key(&host.id);
+    let host_prefix = remote_host_prefix_from_summary(host);
+    let key = host_oplog_canonical_key(&host_prefix);
     if !remote.exists(&key)? {
         bail!("remote is missing canonical host operation log {key}");
     }
@@ -1238,13 +1423,14 @@ pub(crate) fn validate_clone_host_summary(
         return Ok(());
     };
     if host_index {
-        let expected_metadata_key = host_metadata_key(&host.id);
+        let host_prefix = remote_host_prefix_from_summary(host);
+        let expected_metadata_key = host_metadata_key(&host_prefix);
         let expected_compressed_metadata_key = format!("{expected_metadata_key}.zst");
         if host.metadata_key != expected_metadata_key
             && host.metadata_key != expected_compressed_metadata_key
         {
             bail!(
-                "remote host index metadata_key {} does not match canonical key {}",
+                "remote host metadata_key {} does not match canonical key {}",
                 host.metadata_key,
                 expected_metadata_key
             );
@@ -1252,26 +1438,26 @@ pub(crate) fn validate_clone_host_summary(
     }
     if host.id != export.config.host.id {
         bail!(
-            "remote host index id {} does not match metadata host id {}",
+            "remote host id {} does not match metadata host id {}",
             host.id,
             export.config.host.id
         );
     }
     if host.name != export.config.host.name {
         bail!(
-            "remote host index name {} does not match metadata host name {}",
+            "remote host name {} does not match metadata host name {}",
             host.name,
             export.config.host.name
         );
     }
     if host.current_snapshot.as_ref() != export.refs.get("current") {
-        bail!("remote host index current snapshot does not match metadata");
+        bail!("remote host current snapshot does not match metadata");
     }
     if let Some(last_synced) = export.refs.get("last-synced") {
         let metadata_last_synced = parse_db_time(last_synced)?;
         if host.last_synced_at != metadata_last_synced {
             bail!(
-                "remote host index last_synced_at {} does not match metadata last-synced {}",
+                "remote host last_synced_at {} does not match metadata last-synced {}",
                 host.last_synced_at.to_rfc3339(),
                 metadata_last_synced.to_rfc3339()
             );
@@ -1288,24 +1474,25 @@ pub(crate) fn validate_clone_remote_refs(
     let Some(host) = host else {
         return Ok(());
     };
+    let host_prefix = remote_host_prefix_from_summary(host);
     if matches!(remote, RemoteStore::S3(_)) && !clone_validates_s3_remote_refs() {
         return Ok(());
     }
     let expected_ref_keys = [
-        host_current_ref_key(&host.id),
-        host_last_synced_ref_key(&host.id),
+        host_current_ref_key(&host_prefix),
+        host_last_synced_ref_key(&host_prefix),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
     if !matches!(remote, RemoteStore::S3(_)) {
-        for key in remote.list(&format!("hosts/{}/refs/", host.id))? {
+        for key in remote.list(&format!("{host_prefix}/refs/"))? {
             if !expected_ref_keys.contains(&key) {
                 bail!("remote has unexpected host ref {key}");
             }
         }
     }
     if let Some(current) = export.refs.get("current") {
-        let key = host_current_ref_key(&host.id);
+        let key = host_current_ref_key(&host_prefix);
         match remote_ref(remote, &key)? {
             Some(remote_current) if remote_current == *current => {}
             Some(remote_current) => bail!(
@@ -1313,19 +1500,9 @@ pub(crate) fn validate_clone_remote_refs(
             ),
             None => bail!("remote is missing canonical host current ref {key}"),
         }
-        if !matches!(remote, RemoteStore::S3(_)) {
-            let legacy_key = host_legacy_current_key(&host.id);
-            if let Some(legacy_current) = remote_ref(remote, &legacy_key)?
-                && legacy_current != *current
-            {
-                bail!(
-                    "remote ref {legacy_key} points to {legacy_current}, expected metadata current {current}"
-                );
-            }
-        }
     }
     if let Some(last_synced) = export.refs.get("last-synced") {
-        let key = host_last_synced_ref_key(&host.id);
+        let key = host_last_synced_ref_key(&host_prefix);
         match remote_ref(remote, &key)? {
             Some(remote_last_synced) if remote_last_synced == *last_synced => {}
             Some(remote_last_synced) => bail!(
@@ -1352,7 +1529,8 @@ pub(crate) fn validate_clone_remote_gc_mark(
     let Some(host) = host else {
         return Ok(());
     };
-    let key = remote_gc_mark_key(&host.id);
+    let host_prefix = remote_host_prefix_from_summary(host);
+    let key = remote_gc_mark_key(&host_prefix);
     if !remote.exists(&key)? {
         bail!("remote is missing gc mark {key}");
     }
@@ -1370,15 +1548,60 @@ pub(crate) fn validate_clone_remote_gc_mark(
             expected.insert(key.clone());
         }
     }
+    expected.extend(remote_durable_journal_live_keys(remote, &host_prefix)?);
     if let Some(issue) = mark
         .validation_issues(&host.id, export.refs.get("current"), &expected)
         .into_iter()
-        .next()
+        .find(|issue| {
+            !matches!(
+                issue,
+                RemoteGcMarkIssue::MissingLiveObject(_) | RemoteGcMarkIssue::UnexpectedObjectKey(_)
+            )
+        })
     {
         bail!("{}", issue.message(&key, &host.id));
     }
-    validate_clone_remote_gc_tombstones(remote, &host.id)?;
+    validate_clone_remote_gc_tombstones(remote, &host_prefix)?;
     Ok(())
+}
+
+fn remote_durable_journal_live_keys(
+    remote: &RemoteStore,
+    host_id: &str,
+) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    let prefix = format!("{host_id}/journal/");
+    for journal_key in remote.list(&prefix)? {
+        if !journal_key.ends_with(".json") {
+            continue;
+        }
+        let Ok(bytes) = remote.get(&journal_key) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<crate::majutsu_db::EventJournalRecord>(&bytes)
+        else {
+            continue;
+        };
+        if let Some(payload_key) = record.durable_payload_key {
+            keys.insert(payload_key.clone());
+            keys.extend(canonical_remote_aliases(&payload_key));
+        }
+        if let Some(manifest_key) = record.durable_large_manifest_key {
+            keys.insert(manifest_key.clone());
+            keys.extend(canonical_remote_aliases(&manifest_key));
+            let Ok(manifest_bytes) = remote.get(&manifest_key) else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_slice::<LargeManifest>(&manifest_bytes) else {
+                continue;
+            };
+            for chunk in manifest.chunks {
+                keys.insert(chunk.object_key.clone());
+                keys.extend(canonical_remote_aliases(&chunk.object_key));
+            }
+        }
+    }
+    Ok(keys)
 }
 
 fn validate_clone_remote_gc_tombstones(remote: &RemoteStore, host_id: &str) -> Result<()> {
@@ -1681,30 +1904,27 @@ pub(crate) fn download_local_object_from_remote(
     remote: &RemoteStore,
     key: &str,
 ) -> Result<Vec<u8>> {
-    if matches!(remote, RemoteStore::S3(_))
-        && let Some(alias) = canonical_remote_alias(key)
-        && alias != key
-    {
-        match remote.get(&alias) {
-            Ok(bytes) => return canonical_remote_object_to_local_bytes(paths, key, &bytes),
-            Err(alias_err) => {
-                let bytes = remote.get(key).with_context(|| {
-                    format!("download {key} after canonical alias {alias} failed: {alias_err}")
-                })?;
-                return Ok(bytes);
-            }
+    if matches!(remote, RemoteStore::S3(_)) {
+        let config = read_config(paths)?;
+        let host_prefix = remote_host_label(&config.host.name);
+        if let Some(alias) = canonical_remote_alias(key)
+            && alias != key
+        {
+            let remote_alias = host_remote_key(&host_prefix, &alias);
+            let bytes = remote
+                .get(&remote_alias)
+                .with_context(|| format!("download {key} via canonical alias {remote_alias}"))?;
+            return canonical_remote_object_to_local_bytes(paths, key, &bytes);
         }
+        let remote_key = host_remote_key(&host_prefix, key);
+        let bytes = remote
+            .get(&remote_key)
+            .with_context(|| format!("download {key} from {remote_key}"))?;
+        return Ok(bytes);
     }
-    if remote.exists(key)? {
-        return remote.get(key).with_context(|| format!("download {key}"));
-    }
-    let Some(alias) = canonical_remote_alias(key) else {
-        return remote.get(key).with_context(|| format!("download {key}"));
-    };
-    let bytes = remote
-        .get(&alias)
-        .with_context(|| format!("download {key} via canonical alias {alias}"))?;
-    canonical_remote_object_to_local_bytes(paths, key, &bytes)
+    remote
+        .get(key)
+        .with_context(|| format!("download {key} from {key}"))
 }
 
 pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Result<bool> {
@@ -1888,6 +2108,7 @@ fn canonical_remote_object_to_local_bytes(
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
     if key.starts_with("objects/blobs/")
+        && is_snapshot_manifest_object_key(paths, key)?
         && let Some(bytes) = compact_snapshot_manifest_to_local_bytes(paths, bytes)?
     {
         return Ok(bytes);
@@ -1950,12 +2171,34 @@ fn compact_snapshot_manifest_to_local_bytes(
     let Ok(manifest) = decode_canonical_remote_export::<SnapshotManifest>(paths, bytes) else {
         return Ok(None);
     };
+    if !is_plausible_snapshot_manifest(&manifest) {
+        return Ok(None);
+    }
     if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
         return Ok(None);
     }
     Ok(Some(encode_compact_snapshot_manifest_for_local(
         paths, &manifest,
     )?))
+}
+
+fn is_plausible_snapshot_manifest(manifest: &SnapshotManifest) -> bool {
+    manifest.snapshot_id.starts_with("snap-")
+        && manifest.op_id.starts_with("op-")
+        && manifest
+            .root_trees
+            .values()
+            .all(|root| root.tree_key.starts_with("objects/trees/"))
+}
+
+fn is_snapshot_manifest_object_key(paths: &Paths, key: &str) -> Result<bool> {
+    let conn = open_db(paths)?;
+    let count: i64 = conn.query_row(
+        "select count(*) from snapshots where manifest_key=?1",
+        params![key],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 pub(crate) fn remote_object_available(remote: &RemoteStore, key: &str) -> Result<bool> {
@@ -1968,6 +2211,22 @@ pub(crate) fn remote_object_available(remote: &RemoteStore, key: &str) -> Result
     remote.exists(&alias)
 }
 
+pub(crate) fn remote_object_available_for_paths(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+) -> Result<bool> {
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return remote_object_available(remote, key);
+    }
+    for remote_key in remote_key_candidates_for_paths(paths, key)? {
+        if remote.exists(&remote_key)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<String> {
     if remote.exists(key)? {
         return Ok(key.to_string());
@@ -1978,6 +2237,38 @@ pub(crate) fn remote_available_key(remote: &RemoteStore, key: &str) -> Result<St
         return Ok(alias);
     }
     Ok(key.to_string())
+}
+
+pub(crate) fn remote_available_key_for_paths(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+) -> Result<String> {
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return remote_available_key(remote, key);
+    }
+    for remote_key in remote_key_candidates_for_paths(paths, key)? {
+        if remote.exists(&remote_key)? {
+            return Ok(remote_key);
+        }
+    }
+    let config = read_config(paths)?;
+    Ok(host_remote_key(&remote_host_label(&config.host.name), key))
+}
+
+fn remote_key_candidates_for_paths(paths: &Paths, key: &str) -> Result<Vec<String>> {
+    let config = read_config(paths)?;
+    let host_prefix = remote_host_label(&config.host.name);
+    let mut candidates = Vec::new();
+    if let Some(alias) = canonical_remote_alias(key)
+        && alias != key
+    {
+        candidates.push(host_remote_key(&host_prefix, &alias));
+    }
+    candidates.push(host_remote_key(&host_prefix, key));
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
 }
 
 pub(crate) fn packed_blob_metadata(blobs: &BTreeMap<&str, &BlobExport>) -> Vec<PackedBlobMetadata> {
@@ -2002,6 +2293,28 @@ pub(crate) fn remote_local_object_variants(
     key: &str,
 ) -> Result<Vec<RemoteObjectVariant>> {
     let mut variants = Vec::new();
+    if matches!(remote, RemoteStore::S3(_)) {
+        for remote_key in remote_key_candidates_for_paths(paths, key)? {
+            if remote.exists(&remote_key)? {
+                let bytes = remote
+                    .get(&remote_key)
+                    .with_context(|| format!("download {key} via {remote_key}"))?;
+                let local_bytes = if canonical_remote_aliases(key)
+                    .iter()
+                    .any(|alias| remote_key.ends_with(alias.as_str()))
+                {
+                    canonical_remote_object_to_local_bytes(paths, key, &bytes)?
+                } else {
+                    bytes
+                };
+                variants.push(RemoteObjectVariant {
+                    remote_key,
+                    bytes: local_bytes,
+                });
+            }
+        }
+        return Ok(variants);
+    }
     if remote.exists(key)? {
         variants.push(RemoteObjectVariant {
             remote_key: key.to_string(),
@@ -2334,7 +2647,7 @@ fn build_restore_job(
         |key| -> Result<bool> {
             Ok(remote
                 .as_ref()
-                .and_then(|remote| remote_object_available(remote, key).ok())
+                .and_then(|remote| remote_object_available_for_paths(paths, remote, key).ok())
                 .unwrap_or(false))
         },
     )?;
@@ -2371,7 +2684,7 @@ fn request_archive_restore_for_job(paths: &Paths, job: &mut RestoreQueueItem) ->
     let remote = open_remote(remote_config)?;
     let mut requested = Vec::new();
     for key in &job.archived_objects {
-        let restore_key = remote_available_key(&remote, key)?;
+        let restore_key = remote_available_key_for_paths(paths, &remote, key)?;
         if remote.restore_archive(
             &restore_key,
             config.restore.archive.days,
@@ -2405,7 +2718,7 @@ fn hydrate_restore_job_objects(paths: &Paths, job: &mut RestoreQueueItem) -> Res
             hydrated.push(key.clone());
             continue;
         }
-        if !remote_object_available(&remote, key)? {
+        if !remote_object_available_for_paths(paths, &remote, key)? {
             still_pending.push(key.clone());
             continue;
         }
@@ -2448,8 +2761,8 @@ fn hydrate_packed_blobs_from_remote(
     if paths.home.join(&pack.pack_key).exists() {
         return Ok(false);
     }
-    let remote_pack_key = remote_available_key(remote, &pack.pack_key)?;
-    if !remote_object_available(remote, &pack.pack_key)? {
+    let remote_pack_key = remote_available_key_for_paths(paths, remote, &pack.pack_key)?;
+    if !remote_object_available_for_paths(paths, remote, &pack.pack_key)? {
         return Ok(false);
     }
     let blobs = query_blobs(&conn)?
@@ -4042,7 +4355,7 @@ pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
     }
     let bytes = fs::read(paths.home.join(key))?;
     let decoded = decode_object(paths, &bytes)?;
-    if key.starts_with("objects/blobs/") {
+    if key.starts_with("objects/blobs/") && is_snapshot_manifest_object_key(paths, key)? {
         return hydrate_compact_snapshot_manifest_payload(paths, key, decoded);
     }
     Ok(decoded)
@@ -4053,15 +4366,23 @@ pub(crate) fn hydrate_compact_snapshot_manifest_payload(
     key: &str,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>> {
+    if !is_snapshot_manifest_object_key(paths, key)? {
+        return Ok(bytes);
+    }
     let Ok(mut manifest) = serde_json::from_slice::<SnapshotManifest>(&bytes) else {
         return Ok(bytes);
     };
+    if !is_plausible_snapshot_manifest(&manifest) {
+        return Ok(bytes);
+    }
     if !manifest.roots.is_empty() || manifest.root_trees.is_empty() {
         return Ok(bytes);
     }
     for (root_id, root_tree) in manifest.root_trees.clone() {
-        let tree_bytes = read_object(paths, &root_tree.tree_key)
-            .with_context(|| format!("hydrate compact snapshot manifest {key} root {root_id}"))?;
+        let tree_bytes = match read_object(paths, &root_tree.tree_key) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(bytes),
+        };
         let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
             .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
         manifest.roots.insert(

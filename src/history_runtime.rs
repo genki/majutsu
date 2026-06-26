@@ -3,7 +3,8 @@ use crate::majutsu_core::{
     TreeManifest, TreeNodeManifest, TreeNodeRef, payload_blob_ref, payload_large_ref,
 };
 use crate::majutsu_store::{
-    host_current_ref_key, host_last_synced_ref_key, host_root_ack_ref_key, host_root_ack_ref_prefix,
+    host_current_ref_key, host_last_synced_ref_key, host_root_ack_ref_key,
+    host_root_ack_ref_prefix, remote_host_label,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, NaiveTime, TimeZone, Utc};
@@ -35,8 +36,10 @@ use crate::config::{Config, Paths, RootConfig, read_config};
 use crate::daemon_runtime::{
     DaemonHealth, DaemonHealthState, daemon_health, ensure_daemon_running,
 };
-use crate::operation_log::{query_operation_resolved, record_op, update_operation_message};
-use crate::process_runtime::process_lock_owner;
+use crate::operation_log::{
+    query_operation_resolved, record_op, update_operation_message, update_operation_result,
+};
+use crate::process_runtime::{pid_alive, process_lock_owner};
 use crate::queue_runtime::{
     event_journal_records, event_journal_stats, record_event, remote_event_journal_stats,
     upload_queue_stats,
@@ -51,6 +54,7 @@ use crate::snapshot_state::{
     load_snapshot_header_by_id_optional, snapshot_contains_root, snapshot_file_map, snapshot_id_at,
     visit_tree_records,
 };
+use crate::sync_runtime::{SyncDeepHealthSummary, sync_deep_health_summary};
 use crate::util::{
     blake3_hex, parse_duration_ago, parse_time, path_to_slash, stable_read, stable_read_in_root,
 };
@@ -108,6 +112,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         watch_attribution_issue,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
+        deep_remote: None,
         conn: &conn,
     })?;
     let width = terminal_width();
@@ -566,7 +571,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
 
 pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
     crate::ensure_ready(paths)?;
-    let report = current_health_report(paths)?;
+    let report = current_health_report(paths, &args)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -576,7 +581,7 @@ pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
 }
 
 pub(crate) fn refresh_runtime_health(paths: &Paths) -> Result<()> {
-    let report = current_health_report(paths)?;
+    let report = current_health_report(paths, &HealthArgs::default())?;
     let record = RuntimeHealthRecord {
         observed_at: Utc::now(),
         report,
@@ -590,7 +595,7 @@ pub(crate) fn refresh_runtime_health(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn current_health_report(paths: &Paths) -> Result<HealthReport> {
+fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthReport> {
     let conn = crate::open_db(paths)?;
     let config = read_config(paths)?;
     let roots = roots(&conn)?;
@@ -611,6 +616,25 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
     let watch_attribution_issue = watch_attribution_issue(&event_records);
     let remote_journal_stats = remote_event_journal_stats(paths)?;
     let daemon = daemon_health(paths)?;
+    let deep_remote = if args.deep && remote.configured && remote.open_error.is_none() {
+        if let Some(remote_config) = config.remote.as_ref() {
+            match open_remote(remote_config) {
+                Ok(remote_store) => Some(sync_deep_health_summary(
+                    paths,
+                    &conn,
+                    &remote_store,
+                    args.sample,
+                    args.timeout_secs,
+                    !args.history,
+                )?),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     build_health_report(HealthInputs {
         paths,
         config: &config,
@@ -626,6 +650,7 @@ fn current_health_report(paths: &Paths) -> Result<HealthReport> {
         watch_attribution_issue,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
+        deep_remote: deep_remote.as_ref(),
         conn: &conn,
     })
 }
@@ -718,8 +743,19 @@ struct HealthReport {
     durable_journal_pending: usize,
     sync_lock_pid: Option<u32>,
     encryption: String,
+    deep_remote: Option<DeepRemoteHealth>,
     roots: Vec<RootHealth>,
     issues: Vec<HealthIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeepRemoteHealth {
+    scope: String,
+    local_objects: usize,
+    checked: usize,
+    missing: usize,
+    limited: bool,
+    source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -759,6 +795,7 @@ struct HealthInputs<'a> {
     watch_attribution_issue: Option<String>,
     current_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     remote_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
+    deep_remote: Option<&'a SyncDeepHealthSummary>,
     conn: &'a Connection,
 }
 
@@ -778,6 +815,7 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         watch_attribution_issue,
         current_manifest,
         remote_manifest,
+        deep_remote,
         conn,
     } = input;
     let active_roots = roots.iter().filter(|root| root.status == "active").count();
@@ -969,13 +1007,50 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
             ),
         });
     }
+    if let Some(deep) = deep_remote {
+        if deep.missing > 0 {
+            issues.push(HealthIssue {
+                severity: HealthSeverity::Critical,
+                code: "remote-objects-missing".into(),
+                message: format!(
+                    "deep remote check ({}) found {} missing object(s) after checking {}/{} via {}",
+                    deep.scope, deep.missing, deep.checked, deep.local_objects, deep.source
+                ),
+            });
+        } else if deep.limited {
+            issues.push(HealthIssue {
+                severity: HealthSeverity::Warning,
+                code: "remote-objects-check-limited".into(),
+                message: format!(
+                    "deep remote check ({}) was limited after checking {}/{} object(s)",
+                    deep.scope, deep.checked, deep.local_objects
+                ),
+            });
+        }
+    }
 
     let sync_lock_pid = process_lock_owner(&paths.sync_lock)?;
-    if let Some(pid) = sync_lock_pid {
+    let sync_lock_is_only_waiter = remote_head.synced
+        && upload_stats.total == 0
+        && pending_event_count == 0
+        && durable_journal_pending == 0;
+    if let Some(pid) = sync_lock_pid
+        && !sync_lock_is_only_waiter
+    {
         issues.push(HealthIssue {
             severity: HealthSeverity::Warning,
             code: "sync-running".into(),
             message: format!("sync is currently running with pid {pid}"),
+        });
+    }
+    let stale_running = mark_stale_running_operations(conn, 600)?;
+    if stale_running > 0 {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "stale-running-operations".into(),
+            message: format!(
+                "{stale_running} operation(s) are still marked running after 600 seconds"
+            ),
         });
     }
 
@@ -1022,9 +1097,48 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         durable_journal_pending,
         sync_lock_pid,
         encryption: config.security.encryption.clone(),
+        deep_remote: deep_remote.map(|deep| DeepRemoteHealth {
+            scope: deep.scope.to_string(),
+            local_objects: deep.local_objects,
+            checked: deep.checked,
+            missing: deep.missing,
+            limited: deep.limited,
+            source: deep.source.clone(),
+        }),
         roots: root_health,
         issues,
     })
+}
+
+fn mark_stale_running_operations(conn: &Connection, older_than_secs: i64) -> Result<usize> {
+    let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+    let mut stmt = conn.prepare(
+        "select id, process_id from operations where status='running' and created_at < ?1",
+    )?;
+    let rows = stmt.query_map(params![cutoff], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    let mut stale = Vec::new();
+    for row in rows {
+        let (id, pid) = row?;
+        if pid
+            .map(|pid| pid > 0 && pid_alive(pid as u32))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        stale.push(id);
+    }
+    for id in &stale {
+        update_operation_result(
+            conn,
+            id,
+            "failed",
+            Some("operation was still marked running after its process exited"),
+            Some("failed"),
+        )?;
+    }
+    Ok(stale.len())
 }
 
 fn wait_daemon_healthy(paths: &Paths, attempts: usize, delay: StdDuration) -> Result<DaemonHealth> {
@@ -1251,6 +1365,12 @@ fn print_health_report(report: &HealthReport, verbose: bool) {
             .count()
     );
     println!("encryption {}", report.encryption);
+    if let Some(deep) = &report.deep_remote {
+        println!(
+            "deep_remote scope={} checked={}/{} missing={} limited={} source={}",
+            deep.scope, deep.checked, deep.local_objects, deep.missing, deep.limited, deep.source
+        );
+    }
     for issue in &report.issues {
         println!(
             "issue {} {} {}",
@@ -1349,7 +1469,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let state_scope = resolve_state_scope(&configured_roots, &args)?;
     let filter = StateChangeFilter::from_args(&args)?;
     let basis = if let Some(reference) = args.reference.as_deref() {
-        Some(resolve_state_basis(paths, &conn, reference)?)
+        resolve_state_basis_optional(paths, &conn, reference)?
     } else {
         earliest_state_basis(paths, &conn)?
     };
@@ -2941,6 +3061,24 @@ fn earliest_state_basis(paths: &Paths, conn: &Connection) -> Result<Option<State
         .transpose()
 }
 
+fn resolve_state_basis_optional(
+    paths: &Paths,
+    conn: &Connection,
+    input: &str,
+) -> Result<Option<StateBasis>> {
+    match resolve_state_basis(paths, conn, input) {
+        Ok(basis) => Ok(Some(basis)),
+        Err(err) if is_state_reference_before_first_snapshot(&err) => {
+            earliest_state_basis(paths, conn)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_state_reference_before_first_snapshot(err: &anyhow::Error) -> bool {
+    err.to_string().starts_with("no snapshot at or before ")
+}
+
 fn resolve_state_operation_basis(
     paths: &Paths,
     conn: &Connection,
@@ -4041,8 +4179,9 @@ fn read_remote_head_status(
             detail: "unknown".into(),
         });
     };
-    let ref_name = host_current_ref_key(&config.host.id);
-    let last_synced_ref_name = host_last_synced_ref_key(&config.host.id);
+    let host_prefix = remote_host_label(&config.host.name);
+    let ref_name = host_current_ref_key(&host_prefix);
+    let last_synced_ref_name = host_last_synced_ref_key(&host_prefix);
     let remote_current = conn
         .query_row(
             "select value from remote_refs where remote=?1 and name=?2",
@@ -4847,6 +4986,7 @@ struct FileChange {
     path: String,
     large: bool,
     volatile_mode: Option<String>,
+    warning: Option<String>,
 }
 
 impl FileChange {
@@ -4856,6 +4996,17 @@ impl FileChange {
             path,
             large: false,
             volatile_mode: None,
+            warning: None,
+        }
+    }
+
+    fn warning(status: &'static str, path: String, warning: impl Into<String>) -> Self {
+        Self {
+            status,
+            path,
+            large: false,
+            volatile_mode: None,
+            warning: Some(warning.into()),
         }
     }
 
@@ -4886,6 +5037,7 @@ impl FileChange {
             path,
             large,
             volatile_mode,
+            warning: None,
         }
     }
 }
@@ -5034,7 +5186,15 @@ fn snapshot_file_changes_from_root_trees(
             ));
             continue;
         }
-        append_root_file_changes(paths, from, to, &root_id, configured_roots, &mut changes)?;
+        if let Err(err) =
+            append_root_file_changes(paths, from, to, &root_id, configured_roots, &mut changes)
+        {
+            changes.push(FileChange::warning(
+                folded_root_status(from_tree, to_tree),
+                format!("{root_id}/** (tree metadata unavailable; use `mj fsck` and `mj remote fsck --objects`)"),
+                format!("{err:#}"),
+            ));
+        }
     }
     Ok(changes)
 }
@@ -5444,6 +5604,9 @@ fn format_change_tags(ui: &StatusUi, change: &FileChange) -> String {
     }
     if let Some(mode) = &change.volatile_mode {
         tags.push(ui.paint(&format!("[volatile:{mode}]"), "36"));
+    }
+    if change.warning.is_some() {
+        tags.push(ui.paint("[metadata-unavailable]", "33"));
     }
     if tags.is_empty() {
         String::new()

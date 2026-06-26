@@ -13,11 +13,11 @@ GCS request latency に支配されていた。
 S3/GCS 互換 backend では、最新 head 情報を次の単一 object として publish する。
 
 ```text
-hosts/<host-id>/head.cbor.zst.enc
+<host-id>/head.cbor.zst.enc
 ```
 
-この object には current snapshot、last-synced、host metadata key、host index key、
-GC mark key、最新 snapshot/operation export key を含める。
+この object には current snapshot、last-synced、host metadata key、GC mark key、
+最新 snapshot/operation export key を含める。
 あわせて current snapshot に含まれる root 別の `tree_id`、`tree_key`、`file_count`、
 `synced_at` を `root_acks` として同梱する。これにより host単位 current が同じでも、
 root 別にどの tree が remote 側で保全済みかを追加 request なしで確認できる。
@@ -34,37 +34,29 @@ manifest の root tree と照合し、head 自体の破損や古い root ack を
 file remote では従来通り canonical ref を毎回 publish する。S3/GCS 互換 backend では
 compact head を正とし、canonical current / last-synced ref の毎回 publish は既定で省く。
 
-互換確認や移行時に従来挙動へ戻したい場合は次を使う。
+検証目的で canonical ref も毎回更新したい場合は次を使う。
 
 ```sh
 MAJUTSU_SYNC_REMOTE_REF_OBJECTS=1 mj sync
-MAJUTSU_SYNC_LEGACY_CURRENT_REFS=1 mj sync
 ```
 
-## host index
+## host metadata discovery
 
-`hosts/index.json` は host discovery 用の identity index として扱う。S3/GCS 互換 backend では
-同じ host id / name / metadata key のままなら、current snapshot や last-synced だけが進んでも
-index は毎回 publish しない。最新 current、last-synced、root ack は compact head を正とする。
-
-互換確認や手動調査で従来通り毎回更新したい場合は次を使う。
-
-```sh
-MAJUTSU_SYNC_S3_HOST_INDEX_EVERY_TIME=1 mj sync
-```
+S3/GCS 互換 backend では remote root 直下の `<host-id>/metadata/export.json.zst`
+を列挙して host を discovery する。`hosts/index.json` や global metadata object は
+作成しない。最新 current、last-synced、root ack は `<host-id>/head.cbor.zst.enc` を正とする。
 
 2026-06-16 の GCS S3互換 endpoint 実測では、1ファイル追記後の小変更 sync は次の結果だった。
 
 | mode | requests | PUT | HEAD | uploaded body | elapsed |
 |---|---:|---:|---:|---:|---:|
 | compact default | 17 | 7 | 9 | 4,556 bytes | 4.393s |
-| legacy compatibility env | 21 | 9 | 11 | 5,548 bytes | 5.006s |
+| old compatibility env | 21 | 9 | 11 | 5,548 bytes | 5.006s |
 
-legacy compatibility env は `MAJUTSU_SYNC_S3_HOST_INDEX_EVERY_TIME=1`
-と `MAJUTSU_SYNC_S3_BOOTSTRAP_EVERY_TIME=1` を同時指定したもの。
+old compatibility env は旧layout互換確認用の設定を同時指定したもの。
 単発 elapsed は GCS latency の揺れで逆転しうるため、評価では request 数と uploaded body を重視する。
-compact default では `metadata/export.json.zst` の seed 確認も remote-sync cache で省略するため、
-初回 seed 後の小変更 sync では legacy compatibility 比で request 数が 4件少ない。
+compact default では global seed object を作らないため、初回 seed 後の小変更 sync では
+old compatibility 比で request 数が少ない。
 
 ## GC mark
 

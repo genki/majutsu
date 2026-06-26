@@ -78,7 +78,7 @@ struct PackedBlobSizeRef {
 }
 
 pub(crate) fn root_size_summary_key(host_id: &str) -> String {
-    format!("hosts/{host_id}/root-size-summary.cbor.zst.enc")
+    format!("{host_id}/root-size-summary.cbor.zst.enc")
 }
 
 pub(crate) fn build_root_size_summary(
@@ -209,6 +209,17 @@ pub(crate) fn encode_root_size_summary(
     let cbor = serde_cbor::to_vec(summary)?;
     let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
     crate::encode_object(paths, &compressed)
+}
+
+pub(crate) fn decode_root_size_summary(paths: &Paths, bytes: &[u8]) -> Result<RootSizeSummary> {
+    let decoded = crate::decode_object(paths, bytes)?;
+    let cbor = zstd_decode_all_limited(
+        decoded.as_slice(),
+        REMOTE_METADATA_DECODE_LIMIT,
+        "root size summary",
+    )
+    .context("decode root size summary zstd")?;
+    serde_cbor::from_slice(&cbor).context("parse root size summary cbor")
 }
 
 pub(crate) fn write_cached_root_size_summary(

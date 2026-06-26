@@ -1,6 +1,8 @@
 use crate::majutsu_core::{FileRecord, LargeManifest, Payload, SnapshotManifest};
 use crate::majutsu_db::{EventJournalRecord, UploadQueueItem, expected_upload_queue_item_id};
-use crate::majutsu_store::{canonical_remote_aliases, is_content_addressed_remote_key};
+use crate::majutsu_store::{
+    canonical_remote_aliases, host_remote_key, is_content_addressed_remote_key,
+};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
@@ -11,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 use walkdir::WalkDir;
 
+use crate::atomic_io::write_atomic;
 use crate::cli::EventCommand;
 use crate::config::{Config, Paths, RootConfig};
 use crate::object_paths::prefer_canonical_remote_only;
@@ -107,13 +110,26 @@ pub(crate) fn write_upload_item(paths: &Paths, item: UploadQueueItem) -> Result<
     fs::create_dir_all(&paths.upload_queue)?;
     let path = paths.upload_queue.join(format!("{}.json", item.id));
     let item = if path.exists() {
-        let existing: UploadQueueItem = serde_json::from_slice(&fs::read(&path)?)?;
-        item.preserve_retry_state(&existing)
+        match fs::read(&path)
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
+            .and_then(|bytes| serde_json::from_slice::<UploadQueueItem>(&bytes).ok())
+        {
+            Some(existing) => item.preserve_retry_state(&existing),
+            None => item,
+        }
     } else {
         item
     };
-    fs::write(path, serde_json::to_vec_pretty(&item)?)?;
+    write_atomic(&path, &serde_json::to_vec_pretty(&item)?)?;
     Ok(())
+}
+
+pub(crate) fn upload_queue_contains_key(paths: &Paths, key: &str) -> bool {
+    paths
+        .upload_queue
+        .join(format!("{}.json", expected_upload_queue_item_id(key)))
+        .exists()
 }
 
 pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQueueItem)>> {
@@ -137,11 +153,28 @@ pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQu
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
             Err(err) => return Err(err.into()),
         };
-        let item: UploadQueueItem = serde_json::from_slice(&bytes)?;
+        if bytes.is_empty() {
+            discard_upload_queue_file(paths, &entry.path());
+            continue;
+        }
+        let item: UploadQueueItem = match serde_json::from_slice(&bytes) {
+            Ok(item) => item,
+            Err(_) => {
+                discard_upload_queue_file(paths, &entry.path());
+                continue;
+            }
+        };
         items.push((entry.path(), item));
     }
     items.sort_by(|a, b| a.1.key.cmp(&b.1.key));
     Ok(items)
+}
+
+fn discard_upload_queue_file(paths: &Paths, path: &Path) {
+    if let Some(stem) = path.file_stem().and_then(OsStr::to_str) {
+        let _ = remove_upload_payload(paths, stem);
+    }
+    let _ = fs::remove_file(path);
 }
 
 pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
@@ -303,7 +336,7 @@ fn upload_queue_item(
             let mut item = item;
             let next_attempt = item.attempts.saturating_add(1);
             item.record_attempt(Some(next_retry_after(Utc::now(), next_attempt)));
-            fs::write(path, serde_json::to_vec_pretty(&item)?)?;
+            write_atomic(path, &serde_json::to_vec_pretty(&item)?)?;
             Err(err).with_context(|| format!("upload failed for {}", item.key))
         }
     }
@@ -334,7 +367,7 @@ fn upload_queue_parallelism(remote: &RemoteStore, max_parallel_uploads: usize) -
 }
 
 fn upload_publish_priority(key: &str) -> u8 {
-    if key == "hosts/current" || key.starts_with("refs/") || key.contains("/refs/") {
+    if key.starts_with("refs/") || key.contains("/refs/") {
         return 3;
     }
     if key.ends_with("/current")
@@ -346,7 +379,6 @@ fn upload_publish_priority(key: &str) -> u8 {
     if key.starts_with("metadata/")
         || key.ends_with("/metadata/export.json")
         || key == "metadata/export.json"
-        || key.starts_with("hosts/")
     {
         return 2;
     }
@@ -506,7 +538,7 @@ pub(crate) fn enqueue_live_diff_event_journals(
 fn write_event_record(paths: &Paths, event: EventJournalRecord) -> Result<()> {
     fs::create_dir_all(&paths.event_queue)?;
     let path = paths.event_queue.join(format!("{}.json", event.event_id));
-    fs::write(path, serde_json::to_vec_pretty(&event)?)?;
+    write_atomic(&path, &serde_json::to_vec_pretty(&event)?)?;
     Ok(())
 }
 
@@ -553,7 +585,16 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(err.into()),
             };
-            records.push(serde_json::from_slice(&bytes)?);
+            if bytes.is_empty() {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
+            match serde_json::from_slice(&bytes) {
+                Ok(record) => records.push(record),
+                Err(_) => {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
         }
     }
     records.sort_by_key(|a| a.observed_at);
@@ -801,15 +842,19 @@ pub(crate) fn enqueue_remote_event_journal_uploads(
     config: &Config,
     host_id: &str,
     roots: &[RootConfig],
+    current: Option<&SnapshotManifest>,
 ) -> Result<usize> {
     let mut enqueued = 0usize;
     for mut record in event_journal_records(paths)?
         .into_iter()
         .filter(EventJournalRecord::is_remote_journal_pending)
     {
+        if current.is_some_and(|snapshot| record.observed_at <= snapshot.timestamp) {
+            continue;
+        }
         let key = remote_event_journal_key(host_id, &record.event_id);
         record.remote_journal_key = Some(key.clone());
-        enrich_remote_event_journal_payload(paths, config, roots, &mut record)?;
+        enrich_remote_event_journal_payload(paths, config, host_id, roots, &mut record)?;
         let bytes = serde_json::to_vec_pretty(&record)?;
         enqueue_inline_upload_overwrite(paths, &key, bytes)?;
         write_event_record(paths, record)?;
@@ -821,6 +866,7 @@ pub(crate) fn enqueue_remote_event_journal_uploads(
 fn enrich_remote_event_journal_payload(
     paths: &Paths,
     config: &Config,
+    host_id: &str,
     roots: &[RootConfig],
     record: &mut EventJournalRecord,
 ) -> Result<()> {
@@ -887,7 +933,7 @@ fn enrich_remote_event_journal_payload(
                 binary,
             )?
         };
-        enqueue_large_manifest_uploads(paths, &manifest_key)?;
+        enqueue_large_manifest_uploads(paths, config, host_id, &manifest_key)?;
         record.durable_payload_oid = Some(oid);
         record.durable_payload_size = Some(meta.len());
         record.durable_large_manifest_key = Some(manifest_key);
@@ -908,7 +954,7 @@ fn enrich_remote_event_journal_payload(
                 binary,
             )?
         };
-        enqueue_large_manifest_uploads(paths, &manifest_key)?;
+        enqueue_large_manifest_uploads(paths, config, host_id, &manifest_key)?;
         record.durable_payload_oid = Some(oid);
         record.durable_payload_size = Some(meta.len());
         record.durable_large_manifest_key = Some(manifest_key);
@@ -927,23 +973,52 @@ fn enrich_remote_event_journal_payload(
     let oid = blake3_hex(&bytes);
     let object_key = crate::store_bytes(paths, &paths.objects, &oid, &bytes)?;
     let local_object = paths.home.join(&object_key);
-    enqueue_file_upload(paths, &object_key, &local_object)?;
+    enqueue_file_upload(
+        paths,
+        &event_payload_remote_key(config, host_id, &object_key),
+        &local_object,
+    )?;
     record.durable_payload_oid = Some(oid);
     record.durable_payload_key = Some(object_key);
     record.durable_payload_size = Some(bytes.len() as u64);
     Ok(())
 }
 
-fn enqueue_large_manifest_uploads(paths: &Paths, manifest_key: &str) -> Result<()> {
+fn enqueue_large_manifest_uploads(
+    paths: &Paths,
+    config: &Config,
+    host_id: &str,
+    manifest_key: &str,
+) -> Result<()> {
     let manifest_path = paths.home.join(manifest_key);
-    enqueue_file_upload(paths, manifest_key, &manifest_path)?;
+    enqueue_file_upload(
+        paths,
+        &event_payload_remote_key(config, host_id, manifest_key),
+        &manifest_path,
+    )?;
     let manifest: LargeManifest =
         serde_json::from_slice(&crate::read_object(paths, manifest_key)?)?;
     for chunk in manifest.chunks {
         let chunk_path = paths.home.join(&chunk.object_key);
-        enqueue_file_upload(paths, &chunk.object_key, &chunk_path)?;
+        enqueue_file_upload(
+            paths,
+            &event_payload_remote_key(config, host_id, &chunk.object_key),
+            &chunk_path,
+        )?;
     }
     Ok(())
+}
+
+fn event_payload_remote_key(config: &Config, host_id: &str, key: &str) -> String {
+    let is_s3_remote = config
+        .remote
+        .as_ref()
+        .is_some_and(|remote| remote.url().is_ok_and(|url| url.starts_with("s3://")));
+    if is_s3_remote {
+        host_remote_key(host_id, key)
+    } else {
+        key.to_string()
+    }
 }
 
 pub(crate) fn acknowledge_remote_event_journal_uploads(
@@ -955,6 +1030,7 @@ pub(crate) fn acknowledge_remote_event_journal_uploads(
     for mut record in event_journal_records(paths)?
         .into_iter()
         .filter(EventJournalRecord::is_remote_journal_pending)
+        .filter(|record| record.remote_journal_key.is_some())
     {
         let key = record
             .remote_journal_key
@@ -992,11 +1068,11 @@ pub(crate) struct RemoteEventJournalStats {
 }
 
 fn remote_event_journal_key(host_id: &str, event_id: &str) -> String {
-    format!("hosts/{host_id}/journal/{event_id}.json")
+    format!("{host_id}/journal/{event_id}.json")
 }
 
 fn remote_event_journal_prefix(host_id: &str) -> String {
-    format!("hosts/{host_id}/journal/")
+    format!("{host_id}/journal/")
 }
 
 pub(crate) fn has_pending_journal_events(paths: &Paths) -> Result<bool> {
@@ -1241,6 +1317,9 @@ fn event_removable_after_snapshot(
     if event.observed_at >= last_snapshot_finish {
         return false;
     }
+    if compact_event_journal_trust_snapshot_finish() {
+        return true;
+    }
     if event.remote_journal_synced_at.is_none() {
         return false;
     }
@@ -1248,6 +1327,12 @@ fn event_removable_after_snapshot(
         return false;
     };
     durable_event_covered_by_snapshot(paths, event, current).unwrap_or(false)
+}
+
+fn compact_event_journal_trust_snapshot_finish() -> bool {
+    std::env::var("MAJUTSU_EVENT_COMPACT_STRICT")
+        .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn durable_event_covered_by_snapshot(
@@ -1300,15 +1385,15 @@ mod tests {
         );
         assert!(
             upload_publish_priority("metadata/export.json")
-                < upload_publish_priority("hosts/current")
+                < upload_publish_priority("host-a/current")
         );
         assert!(
-            upload_publish_priority("hosts/example/metadata/export.json")
-                < upload_publish_priority("hosts/example/refs/current")
+            upload_publish_priority("example/metadata/export.json")
+                < upload_publish_priority("example/refs/current")
         );
         assert!(
-            upload_publish_priority("hosts/example/metadata/export.json")
-                < upload_publish_priority("hosts/example/head.cbor.zst.enc")
+            upload_publish_priority("example/metadata/export.json")
+                < upload_publish_priority("example/head.cbor.zst.enc")
         );
     }
 }
