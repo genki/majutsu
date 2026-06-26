@@ -27,7 +27,7 @@ use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteObjectStat, RemoteStore, open_remote};
 use crate::root_size_summary::{
     RootSizeSummary, RootSizeSummaryRow, RootSizeSummaryTotals, decode_root_size_summary,
-    root_size_summary_key, write_cached_root_size_summary,
+    read_cached_root_size_summary, root_size_summary_key, write_cached_root_size_summary,
 };
 use crate::root_state::{
     all_tracked_paths, mark_path_tracked, mark_path_untracked, root_by_id, root_by_id_optional,
@@ -1010,6 +1010,7 @@ struct RootSizeRemoteObjects {
 }
 
 struct RootSizeTotalsInput<'a> {
+    paths: &'a Paths,
     remote_objects: &'a RootSizeRemoteObjects,
     remote_size_map: &'a BTreeMap<String, u64>,
     unique_keys: &'a BTreeSet<String>,
@@ -1051,6 +1052,54 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
     let host_prefix = remote_host_label(&config.host.name);
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
     let is_s3_remote = matches!(remote, Some(RemoteStore::S3(_)));
+    if !args.no_remote_cache
+        && !args.history
+        && let Some(summary) = read_cached_root_size_summary(paths, &config.host.id)?
+        && summary.snapshot_id == current
+    {
+        let remote_objects = match remote.as_ref() {
+            Some(remote) => root_size_remote_objects(paths, remote, true)?,
+            None => RootSizeRemoteObjects {
+                objects: Vec::new(),
+                exact: true,
+                scope: "no-remote".into(),
+            },
+        };
+        let rows = root_size_rows_from_summary(&summary);
+        let totals = root_size_totals_from_summary(&summary, &remote_objects);
+        let host_summaries = root_size_host_summaries(
+            paths,
+            remote.as_ref(),
+            &config.host.id,
+            &config.host.name,
+            &summary,
+            root_size_cross_host_summary_enabled(),
+        );
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&RootSizeReport {
+                    roots: &rows,
+                    totals,
+                    host_summaries,
+                    remote_breakdown: Vec::new(),
+                    current_host_cleanup: root_size_empty_host_cleanup(
+                        &config.host.id,
+                        &config.host.name,
+                    ),
+                    history: None,
+                })?
+            );
+        } else {
+            print_root_size_table(&rows, &totals);
+            print_root_size_current_host_cleanup(&root_size_empty_host_cleanup(
+                &config.host.id,
+                &config.host.name,
+            ));
+            print_root_size_host_summaries(&host_summaries);
+        }
+        return Ok(());
+    }
     let remote_sizes_task = remote.as_ref().map(|remote| {
         let paths = paths.clone();
         let remote = remote.clone();
@@ -1117,12 +1166,14 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
     let mut unique_packed_slice_bytes = 0u64;
     for (root, stat) in stats {
         let payload_keys = resolve_remote_keys(
+            paths,
             &stat.payload_keys,
             &remote_size_map,
             is_s3_remote,
             &host_prefix,
         );
         let metadata_keys = resolve_remote_keys(
+            paths,
             &stat.metadata_keys,
             &remote_size_map,
             is_s3_remote,
@@ -1136,9 +1187,10 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         unique_keys.extend(all_keys.iter().cloned());
         unique_payload_keys.extend(payload_keys.found.iter().cloned());
         unique_metadata_keys.extend(metadata_keys.found.iter().cloned());
-        let payload_bytes = sum_remote_keys(&remote_size_map, &payload_keys.found);
-        let metadata_bytes = sum_remote_keys(&remote_size_map, &metadata_keys.found);
+        let payload_bytes = sum_size_keys(paths, &remote_size_map, &payload_keys.found);
+        let metadata_bytes = sum_size_keys(paths, &remote_size_map, &metadata_keys.found);
         let packed_payload_keys = resolve_remote_keys(
+            paths,
             &stat.packed_payload_keys,
             &remote_size_map,
             is_s3_remote,
@@ -1153,8 +1205,9 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
                     unique_packed_slice_bytes.saturating_add(packed.pack_len);
             }
         }
-        let packed_payload_bytes = sum_remote_keys(&remote_size_map, &packed_payload_keys.found);
-        let backend_bytes = sum_remote_keys(&remote_size_map, &all_keys);
+        let packed_payload_bytes =
+            sum_size_keys(paths, &remote_size_map, &packed_payload_keys.found);
+        let backend_bytes = sum_size_keys(paths, &remote_size_map, &all_keys);
         let used_bytes = backend_bytes
             .saturating_sub(packed_payload_bytes)
             .saturating_add(stat.packed_slice_bytes);
@@ -1172,6 +1225,7 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         });
     }
     let totals = root_size_totals(RootSizeTotalsInput {
+        paths,
         remote_objects: &remote_objects,
         remote_size_map: &remote_size_map,
         unique_keys: &unique_keys,
@@ -1223,6 +1277,7 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         &config.host.id,
         &config.host.name,
         &summary,
+        root_size_cross_host_summary_enabled(),
     );
     if args.json {
         println!(
@@ -1578,6 +1633,59 @@ fn root_size_summary_from_scan(
     }
 }
 
+fn root_size_rows_from_summary(summary: &RootSizeSummary) -> Vec<RootSizeRow> {
+    summary
+        .roots
+        .iter()
+        .map(|row| RootSizeRow {
+            root: row.root.clone(),
+            files: row.files,
+            dirs: row.dirs,
+            client_bytes: row.client_bytes,
+            used_bytes: row.used_bytes,
+            backend_bytes: row.backend_bytes,
+            payload_bytes: row.payload_bytes,
+            metadata_bytes: row.metadata_bytes,
+            backend_objects: row.backend_objects,
+            missing_objects: row.missing_objects,
+        })
+        .collect()
+}
+
+fn root_size_totals_from_summary(
+    summary: &RootSizeSummary,
+    remote_objects: &RootSizeRemoteObjects,
+) -> RootSizeTotals {
+    let billed_bytes = remote_objects
+        .objects
+        .iter()
+        .map(|object| object.size)
+        .sum();
+    RootSizeTotals {
+        billed_bytes,
+        billed_objects: remote_objects.objects.len(),
+        row_used_bytes: summary.totals.row_used_bytes,
+        unique_used_bytes: summary.totals.unique_used_bytes,
+        current_backend_bytes: summary.totals.current_backend_bytes,
+        payload_bytes: summary.totals.payload_bytes,
+        metadata_bytes: summary.totals.metadata_bytes,
+        objects: summary.totals.objects,
+        backend_prefix_bytes: billed_bytes,
+        backend_prefix_objects: remote_objects.objects.len(),
+        backend_prefix_exact: remote_objects.exact,
+        backend_prefix_scope: remote_objects.scope.clone(),
+    }
+}
+
+fn root_size_empty_host_cleanup(host_id: &str, host_name: &str) -> RootSizeHostCleanupSummary {
+    RootSizeHostCleanupSummary {
+        host_id: host_id.to_string(),
+        host_name: host_name.to_string(),
+        note: "cached current summary pathではremote object明細を走査しないため、未参照候補は集計していません。正確な確認には `mj root size --no-remote-cache` を使います。".into(),
+        ..Default::default()
+    }
+}
+
 fn root_size_remote_objects(
     paths: &Paths,
     remote: &RemoteStore,
@@ -1602,6 +1710,13 @@ fn root_size_remote_objects(
             objects: cache.objects,
             exact: false,
             scope: format!("stale-cached-prefix-list:{}", cache.fetched_at.to_rfc3339()),
+        });
+    }
+    if use_cache && env::var("MAJUTSU_ROOT_SIZE_FORCE_SCAN").as_deref() != Ok("1") {
+        return Ok(RootSizeRemoteObjects {
+            objects: Vec::new(),
+            exact: false,
+            scope: "not-scanned:no-cached-prefix-list".into(),
         });
     }
     if let Some(delay) = root_size_remote_list_delay() {
@@ -1872,6 +1987,7 @@ struct ResolvedRemoteKeys {
 }
 
 fn resolve_remote_keys(
+    paths: &Paths,
     keys: &BTreeSet<String>,
     remote_size_map: &BTreeMap<String, u64>,
     is_s3_remote: bool,
@@ -1880,6 +1996,14 @@ fn resolve_remote_keys(
     let mut found = BTreeSet::new();
     let mut missing = 0usize;
     for key in keys {
+        if remote_size_map.is_empty() {
+            if local_object_size(paths, key).is_some() {
+                found.insert(key.clone());
+            } else {
+                missing += 1;
+            }
+            continue;
+        }
         let candidates = remote_key_candidates(key, is_s3_remote, host_id);
         if let Some(candidate) = candidates
             .into_iter()
@@ -1912,6 +2036,25 @@ fn sum_remote_keys(remote_size_map: &BTreeMap<String, u64>, keys: &BTreeSet<Stri
         .sum()
 }
 
+fn sum_size_keys(
+    paths: &Paths,
+    remote_size_map: &BTreeMap<String, u64>,
+    keys: &BTreeSet<String>,
+) -> u64 {
+    if !remote_size_map.is_empty() {
+        return sum_remote_keys(remote_size_map, keys);
+    }
+    keys.iter()
+        .filter_map(|key| local_object_size(paths, key))
+        .sum()
+}
+
+fn local_object_size(paths: &Paths, key: &str) -> Option<u64> {
+    fs::metadata(paths.home.join(key))
+        .ok()
+        .map(|meta| meta.len())
+}
+
 fn root_size_totals(input: RootSizeTotalsInput<'_>) -> RootSizeTotals {
     let billed_bytes = input
         .remote_objects
@@ -1920,11 +2063,23 @@ fn root_size_totals(input: RootSizeTotalsInput<'_>) -> RootSizeTotals {
         .map(|object| object.size)
         .sum();
     let billed_objects = input.remote_objects.objects.len();
-    let current_backend_bytes = sum_remote_keys(input.remote_size_map, input.unique_keys);
-    let payload_bytes = sum_remote_keys(input.remote_size_map, input.unique_payload_keys);
-    let metadata_bytes = sum_remote_keys(input.remote_size_map, input.unique_metadata_keys);
-    let packed_payload_bytes =
-        sum_remote_keys(input.remote_size_map, input.unique_packed_payload_keys);
+    let current_backend_bytes =
+        sum_size_keys(input.paths, input.remote_size_map, input.unique_keys);
+    let payload_bytes = sum_size_keys(
+        input.paths,
+        input.remote_size_map,
+        input.unique_payload_keys,
+    );
+    let metadata_bytes = sum_size_keys(
+        input.paths,
+        input.remote_size_map,
+        input.unique_metadata_keys,
+    );
+    let packed_payload_bytes = sum_size_keys(
+        input.paths,
+        input.remote_size_map,
+        input.unique_packed_payload_keys,
+    );
     let row_used_bytes = input.rows.iter().map(|row| row.used_bytes).sum();
     let unique_used_bytes = current_backend_bytes
         .saturating_sub(packed_payload_bytes)
@@ -1951,7 +2106,16 @@ fn root_size_host_summaries(
     current_host_id: &str,
     current_host_name: &str,
     current_summary: &RootSizeSummary,
+    include_remote_hosts: bool,
 ) -> Vec<RootSizeHostSummary> {
+    if !include_remote_hosts {
+        return vec![root_size_host_summary_from_summary(
+            current_host_id,
+            current_host_name,
+            current_summary,
+            true,
+        )];
+    }
     let Some(remote) = remote else {
         return vec![root_size_host_summary_from_summary(
             current_host_id,
@@ -2021,6 +2185,12 @@ fn root_size_host_summaries(
     summaries
 }
 
+fn root_size_cross_host_summary_enabled() -> bool {
+    env::var("MAJUTSU_ROOT_SIZE_CROSS_HOST_SUMMARY")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 fn root_size_host_summary_from_summary(
     host_id: &str,
     host_name: &str,
@@ -2079,6 +2249,9 @@ struct RootSizeRemoteBreakdownInput<'a> {
 fn root_size_remote_breakdown(
     input: RootSizeRemoteBreakdownInput<'_>,
 ) -> Vec<RootSizeRemoteBreakdownRow> {
+    if input.remote_objects.objects.is_empty() {
+        return Vec::new();
+    }
     let local_history_keys =
         local_history_remote_keys(input.paths, input.conn, input.config, input.is_s3_remote)
             .unwrap_or_default()
@@ -2614,6 +2787,7 @@ fn print_root_size_table(rows: &[RootSizeRow], totals: &RootSizeTotals) {
     println!("  - 注: 同じremote prefixを共有する全hostのobjectを含みます。");
     println!("  - objects: {}", format_count(totals.billed_objects));
     println!("  - exact: {}", totals.backend_prefix_exact);
+    println!("  - scope: {}", totals.backend_prefix_scope);
 }
 
 fn print_root_size_remote_breakdown(rows: &[RootSizeRemoteBreakdownRow]) {

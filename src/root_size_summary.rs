@@ -67,6 +67,7 @@ struct BuilderStat {
     payload_keys: BTreeSet<String>,
     metadata_keys: BTreeSet<String>,
     packed_payload_keys: BTreeSet<String>,
+    packed_payload_oids: BTreeSet<String>,
     packed_slice_bytes: u64,
 }
 
@@ -142,6 +143,9 @@ pub(crate) fn build_root_size_summary(
     let mut unique_keys = BTreeSet::new();
     let mut unique_payload_keys = BTreeSet::new();
     let mut unique_metadata_keys = BTreeSet::new();
+    let mut unique_packed_payload_keys = BTreeSet::new();
+    let mut unique_packed_payload_oids = BTreeSet::new();
+    let mut unique_packed_slice_bytes = 0u64;
     for (root, stat) in stats {
         let payload_bytes = sum_local_sizes(paths, &stat.payload_keys);
         let metadata_bytes = sum_local_sizes(paths, &stat.metadata_keys);
@@ -154,6 +158,15 @@ pub(crate) fn build_root_size_summary(
         unique_keys.extend(all_keys.iter().cloned());
         unique_payload_keys.extend(stat.payload_keys.iter().cloned());
         unique_metadata_keys.extend(stat.metadata_keys.iter().cloned());
+        unique_packed_payload_keys.extend(stat.packed_payload_keys.iter().cloned());
+        for oid in &stat.packed_payload_oids {
+            if unique_packed_payload_oids.insert(oid.clone())
+                && let Some(packed) = packed_blobs.get(oid)
+            {
+                unique_packed_slice_bytes =
+                    unique_packed_slice_bytes.saturating_add(packed.pack_len);
+            }
+        }
         let backend_bytes = sum_local_sizes(paths, &all_keys);
         let used_bytes = backend_bytes
             .saturating_sub(packed_payload_bytes)
@@ -177,11 +190,15 @@ pub(crate) fn build_root_size_summary(
     let payload_bytes = sum_local_sizes(paths, &unique_payload_keys);
     let metadata_bytes = sum_local_sizes(paths, &unique_metadata_keys);
     let row_used_bytes = rows.iter().map(|row| row.used_bytes).sum();
+    let packed_payload_bytes = sum_local_sizes(paths, &unique_packed_payload_keys);
+    let unique_used_bytes = current_backend_bytes
+        .saturating_sub(packed_payload_bytes)
+        .saturating_add(unique_packed_slice_bytes);
     let totals = RootSizeSummaryTotals {
         billed_bytes: 0,
         billed_objects: 0,
         row_used_bytes,
-        unique_used_bytes: row_used_bytes,
+        unique_used_bytes,
         current_backend_bytes,
         payload_bytes,
         metadata_bytes,
@@ -232,6 +249,19 @@ pub(crate) fn write_cached_root_size_summary(
     }
     write_atomic(&path, &serde_json::to_vec(summary)?)?;
     Ok(())
+}
+
+pub(crate) fn read_cached_root_size_summary(
+    paths: &Paths,
+    host_id: &str,
+) -> Result<Option<RootSizeSummary>> {
+    let path = cached_root_size_summary_path(paths, host_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let summary =
+        serde_json::from_slice(&fs::read(path)?).context("parse cached root size summary")?;
+    Ok(Some(summary))
 }
 
 fn cached_root_size_summary_path(paths: &Paths, host_id: &str) -> std::path::PathBuf {
@@ -309,6 +339,7 @@ fn add_payload_keys(
 ) -> Result<()> {
     if let Some((oid, object_key)) = payload_blob_ref(payload) {
         if let Some(packed) = packed_blobs.get(oid) {
+            stat.packed_payload_oids.insert(oid.to_string());
             stat.packed_payload_keys.insert(packed.pack_key.clone());
             stat.payload_keys.insert(packed.pack_key.clone());
             stat.metadata_keys.insert(packed.index_key.clone());

@@ -14237,7 +14237,11 @@ fn root_size_reports_client_and_backend_totals() {
 
     let sizes = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("root").arg("size");
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--no-remote-cache");
         c
     });
     assert!(sizes.contains("root"));
@@ -14266,7 +14270,8 @@ fn root_size_reports_client_and_backend_totals() {
             .arg(&state)
             .arg("root")
             .arg("size")
-            .arg("--json");
+            .arg("--json")
+            .arg("--no-remote-cache");
         c
     });
     let report: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -14383,6 +14388,66 @@ fn root_size_streams_local_scan_before_uncached_remote_listing() {
     assert!(streamed.contains("0.00 MiB"));
     assert!(streamed.contains("- remote集計: ..."));
     assert!(streamed.contains("- S3上の実サイズ共有remote prefix全体: ..."));
+}
+
+#[test]
+fn root_size_default_does_not_block_on_uncached_remote_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("--wait");
+        c
+    });
+
+    let started = std::time::Instant::now();
+    let sizes = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .env("MAJUTSU_ROOT_SIZE_REMOTE_LIST_DELAY_MS", "1200");
+        c
+    });
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "default root size blocked on uncached remote listing:\n{sizes}"
+    );
+    assert!(sizes.contains("sample"));
+    assert!(sizes.contains("not-scanned:no-cached-prefix-list"));
+    assert!(sizes.contains("exact: false"));
+    assert!(sizes.contains("- current snapshotのユニークused推定:"));
+    assert!(!sizes.contains("0 objects\n\n環境別current snapshotサイズ:"));
 }
 
 #[test]
@@ -14569,21 +14634,16 @@ fn root_size_falls_back_when_remote_summary_is_corrupt() {
         c
     });
 
-    let hosts_dir = remote.join("hosts");
-    let host_dir = fs::read_dir(hosts_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.join("root-size-summary.cbor.zst.enc").exists())
-        .expect("root size summary host dir");
-    fs::write(
-        host_dir.join("root-size-summary.cbor.zst.enc"),
-        b"corrupt summary",
-    )
-    .unwrap();
+    let summary_path = find_file_ending(&remote, "root-size-summary.cbor.zst.enc");
+    fs::write(summary_path, b"corrupt summary").unwrap();
 
     let sizes = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("root").arg("size");
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--no-remote-cache");
         c
     });
     assert!(sizes.contains("sample"));
@@ -14630,17 +14690,16 @@ fn root_size_reports_full_totals_when_remote_summary_is_missing() {
         c
     });
 
-    let hosts_dir = remote.join("hosts");
-    let summary_path = fs::read_dir(hosts_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path().join("root-size-summary.cbor.zst.enc"))
-        .find(|path| path.exists())
-        .expect("root size summary");
+    let summary_path = find_file_ending(&remote, "root-size-summary.cbor.zst.enc");
     fs::remove_file(summary_path).unwrap();
 
     let sizes = output({
         let mut c = mj();
-        c.arg("--home").arg(&state).arg("root").arg("size");
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--no-remote-cache");
         c
     });
     assert!(sizes.contains("sample"));

@@ -227,13 +227,21 @@ remote-side data. `backend` is the full remote object set required to restore
 the root, while `used` is the pack-slice-adjusted amount actually used by that
 root.
 
+By default, `mj root size` prefers the local current root-size summary cache.
+This keeps the command responsive even when the S3 prefix contains many
+objects. Current snapshot `backend` and `used` values are shown from the local
+summary or local object metadata. The physical S3 prefix total is shown from a
+cached object listing when one exists; otherwise it is marked `exact: false`
+with `scope: not-scanned:no-cached-prefix-list`.
+
+Use `mj root size --no-remote-cache` when you specifically need a fresh exact
+S3 object listing. That path can take much longer on large buckets because it
+lists the configured remote prefix directly.
+
 When multiple hosts share the same bucket, the remote URL path is the Majutsu
 remote root. The intended layout is one host/environment directory directly
-under that remote root. The final `S3 backend prefix total` line is the
-physical object total for the configured remote root. Existing pre-migration
-repositories may still include every host in that total; the host summary table
-shows per-host current snapshot totals so the local environment can be
-distinguished from other environments:
+under that remote root. The host summary table shows per-host current snapshot
+totals so the local environment can be distinguished from other environments:
 
 ```text
 host      id        roots      client        used     backend  objects  snapshot
@@ -242,9 +250,9 @@ vagrant*  c071a4f3     18  720.92 MiB  242.87 MiB  337.12 MiB    5,459  snap-e0a
 winvr     0a88f6e2      8    7.58 MiB   16.55 MiB  246.74 MiB      152  snap-25457225
 ```
 
-`*` marks the current local host. Other host rows are read from the last
-published root-size summary in the shared remote; if an older host has not
-published a summary yet, the row remains visible with an availability note.
+`*` marks the current local host. For responsiveness, the default command shows
+the current host. Set `MAJUTSU_ROOT_SIZE_CROSS_HOST_SUMMARY=1` when you need to
+read other hosts' last published summaries from the shared remote.
 
 The `S3 physical size breakdown` section explains the remote root total as a
 sum of object categories. `local-current` is the current host's current
@@ -253,7 +261,9 @@ restore data. Host metadata, journal, GC state, legacy aliases, and
 `other-payload-or-metadata` account for the remaining physical objects.
 `other-payload-or-metadata` can include other hosts' current/history data and
 objects that remote cleanup has not reclaimed yet, so it is the first place to
-look when the shared prefix is much larger than host current totals.
+look when the shared prefix is much larger than host current totals. This
+breakdown is produced on exact or cached remote object listings; it is skipped
+when the remote listing is not available.
 
 The long-term remote layout is host-scoped: a bucket may be shared, but durable
 payload, metadata, journal, and GC objects should live directly under a
