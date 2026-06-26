@@ -2515,6 +2515,9 @@ fn state_stream_live_file_changes_for_root(
     let untracked_paths = untracked_paths_for_root(&conn, &root.id)?;
     from_files.retain(|path, _| !untracked_paths.contains(path));
     for path in tracked_paths_for_root(&conn, &root.id)? {
+        if !state_record_path_is_file_relative(&path) {
+            continue;
+        }
         from_files
             .entry(path.clone())
             .or_insert_with(|| tracked_tombstone_record(root, path));
