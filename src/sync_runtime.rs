@@ -1127,8 +1127,8 @@ fn sync_verify_cached_remote_aliases() -> bool {
 
 fn sync_remote_prune_enabled() -> bool {
     std::env::var("MAJUTSU_SYNC_REMOTE_PRUNE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn sync_wait_deep_repair_enabled() -> bool {

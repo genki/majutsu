@@ -995,17 +995,23 @@ pub(crate) fn validate_clone_remote_snapshot_objects(
     export: &MetadataExport,
 ) -> Result<()> {
     for snapshot in &export.snapshots {
+        if !is_snapshot_manifest_object_key(paths, &snapshot.manifest_key)? {
+            continue;
+        }
         let metadata_manifest = raw_snapshot_manifest_from_export(paths, snapshot)?;
         for variant in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
+            let payload = hydrate_compact_snapshot_manifest_payload(
+                paths,
+                &snapshot.manifest_key,
+                decode_object(paths, &variant.bytes)?,
+            )?;
             let remote_manifest: SnapshotManifest =
-                serde_json::from_slice(&decode_object(paths, &variant.bytes)?).with_context(
-                    || {
-                        format!(
-                            "parse remote snapshot manifest {} from {}",
-                            snapshot.manifest_key, variant.remote_key
-                        )
-                    },
-                )?;
+                serde_json::from_slice(&payload).with_context(|| {
+                    format!(
+                        "parse remote snapshot manifest {} from {}",
+                        snapshot.manifest_key, variant.remote_key
+                    )
+                })?;
             if !snapshot_manifest_matches(&remote_manifest, &metadata_manifest) {
                 bail!(
                     "remote snapshot manifest object does not match metadata {} {}",

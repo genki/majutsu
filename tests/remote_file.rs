@@ -56,6 +56,16 @@ fn synced_object_count(output: &str) -> usize {
         .unwrap_or_else(|| panic!("missing synced object count in output:\n{output}"))
 }
 
+fn output_metric(output: &str, name: &str) -> usize {
+    output
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(name)?.trim_start();
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .unwrap_or_else(|| panic!("missing metric {name} in output:\n{output}"))
+}
+
 fn set_watch_backend(state: &std::path::Path, backend: &str) {
     let config_path = state.join("config.toml");
     let config = fs::read_to_string(&config_path).unwrap();
@@ -9491,7 +9501,10 @@ fn sync_prunes_remote_loose_blobs_after_pack() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    assert!(sync.contains("pruned_remote_objects "));
+    assert!(
+        output_metric(&sync, "pruned_remote_objects") > 0,
+        "sync should prune stale loose blob aliases by default:\n{sync}"
+    );
     assert!(!remote.join(&object_key).exists());
     assert!(!remote.join(&canonical_key).exists());
 
