@@ -234,6 +234,10 @@ by `mj key export` when cloning into the empty recovered state.
 - Use `mj root add <id> <path> --no-default-excludes` only for roots where VCS
   internals, dependency directories, build outputs, and caches are part of the
   data you intentionally need to recover.
+- Review `mj state` after adding or copying files into a root. Unknown large
+  files and large batches of unknown files are shown as additions but are not
+  automatically tracked after the initial root scan; use `mj track <path>` when
+  they are truly recovery-critical.
 - Use `mj state 1d -r <root> --diff` for Git-style inspection of recent file
   changes.
 - Use `mj branch create <name> --at <time> --switch --restore --force` to branch

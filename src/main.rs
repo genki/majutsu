@@ -211,15 +211,16 @@ use restore_runtime::{
 };
 use root_runtime::root_cmd;
 use root_state::{
-    mark_path_tracked, roots, sync_config_roots, sync_roots_to_config, update_root_degraded,
-    update_root_status,
+    mark_path_tracked, roots, sync_config_roots, sync_roots_to_config, tracked_paths_for_root,
+    untracked_paths_for_root, update_root_degraded, update_root_status,
 };
 use snapshot_rules::{
     build_ignore, classify_large, effective_large_config, large_pointer_compression, looks_binary,
     root_dir_allows_descend, root_record_is_managed,
 };
 use snapshot_state::{
-    carry_forward_root_snapshot, current_snapshot, load_snapshot_by_id, load_snapshot_header,
+    carry_forward_root_snapshot, current_snapshot, load_root_tree_entries, load_snapshot_by_id,
+    load_snapshot_header,
 };
 use sync_runtime::sync_cmd;
 use util::{
@@ -503,6 +504,8 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let mut root_trees = BTreeMap::new();
     let mut total_files = 0usize;
     let mut large_files = 0usize;
+    let mut skipped_auto_track_large = 0usize;
+    let mut skipped_auto_track_batch = 0usize;
     let mut pending_blob_inserts = Vec::new();
     let mut pending_tracked_paths = Vec::new();
     for root in roots(&conn)? {
@@ -587,7 +590,15 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             return Err(err);
         }
         let scan_root_config = snapshot_scan_root(paths, &root)?;
-        let scan_result = scan_root(paths, &conn, &config, &scan_root_config);
+        let parent_root_files = parent_manifest
+            .as_ref()
+            .map(|manifest| snapshot_root_file_paths(paths, manifest, &root.id))
+            .transpose()?;
+        let known_paths = root_known_paths(&conn, &root.id, parent_root_files.as_ref())?;
+        let initial_root_scan = parent_root_files.is_none() && known_paths.is_empty();
+        let auto_track_policy =
+            AutoTrackPolicy::for_root(&scan_root_config, &known_paths, initial_root_scan)?;
+        let scan_result = scan_root(paths, &conn, &config, &scan_root_config, &auto_track_policy);
         let post_result = run_post_snapshot_hook(paths, &root);
         let scanned = match scan_result {
             Ok(scanned) => scanned,
@@ -644,6 +655,18 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         let records = scanned.records;
         pending_blob_inserts.extend(scanned.blobs);
         pending_tracked_paths.extend(scanned.tracked_paths);
+        skipped_auto_track_large += scanned.skipped_auto_track_large;
+        skipped_auto_track_batch += scanned.skipped_auto_track_batch;
+        if scanned.skipped_auto_track_large > 0 || scanned.skipped_auto_track_batch > 0 {
+            record_event(
+                paths,
+                "auto-track-skipped",
+                &format!(
+                    "{} large={} batch={}",
+                    root.id, scanned.skipped_auto_track_large, scanned.skipped_auto_track_batch
+                ),
+            )?;
+        }
         if let Err(err) = post_result {
             record_snapshot_failure(
                 &conn,
@@ -708,6 +731,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         prune_noop_snapshot_cache(paths, &conn, &config);
         println!("snapshot unchanged {current_id}");
         println!("files {total_files}, large {large_files}");
+        if skipped_auto_track_large > 0 || skipped_auto_track_batch > 0 {
+            println!(
+                "auto_track_skipped large={} batch={}",
+                skipped_auto_track_large, skipped_auto_track_batch
+            );
+        }
         return Ok(());
     }
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
@@ -764,6 +793,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     tx.commit()?;
     println!("snapshot {}", manifest.snapshot_id);
     println!("files {total_files}, large {large_files}");
+    if skipped_auto_track_large > 0 || skipped_auto_track_batch > 0 {
+        println!(
+            "auto_track_skipped large={} batch={}",
+            skipped_auto_track_large, skipped_auto_track_batch
+        );
+    }
     record_event(paths, "snapshot-finish", &manifest.snapshot_id)?;
     let _ = compact_event_journal_force(paths);
     Ok(())
@@ -2814,6 +2849,121 @@ struct ScannedRoot {
     records: Vec<FileRecord>,
     blobs: Vec<BlobInsert>,
     tracked_paths: Vec<(String, String)>,
+    skipped_auto_track_large: usize,
+    skipped_auto_track_batch: usize,
+}
+
+struct AutoTrackPolicy {
+    known_paths: BTreeSet<String>,
+    initial_root_scan: bool,
+    unknown_add_count: usize,
+    max_auto_add: usize,
+}
+
+impl AutoTrackPolicy {
+    fn for_root(
+        root: &RootConfig,
+        known_paths: &BTreeSet<String>,
+        initial_root_scan: bool,
+    ) -> Result<Self> {
+        let max_auto_add = max_auto_track_new_files();
+        let unknown_add_count = if initial_root_scan {
+            0
+        } else {
+            count_unknown_file_candidates(root, known_paths, max_auto_add.saturating_add(1))?
+        };
+        Ok(Self {
+            known_paths: known_paths.clone(),
+            initial_root_scan,
+            unknown_add_count,
+            max_auto_add,
+        })
+    }
+
+    fn known(&self, rel: &str) -> bool {
+        self.initial_root_scan || self.known_paths.contains(rel)
+    }
+
+    fn unknown_batch_too_large(&self) -> bool {
+        !self.initial_root_scan && self.unknown_add_count > self.max_auto_add
+    }
+}
+
+fn root_known_paths(
+    conn: &Connection,
+    root_id: &str,
+    parent_root_files: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<String>> {
+    let mut known = tracked_paths_for_root(conn, root_id)?;
+    if let Some(parent_root_files) = parent_root_files {
+        known.extend(parent_root_files.iter().cloned());
+    }
+    for path in untracked_paths_for_root(conn, root_id)? {
+        known.remove(&path);
+    }
+    Ok(known)
+}
+
+fn snapshot_root_file_paths(
+    paths: &Paths,
+    manifest: &SnapshotManifest,
+    root_id: &str,
+) -> Result<BTreeSet<String>> {
+    let Some(root_snapshot) = manifest.root_trees.get(root_id) else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(load_root_tree_entries(paths, root_snapshot)?
+        .into_iter()
+        .filter(|(_, record)| record.kind != "directory")
+        .map(|(path, _)| path)
+        .collect())
+}
+
+fn max_auto_track_new_files() -> usize {
+    env::var("MAJUTSU_MAX_AUTO_TRACK_NEW_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+}
+
+fn count_unknown_file_candidates(
+    root: &RootConfig,
+    known_paths: &BTreeSet<String>,
+    stop_after: usize,
+) -> Result<usize> {
+    let ignore = build_ignore(root)?;
+    let mut count = 0usize;
+    let walker = WalkDir::new(&root.path)
+        .follow_links(root.follow_symlinks)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == root.path {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root.path) else {
+                return true;
+            };
+            !entry.file_type().is_dir() || root_dir_allows_descend(root, &ignore, rel)
+        });
+    for entry in walker {
+        let entry = entry?;
+        if entry.path() == root.path || entry.file_type().is_dir() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(&root.path)?.to_path_buf();
+        if !root_record_is_managed(root, &ignore, &rel, false) {
+            continue;
+        }
+        let rel_s = path_to_slash(&rel);
+        if !known_paths.contains(&rel_s) {
+            count += 1;
+            if count >= stop_after {
+                break;
+            }
+        }
+    }
+    Ok(count)
 }
 
 struct BlobInsert {
@@ -2827,10 +2977,13 @@ fn scan_root(
     conn: &Connection,
     config: &Config,
     root: &RootConfig,
+    auto_track: &AutoTrackPolicy,
 ) -> Result<ScannedRoot> {
     let ignore = build_ignore(root)?;
     let mut records = Vec::new();
     let mut blobs = Vec::new();
+    let mut skipped_auto_track_large = 0usize;
+    let mut skipped_auto_track_batch = 0usize;
     let packed_blob_keys = packed_blob_object_keys(conn)?;
     let walker = WalkDir::new(&root.path)
         .follow_links(root.follow_symlinks)
@@ -2855,6 +3008,8 @@ fn scan_root(
             continue;
         }
         let rel_s = path_to_slash(&rel);
+        let known_path = auto_track.known(&rel_s);
+        let skip_unknown_batch = !known_path && auto_track.unknown_batch_too_large();
         if entry.file_type().is_dir() {
             let meta = fs::symlink_metadata(entry.path())?;
             records.push(FileRecord {
@@ -2872,6 +3027,10 @@ fn scan_root(
             continue;
         }
         let link_meta = fs::symlink_metadata(entry.path())?;
+        if skip_unknown_batch {
+            skipped_auto_track_batch += 1;
+            continue;
+        }
         if link_meta.file_type().is_symlink() && !root.follow_symlinks {
             let target = fs::read_link(entry.path())?.to_string_lossy().to_string();
             records.push(FileRecord {
@@ -2914,6 +3073,12 @@ fn scan_root(
         let large_config = effective_large_config(config, root);
         let binary = looks_binary(entry.path()).unwrap_or(false);
         let large = classify_large(&large_config, &rel, meta.len(), binary);
+        if !known_path
+            && (large || (large_config.enabled && meta.len() >= large_config.chunked_min_size))
+        {
+            skipped_auto_track_large += 1;
+            continue;
+        }
         let payload = if large {
             let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
                 store_large_file(paths, entry.path(), &rel, &large_config, binary)?
@@ -2989,6 +3154,8 @@ fn scan_root(
         records,
         blobs,
         tracked_paths,
+        skipped_auto_track_large,
+        skipped_auto_track_batch,
     })
 }
 

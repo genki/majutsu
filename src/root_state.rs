@@ -192,6 +192,20 @@ pub(crate) fn tracked_paths_for_root(conn: &Connection, root_id: &str) -> Result
     Ok(paths)
 }
 
+pub(crate) fn untracked_paths_for_root(
+    conn: &Connection,
+    root_id: &str,
+) -> Result<BTreeSet<String>> {
+    let mut stmt =
+        conn.prepare("select path from tracked_paths where root_id=?1 and status='untracked'")?;
+    let rows = stmt.query_map(params![root_id], |row| row.get::<_, String>(0))?;
+    let mut paths = BTreeSet::new();
+    for row in rows {
+        paths.insert(row?);
+    }
+    Ok(paths)
+}
+
 pub(crate) fn all_tracked_paths(conn: &Connection, root_id: &str) -> Result<BTreeSet<String>> {
     tracked_paths_for_root(conn, root_id)
 }

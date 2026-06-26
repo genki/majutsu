@@ -5,7 +5,7 @@ use crate::majutsu_store::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
@@ -452,11 +452,6 @@ pub(crate) fn record_file_event(
     raw_backend: &str,
     detail: &str,
 ) -> Result<()> {
-    if matches!(event_kind, "create" | "modify")
-        && let Ok(conn) = crate::open_db(paths)
-    {
-        let _ = crate::root_state::mark_path_tracked(&conn, root_id, path);
-    }
     write_event_record(
         paths,
         EventJournalRecord::new_file_event(
@@ -486,7 +481,18 @@ pub(crate) fn enqueue_live_diff_event_journals(
         .filter(|root| root.status == "active" && root.path.exists())
     {
         let snapshot_files = snapshot_root_file_map(paths, current, &root.id)?;
-        let live_files = scan_live_root_for_journal(root, &snapshot_files)?;
+        let known_paths = journal_known_paths(paths, &root.id, &snapshot_files)?;
+        let max_auto_add = max_auto_track_new_files();
+        let unknown_add_count =
+            count_unknown_journal_file_candidates(root, &known_paths, max_auto_add + 1)?;
+        let config = crate::read_config(paths)?;
+        let live_files = scan_live_root_for_journal(
+            &config,
+            root,
+            &snapshot_files,
+            &known_paths,
+            unknown_add_count > max_auto_add,
+        )?;
         let mut paths_all = snapshot_files.keys().cloned().collect::<Vec<_>>();
         paths_all.extend(
             live_files
@@ -502,7 +508,7 @@ pub(crate) fn enqueue_live_diff_event_journals(
             let Some(event_kind) = live_diff_event_kind(snapshot_record, live_record) else {
                 continue;
             };
-            if matches!(event_kind, "create" | "modify") {
+            if matches!(event_kind, "create" | "modify") && live_record.is_some() {
                 crate::root_state::mark_path_tracked(&crate::open_db(paths)?, &root.id, &rel_path)?;
             }
             if live_diff_event_already_covered(
@@ -570,6 +576,78 @@ pub(crate) fn import_remote_event_journals(
     Ok(imported)
 }
 
+fn journal_known_paths(
+    paths: &Paths,
+    root_id: &str,
+    snapshot_files: &BTreeMap<String, FileRecord>,
+) -> Result<BTreeSet<String>> {
+    let conn = crate::open_db(paths)?;
+    let mut known = crate::root_state::tracked_paths_for_root(&conn, root_id)?;
+    known.extend(snapshot_files.keys().cloned());
+    Ok(known)
+}
+
+fn max_auto_track_new_files() -> usize {
+    std::env::var("MAJUTSU_MAX_AUTO_TRACK_NEW_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+}
+
+fn count_unknown_journal_file_candidates(
+    root: &RootConfig,
+    known_paths: &BTreeSet<String>,
+    stop_after: usize,
+) -> Result<usize> {
+    let ignore = build_ignore(root)?;
+    let scan_base = journal_source_base(root);
+    let mut count = 0usize;
+    let walker = WalkDir::new(scan_base)
+        .follow_links(root.follow_symlinks)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == scan_base {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(scan_base) else {
+                return true;
+            };
+            !entry.file_type().is_dir() || root_dir_allows_descend(root, &ignore, rel)
+        });
+    for entry in walker {
+        let entry = entry?;
+        if entry.path() == scan_base || entry.file_type().is_dir() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(scan_base)?.to_path_buf();
+        if !root_record_is_managed(root, &ignore, &rel, false) {
+            continue;
+        }
+        let rel_s = path_to_slash(&rel);
+        if !known_paths.contains(&rel_s) {
+            count += 1;
+            if count >= stop_after {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn journal_path_is_known(paths: &Paths, root_id: &str, rel_path: &str) -> Result<bool> {
+    let conn = crate::open_db(paths)?;
+    if crate::root_state::tracked_paths_for_root(&conn, root_id)?.contains(rel_path) {
+        return Ok(true);
+    }
+    let Some(current) = current_snapshot(&conn)? else {
+        return Ok(false);
+    };
+    let snapshot = load_snapshot_by_id(paths, &conn, &current)?;
+    let files = snapshot_root_file_map(paths, &snapshot, root_id)?;
+    Ok(files.contains_key(rel_path))
+}
+
 pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRecord>> {
     if !paths.event_queue.exists() {
         return Ok(Vec::new());
@@ -623,8 +701,11 @@ fn snapshot_root_file_map(
 }
 
 fn scan_live_root_for_journal(
+    config: &Config,
     root: &RootConfig,
     snapshot_files: &BTreeMap<String, FileRecord>,
+    known_paths: &BTreeSet<String>,
+    unknown_batch_too_large: bool,
 ) -> Result<BTreeMap<String, FileRecord>> {
     let ignore = build_ignore(root)?;
     let mut records = BTreeMap::new();
@@ -652,8 +733,12 @@ fn scan_live_root_for_journal(
             continue;
         }
         let rel_s = path_to_slash(&rel);
+        let known_path = known_paths.contains(&rel_s);
         let link_meta = fs::symlink_metadata(entry.path())?;
         if entry.file_type().is_dir() {
+            continue;
+        }
+        if !known_path && unknown_batch_too_large {
             continue;
         }
         let record = if link_meta.file_type().is_symlink() && !root.follow_symlinks {
@@ -691,6 +776,14 @@ fn scan_live_root_for_journal(
                 link_meta
             };
             if !meta.is_file() {
+                continue;
+            }
+            let large_config = effective_large_config(config, root);
+            let binary = looks_binary(entry.path()).unwrap_or(false);
+            if !known_path
+                && (classify_large(&large_config, &rel, meta.len(), binary)
+                    || (large_config.enabled && meta.len() >= large_config.chunked_min_size))
+            {
                 continue;
             }
             let mode = crate::fs_meta::file_mode(&meta);
@@ -914,13 +1007,19 @@ fn enrich_remote_event_journal_payload(
     if !meta.is_file() {
         return Ok(());
     }
+    let large_config = effective_large_config(config, root);
+    let binary = looks_binary(&source).unwrap_or(false);
+    if !journal_path_is_known(paths, root_id, rel_path)?
+        && (classify_large(&large_config, Path::new(rel_path), meta.len(), binary)
+            || (large_config.enabled && meta.len() >= large_config.chunked_min_size))
+    {
+        return Ok(());
+    }
     record.durable_entry_kind = Some("file".into());
     record.durable_mode = Some(crate::fs_meta::file_mode(&meta));
     record.durable_modified = crate::util::modified_secs(&meta);
     record.durable_uid = crate::fs_meta::file_uid(&meta);
     record.durable_gid = crate::fs_meta::file_gid(&meta);
-    let large_config = effective_large_config(config, root);
-    let binary = looks_binary(&source).unwrap_or(false);
     if classify_large(&large_config, Path::new(rel_path), meta.len(), binary) {
         let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
             crate::store_large_file(paths, &source, Path::new(rel_path), &large_config, binary)?

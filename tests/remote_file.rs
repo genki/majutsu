@@ -14451,6 +14451,133 @@ fn root_size_default_does_not_block_on_uncached_remote_listing() {
 }
 
 #[test]
+fn snapshot_does_not_auto_track_new_large_file_after_initial_root_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("seed.txt"), b"seed\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--large-min-size")
+            .arg("1024")
+            .arg("--large-binary-min-size")
+            .arg("1024");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::write(source.join("large.bin"), vec![b'x'; 2048]).unwrap();
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(
+        snapshot.contains("auto_track_skipped large=1 batch=0"),
+        "{snapshot}"
+    );
+
+    let state_out = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    assert!(
+        state_out.contains("A sample/large.bin") || state_out.contains("A large.bin"),
+        "{state_out}"
+    );
+}
+
+#[test]
+fn snapshot_does_not_auto_track_large_batches_of_new_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("seed.txt"), b"seed\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    for index in 0..3 {
+        fs::write(source.join(format!("bulk-{index}.txt")), b"bulk\n").unwrap();
+    }
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .env("MAJUTSU_MAX_AUTO_TRACK_NEW_FILES", "2");
+        c
+    });
+    assert!(
+        snapshot.contains("auto_track_skipped large=0 batch=3"),
+        "{snapshot}"
+    );
+
+    let state_out = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    assert!(
+        state_out.contains("A sample/bulk-0.txt") || state_out.contains("A bulk-0.txt"),
+        "{state_out}"
+    );
+    assert!(
+        state_out.contains("A sample/bulk-1.txt") || state_out.contains("A bulk-1.txt"),
+        "{state_out}"
+    );
+    assert!(
+        state_out.contains("A sample/bulk-2.txt") || state_out.contains("A bulk-2.txt"),
+        "{state_out}"
+    );
+}
+
+#[test]
 fn root_size_history_reports_payloads_not_referenced_by_current_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -16062,6 +16189,27 @@ fn track_untrack_separate_deleted_state_from_management_removal() {
     });
     assert_eq!(deleted_after_untrack, "");
 
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("after untrack");
+        c
+    });
+    let deleted_after_untrack_snapshot = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--deleted");
+        c
+    });
+    assert_eq!(deleted_after_untrack_snapshot, "");
+
     fs::create_dir_all(source.join("ignored")).unwrap();
     fs::write(source.join("ignored/keep.txt"), b"keep\n").unwrap();
     run({
@@ -16085,6 +16233,84 @@ fn track_untrack_separate_deleted_state_from_management_removal() {
         c
     });
     assert!(added.contains(" A sample/ignored/keep.txt"), "{added}");
+}
+
+#[test]
+fn state_hides_untracked_path_even_when_basis_snapshot_contains_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("old.txt"), b"old\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("initial");
+        c
+    });
+
+    fs::remove_file(source.join("old.txt")).unwrap();
+    let deleted = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--deleted")
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    assert_eq!(deleted, " D sample/old.txt\n");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("old.txt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("after untrack");
+        c
+    });
+    let deleted_after_untrack = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--deleted")
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    assert_eq!(deleted_after_untrack, "");
 }
 
 #[test]

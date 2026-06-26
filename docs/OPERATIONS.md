@@ -137,6 +137,13 @@ mj daemon service --provider systemd --scope user
 を使う。root 固有に追加で外すものがある場合は `--exclude`、`--preset`、`mj root set`
 で明示する。
 
+初回 root scan では root rules に合う既存ファイルを広く取り込む。一方で、その後に
+未知の large file や大量の未知ファイルが追加された場合は、自動的には tracked にせず
+`mj state` に `A` として表示する。保護対象として妥当なら `mj track <path>` で明示的に
+取り込む。これは Git/Jujutsu の作業tree確認に近い運用で、build output、archive、
+生成dataset、大量コピーの誤混入を backend に送る事故を避けるための既定動作である。
+大量追加の閾値は `MAJUTSU_MAX_AUTO_TRACK_NEW_FILES` で調整でき、既定は 100 files。
+
 `/etc`、systemd system unit、root所有のenvファイル、`/usr/local/sbin` の手製スクリプトなど、
 ホスト復旧に必要で通常ユーザーから読めない構成は、root権限のsystemインスタンスで保護する。
 systemインスタンスはユーザー用 `~/.majutsu` とstateを共有しない。
