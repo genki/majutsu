@@ -234,6 +234,13 @@ summary or local object metadata. The physical S3 prefix total is shown from a
 cached object listing when one exists; otherwise it is marked `exact: false`
 with `scope: not-scanned:no-cached-prefix-list`.
 
+New roots apply best-practice excludes before the first snapshot. Besides VCS
+and dependency directories, the defaults also avoid generated `artifacts/**`
+trees and transient sqlite sidecar files such as `*.sqlite-wal`,
+`*.sqlite-shm`, `*.db-wal`, and `*.db-shm`. Add an explicit include or use
+`--no-default-excludes` only when those generated files are intentionally part
+of the recovery target.
+
 Use `mj root size --no-remote-cache` when you specifically need a fresh exact
 S3 object listing. That path can take much longer on large buckets because it
 lists the configured remote prefix directly.
@@ -250,19 +257,22 @@ vagrant*  c071a4f3     18  720.92 MiB  242.87 MiB  337.12 MiB    5,459  snap-e0a
 winvr     0a88f6e2      8    7.58 MiB   16.55 MiB  246.74 MiB      152  snap-25457225
 ```
 
-`*` marks the current local host. For responsiveness, the default command shows
-the current host. Set `MAJUTSU_ROOT_SIZE_CROSS_HOST_SUMMARY=1` when you need to
-read other hosts' last published summaries from the shared remote.
+`*` marks the current local host. For responsiveness, the default cached command
+shows the current host. `mj root size --no-remote-cache` already scans the
+remote prefix, so it also reads other hosts' last published summaries by
+default. Set `MAJUTSU_ROOT_SIZE_CROSS_HOST_SUMMARY=1` when you want the cached
+path to read those remote summaries too.
 
 The `S3 physical size breakdown` section explains the remote root total as a
 sum of object categories. `local-current` is the current host's current
 snapshot restore set. `local-history` is the current host's retained historical
 restore data. Host metadata, journal, GC state, legacy aliases, and
 `other-payload-or-metadata` account for the remaining physical objects.
-`other-payload-or-metadata` can include other hosts' current/history data and
-objects that remote cleanup has not reclaimed yet, so it is the first place to
-look when the shared prefix is much larger than host current totals. This
-breakdown is produced on exact or cached remote object listings; it is skipped
+`host:<name>` rows are objects below another host's top-level prefix. Remaining
+`other-payload-or-metadata` rows are objects that do not belong to a known host
+prefix and are the first place to look when the shared prefix is much larger
+than host current totals. This breakdown is produced on exact or cached remote
+object listings; it is skipped
 when the remote listing is not available.
 
 The long-term remote layout is host-scoped: a bucket may be shared, but durable

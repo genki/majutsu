@@ -1277,7 +1277,7 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
         &config.host.id,
         &config.host.name,
         &summary,
-        root_size_cross_host_summary_enabled(),
+        args.no_remote_cache || root_size_cross_host_summary_enabled(),
     );
     if args.json {
         println!(
@@ -2275,6 +2275,8 @@ fn root_size_remote_breakdown(
     } else {
         Default::default()
     };
+    let remote_host_prefixes = remote_host_prefixes_from_objects(&input.remote_objects.objects);
+    let current_host_prefix = remote_host_label(&input.config.host.name);
     let mut categories = BTreeMap::<String, (u64, usize, String)>::new();
     for object in &input.remote_objects.objects {
         let (category, note) = if input.current_keys.contains(&object.key) {
@@ -2297,6 +2299,14 @@ fn root_size_remote_breakdown(
                 "other-host-history".to_string(),
                 "他hostの保持履歴が参照するS3 object".to_string(),
             )
+        } else if let Some((host_prefix, _)) = object.key.split_once('/')
+            && host_prefix != current_host_prefix
+            && remote_host_prefixes.contains(host_prefix)
+        {
+            (
+                format!("host:{host_prefix}"),
+                format!("他host prefix `{host_prefix}` 配下のS3 object"),
+            )
         } else {
             classify_remote_size_object(&object.key)
         };
@@ -2315,6 +2325,25 @@ fn root_size_remote_breakdown(
             },
         )
         .collect()
+}
+
+fn remote_host_prefixes_from_objects(objects: &[RemoteObjectStat]) -> BTreeSet<String> {
+    let mut prefixes = BTreeSet::new();
+    for object in objects {
+        let Some((prefix, rest)) = object.key.split_once('/') else {
+            continue;
+        };
+        if matches!(
+            rest,
+            "host.toml"
+                | "root-size-summary.cbor.zst.enc"
+                | "metadata/export.json"
+                | "metadata/export.json.zst"
+        ) {
+            prefixes.insert(prefix.to_string());
+        }
+    }
+    prefixes
 }
 
 fn local_history_remote_keys(
@@ -2564,13 +2593,18 @@ fn classify_remote_size_object(key: &str) -> (String, String) {
         || key.contains("/snapshots/")
         || key.contains("/journal/")
         || key.contains("/root-size-summary")
+        || key.contains("/indexes/")
+        || key.contains("/keys/")
+        || key.ends_with("/config.toml")
+        || key.ends_with("/host.toml")
+        || key.ends_with("/head.cbor.zst.enc")
     {
         return (
             "host-metadata-journal".into(),
             "metadata export、refs、journal、host summaryなど".into(),
         );
     }
-    if key.starts_with("gc/") {
+    if key.starts_with("gc/") || key.contains("/gc/") {
         return (
             "gc-state".into(),
             "GC mark/tombstoneなどremote cleanup用の管理object".into(),
@@ -2592,13 +2626,17 @@ fn classify_remote_size_object(key: &str) -> (String, String) {
         || key.starts_with("large/")
         || key.starts_with("packs/")
         || key.starts_with("trees/")
+        || key.contains("/blobs/")
+        || key.contains("/large/")
+        || key.contains("/packs/")
+        || key.contains("/trees/")
     {
         return (
             "unreferenced-payload-or-metadata".into(),
             "現在hostのcurrent/historyから参照されない未回収payload/metadata候補".into(),
         );
     }
-    if key.starts_with("objects/") {
+    if key.starts_with("objects/") || key.contains("/objects/") {
         return (
             "legacy-object-alias".into(),
             "旧objects/形式alias、または互換用に残るobject".into(),

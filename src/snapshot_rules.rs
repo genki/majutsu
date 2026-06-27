@@ -148,6 +148,22 @@ pub fn default_root_excludes() -> Vec<String> {
         "**/logs/**",
         "*.log",
         "**/*.log",
+        "artifacts/**",
+        "/artifacts/**",
+        "**/artifacts/**",
+        "shell_snapshots/**",
+        "/shell_snapshots/**",
+        "**/shell_snapshots/**",
+        "*.sqlite-wal",
+        "**/*.sqlite-wal",
+        "*.sqlite-shm",
+        "**/*.sqlite-shm",
+        "*.db-wal",
+        "**/*.db-wal",
+        "*.db-shm",
+        "**/*.db-shm",
+        "*.sqlite-journal",
+        "**/*.sqlite-journal",
         ".cache/**",
         "/.cache/**",
         "**/.cache/**",
@@ -611,6 +627,9 @@ fn path_pattern_match(pattern: &str, rel: &str) -> bool {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/**") {
+        if pattern_has_glob_meta(prefix) {
+            return glob_path_match(pattern, rel);
+        }
         return rel == prefix || rel.starts_with(&format!("{prefix}/"));
     }
     if let Some(ext) = pattern.strip_prefix("*.") {
@@ -838,6 +857,13 @@ mod moon_root_tests {
             "target",
             "build-device-check",
             "logs/app.log",
+            "artifacts/e2e/screen.png",
+            "shell_snapshots/019ef612-b3c1.sh",
+            "db/app.sqlite-wal",
+            "db/app.sqlite-shm",
+            "db/app.db-wal",
+            "db/app.db-shm",
+            "db/app.sqlite-journal",
             "cache/model-recommendations.json",
             "AppData/Local/Temp/mj-smoke/home/config.toml",
             "AppData/Local/Packages/MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy/AC/INetCache/5HLB4PUV/wdgts_conf.json",

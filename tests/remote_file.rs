@@ -14351,6 +14351,98 @@ fn root_size_reports_client_and_backend_totals() {
 }
 
 #[test]
+fn root_size_exact_breakdown_groups_other_host_prefixes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let alpha_source = tmp.path().join("alpha-source");
+    let beta_source = tmp.path().join("beta-source");
+    let alpha_state = tmp.path().join("alpha-state");
+    let beta_state = tmp.path().join("beta-state");
+    fs::create_dir_all(&alpha_source).unwrap();
+    fs::create_dir_all(&beta_source).unwrap();
+    fs::write(alpha_source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(beta_source.join("beta.txt"), b"beta\n").unwrap();
+
+    for (state, source, host, root) in [
+        (&alpha_state, &alpha_source, "alpha-host", "alpha-root"),
+        (&beta_state, &beta_source, "beta-host", "beta-root"),
+    ] {
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("init")
+                .arg("--host-name")
+                .arg(host)
+                .arg("--remote")
+                .arg(format!("file://{}", remote.display()));
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(state)
+                .arg("root")
+                .arg("add")
+                .arg(root)
+                .arg(source);
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("snapshot");
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(state).arg("sync").arg("--wait");
+            c
+        });
+    }
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&alpha_state)
+            .arg("root")
+            .arg("size")
+            .arg("--json")
+            .arg("--no-remote-cache");
+        c
+    });
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let hosts = report["host_summaries"].as_array().unwrap();
+    assert_eq!(hosts.len(), 2, "{json}");
+    assert!(
+        hosts
+            .iter()
+            .any(|host| host["host_name"] == "alpha-host" && host["current"] == true),
+        "{json}"
+    );
+    assert!(
+        hosts
+            .iter()
+            .any(|host| host["host_name"] == "beta-host" && host["current"] == false),
+        "{json}"
+    );
+    let breakdown = report["remote_breakdown"].as_array().unwrap();
+    assert!(
+        breakdown
+            .iter()
+            .any(|row| row["category"] == "host:beta-host"),
+        "{json}"
+    );
+    let breakdown_total = breakdown
+        .iter()
+        .map(|row| row["bytes"].as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(
+        breakdown_total,
+        report["totals"]["backend_prefix_bytes"].as_u64().unwrap()
+    );
+}
+
+#[test]
 fn root_size_streams_local_scan_before_uncached_remote_listing() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
