@@ -17,6 +17,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::Duration;
 use url::Url;
 use walkdir::WalkDir;
@@ -31,6 +32,8 @@ pub(crate) const DEFAULT_MAX_MULTIPART_PARTS: usize = 10_000;
 pub(crate) const DEFAULT_METADATA_MULTIPART_PARALLELISM: usize = 2;
 pub(crate) const DEFAULT_S3_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub(crate) const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 60;
+pub(crate) const DEFAULT_S3_TRANSIENT_RETRY_ATTEMPTS: usize = 4;
+pub(crate) const DEFAULT_S3_TRANSIENT_RETRY_BASE_MS: u64 = 250;
 
 pub(crate) fn adaptive_multipart_part_size(len: usize, endpoint: &str) -> usize {
     let requested = env::var("MAJUTSU_S3_MULTIPART_PART_SIZE")
@@ -84,6 +87,37 @@ fn s3_timeout_secs_env(name: &str, default: u64) -> Result<u64> {
         Err(env::VarError::NotPresent) => Ok(default),
         Err(err) => Err(err).with_context(|| format!("read {name}")),
     }
+}
+
+fn s3_retry_attempts() -> usize {
+    env::var("MAJUTSU_S3_TRANSIENT_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_S3_TRANSIENT_RETRY_ATTEMPTS)
+}
+
+fn s3_retry_base_delay() -> Duration {
+    let millis = env::var("MAJUTSU_S3_TRANSIENT_RETRY_BASE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_S3_TRANSIENT_RETRY_BASE_MS);
+    Duration::from_millis(millis)
+}
+
+fn s3_retry_delay(attempt: usize) -> Duration {
+    let base = s3_retry_base_delay();
+    let multiplier = 1_u32.checked_shl(attempt.min(6) as u32).unwrap_or(64);
+    base.saturating_mul(multiplier)
+}
+
+fn s3_status_is_transient(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 429)
+}
+
+fn sleep_before_s3_retry(attempt: usize) {
+    thread::sleep(s3_retry_delay(attempt));
 }
 
 pub(crate) fn s3_http_client() -> Result<Client> {
@@ -761,48 +795,65 @@ impl S3Remote {
         }
         let remote_key = self.remote_key(key);
         let url = self.object_url(&remote_key);
-        let response = if self.uses_sigv2() {
-            let date = http_date();
-            let path = format!("/{}/{}", self.bucket, remote_key);
-            let auth = self.auth_v2("PUT", "", "application/octet-stream", &date, &path)?;
-            let file = File::open(source)?;
-            self.client
-                .put(url)
-                .header(DATE, date)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .header(AUTHORIZATION, auth)
-                .body(Body::sized(file, len))
-                .send()?
-        } else {
-            let payload_hash = sha256_file(source)?;
-            let mut extra_headers = self.put_object_headers(key)?;
-            if if_absent {
-                extra_headers.push(("if-none-match".to_string(), "*".to_string()));
+        let attempts = s3_retry_attempts();
+        for attempt in 0..attempts {
+            let response = if self.uses_sigv2() {
+                let date = http_date();
+                let path = format!("/{}/{}", self.bucket, remote_key);
+                let auth = self.auth_v2("PUT", "", "application/octet-stream", &date, &path)?;
+                let file = File::open(source)?;
+                self.client
+                    .put(url.clone())
+                    .header(DATE, date)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header(AUTHORIZATION, auth)
+                    .body(Body::sized(file, len))
+                    .send()
+            } else {
+                let payload_hash = sha256_file(source)?;
+                let mut extra_headers = self.put_object_headers(key)?;
+                if if_absent {
+                    extra_headers.push(("if-none-match".to_string(), "*".to_string()));
+                }
+                let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &extra_headers)?;
+                let mut request = self
+                    .client
+                    .put(url.clone())
+                    .header(HOST, self.host_header()?)
+                    .header("x-amz-date", auth.amz_date)
+                    .header("x-amz-content-sha256", payload_hash)
+                    .header(AUTHORIZATION, auth.authorization)
+                    .header(CONTENT_TYPE, "application/octet-stream");
+                for (name, value) in extra_headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                let file = File::open(source)?;
+                request.body(Body::sized(file, len)).send()
+            };
+            match response {
+                Ok(response) => {
+                    record_s3_put(len);
+                    if if_absent && matches!(response.status().as_u16(), 409 | 412) {
+                        return Ok(false);
+                    }
+                    if response.status().is_success() {
+                        advise_path_dontneed(source);
+                        return Ok(true);
+                    }
+                    if attempt + 1 < attempts && s3_status_is_transient(response.status()) {
+                        sleep_before_s3_retry(attempt);
+                        continue;
+                    }
+                    bail!("s3 put failed for {key}: HTTP {}", response.status());
+                }
+                Err(err) if attempt + 1 < attempts => {
+                    sleep_before_s3_retry(attempt);
+                    drop(err);
+                }
+                Err(err) => return Err(err.into()),
             }
-            let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &extra_headers)?;
-            let mut request = self
-                .client
-                .put(url)
-                .header(HOST, self.host_header()?)
-                .header("x-amz-date", auth.amz_date)
-                .header("x-amz-content-sha256", payload_hash)
-                .header(AUTHORIZATION, auth.authorization)
-                .header(CONTENT_TYPE, "application/octet-stream");
-            for (name, value) in extra_headers {
-                request = request.header(name.as_str(), value.as_str());
-            }
-            let file = File::open(source)?;
-            request.body(Body::sized(file, len)).send()?
-        };
-        record_s3_put(len);
-        advise_path_dontneed(source);
-        if if_absent && matches!(response.status().as_u16(), 409 | 412) {
-            return Ok(false);
         }
-        if !response.status().is_success() {
-            bail!("s3 put failed for {key}: HTTP {}", response.status());
-        }
-        Ok(true)
+        unreachable!("s3 retry loop always returns")
     }
 
     fn put_object(&self, key: &str, bytes: &[u8], if_absent: bool) -> Result<bool> {
@@ -815,45 +866,62 @@ impl S3Remote {
         }
         let remote_key = self.remote_key(key);
         let url = self.object_url(&remote_key);
-        let response = if self.uses_sigv2() {
-            let date = http_date();
-            let path = format!("/{}/{}", self.bucket, remote_key);
-            let auth = self.auth_v2("PUT", "", "application/octet-stream", &date, &path)?;
-            self.client
-                .put(url)
-                .header(DATE, date)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .header(AUTHORIZATION, auth)
-                .body(bytes.to_vec())
-                .send()?
-        } else {
-            let payload_hash = sha256_hex(bytes);
-            let mut extra_headers = self.put_object_headers(key)?;
-            if if_absent {
-                extra_headers.push(("if-none-match".to_string(), "*".to_string()));
+        let attempts = s3_retry_attempts();
+        for attempt in 0..attempts {
+            let response = if self.uses_sigv2() {
+                let date = http_date();
+                let path = format!("/{}/{}", self.bucket, remote_key);
+                let auth = self.auth_v2("PUT", "", "application/octet-stream", &date, &path)?;
+                self.client
+                    .put(url.clone())
+                    .header(DATE, date)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header(AUTHORIZATION, auth)
+                    .body(bytes.to_vec())
+                    .send()
+            } else {
+                let payload_hash = sha256_hex(bytes);
+                let mut extra_headers = self.put_object_headers(key)?;
+                if if_absent {
+                    extra_headers.push(("if-none-match".to_string(), "*".to_string()));
+                }
+                let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &extra_headers)?;
+                let mut request = self
+                    .client
+                    .put(url.clone())
+                    .header(HOST, self.host_header()?)
+                    .header("x-amz-date", auth.amz_date)
+                    .header("x-amz-content-sha256", payload_hash)
+                    .header(AUTHORIZATION, auth.authorization)
+                    .header(CONTENT_TYPE, "application/octet-stream");
+                for (name, value) in extra_headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                request.body(bytes.to_vec()).send()
+            };
+            match response {
+                Ok(response) => {
+                    record_s3_put(bytes.len() as u64);
+                    if if_absent && matches!(response.status().as_u16(), 409 | 412) {
+                        return Ok(false);
+                    }
+                    if response.status().is_success() {
+                        return Ok(true);
+                    }
+                    if attempt + 1 < attempts && s3_status_is_transient(response.status()) {
+                        sleep_before_s3_retry(attempt);
+                        continue;
+                    }
+                    bail!("s3 put failed for {key}: HTTP {}", response.status());
+                }
+                Err(err) if attempt + 1 < attempts => {
+                    sleep_before_s3_retry(attempt);
+                    drop(err);
+                }
+                Err(err) => return Err(err.into()),
             }
-            let auth = self.auth_v4("PUT", &remote_key, "", &payload_hash, &extra_headers)?;
-            let mut request = self
-                .client
-                .put(url)
-                .header(HOST, self.host_header()?)
-                .header("x-amz-date", auth.amz_date)
-                .header("x-amz-content-sha256", payload_hash)
-                .header(AUTHORIZATION, auth.authorization)
-                .header(CONTENT_TYPE, "application/octet-stream");
-            for (name, value) in extra_headers {
-                request = request.header(name.as_str(), value.as_str());
-            }
-            request.body(bytes.to_vec()).send()?
-        };
-        record_s3_put(bytes.len() as u64);
-        if if_absent && matches!(response.status().as_u16(), 409 | 412) {
-            return Ok(false);
         }
-        if !response.status().is_success() {
-            bail!("s3 put failed for {key}: HTTP {}", response.status());
-        }
-        Ok(true)
+        unreachable!("s3 retry loop always returns")
     }
 
     pub(crate) fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -1289,32 +1357,49 @@ impl S3Remote {
 
     fn delete(&self, key: &str) -> Result<()> {
         let remote_key = self.remote_key(key);
-        let response = if self.uses_sigv2() {
-            let date = http_date();
-            let path = format!("/{}/{}", self.bucket, remote_key);
-            let auth = self.auth_v2("DELETE", "", "", &date, &path)?;
-            self.client
-                .delete(self.object_url(&remote_key))
-                .header(DATE, date)
-                .header(AUTHORIZATION, auth)
-                .send()?
-        } else {
-            let payload_hash = sha256_hex(b"");
-            let auth = self.auth_v4("DELETE", &remote_key, "", &payload_hash, &[])?;
-            self.client
-                .delete(self.object_url(&remote_key))
-                .header(HOST, self.host_header()?)
-                .header("x-amz-date", auth.amz_date)
-                .header("x-amz-content-sha256", payload_hash)
-                .header(AUTHORIZATION, auth.authorization)
-                .send()?
-        };
-        record_s3_delete();
-        if response.status().is_success() || response.status().as_u16() == 404 {
-            Ok(())
-        } else {
-            bail!("s3 delete failed for {key}: HTTP {}", response.status())
+        let url = self.object_url(&remote_key);
+        let attempts = s3_retry_attempts();
+        for attempt in 0..attempts {
+            let response = if self.uses_sigv2() {
+                let date = http_date();
+                let path = format!("/{}/{}", self.bucket, remote_key);
+                let auth = self.auth_v2("DELETE", "", "", &date, &path)?;
+                self.client
+                    .delete(url.clone())
+                    .header(DATE, date)
+                    .header(AUTHORIZATION, auth)
+                    .send()
+            } else {
+                let payload_hash = sha256_hex(b"");
+                let auth = self.auth_v4("DELETE", &remote_key, "", &payload_hash, &[])?;
+                self.client
+                    .delete(url.clone())
+                    .header(HOST, self.host_header()?)
+                    .header("x-amz-date", auth.amz_date)
+                    .header("x-amz-content-sha256", payload_hash)
+                    .header(AUTHORIZATION, auth.authorization)
+                    .send()
+            };
+            match response {
+                Ok(response) => {
+                    record_s3_delete();
+                    if response.status().is_success() || response.status().as_u16() == 404 {
+                        return Ok(());
+                    }
+                    if attempt + 1 < attempts && s3_status_is_transient(response.status()) {
+                        sleep_before_s3_retry(attempt);
+                        continue;
+                    }
+                    bail!("s3 delete failed for {key}: HTTP {}", response.status())
+                }
+                Err(err) if attempt + 1 < attempts => {
+                    sleep_before_s3_retry(attempt);
+                    drop(err);
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
+        unreachable!("s3 retry loop always returns")
     }
 
     fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Vec<u8>> {
