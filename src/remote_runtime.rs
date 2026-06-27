@@ -1,7 +1,8 @@
 use crate::majutsu_store::{
     RemoteGcMark as GcMarkExport, RemoteGcTombstone as GcTombstoneExport, RemoteHostIndex,
     RemoteHostSummary, host_current_ref_key, host_last_synced_ref_key, host_metadata_key,
-    host_remote_key, remote_gc_mark_key, remote_gc_tombstone_prefix, select_remote_host,
+    host_remote_key, remote_gc_mark_key, remote_gc_tombstone_prefix, remote_host_label,
+    select_remote_host,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -873,9 +874,11 @@ fn remote_repair_summary(
     let mut repaired = 0usize;
     let mut missing_local = 0usize;
     let mut still_missing = BTreeSet::new();
-    let host_id = read_config(paths)?.host.id;
+    let config = read_config(paths)?;
+    let host_label = remote_host_label(&config.host.name);
     for key in &scan.missing {
-        let Some((source, remote_key)) = repair_source_and_remote_key(paths, remote, &host_id, key)
+        let Some((source, remote_key)) =
+            repair_source_and_remote_key(paths, remote, &host_label, key)
         else {
             missing_local += 1;
             still_missing.insert(key.clone());
@@ -972,9 +975,10 @@ fn remote_repair_canonical_aliases(
             exists
         })
         .collect::<Vec<_>>();
-    let host_id = read_config(paths)?.host.id;
+    let config = read_config(paths)?;
+    let host_label = remote_host_label(&config.host.name);
     let remote_keys =
-        list_remote_alias_candidate_keys(remote, &host_id, &alias_candidates, verbose)
+        list_remote_alias_candidate_keys(remote, &host_label, &alias_candidates, verbose)
             .context("list remote keys for canonical alias repair")?;
     let mut checked = 0usize;
     let mut missing = 0usize;
@@ -984,7 +988,7 @@ fn remote_repair_canonical_aliases(
     for (key, alias) in alias_candidates {
         checked += 1;
         let remote_alias = if matches!(remote, RemoteStore::S3(_)) {
-            host_remote_key(&host_id, &alias)
+            host_remote_key(&host_label, &alias)
         } else {
             alias.clone()
         };
@@ -1032,7 +1036,7 @@ fn remote_repair_canonical_aliases(
 
 fn list_remote_alias_candidate_keys(
     remote: &RemoteStore,
-    host_id: &str,
+    host_label: &str,
     alias_candidates: &[(String, String)],
     verbose: bool,
 ) -> Result<BTreeSet<String>> {
@@ -1051,7 +1055,7 @@ fn list_remote_alias_candidate_keys(
     for prefix in prefixes {
         let started = Instant::now();
         let list_prefix = if matches!(remote, RemoteStore::S3(_)) {
-            host_remote_key(host_id, &prefix)
+            host_remote_key(host_label, &prefix)
         } else {
             prefix.clone()
         };
@@ -1225,22 +1229,26 @@ fn repair_key_fingerprint(
 fn repair_source_and_remote_key(
     paths: &Paths,
     remote: &RemoteStore,
-    host_id: &str,
+    host_label: &str,
     key: &str,
 ) -> Option<(PathBuf, String)> {
     let source = paths.home.join(key);
     if !source.exists() {
         return None;
     }
-    let remote_key = if matches!(remote, RemoteStore::S3(_)) {
+    let remote_key = repair_remote_key(matches!(remote, RemoteStore::S3(_)), host_label, key);
+    Some((source, remote_key))
+}
+
+fn repair_remote_key(s3_remote: bool, host_label: &str, key: &str) -> String {
+    if s3_remote {
         host_remote_key(
-            host_id,
+            host_label,
             &canonical_remote_alias(key).unwrap_or_else(|| key.to_string()),
         )
     } else {
         key.to_string()
-    };
-    Some((source, remote_key))
+    }
 }
 
 fn remote_explain_object(paths: &Paths, key: &str) -> Result<()> {
@@ -1539,5 +1547,24 @@ fn print_remote_host_operations(export: &MetadataExport) {
             operation.after_snapshot.as_deref().unwrap_or("-"),
             operation.message.as_deref().unwrap_or("")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repair_remote_key_uses_host_label_for_s3() {
+        let key = "objects/blobs/aa/bb";
+        let remote_key = repair_remote_key(true, "mba22", key);
+        assert_eq!(remote_key, "mba22/blobs/loose/aa/bb.blob.enc");
+    }
+
+    #[test]
+    fn repair_remote_key_keeps_file_remote_local_key() {
+        let key = "objects/blobs/aa/bb";
+        let remote_key = repair_remote_key(false, "mba22", key);
+        assert_eq!(remote_key, key);
     }
 }
