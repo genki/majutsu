@@ -574,8 +574,9 @@ pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig)
 
     #[cfg(windows)]
     {
-        start_watch_daemon_windows(paths, &config)?;
+        let task_name = start_watch_daemon_windows(paths, &config)?;
         let pid = wait_for_daemon_registered_pid(paths, 0)?;
+        disable_windows_daemon_launch_task(&task_name);
         append_daemon_launch_log(paths, pid, &config);
         Ok(pid)
     }
@@ -666,7 +667,7 @@ fn append_daemon_launch_log(paths: &Paths, pid: u32, config: &WatchDaemonLaunchC
 }
 
 #[cfg(windows)]
-fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -> Result<()> {
+fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -> Result<String> {
     let exe = env::current_exe()?;
     let stdout_log = daemon_log_path(paths);
     let stderr_log = paths.logs.join("majutsu.err.log");
@@ -721,25 +722,13 @@ fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -
     let runner_path = paths.runtime.join("run-daemon.ps1");
     fs::write(&runner_path, runner)?;
 
-    let task_name = format!("MajutsuWatchLaunch-{}", Utc::now().timestamp_millis());
+    let task_name = windows_daemon_launch_task_name(paths);
     let task_command = format!(
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
         runner_path.display()
     );
-    let create = ProcessCommand::new("schtasks.exe")
-        .args([
-            "/Create",
-            "/TN",
-            &task_name,
-            "/SC",
-            "ONCE",
-            "/ST",
-            "23:59",
-            "/TR",
-            &task_command,
-            "/F",
-        ])
-        .output()?;
+    let create = create_windows_daemon_launch_task(&task_name, &task_command, true)
+        .or_else(|_| create_windows_daemon_launch_task(&task_name, &task_command, false))?;
     if !create.status.success() {
         bail!(
             "failed to create Windows daemon launch task\nstdout:\n{}\nstderr:\n{}",
@@ -750,17 +739,57 @@ fn start_watch_daemon_windows(paths: &Paths, config: &WatchDaemonLaunchConfig) -
     let run = ProcessCommand::new("schtasks.exe")
         .args(["/Run", "/TN", &task_name])
         .output()?;
-    let _ = ProcessCommand::new("schtasks.exe")
-        .args(["/Delete", "/TN", &task_name, "/F"])
-        .output();
     if !run.status.success() {
+        disable_windows_daemon_launch_task(&task_name);
         bail!(
             "failed to run Windows daemon launch task\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
     }
-    Ok(())
+    Ok(task_name)
+}
+
+#[cfg(windows)]
+fn create_windows_daemon_launch_task(
+    task_name: &str,
+    task_command: &str,
+    system: bool,
+) -> Result<std::process::Output> {
+    let mut command = ProcessCommand::new("schtasks.exe");
+    command.args([
+        "/Create",
+        "/TN",
+        task_name,
+        "/SC",
+        "ONCE",
+        "/ST",
+        "23:59",
+        "/TR",
+        task_command,
+        "/F",
+    ]);
+    if system {
+        command.args(["/RU", "SYSTEM", "/RL", "HIGHEST"]);
+    }
+    Ok(command.output()?)
+}
+
+#[cfg(windows)]
+fn disable_windows_daemon_launch_task(task_name: &str) {
+    let _ = ProcessCommand::new("schtasks.exe")
+        .args(["/Change", "/TN", task_name, "/DISABLE"])
+        .output();
+}
+
+#[cfg(windows)]
+fn windows_daemon_launch_task_name(paths: &Paths) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in paths.home.as_os_str().to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("MajutsuWatchLaunch-{hash:016x}")
 }
 
 #[cfg(windows)]
