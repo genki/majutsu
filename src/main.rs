@@ -3194,6 +3194,7 @@ fn scan_root(
     }
     let tracked_paths = records
         .iter()
+        .filter(|record| record.kind != "directory")
         .map(|record| (record.root_id.clone(), record.path.clone()))
         .collect();
     Ok(ScannedRoot {

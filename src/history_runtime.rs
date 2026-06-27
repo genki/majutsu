@@ -45,7 +45,7 @@ use crate::queue_runtime::{
     upload_queue_stats,
 };
 use crate::remote_store::open_remote;
-use crate::root_state::{roots, tracked_paths_for_root, untracked_paths_for_root};
+use crate::root_state::{roots, tombstone_tracked_paths_for_root, untracked_paths_for_root};
 use crate::snapshot_rules::{
     build_ignore, is_volatile, root_dir_allows_descend, root_record_is_managed,
 };
@@ -2445,6 +2445,14 @@ fn state_live_file_changes_for_root(
     let untracked_paths = untracked_paths_for_root(&conn, &root.id)?;
     let mut from_files = root_file_map(paths, Some(from), &root.id)?;
     from_files.retain(|path, _| !untracked_paths.contains(path));
+    for path in tombstone_tracked_paths_for_root(&conn, root)? {
+        if !state_record_path_is_file_relative(&path) {
+            continue;
+        }
+        from_files
+            .entry(path.clone())
+            .or_insert_with(|| tracked_tombstone_record(root, path));
+    }
     let mut live_files = scan_live_root_for_state(root)?;
     live_files.retain(|path, _| !untracked_paths.contains(path));
     let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
@@ -2514,7 +2522,7 @@ fn state_stream_live_file_changes_for_root(
     let conn = crate::open_db(paths)?;
     let untracked_paths = untracked_paths_for_root(&conn, &root.id)?;
     from_files.retain(|path, _| !untracked_paths.contains(path));
-    for path in tracked_paths_for_root(&conn, &root.id)? {
+    for path in tombstone_tracked_paths_for_root(&conn, root)? {
         if !state_record_path_is_file_relative(&path) {
             continue;
         }

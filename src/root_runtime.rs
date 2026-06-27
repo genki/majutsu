@@ -30,8 +30,8 @@ use crate::root_size_summary::{
     read_cached_root_size_summary, root_size_summary_key, write_cached_root_size_summary,
 };
 use crate::root_state::{
-    all_tracked_paths, mark_path_tracked, mark_path_untracked, root_by_id, root_by_id_optional,
-    roots, save_root, sync_roots_to_config, update_root_status,
+    all_tracked_paths, mark_path_explicitly_tracked, mark_path_untracked, root_by_id,
+    root_by_id_optional, roots, save_root, sync_roots_to_config, update_root_status,
 };
 use crate::snapshot_rules::{
     apply_default_root_excludes, apply_root_large_set, apply_root_presets, apply_root_volatile_set,
@@ -317,7 +317,7 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
         if track {
             remove_pattern(&mut root.explicit_untrack, &rel);
             push_pattern(&mut root.explicit_track, rel.clone());
-            mark_path_tracked(&conn, &root.id, &rel)?;
+            mark_path_explicitly_tracked(&conn, &root.id, &rel)?;
             println!("tracked {}:{}", root.id, rel);
         } else {
             if args.dry_run {

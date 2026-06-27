@@ -153,16 +153,50 @@ pub(crate) fn root_by_id(conn: &Connection, id: &str) -> Result<RootConfig> {
     root_by_id_optional(conn, id)?.ok_or_else(|| anyhow!("unknown root: {id}"))
 }
 
+const TRACKING_SOURCE_SNAPSHOT: &str = "snapshot";
+const TRACKING_SOURCE_EXPLICIT: &str = "explicit";
+const TRACKING_SOURCE_JOURNAL: &str = "journal";
+
 pub(crate) fn mark_path_tracked(conn: &Connection, root_id: &str, path: &str) -> Result<()> {
+    mark_path_tracked_with_source(conn, root_id, path, TRACKING_SOURCE_SNAPSHOT)
+}
+
+pub(crate) fn mark_path_explicitly_tracked(
+    conn: &Connection,
+    root_id: &str,
+    path: &str,
+) -> Result<()> {
+    mark_path_tracked_with_source(conn, root_id, path, TRACKING_SOURCE_EXPLICIT)
+}
+
+pub(crate) fn mark_path_journal_tracked(
+    conn: &Connection,
+    root_id: &str,
+    path: &str,
+) -> Result<()> {
+    mark_path_tracked_with_source(conn, root_id, path, TRACKING_SOURCE_JOURNAL)
+}
+
+fn mark_path_tracked_with_source(
+    conn: &Connection,
+    root_id: &str,
+    path: &str,
+    source: &str,
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "insert into tracked_paths(root_id, path, status, first_seen_at, last_seen_at, untracked_at)
-         values (?1, ?2, 'tracked', ?3, ?3, null)
+        "insert into tracked_paths(root_id, path, status, tracking_source, first_seen_at, last_seen_at, untracked_at)
+         values (?1, ?2, 'tracked', ?3, ?4, ?4, null)
          on conflict(root_id, path) do update set
            status='tracked',
+           tracking_source=case
+             when tracked_paths.tracking_source='explicit' then tracked_paths.tracking_source
+             when excluded.tracking_source='snapshot' then tracked_paths.tracking_source
+             else excluded.tracking_source
+           end,
            last_seen_at=excluded.last_seen_at,
            untracked_at=null",
-        params![root_id, path, now],
+        params![root_id, path, source, now],
     )?;
     Ok(())
 }
@@ -170,10 +204,11 @@ pub(crate) fn mark_path_tracked(conn: &Connection, root_id: &str, path: &str) ->
 pub(crate) fn mark_path_untracked(conn: &Connection, root_id: &str, path: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "insert into tracked_paths(root_id, path, status, first_seen_at, last_seen_at, untracked_at)
-         values (?1, ?2, 'untracked', ?3, ?3, ?3)
+        "insert into tracked_paths(root_id, path, status, tracking_source, first_seen_at, last_seen_at, untracked_at)
+         values (?1, ?2, 'untracked', 'explicit', ?3, ?3, ?3)
          on conflict(root_id, path) do update set
            status='untracked',
+           tracking_source='explicit',
            last_seen_at=excluded.last_seen_at,
            untracked_at=excluded.untracked_at",
         params![root_id, path, now],
@@ -208,6 +243,30 @@ pub(crate) fn untracked_paths_for_root(
 
 pub(crate) fn all_tracked_paths(conn: &Connection, root_id: &str) -> Result<BTreeSet<String>> {
     tracked_paths_for_root(conn, root_id)
+}
+
+pub(crate) fn tombstone_tracked_paths_for_root(
+    conn: &Connection,
+    root: &RootConfig,
+) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "select path from tracked_paths
+         where root_id=?1
+           and status='tracked'
+           and tracking_source in ('explicit', 'journal')",
+    )?;
+    let rows = stmt.query_map(params![root.id], |row| row.get::<_, String>(0))?;
+    let mut paths = BTreeSet::new();
+    for row in rows {
+        paths.insert(row?);
+    }
+    let tracked = tracked_paths_for_root(conn, &root.id)?;
+    for explicit in &root.explicit_track {
+        if tracked.contains(explicit) {
+            paths.insert(explicit.clone());
+        }
+    }
+    Ok(paths)
 }
 
 pub(crate) fn save_root(conn: &Connection, root: &RootConfig) -> Result<()> {

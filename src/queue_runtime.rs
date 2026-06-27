@@ -509,7 +509,11 @@ pub(crate) fn enqueue_live_diff_event_journals(
                 continue;
             };
             if matches!(event_kind, "create" | "modify") && live_record.is_some() {
-                crate::root_state::mark_path_tracked(&crate::open_db(paths)?, &root.id, &rel_path)?;
+                crate::root_state::mark_path_journal_tracked(
+                    &crate::open_db(paths)?,
+                    &root.id,
+                    &rel_path,
+                )?;
             }
             if live_diff_event_already_covered(
                 &existing,

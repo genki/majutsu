@@ -16568,6 +16568,23 @@ fn track_untrack_separate_deleted_state_from_management_removal() {
         c
     });
     assert_eq!(deleted, " D sample/short-lived.txt\n");
+    let deleted_json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--deleted")
+            .arg("--json");
+        c
+    });
+    let deleted_value: serde_json::Value = serde_json::from_str(&deleted_json).unwrap();
+    assert_eq!(deleted_value["changes"]["total"], 1);
+    assert_eq!(
+        deleted_value["changes"]["files"][0]["path"],
+        "short-lived.txt"
+    );
 
     run({
         let mut c = mj();
@@ -16635,6 +16652,149 @@ fn track_untrack_separate_deleted_state_from_management_removal() {
         c
     });
     assert!(added.contains(" A sample/ignored/keep.txt"), "{added}");
+}
+
+#[test]
+fn state_stream_does_not_report_snapshot_source_tracked_temp_dirs_as_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("empty baseline");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    conn.execute(
+        "insert into tracked_paths(root_id, path, status, tracking_source, first_seen_at, last_seen_at)
+         values ('sample', 'tests/XXtmpdir', 'tracked', 'snapshot', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+
+    let text = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    assert_eq!(text, "");
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["changes"]["total"], 0, "{json}");
+}
+
+#[test]
+fn state_reports_live_added_modified_and_deleted_files_before_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("modified.txt"), b"one\n").unwrap();
+    fs::write(source.join("deleted.txt"), b"remove me\n").unwrap();
+    fs::write(source.join("unchanged.txt"), b"same\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("baseline");
+        c
+    });
+
+    fs::write(source.join("modified.txt"), b"two\n").unwrap();
+    fs::remove_file(source.join("deleted.txt")).unwrap();
+    fs::write(source.join("added.txt"), b"new\n").unwrap();
+
+    let text = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("3650d");
+        c
+    });
+    let mut lines = text.lines().collect::<Vec<_>>();
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec![
+            " A sample/added.txt",
+            " D sample/deleted.txt",
+            " M sample/modified.txt",
+        ]
+    );
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("3650d")
+            .arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["changes"]["total"], 3, "{json}");
+    assert_eq!(value["changes"]["added"], 1, "{json}");
+    assert_eq!(value["changes"]["modified"], 1, "{json}");
+    assert_eq!(value["changes"]["deleted"], 1, "{json}");
 }
 
 #[test]
