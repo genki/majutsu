@@ -8808,6 +8808,26 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         c
     });
     assert!(sync.contains("pruned_remote_exports "));
+    fs::create_dir_all(remote.join("indexes/chunk-index")).unwrap();
+    fs::write(
+        remote.join("indexes/chunk-index/stale-shard.cbor.zst.enc"),
+        b"stale chunk index",
+    )
+    .unwrap();
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_REMOTE_PRUNE_FORCE", "1");
+        c
+    });
+    assert!(output_metric(&sync, "pruned_remote_objects") > 0, "{sync}");
+    assert!(
+        !remote
+            .join("indexes/chunk-index/stale-shard.cbor.zst.enc")
+            .exists()
+    );
     let after = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .filter_map(Result::ok)
