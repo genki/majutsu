@@ -1,5 +1,6 @@
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use rusqlite::Connection;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -16795,6 +16796,198 @@ fn state_reports_live_added_modified_and_deleted_files_before_snapshot() {
     assert_eq!(value["changes"]["added"], 1, "{json}");
     assert_eq!(value["changes"]["modified"], 1, "{json}");
     assert_eq!(value["changes"]["deleted"], 1, "{json}");
+}
+
+#[test]
+fn state_default_uses_each_root_first_snapshot_as_basis() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alpha = tmp.path().join("alpha");
+    let beta = tmp.path().join("beta");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&alpha).unwrap();
+    fs::create_dir_all(&beta).unwrap();
+    fs::write(alpha.join("note.txt"), b"alpha v1\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("alpha")
+            .arg(&alpha);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("alpha baseline");
+        c
+    });
+
+    fs::write(alpha.join("note.txt"), b"alpha v2\n").unwrap();
+    fs::write(beta.join("note.txt"), b"beta v1\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("beta")
+            .arg(&beta);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("beta baseline");
+        c
+    });
+
+    fs::write(alpha.join("note.txt"), b"alpha v3\n").unwrap();
+    fs::write(beta.join("note.txt"), b"beta v2\n").unwrap();
+
+    let text = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("state");
+        c
+    });
+    let mut lines = text.lines().collect::<Vec<_>>();
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec![" M alpha/note.txt", " M beta/note.txt"],
+        "{text}"
+    );
+    assert!(!text.contains(" A beta/note.txt"), "{text}");
+
+    let json = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("state").arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["basis"], serde_json::Value::Null, "{json}");
+    assert_eq!(value["basis_roots"].as_array().unwrap().len(), 2, "{json}");
+    assert_eq!(value["changes"]["total"], 2, "{json}");
+    assert_eq!(value["changes"]["modified"], 2, "{json}");
+}
+
+#[test]
+fn prune_preserves_each_root_first_snapshot_for_default_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alpha = tmp.path().join("alpha");
+    let beta = tmp.path().join("beta");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&alpha).unwrap();
+    fs::create_dir_all(&beta).unwrap();
+    fs::write(alpha.join("note.txt"), b"alpha v1\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("alpha")
+            .arg(&alpha);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let alpha_basis: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select id from snapshots order by created_at asc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    fs::write(beta.join("note.txt"), b"beta v1\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("beta")
+            .arg(&beta);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let beta_basis: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select id from snapshots order by created_at asc limit 1 offset 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    fs::write(alpha.join("note.txt"), b"alpha v2\n").unwrap();
+    fs::write(beta.join("note.txt"), b"beta v2\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let current: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row("select value from refs where name='current'", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+
+    let prune = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--keep-daily")
+            .arg("0")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    assert!(prune.contains("deleted_snapshots 0"), "{prune}");
+    let remaining = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        let mut stmt = conn.prepare("select id from snapshots").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap()
+    };
+    assert!(remaining.contains(&alpha_basis), "{remaining:?}");
+    assert!(remaining.contains(&beta_basis), "{remaining:?}");
+    assert!(remaining.contains(&current), "{remaining:?}");
 }
 
 #[test]

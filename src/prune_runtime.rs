@@ -11,7 +11,8 @@ use crate::config::{Paths, read_config};
 use crate::object_paths::{all_local_object_keys, local_object_keys_with_progress};
 use crate::operation_log::record_op;
 use crate::remote_store::RemoteStore;
-use crate::snapshot_state::current_snapshot;
+use crate::root_state::roots;
+use crate::snapshot_state::{current_snapshot, first_snapshots_for_roots};
 use crate::util::parse_db_time;
 use crate::{ensure_ready, export_metadata, open_db, open_remote, read_object};
 
@@ -119,7 +120,7 @@ fn build_prune_plan(paths: &Paths, conn: &Connection, args: &PruneArgs) -> Resul
         args.keep_daily,
         args.keep_monthly,
     );
-    let protected = protected_ref_snapshots(conn, &snapshots)?;
+    let protected = protected_ref_snapshots(paths, conn, &snapshots)?;
     let mut still_delete = Vec::new();
     for snapshot_id in plan.delete {
         if protected.contains(&snapshot_id) {
@@ -156,6 +157,7 @@ fn build_prune_plan(paths: &Paths, conn: &Connection, args: &PruneArgs) -> Resul
 }
 
 fn protected_ref_snapshots(
+    paths: &Paths,
     conn: &Connection,
     snapshots: &[SnapshotPruneInput],
 ) -> Result<BTreeSet<String>> {
@@ -170,6 +172,15 @@ fn protected_ref_snapshots(
         let value = row?;
         if snapshot_ids.contains(&value) {
             protected.insert(value);
+        }
+    }
+    let root_ids = roots(conn)?
+        .into_iter()
+        .map(|root| root.id)
+        .collect::<BTreeSet<_>>();
+    for snapshot in first_snapshots_for_roots(paths, conn, &root_ids)?.into_values() {
+        if snapshot_ids.contains(&snapshot) {
+            protected.insert(snapshot);
         }
     }
     Ok(protected)

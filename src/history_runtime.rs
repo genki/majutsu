@@ -50,7 +50,7 @@ use crate::snapshot_rules::{
     build_ignore, is_volatile, root_dir_allows_descend, root_record_is_managed,
 };
 use crate::snapshot_state::{
-    current_snapshot, load_snapshot_by_id, load_snapshot_header_by_id,
+    current_snapshot, first_snapshots_for_roots, load_snapshot_by_id, load_snapshot_header_by_id,
     load_snapshot_header_by_id_optional, snapshot_contains_root, snapshot_file_map, snapshot_id_at,
     visit_tree_records,
 };
@@ -1468,16 +1468,19 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let configured_roots = roots(&conn)?;
     let state_scope = resolve_state_scope(&configured_roots, &args)?;
     let filter = StateChangeFilter::from_args(&args)?;
-    let basis = if let Some(reference) = args.reference.as_deref() {
-        resolve_state_basis_optional(paths, &conn, reference)?
+    let basis_set = if let Some(reference) = args.reference.as_deref() {
+        StateBasisSet::from_single(
+            resolve_state_basis_optional(paths, &conn, reference)?,
+            &state_scope.roots,
+        )
     } else {
-        earliest_state_basis(paths, &conn)?
+        default_state_basis_set(paths, &conn, &state_scope.roots)?
     };
-    if let Some(basis) = basis.as_ref().filter(|_| !args.json) {
+    if !basis_set.entries.is_empty() && !args.json {
         stream_state_short_changes(
             paths,
             &conn,
-            basis,
+            &basis_set,
             &state_scope,
             StateChangeOptions {
                 show_diff: args.diff,
@@ -1487,7 +1490,7 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
         )?;
         return Ok(());
     }
-    if basis.is_none() && !args.json {
+    if basis_set.entries.is_empty() && !args.json {
         return Ok(());
     }
     let active_branch = ref_value_for_state(&conn, "current-branch")?;
@@ -1505,10 +1508,9 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let daemon = daemon_health(paths)?;
-    let changes = if let Some(basis) = basis.as_ref() {
-        let from = load_snapshot_by_id(paths, &conn, &basis.snapshot)?;
+    let changes = if !basis_set.entries.is_empty() {
         Some(state_change_report(
-            state_live_file_changes(paths, &from, &state_scope.roots, false, args.meta)?,
+            state_live_file_changes_for_basis_set(paths, &basis_set, false, args.meta)?,
             current.as_deref().unwrap_or("(none)").to_string(),
             &filter,
         ))
@@ -1601,7 +1603,8 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
             durable_journal_pending: remote_journal_stats.pending as u64,
             restore_jobs: restore_queue_count as u64,
         },
-        basis,
+        basis: basis_set.report_basis(),
+        basis_roots: basis_set.report_root_bases(),
         changes,
         branches,
         refs,
@@ -1995,6 +1998,8 @@ struct StateReport {
     queues: StateQueues,
     #[serde(skip_serializing_if = "Option::is_none")]
     basis: Option<StateBasis>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    basis_roots: Vec<StateRootBasis>,
     #[serde(skip_serializing_if = "Option::is_none")]
     changes: Option<StateChangeReport>,
     branches: Vec<StateBranch>,
@@ -2103,7 +2108,7 @@ struct StateQueues {
     restore_jobs: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StateBasis {
     input: String,
     kind: String,
@@ -2112,6 +2117,85 @@ struct StateBasis {
     operation: Option<String>,
     operation_created_at: Option<String>,
     resolved_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StateRootBasis {
+    root: String,
+    input: String,
+    kind: String,
+    snapshot: String,
+    snapshot_created_at: String,
+    operation: Option<String>,
+    operation_created_at: Option<String>,
+    resolved_at: Option<String>,
+}
+
+#[derive(Clone)]
+struct StateRootBasisEntry {
+    root: RootConfig,
+    basis: StateBasis,
+}
+
+struct StateBasisSet {
+    explicit_reference: bool,
+    entries: Vec<StateRootBasisEntry>,
+}
+
+impl StateBasisSet {
+    fn from_single(basis: Option<StateBasis>, roots: &[RootConfig]) -> Self {
+        let entries = basis
+            .clone()
+            .map(|basis| {
+                roots
+                    .iter()
+                    .cloned()
+                    .map(|root| StateRootBasisEntry {
+                        root,
+                        basis: basis.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            explicit_reference: true,
+            entries,
+        }
+    }
+
+    fn report_basis(&self) -> Option<StateBasis> {
+        if self.explicit_reference {
+            return self.entries.first().map(|entry| entry.basis.clone());
+        }
+        let first = self.entries.first()?.basis.clone();
+        if self
+            .entries
+            .iter()
+            .all(|entry| entry.basis.snapshot == first.snapshot)
+        {
+            return Some(first);
+        }
+        None
+    }
+
+    fn report_root_bases(&self) -> Vec<StateRootBasis> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .map(|entry| StateRootBasis {
+                root: entry.root.id.clone(),
+                input: entry.basis.input.clone(),
+                kind: entry.basis.kind.clone(),
+                snapshot: entry.basis.snapshot.clone(),
+                snapshot_created_at: entry.basis.snapshot_created_at.clone(),
+                operation: entry.basis.operation.clone(),
+                operation_created_at: entry.basis.operation_created_at.clone(),
+                resolved_at: entry.basis.resolved_at.clone(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Serialize)]
@@ -2216,22 +2300,22 @@ fn state_change_report(
 fn stream_state_short_changes(
     paths: &Paths,
     conn: &Connection,
-    basis: &StateBasis,
+    basis_set: &StateBasisSet,
     scope: &StateScope,
     options: StateChangeOptions,
 ) -> Result<()> {
     let _ = conn;
-    let snapshot_id = basis.snapshot.clone();
-    let roots = scope.roots.clone();
+    let entries = basis_set.entries.clone();
     let local_paths = scope.local_paths;
     let paths = paths.clone();
     let (tx, rx) = mpsc::channel::<LogProducerMessage>();
     thread::spawn(move || {
-        let mut handles = Vec::with_capacity(roots.len());
-        for root in roots {
+        let mut handles = Vec::with_capacity(entries.len());
+        for entry in entries {
             let tx = tx.clone();
             let paths = paths.clone();
-            let snapshot_id = snapshot_id.clone();
+            let snapshot_id = entry.basis.snapshot.clone();
+            let root = entry.root;
             let options = options.clone();
             handles.push(thread::spawn(move || {
                 let ui = StatusUi::new();
@@ -2414,19 +2498,29 @@ fn absolutize_existing_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn state_live_file_changes(
+fn state_live_file_changes_for_basis_set(
     paths: &Paths,
-    from: &SnapshotManifest,
-    roots: &[RootConfig],
+    basis_set: &StateBasisSet,
     local_paths: bool,
     include_meta: bool,
 ) -> Result<Vec<FileChange>> {
+    let conn = crate::open_db(paths)?;
+    let mut snapshots = BTreeMap::<String, SnapshotManifest>::new();
     let mut changes = Vec::new();
-    for root in roots {
+    for entry in &basis_set.entries {
+        if !snapshots.contains_key(&entry.basis.snapshot) {
+            snapshots.insert(
+                entry.basis.snapshot.clone(),
+                load_snapshot_by_id(paths, &conn, &entry.basis.snapshot)?,
+            );
+        }
+        let from = snapshots
+            .get(&entry.basis.snapshot)
+            .expect("snapshot inserted before use");
         changes.extend(state_live_file_changes_for_root(
             paths,
             from,
-            root,
+            &entry.root,
             local_paths,
             include_meta,
         )?);
@@ -3079,6 +3173,40 @@ fn earliest_state_basis(paths: &Paths, conn: &Connection) -> Result<Option<State
             )
         })
         .transpose()
+}
+
+fn default_state_basis_set(
+    paths: &Paths,
+    conn: &Connection,
+    roots: &[RootConfig],
+) -> Result<StateBasisSet> {
+    let root_ids = roots
+        .iter()
+        .map(|root| root.id.clone())
+        .collect::<BTreeSet<_>>();
+    let first_snapshots = first_snapshots_for_roots(paths, conn, &root_ids)?;
+    let mut entries = Vec::new();
+    for root in roots {
+        let Some(snapshot) = first_snapshots.get(&root.id) else {
+            continue;
+        };
+        entries.push(StateRootBasisEntry {
+            root: root.clone(),
+            basis: state_basis_from_snapshot(
+                paths,
+                conn,
+                "root-added",
+                "initial-snapshot",
+                snapshot.clone(),
+                None,
+                None,
+            )?,
+        });
+    }
+    Ok(StateBasisSet {
+        explicit_reference: false,
+        entries,
+    })
 }
 
 fn resolve_state_basis_optional(

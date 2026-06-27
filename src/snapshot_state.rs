@@ -3,7 +3,7 @@ use crate::majutsu_core::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use crate::cli::RestoreArgs;
@@ -263,9 +263,41 @@ pub(crate) fn snapshot_contains_root(
     snapshot_id: &str,
     root: &str,
 ) -> Result<bool> {
-    Ok(load_snapshot_by_id(paths, conn, snapshot_id)?
-        .roots
-        .contains_key(root))
+    Ok(snapshot_manifest_contains_root(
+        &load_snapshot_header_by_id(paths, conn, snapshot_id)?,
+        root,
+    ))
+}
+
+pub(crate) fn snapshot_manifest_contains_root(snapshot: &SnapshotManifest, root: &str) -> bool {
+    snapshot.root_trees.contains_key(root) || snapshot.roots.contains_key(root)
+}
+
+pub(crate) fn first_snapshots_for_roots(
+    paths: &Paths,
+    conn: &Connection,
+    root_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut found = BTreeMap::new();
+    if root_ids.is_empty() {
+        return Ok(found);
+    }
+    let mut stmt = conn.prepare("select id from snapshots order by created_at asc, id asc")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let snapshot_id = row?;
+        let snapshot = load_snapshot_header_by_id(paths, conn, &snapshot_id)?;
+        for root_id in root_ids {
+            if found.contains_key(root_id) || !snapshot_manifest_contains_root(&snapshot, root_id) {
+                continue;
+            }
+            found.insert(root_id.clone(), snapshot_id.clone());
+        }
+        if found.len() == root_ids.len() {
+            break;
+        }
+    }
+    Ok(found)
 }
 
 pub(crate) fn snapshot_file_map(
