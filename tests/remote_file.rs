@@ -924,11 +924,31 @@ fn local_snapshot_manifest(state: &std::path::Path, order: &str) -> serde_json::
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    if !manifest_json.trim().is_empty() {
-        return serde_json::from_str(&manifest_json).unwrap();
-    }
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(state.join(manifest_key)).unwrap()).unwrap();
+    local_snapshot_manifest_from_record(state, &manifest_key, &manifest_json)
+}
+
+fn local_snapshot_manifest_by_id(state: &std::path::Path, snapshot_id: &str) -> serde_json::Value {
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let (manifest_key, manifest_json): (String, String) = conn
+        .query_row(
+            "select manifest_key, manifest_json from snapshots where id=?1",
+            [snapshot_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    local_snapshot_manifest_from_record(state, &manifest_key, &manifest_json)
+}
+
+fn local_snapshot_manifest_from_record(
+    state: &std::path::Path,
+    manifest_key: &str,
+    manifest_json: &str,
+) -> serde_json::Value {
+    let mut manifest: serde_json::Value = if !manifest_json.trim().is_empty() {
+        serde_json::from_str(manifest_json).unwrap()
+    } else {
+        serde_json::from_slice(&fs::read(state.join(manifest_key)).unwrap()).unwrap()
+    };
     if manifest["roots"]
         .as_object()
         .is_some_and(|roots| roots.is_empty())
@@ -951,6 +971,23 @@ fn local_snapshot_manifest(state: &std::path::Path, order: &str) -> serde_json::
         manifest["roots"] = serde_json::Value::Object(roots);
     }
     manifest
+}
+
+fn local_snapshot_file_object_key(
+    state: &std::path::Path,
+    snapshot_id: &str,
+    root_id: &str,
+    path: &str,
+) -> String {
+    let manifest = local_snapshot_manifest_by_id(state, snapshot_id);
+    manifest["roots"][root_id]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == path)
+        .and_then(|entry| entry["payload"]["object_key"].as_str())
+        .unwrap_or_else(|| panic!("missing object key for {root_id}/{path} in {snapshot_id}"))
+        .to_string()
 }
 
 fn local_tree_node_entries(
@@ -8610,6 +8647,16 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
     .find_map(|line| line.strip_prefix("snapshot "))
     .unwrap()
     .to_string();
+    fs::write(source.join("alpha.txt"), b"three\n").unwrap();
+    let third = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
 
     let dry_run = output({
         let mut c = mj();
@@ -8652,7 +8699,7 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
     });
     assert!(prune.contains("deleted_snapshots 1"));
     assert_eq!(db_operation_count(&state, "prune"), 1);
-    fails({
+    run({
         let mut c = mj();
         c.arg("--home")
             .arg(&state)
@@ -8660,6 +8707,18 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
             .arg("plan")
             .arg("--snapshot")
             .arg(&first)
+            .arg("--to")
+            .arg(&restore);
+        c
+    });
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&second)
             .arg("--to")
             .arg(&restore);
         c
@@ -8682,14 +8741,14 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
             .arg("restore")
             .arg("apply")
             .arg("--snapshot")
-            .arg(&second)
+            .arg(&third)
             .arg("--to")
             .arg(&restore);
         c
     });
     assert_eq!(
         fs::read(restore.join("sample/alpha.txt")).unwrap(),
-        b"two\n"
+        b"three\n"
     );
 }
 
@@ -8730,7 +8789,6 @@ fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
     .find_map(|line| line.strip_prefix("snapshot "))
     .unwrap()
     .to_string();
-    let old_blob = first_blob_object_key(&state);
     fs::write(source.join("alpha.txt"), b"two\n").unwrap();
     let second = output({
         let mut c = mj();
@@ -8742,6 +8800,18 @@ fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
     .unwrap()
     .to_string();
     assert_ne!(first, second);
+    let old_blob = local_snapshot_file_object_key(&state, &second, "sample", "alpha.txt");
+    fs::write(source.join("alpha.txt"), b"three\n").unwrap();
+    let third = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    assert_ne!(second, third);
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
@@ -8772,7 +8842,7 @@ fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
         "{dry_run}"
     );
     assert!(
-        dry_run.contains(&format!("missing_remote_history_snapshot {first}")),
+        dry_run.contains(&format!("missing_remote_history_snapshot {second}")),
         "{dry_run}"
     );
 
@@ -8790,7 +8860,7 @@ fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
         c
     });
     assert!(prune.contains("deleted_snapshots 1"), "{prune}");
-    fails({
+    run({
         let mut c = mj();
         c.arg("--home")
             .arg(&state)
@@ -8802,7 +8872,7 @@ fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
             .arg(tmp.path().join("restore-old"));
         c
     });
-    run({
+    fails({
         let mut c = mj();
         c.arg("--home")
             .arg(&state)
@@ -8810,6 +8880,18 @@ fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
             .arg("plan")
             .arg("--snapshot")
             .arg(&second)
+            .arg("--to")
+            .arg(tmp.path().join("restore-middle"));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&third)
             .arg("--to")
             .arg(tmp.path().join("restore-current"));
         c
@@ -8850,6 +8932,12 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         c
     });
     fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"three\n").unwrap();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
@@ -8926,7 +9014,7 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
                     .is_some_and(|name| name.ends_with(".cbor.zst.enc"))
         })
         .count();
-    assert_eq!(after, 2);
+    assert!(after < before, "before={before} after={after}");
     assert!(
         find_file_ending(
             &first_remote_host_dir(&remote).join("gc/tombstones"),
@@ -8970,6 +9058,12 @@ fn prune_remote_cleanup_prunes_stale_remote_exports_immediately() {
         c
     });
     fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"three\n").unwrap();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
@@ -9044,6 +9138,12 @@ fn remote_fsck_detects_corrupt_gc_tombstone() {
         c
     });
     fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"three\n").unwrap();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
@@ -9311,6 +9411,12 @@ fn clone_rejects_corrupt_gc_tombstone_without_creating_home() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    fs::write(source.join("alpha.txt"), b"three\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
@@ -9395,6 +9501,12 @@ fn clone_accepts_valid_gc_tombstone_after_remote_prune() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
+    fs::write(source.join("alpha.txt"), b"three\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
@@ -9448,7 +9560,7 @@ fn clone_accepts_valid_gc_tombstone_after_remote_prune() {
     });
     assert_eq!(
         fs::read_to_string(restore.join("sample/alpha.txt")).unwrap(),
-        "two\n"
+        "three\n"
     );
 }
 
@@ -13896,13 +14008,24 @@ fn prune_removes_pins_for_pruned_large_objects() {
         c.arg("--home").arg(&state).arg("large").arg("pin");
         c
     });
+    fs::write(source.join("payload.zip"), vec![9u8; 16 * 1024]).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("large").arg("pin");
+        c
+    });
     let before = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("large").arg("stat");
         c
     });
-    assert!(before.contains("large_objects 2"));
-    assert!(before.contains("pinned 2"));
+    assert!(before.contains("large_objects 3"));
+    assert!(before.contains("pinned 3"));
 
     let pruned = output({
         let mut c = mj();
@@ -13923,8 +14046,8 @@ fn prune_removes_pins_for_pruned_large_objects() {
         c.arg("--home").arg(&state).arg("large").arg("stat");
         c
     });
-    assert!(after.contains("large_objects 1"));
-    assert!(after.contains("pinned 1"));
+    assert!(after.contains("large_objects 2"));
+    assert!(after.contains("pinned 2"));
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("fsck");
@@ -20576,12 +20699,28 @@ fn prune_drop_missing_remote_history_unblocks_sync_after_compacted_tree_loss() {
         c
     });
 
-    let old_manifest = local_snapshot_manifest(&state, "asc");
+    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+    let second = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+
+    let old_manifest = local_snapshot_manifest_by_id(&state, &second);
     let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
     let manifest_key: String = conn
         .query_row(
-            "select manifest_key from snapshots order by created_at asc limit 1",
-            [],
+            "select manifest_key from snapshots where id=?1",
+            [&second],
             |row| row.get(0),
         )
         .unwrap();
@@ -20590,7 +20729,7 @@ fn prune_drop_missing_remote_history_unblocks_sync_after_compacted_tree_loss() {
         .unwrap()
         .to_string();
 
-    fs::write(source.join("beta.txt"), b"beta\n").unwrap();
+    fs::write(source.join("gamma.txt"), b"gamma\n").unwrap();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");

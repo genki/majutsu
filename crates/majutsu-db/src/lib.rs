@@ -84,6 +84,7 @@ create table if not exists tracked_paths(
   root_id text not null,
   path text not null,
   status text not null,
+  tracking_source text not null default 'snapshot',
   first_seen_at text not null,
   last_seen_at text not null,
   untracked_at text,
@@ -113,7 +114,8 @@ pub const COMPAT_MIGRATIONS: &[&str] = &[
     "create table if not exists snapshot_payload_index(snapshot_id text primary key, indexed_at text not null)",
     "create table if not exists snapshot_payloads(snapshot_id text not null, kind text not null, oid text not null, primary key(snapshot_id, kind, oid))",
     "create table if not exists large_object_chunks(large_oid text not null, chunk_oid text not null, primary key(large_oid, chunk_oid))",
-    "create table if not exists tracked_paths(root_id text not null, path text not null, status text not null, first_seen_at text not null, last_seen_at text not null, untracked_at text, primary key(root_id, path))",
+    "create table if not exists tracked_paths(root_id text not null, path text not null, status text not null, tracking_source text not null default 'snapshot', first_seen_at text not null, last_seen_at text not null, untracked_at text, primary key(root_id, path))",
+    "alter table tracked_paths add column tracking_source text not null default 'snapshot'",
 ];
 
 pub fn schema_sql() -> &'static str {
@@ -787,6 +789,11 @@ mod tests {
                 .any(|sql| sql.contains("origin_process_path"))
         );
         assert!(COMPAT_MIGRATIONS.iter().any(|sql| sql.contains("status")));
+        assert!(
+            COMPAT_MIGRATIONS
+                .iter()
+                .any(|sql| sql.contains("tracking_source"))
+        );
     }
 
     #[test]
