@@ -99,6 +99,7 @@ pub(crate) fn build_root_size_summary(
     };
     let manifest = read_snapshot_manifest(paths, snapshot)?;
     let packed_blobs = packed_blob_size_refs(paths)?;
+    let known_object_sizes = known_payload_object_sizes(paths)?;
     let mut stats = BTreeMap::<String, BuilderStat>::new();
 
     for (root_id, root_snapshot) in &manifest.root_trees {
@@ -147,9 +148,10 @@ pub(crate) fn build_root_size_summary(
     let mut unique_packed_payload_oids = BTreeSet::new();
     let mut unique_packed_slice_bytes = 0u64;
     for (root, stat) in stats {
-        let payload_bytes = sum_local_sizes(paths, &stat.payload_keys);
+        let payload_bytes = sum_known_sizes(paths, &known_object_sizes, &stat.payload_keys);
         let metadata_bytes = sum_local_sizes(paths, &stat.metadata_keys);
-        let packed_payload_bytes = sum_local_sizes(paths, &stat.packed_payload_keys);
+        let packed_payload_bytes =
+            sum_known_sizes(paths, &known_object_sizes, &stat.packed_payload_keys);
         let all_keys = stat
             .payload_keys
             .union(&stat.metadata_keys)
@@ -167,7 +169,7 @@ pub(crate) fn build_root_size_summary(
                     unique_packed_slice_bytes.saturating_add(packed.pack_len);
             }
         }
-        let backend_bytes = sum_local_sizes(paths, &all_keys);
+        let backend_bytes = sum_known_sizes(paths, &known_object_sizes, &all_keys);
         let used_bytes = backend_bytes
             .saturating_sub(packed_payload_bytes)
             .saturating_add(stat.packed_slice_bytes);
@@ -181,16 +183,17 @@ pub(crate) fn build_root_size_summary(
             payload_bytes,
             metadata_bytes,
             backend_objects: all_keys.len(),
-            missing_objects: missing_local_objects(paths, &all_keys),
+            missing_objects: missing_objects(paths, &known_object_sizes, &all_keys),
         });
     }
     rows.sort_by(|left, right| left.root.cmp(&right.root));
 
-    let current_backend_bytes = sum_local_sizes(paths, &unique_keys);
-    let payload_bytes = sum_local_sizes(paths, &unique_payload_keys);
+    let current_backend_bytes = sum_known_sizes(paths, &known_object_sizes, &unique_keys);
+    let payload_bytes = sum_known_sizes(paths, &known_object_sizes, &unique_payload_keys);
     let metadata_bytes = sum_local_sizes(paths, &unique_metadata_keys);
     let row_used_bytes = rows.iter().map(|row| row.used_bytes).sum();
-    let packed_payload_bytes = sum_local_sizes(paths, &unique_packed_payload_keys);
+    let packed_payload_bytes =
+        sum_known_sizes(paths, &known_object_sizes, &unique_packed_payload_keys);
     let unique_used_bytes = current_backend_bytes
         .saturating_sub(packed_payload_bytes)
         .saturating_add(unique_packed_slice_bytes);
@@ -419,8 +422,51 @@ fn sum_local_sizes(paths: &Paths, keys: &BTreeSet<String>) -> u64 {
         .sum()
 }
 
-fn missing_local_objects(paths: &Paths, keys: &BTreeSet<String>) -> usize {
+fn known_payload_object_sizes(paths: &Paths) -> Result<BTreeMap<String, u64>> {
+    let conn = crate::open_db(paths)?;
+    let mut sizes = BTreeMap::new();
+    let mut pack_stmt = conn.prepare("select pack_key, size from packs")?;
+    let pack_rows = pack_stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    for row in pack_rows {
+        let (key, size) = row?;
+        sizes.insert(key, size);
+    }
+    let mut chunk_stmt = conn.prepare("select object_key, size from chunks")?;
+    let chunk_rows = chunk_stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    for row in chunk_rows {
+        let (key, size) = row?;
+        sizes.insert(key, size);
+    }
+    Ok(sizes)
+}
+
+fn sum_known_sizes(
+    paths: &Paths,
+    known_sizes: &BTreeMap<String, u64>,
+    keys: &BTreeSet<String>,
+) -> u64 {
     keys.iter()
+        .map(|key| {
+            known_sizes.get(key).copied().unwrap_or_else(|| {
+                fs::metadata(paths.home.join(key))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0)
+            })
+        })
+        .sum()
+}
+
+fn missing_objects(
+    paths: &Paths,
+    known_sizes: &BTreeMap<String, u64>,
+    keys: &BTreeSet<String>,
+) -> usize {
+    keys.iter()
+        .filter(|key| !known_sizes.contains_key(*key))
         .filter(|key| fs::metadata(paths.home.join(key)).is_err())
         .count()
 }
