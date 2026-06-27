@@ -6349,6 +6349,8 @@ fn sync_wait_reports_status_when_existing_sync_lock_is_held() {
     assert!(waited.contains("sync already running pid"));
     assert!(waited.contains("status_mode quick"));
     assert!(waited.contains("queued_uploads 0"));
+    assert!(waited.contains("event_journal_pending 0"));
+    assert!(waited.contains("durable_journal_pending 0"));
     assert!(waited.contains("timed out waiting for sync target"));
 }
 
@@ -17365,7 +17367,8 @@ fn sync_publishes_event_journal_as_durable_remote_journal() {
     let local_event: serde_json::Value =
         serde_json::from_slice(&fs::read(event_dir.join("event-durable.json")).unwrap()).unwrap();
     let remote_journal_key = local_event["remote_journal_key"].as_str().unwrap();
-    assert!(remote_journal_key.starts_with("hosts/"));
+    assert!(!remote_journal_key.starts_with("hosts/"));
+    assert!(remote_journal_key.ends_with("/journal/event-durable.json"));
     assert!(local_event["remote_journal_synced_at"].as_str().is_some());
     let payload_key = local_event["durable_payload_key"].as_str().unwrap();
     assert!(

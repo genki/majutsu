@@ -991,11 +991,13 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         });
     }
 
-    if pending_event_count > 0 {
+    if pending_event_count > 0 && durable_journal_pending > 0 {
         issues.push(HealthIssue {
             severity: HealthSeverity::Warning,
             code: "pending-journal-events".into(),
-            message: format!("event journal has {pending_event_count} pending trigger event(s)"),
+            message: format!(
+                "event journal has {pending_event_count} pending trigger event(s), {durable_journal_pending} awaiting remote ack"
+            ),
         });
     }
     if durable_journal_pending > 0 {
@@ -1030,10 +1032,8 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
     }
 
     let sync_lock_pid = process_lock_owner(&paths.sync_lock)?;
-    let sync_lock_is_only_waiter = remote_head.synced
-        && upload_stats.total == 0
-        && pending_event_count == 0
-        && durable_journal_pending == 0;
+    let sync_lock_is_only_waiter =
+        remote_head.synced && upload_stats.total == 0 && durable_journal_pending == 0;
     if let Some(pid) = sync_lock_pid
         && !sync_lock_is_only_waiter
     {

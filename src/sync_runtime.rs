@@ -42,7 +42,7 @@ use crate::queue_runtime::{
     acknowledge_remote_event_journal_uploads, drain_upload_queue, enqueue_file_upload,
     enqueue_file_upload_overwrite, enqueue_inline_upload, enqueue_inline_upload_overwrite,
     enqueue_live_diff_event_journals, enqueue_remote_event_journal_uploads, event_journal_records,
-    upload_queue_contains_key, upload_queue_stats,
+    event_journal_stats, remote_event_journal_stats, upload_queue_contains_key, upload_queue_stats,
 };
 use crate::remote_runtime::repair_missing_referenced_objects;
 use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
@@ -247,7 +247,7 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
                 &remote,
                 &target_current,
                 args.timeout_secs,
-                Some(pid),
+                None,
             );
         }
         println!("sync already running pid {pid}");
@@ -459,14 +459,17 @@ struct SyncWaitStatus {
     queued_upload_attempts: u64,
     queued_upload_max_attempts: u32,
     upload_queue_backpressure: bool,
+    event_journal_pending: usize,
+    durable_journal_pending: usize,
     sync_lock_pid: Option<u32>,
 }
 
 impl SyncWaitStatus {
-    fn is_caught_up_ignoring_lock(&self, allowed_lock_pid: Option<u32>) -> bool {
+    fn is_caught_up(&self) -> bool {
         self.local_current == self.remote_current
             && self.queued_uploads == 0
-            && (self.sync_lock_pid.is_none() || self.sync_lock_pid == allowed_lock_pid)
+            && self.durable_journal_pending == 0
+            && self.sync_lock_pid.is_none()
     }
 }
 
@@ -489,6 +492,8 @@ fn sync_wait_status(
         }
     };
     let upload_stats = upload_queue_stats(paths)?;
+    let event_stats = event_journal_stats(paths)?;
+    let remote_journal_stats = remote_event_journal_stats(paths)?;
     let sync_lock_pid = process_lock_owner(&paths.sync_lock).ok().flatten();
     Ok(SyncWaitStatus {
         remote: remote.describe(),
@@ -505,6 +510,8 @@ fn sync_wait_status(
         queued_upload_attempts: upload_stats.attempts,
         queued_upload_max_attempts: upload_stats.max_attempts,
         upload_queue_backpressure: upload_stats.has_backpressure(),
+        event_journal_pending: event_stats.pending,
+        durable_journal_pending: remote_journal_stats.pending,
         sync_lock_pid,
     })
 }
@@ -530,6 +537,8 @@ fn print_sync_wait_status(status: &SyncWaitStatus) {
         "upload_queue_backpressure {}",
         status.upload_queue_backpressure
     );
+    println!("event_journal_pending {}", status.event_journal_pending);
+    println!("durable_journal_pending {}", status.durable_journal_pending);
     println!(
         "sync_lock_pid {}",
         status
@@ -561,7 +570,7 @@ fn wait_for_sync_catchup(
             target_current = latest_current;
         }
         let status = sync_wait_status(paths, conn, remote)?;
-        if status.is_caught_up_ignoring_lock(allowed_lock_pid.or(Some(std::process::id()))) {
+        if status.is_caught_up() {
             if sync_wait_deep_repair_enabled() {
                 let repair = repair_missing_referenced_objects(paths, remote)?;
                 if repair.missing > 0 || repair.repaired > 0 {
@@ -603,13 +612,15 @@ fn wait_for_sync_catchup(
             print_sync_wait_status(&status);
             println!("status_mode quick");
             bail!(
-                "timed out waiting for sync target {} after {}s; local_current={} remote_current={} queued_uploads={} delayed={} lock_pid={}",
+                "timed out waiting for sync target {} after {}s; local_current={} remote_current={} queued_uploads={} delayed={} event_journal_pending={} durable_journal_pending={} lock_pid={}",
                 target_current,
                 timeout_secs,
                 status.local_current,
                 status.remote_current,
                 status.queued_uploads,
                 status.queued_uploads_delayed,
+                status.event_journal_pending,
+                status.durable_journal_pending,
                 status
                     .sync_lock_pid
                     .map(|pid| pid.to_string())
