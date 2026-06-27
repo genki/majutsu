@@ -232,6 +232,19 @@ daemon は watch loop の起動時、periodic rescan 後、filesystem event snap
 `$MAJUTSU_HOME/runtime/health.json` を更新する。外部監視はこのファイルを読むことで、
 full fsck を回さずに直近の保護状態を確認できる。
 
+remote を設定した watch daemon は、snapshot を backend に同期できた後で retention
+prune も自動実行する。既定では `keep_daily=0` / `keep_monthly=0` として current
+snapshot 以外の snapshot metadata を残さず、GCS/S3 の実サイズが current の復元に
+必要な object 集合へ収束することを優先する。短期/長期の snapshot 履歴を backend に
+残したい場合は、daemon 環境変数で保持数を明示する。
+
+```sh
+MAJUTSU_WATCH_PRUNE_KEEP_DAILY=7
+MAJUTSU_WATCH_PRUNE_KEEP_MONTHLY=3
+```
+
+daemon による自動pruneを止める場合は `MAJUTSU_WATCH_AUTO_PRUNE=0` を設定する。
+
 health が `degraded` / `unprotected` になった時に通知したい場合は
 `MAJUTSU_HEALTH_NOTICE_CMD` を設定する。通知コマンドには `MAJUTSU_HOME`、
 `MAJUTSU_HEALTH_STATE`、`MAJUTSU_HEALTH_ISSUE_COUNT`、

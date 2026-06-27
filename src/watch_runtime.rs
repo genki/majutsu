@@ -912,7 +912,8 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         snapshot(paths, args)?;
         match sync_current_if_remote(paths) {
             Ok(AutoSyncResult::Synced) => {
-                record_event(paths, "watch-sync", "synced current snapshot to remote")?
+                record_event(paths, "watch-sync", "synced current snapshot to remote")?;
+                auto_prune_after_sync(paths)?;
             }
             Ok(AutoSyncResult::Deferred {
                 delayed,
@@ -1010,11 +1011,46 @@ fn sync_current_external(paths: &Paths) -> Result<()> {
         .status()?;
     if status.success() {
         record_event(paths, "watch-sync", "external sync completed")?;
+        auto_prune_after_sync(paths)?;
     } else {
         record_event(
             paths,
             "watch-sync-error",
             &format!("external sync exited with status {status}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
+    if std::env::var("MAJUTSU_WATCH_AUTO_PRUNE").as_deref() == Ok("0") {
+        return Ok(());
+    }
+    let keep_daily = std::env::var("MAJUTSU_WATCH_PRUNE_KEEP_DAILY").unwrap_or_else(|_| "0".into());
+    let keep_monthly =
+        std::env::var("MAJUTSU_WATCH_PRUNE_KEEP_MONTHLY").unwrap_or_else(|_| "0".into());
+    let exe = child_process_exe()?;
+    let status = std::process::Command::new(&exe)
+        .arg("--home")
+        .arg(&paths.home)
+        .arg("prune")
+        .arg("--dry-run=false")
+        .arg("--keep-daily")
+        .arg(&keep_daily)
+        .arg("--keep-monthly")
+        .arg(&keep_monthly)
+        .status()?;
+    if status.success() {
+        record_event(
+            paths,
+            "watch-prune",
+            &format!("auto prune completed keep_daily={keep_daily} keep_monthly={keep_monthly}"),
+        )?;
+    } else {
+        record_event(
+            paths,
+            "watch-prune-error",
+            &format!("auto prune exited with status {status}"),
         )?;
     }
     Ok(())

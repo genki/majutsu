@@ -404,6 +404,8 @@ directly. Use `--style forking` when the host should delegate lifecycle to
 Prune old snapshot metadata:
 
 ```sh
+mj prune --dry-run --keep-daily 0 --keep-monthly 0
+mj prune --dry-run=false --keep-daily 0 --keep-monthly 0
 mj prune --dry-run --keep-daily 90 --keep-monthly 36
 mj prune --dry-run=false --keep-daily 90 --keep-monthly 36
 mj prune --dry-run --drop-missing-remote-history
@@ -412,6 +414,12 @@ mj prune --dry-run --drop-missing-remote-history
 The current snapshot is always kept. Non-dry-run prune removes unkept snapshot
 metadata and drops blob/large/chunk metadata no longer referenced by remaining
 snapshots.
+
+`mj daemon` runs the same retention prune after a successful watch snapshot sync.
+The daemon default is `keep-daily 0` / `keep-monthly 0`, so remote storage
+converges toward the current restore set. Set `MAJUTSU_WATCH_PRUNE_KEEP_DAILY`,
+`MAJUTSU_WATCH_PRUNE_KEEP_MONTHLY`, or `MAJUTSU_WATCH_AUTO_PRUNE=0` when the
+backend should keep longer snapshot history.
 
 Use `--drop-missing-remote-history` when `mj health --deep --history` reports
 missing remote objects for old history, while current health remains protected.
