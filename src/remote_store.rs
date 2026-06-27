@@ -30,7 +30,7 @@ pub(crate) const DEFAULT_CLOUD_MULTIPART_PART_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_MULTIPART_PARTS: usize = 10_000;
 pub(crate) const DEFAULT_METADATA_MULTIPART_PARALLELISM: usize = 2;
 pub(crate) const DEFAULT_S3_CONNECT_TIMEOUT_SECS: u64 = 10;
-pub(crate) const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 300;
+pub(crate) const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 pub(crate) fn adaptive_multipart_part_size(len: usize, endpoint: &str) -> usize {
     let requested = env::var("MAJUTSU_S3_MULTIPART_PART_SIZE")
@@ -98,6 +98,7 @@ pub(crate) fn s3_http_client() -> Result<Client> {
     Ok(Client::builder()
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
+        .pool_idle_timeout(Duration::from_secs(30))
         .redirect(RedirectPolicy::none())
         .build()?)
 }

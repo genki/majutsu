@@ -220,7 +220,7 @@ pub(crate) fn drain_upload_queue(
             .then_with(|| a.1.key.cmp(&b.1.key))
     });
     let total = items.len();
-    let progress_enabled = total >= 16;
+    let progress_enabled = total > 0;
     let parallelism = upload_queue_parallelism(remote, max_parallel_uploads);
     let mut last_progress = Instant::now()
         .checked_sub(StdDuration::from_secs(10))

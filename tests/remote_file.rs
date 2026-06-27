@@ -10878,6 +10878,116 @@ fn pack_compaction_rewrites_existing_packs() {
 }
 
 #[test]
+fn pack_compaction_separates_current_blobs_from_history_only_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept.txt"), vec![b'a'; 4096]).unwrap();
+    fs::write(source.join("old.txt"), vec![b'b'; 4096]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace(
+            "small_pack_target = 67108864",
+            "small_pack_target = \"16 KiB\"",
+        )
+        .replace(
+            "normal_pack_target = 268435456",
+            "normal_pack_target = \"16 KiB\"",
+        );
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+
+    fs::remove_file(source.join("old.txt")).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack").arg("--compact");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let current: String = conn
+        .query_row("select value from refs where name='current'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut current_stmt = conn
+        .prepare(
+            "select distinct b.pack_id
+             from blobs b
+             join snapshot_payloads sp on sp.kind='blob' and sp.oid=b.oid
+             where sp.snapshot_id=?1 and b.pack_id is not null
+             order by b.pack_id",
+        )
+        .unwrap();
+    let current_pack_ids = current_stmt
+        .query_map([current.as_str()], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut history_stmt = conn
+        .prepare(
+            "select distinct b.pack_id
+             from blobs b
+             where b.pack_id is not null
+               and b.oid not in (
+                 select oid from snapshot_payloads where snapshot_id=?1 and kind='blob'
+               )
+             order by b.pack_id",
+        )
+        .unwrap();
+    let history_pack_ids = history_stmt
+        .query_map([current.as_str()], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!current_pack_ids.is_empty());
+    assert!(!history_pack_ids.is_empty());
+    assert!(
+        current_pack_ids
+            .iter()
+            .all(|pack_id| !history_pack_ids.contains(pack_id)),
+        "current blobs should not share packs with history-only blobs: current={current_pack_ids:?} history={history_pack_ids:?}"
+    );
+}
+
+#[test]
 fn pack_respects_configured_normal_pack_target() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

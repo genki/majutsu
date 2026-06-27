@@ -4,13 +4,15 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 
 use crate::cli::PackArgs;
 use crate::config::{PackConfig, Paths, read_config};
+use crate::majutsu_core::{FileRecord, payload_blob_ref};
 use crate::operation_log::record_op;
-use crate::snapshot_state::current_snapshot;
+use crate::snapshot_state::{current_snapshot, load_snapshot_by_id};
 use crate::util::new_id;
 use crate::{
     decode_object, encode_object, ensure_ready, open_db, pack_entry_payload, query_blobs,
@@ -22,6 +24,40 @@ pub(crate) fn pack_cmd(paths: &Paths, args: PackArgs) -> Result<()> {
         return pack_compact_cmd(paths);
     }
     pack_loose_blobs(paths)
+}
+
+pub(crate) fn auto_compact_packs_if_needed(paths: &Paths, conn: &Connection) -> Result<bool> {
+    if env::var("MAJUTSU_SYNC_AUTO_PACK_COMPACT").as_deref() == Ok("0") {
+        return Ok(false);
+    }
+    let Some(stats) = pack_compaction_stats(paths, conn)? else {
+        return Ok(false);
+    };
+    let reclaim_bytes = stats
+        .all_pack_bytes
+        .saturating_sub(stats.all_slice_bytes)
+        .max(
+            stats
+                .current_pack_bytes
+                .saturating_sub(stats.current_slice_bytes),
+        );
+    if reclaim_bytes < auto_compact_min_reclaim_bytes() {
+        return Ok(false);
+    }
+    let all_utilization = utilization_percent(stats.all_slice_bytes, stats.all_pack_bytes);
+    let current_utilization =
+        utilization_percent(stats.current_slice_bytes, stats.current_pack_bytes);
+    if all_utilization > auto_compact_max_utilization_percent()
+        && current_utilization > auto_compact_max_utilization_percent()
+    {
+        return Ok(false);
+    }
+    eprintln!(
+        "auto_pack_compact packs={} reclaim_bytes={} all_utilization={} current_utilization={}",
+        stats.pack_count, reclaim_bytes, all_utilization, current_utilization
+    );
+    pack_compact_cmd(paths)?;
+    Ok(true)
 }
 
 fn pack_loose_blobs(paths: &Paths) -> Result<()> {
@@ -265,7 +301,7 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
     ensure_ready(paths)?;
     let config = read_config(paths)?;
     let mut conn = open_db(paths)?;
-    let mut blobs = query_blobs(&conn)?;
+    let blobs = query_blobs(&conn)?;
     let packed = blobs.iter().filter(|blob| blob.pack_id.is_some()).count();
     if packed == 0 {
         println!("compacted 0 objects");
@@ -280,27 +316,52 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
         .into_iter()
         .map(|pack| pack.pack_id)
         .collect::<BTreeSet<_>>();
-    blobs.sort_by(|left, right| {
-        left.pack_id
-            .cmp(&right.pack_id)
-            .then_with(|| left.pack_offset.cmp(&right.pack_offset))
-            .then_with(|| left.oid.cmp(&right.oid))
-    });
+    let current_blob_oids = current_snapshot_blob_oids(paths, &conn)?;
+    let (mut current_blobs, mut history_blobs): (Vec<_>, Vec<_>) = blobs
+        .into_iter()
+        .partition(|blob| current_blob_oids.contains(&blob.oid));
+    sort_blobs_for_compaction(&mut current_blobs);
+    sort_blobs_for_compaction(&mut history_blobs);
     eprintln!(
         "compact reading {} blob(s), {} currently packed",
-        blobs.len(),
+        current_blobs.len() + history_blobs.len(),
         packed
     );
     let mut reader = CompactPayloadReader::new(paths, &packs_by_id);
     let mut read_count = 0usize;
-    let indexes = write_tiered_blob_packs(paths, &config.pack, &blobs, |blob| {
-        read_count += 1;
-        if read_count == 1 || read_count.is_multiple_of(500) || read_count == blobs.len() {
-            eprintln!("compact read progress {}/{}", read_count, blobs.len());
-        }
-        reader.read_blob(paths, &conn, blob)
-    })?;
+    let total_blobs = current_blobs.len() + history_blobs.len();
+    let mut indexes = Vec::new();
+    indexes.extend(write_tiered_blob_packs(
+        paths,
+        &config.pack,
+        &current_blobs,
+        |blob| {
+            read_count += 1;
+            if read_count == 1 || read_count.is_multiple_of(500) || read_count == total_blobs {
+                eprintln!("compact read progress {}/{}", read_count, total_blobs);
+            }
+            reader.read_blob(paths, &conn, blob)
+        },
+    )?);
+    indexes.extend(write_tiered_blob_packs(
+        paths,
+        &config.pack,
+        &history_blobs,
+        |blob| {
+            read_count += 1;
+            if read_count == 1 || read_count.is_multiple_of(500) || read_count == total_blobs {
+                eprintln!("compact read progress {}/{}", read_count, total_blobs);
+            }
+            reader.read_blob(paths, &conn, blob)
+        },
+    )?);
+    eprintln!(
+        "compact current_blobs={} history_blobs={}",
+        current_blobs.len(),
+        history_blobs.len()
+    );
     eprintln!("compact wrote {} pack(s)", indexes.len());
+    let compacted_blob_count = total_blobs;
     persist_written_packs(&mut conn, &indexes)?;
     let new_pack_ids = indexes
         .iter()
@@ -314,14 +375,121 @@ fn pack_compact_cmd(paths: &Paths) -> Result<()> {
         "pack-compact",
         current_snapshot(&conn)?.as_deref(),
         current_snapshot(&conn)?.as_deref(),
-        Some(&format!("compacted {} blobs", blobs.len())),
+        Some(&format!("compacted {} blobs", compacted_blob_count)),
     )?;
     println!(
         "compacted {} objects into {} pack(s)",
-        blobs.len(),
+        compacted_blob_count,
         indexes.len()
     );
     Ok(())
+}
+
+fn sort_blobs_for_compaction(blobs: &mut [BlobExport]) {
+    blobs.sort_by(|left, right| {
+        left.pack_id
+            .cmp(&right.pack_id)
+            .then_with(|| left.pack_offset.cmp(&right.pack_offset))
+            .then_with(|| left.oid.cmp(&right.oid))
+    });
+}
+
+fn current_snapshot_blob_oids(paths: &Paths, conn: &Connection) -> Result<BTreeSet<String>> {
+    let Some(current) = current_snapshot(conn)? else {
+        return Ok(BTreeSet::new());
+    };
+    let manifest = load_snapshot_by_id(paths, conn, &current)?;
+    let mut oids = BTreeSet::new();
+    for root_tree in manifest.root_trees.values() {
+        crate::snapshot_state::visit_tree_records(paths, root_tree, |record| {
+            add_record_blob_oid(record, &mut oids);
+            Ok(())
+        })?;
+    }
+    for records in manifest.roots.values() {
+        for record in records {
+            add_record_blob_oid(record, &mut oids);
+        }
+    }
+    Ok(oids)
+}
+
+fn add_record_blob_oid(record: &FileRecord, oids: &mut BTreeSet<String>) {
+    if let Some((oid, _)) = payload_blob_ref(&record.payload) {
+        oids.insert(oid.to_string());
+    }
+}
+
+struct PackCompactionStats {
+    pack_count: usize,
+    all_pack_bytes: u64,
+    all_slice_bytes: u64,
+    current_pack_bytes: u64,
+    current_slice_bytes: u64,
+}
+
+fn pack_compaction_stats(paths: &Paths, conn: &Connection) -> Result<Option<PackCompactionStats>> {
+    let packs = query_packs(conn)?;
+    if packs.len() < 2 {
+        return Ok(None);
+    }
+    let blobs = query_blobs(conn)?;
+    let current_oids = current_snapshot_blob_oids(paths, conn)?;
+    let pack_size_by_id = packs
+        .iter()
+        .map(|pack| (pack.pack_id.as_str(), pack.size))
+        .collect::<BTreeMap<_, _>>();
+    let all_pack_bytes = packs
+        .iter()
+        .fold(0_u64, |sum, pack| sum.saturating_add(pack.size));
+    let mut all_slice_bytes = 0_u64;
+    let mut current_pack_ids = BTreeSet::new();
+    let mut current_slice_bytes = 0_u64;
+    for blob in blobs {
+        let Some(pack_id) = blob.pack_id.as_deref() else {
+            continue;
+        };
+        let Some(pack_len) = blob.pack_len else {
+            continue;
+        };
+        all_slice_bytes = all_slice_bytes.saturating_add(pack_len);
+        if current_oids.contains(&blob.oid) {
+            current_pack_ids.insert(pack_id.to_string());
+            current_slice_bytes = current_slice_bytes.saturating_add(pack_len);
+        }
+    }
+    let current_pack_bytes = current_pack_ids
+        .iter()
+        .filter_map(|pack_id| pack_size_by_id.get(pack_id.as_str()))
+        .fold(0_u64, |sum, size| sum.saturating_add(*size));
+    Ok(Some(PackCompactionStats {
+        pack_count: packs.len(),
+        all_pack_bytes,
+        all_slice_bytes,
+        current_pack_bytes,
+        current_slice_bytes,
+    }))
+}
+
+fn utilization_percent(used: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 100;
+    }
+    used.saturating_mul(100) / total
+}
+
+fn auto_compact_min_reclaim_bytes() -> u64 {
+    env::var("MAJUTSU_SYNC_AUTO_PACK_COMPACT_MIN_RECLAIM_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(32 * 1024 * 1024)
+}
+
+fn auto_compact_max_utilization_percent() -> u64 {
+    env::var("MAJUTSU_SYNC_AUTO_PACK_COMPACT_MAX_UTILIZATION_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(70)
 }
 
 struct CompactPayloadReader<'a> {

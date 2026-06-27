@@ -29,12 +29,16 @@ mj root set moon --preset git-working-tree
 ## sync
 
 `mj sync` は未 pack の小さな blob が多い場合に、自動的に `mj pack` 相当の処理を実行してから upload queue を作る。これにより remote への PUT / HEAD request 数を減らす。
+また、既存 pack のうち live slice 利用率が低く、remote 課金対象サイズに対して current / retained payload が小さくなっている場合は、sync 前に `mj pack --compact` 相当の current-aware compact を自動実行する。compact は current snapshot が参照する blob を履歴専用 blob と別 pack に分けるため、履歴を残す場合でも current restore に必要な pack 全体サイズが過大化しにくい。
 
 自動 pack は環境変数で調整できる。
 
 ```sh
 MAJUTSU_SYNC_AUTO_PACK=0 mj sync
 MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS=512 mj sync
+MAJUTSU_SYNC_AUTO_PACK_COMPACT=0 mj sync
+MAJUTSU_SYNC_AUTO_PACK_COMPACT_MIN_RECLAIM_BYTES=33554432 mj sync
+MAJUTSU_SYNC_AUTO_PACK_COMPACT_MAX_UTILIZATION_PERCENT=70 mj sync
 ```
 
 sync 後は、current retention metadata から参照されない remote content object を削除する。対象には旧 loose blob object、canonical loose blob alias、pack、pack index、tree node、large object manifest / chunk を含める。S3/GCS 互換 remote では remote root 直下の `<host-id>/` が最上位境界であり、GC mark と tombstone も `<host-id>/gc/...` に保存する。削除判定はその host 境界内で完結し、別 host の payload object を共有前提で保護する設計にはしない。
@@ -56,6 +60,8 @@ MAJUTSU_SYNC_REMOTE_PRUNE_INTERVAL_SECS=3600 mj sync
 ```
 
 cleanup は remote list で存在する content object を絞り込み、S3 upload 並列度の設定を使って delete を並列化する。削除された旧 object は current retention metadata から到達不能なため、通常の clone / restore には不要。
+
+S3/GCS 互換 remote の 1 request timeout は既定で 60 秒。低速または高遅延の backend を使う場合は `MAJUTSU_S3_REQUEST_TIMEOUT_SECS` と `MAJUTSU_S3_CONNECT_TIMEOUT_SECS` で調整できる。timeout を長くしすぎると daemon 子プロセスが `sync.lock` を長時間保持し、後続の保全処理を待たせる原因になる。
 
 `mj sync` 成功後は、ローカルに pack と pack index が揃っている pack 済み blob の旧 loose file も削除する。これにより auto pack 後の `~/.majutsu` 使用量が blob と pack の二重保持で増え続けることを抑える。pack から読める状態を確認してから削除するため、restore / fsck / remote sync の参照先は維持される。
 

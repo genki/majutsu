@@ -36,7 +36,7 @@ use crate::object_paths::{
     remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
 };
 use crate::operation_log::{OperationDetails, record_op_with_details, update_operation_result};
-use crate::pack_runtime::pack_cmd;
+use crate::pack_runtime::{auto_compact_packs_if_needed, pack_cmd};
 use crate::process_runtime::{acquire_process_lock, process_lock_owner};
 use crate::queue_runtime::{
     acknowledge_remote_event_journal_uploads, drain_upload_queue, enqueue_file_upload,
@@ -648,6 +648,9 @@ fn auto_pack_before_sync(paths: &Paths, conn: &Connection) -> Result<()> {
         println!("auto_pack unpacked_small_blobs {unpacked_small_blobs}");
         pack_cmd(paths, PackArgs { compact: false })?;
     }
+    if auto_compact_packs_if_needed(paths, conn)? {
+        println!("auto_pack_compacted true");
+    }
     Ok(())
 }
 
@@ -792,20 +795,37 @@ fn enqueue_and_drain_sync(
         };
     for key in content_keys {
         let local = paths.home.join(&key);
-        if !local.exists() && !crate::hydrate_local_object_from_remote(paths, &key)? {
-            bail!(
-                "cannot sync referenced object {key}: local object is missing and remote hydration failed"
-            );
+        let canonical_only =
+            remote_prefers_canonical_only(remote) && s3_prefers_canonical_remote_only(&key);
+        let aliases = canonical_remote_aliases(&key);
+        if !local.exists() {
+            if canonical_only
+                && canonical_aliases_available_without_local(
+                    paths,
+                    remote,
+                    &host_label,
+                    &key,
+                    &aliases,
+                    &sync_cache,
+                    &mut sync_fingerprints,
+                    existing_canonical_aliases.as_ref(),
+                )?
+            {
+                continue;
+            }
+            if !crate::hydrate_local_object_from_remote(paths, &key)? {
+                bail!(
+                    "cannot sync referenced object {key}: local object is missing and remote hydration failed"
+                );
+            }
         }
         if local.exists() {
-            let canonical_only =
-                remote_prefers_canonical_only(remote) && s3_prefers_canonical_remote_only(&key);
             if !canonical_only {
                 let force = snapshot_manifest_keys.contains(key.as_str());
                 let upload_key = remote_upload_key(remote, &host_label, &key);
                 enqueue_file_upload_if_needed(paths, remote, &upload_key, &local, force)?;
             }
-            for alias in canonical_remote_aliases(&key) {
+            for alias in aliases {
                 let upload_alias = remote_upload_key(remote, &host_label, &alias);
                 let snapshot_manifest = snapshot_manifest_keys.contains(&key);
                 let mut structured_bytes = None;
@@ -962,6 +982,40 @@ fn enqueue_and_drain_sync(
         pruned_metadata_cache.metadata_removed_bytes
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_aliases_available_without_local(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_label: &str,
+    key: &str,
+    aliases: &[String],
+    sync_cache: &RemoteSyncCache,
+    sync_fingerprints: &mut BTreeMap<String, String>,
+    existing_canonical_aliases: Option<&BTreeSet<String>>,
+) -> Result<bool> {
+    if aliases.is_empty() {
+        return Ok(false);
+    }
+    let mut all_cached = true;
+    for alias in aliases {
+        let upload_alias = remote_upload_key(remote, host_label, alias);
+        let fingerprint = content_object_fingerprint(alias);
+        sync_fingerprints.insert(upload_alias.clone(), fingerprint.clone());
+        let alias_exists = existing_canonical_aliases
+            .as_ref()
+            .is_some_and(|keys| keys.contains(&upload_alias));
+        if !cache_matches(sync_cache, &upload_alias, &fingerprint)
+            || (existing_canonical_aliases.is_some() && !alias_exists)
+        {
+            all_cached = false;
+        }
+    }
+    if all_cached {
+        return Ok(true);
+    }
+    remote_object_available_for_paths(paths, remote, key)
 }
 
 fn remote_prefers_canonical_only(remote: &RemoteStore) -> bool {
