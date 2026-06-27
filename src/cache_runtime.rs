@@ -430,7 +430,3 @@ fn metadata_cache_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<Str
     keys.dedup();
     Ok(keys)
 }
-
-pub(crate) fn payload_cache_key_set(export: &MetadataExport) -> std::collections::BTreeSet<String> {
-    payload_cache_keys(export).into_iter().collect()
-}

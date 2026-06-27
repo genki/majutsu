@@ -121,6 +121,35 @@ dd if=/dev/zero of="$multipart_root/multipart-normal.bin" bs=1M count=6 status=n
   --large-binary-min-size $((16 * 1024 * 1024))
 "$mj_bin" --home "$home" snapshot --message minio-e2e
 "$mj_bin" --home "$home" sync
+
+object_listing="$(podman_cmd run \
+  --rm \
+  --network host \
+  --entrypoint /bin/sh \
+  "$MC_IMAGE" \
+  -c "mc alias set local http://127.0.0.1:${MINIO_PORT} minioadmin minioadmin >/dev/null && mc ls --recursive local/majutsu/e2e")"
+listing_keys="$(printf '%s\n' "$object_listing" | awk 'NF {print $NF}')"
+if ! printf '%s\n' "$listing_keys" | grep -Eq '(^|/)minio-e2e/metadata/export.json.zst$'; then
+  echo "MinIO E2E: host-prefixed compressed metadata が見つかりません" >&2
+  printf '%s\n' "$object_listing" >&2
+  exit 4
+fi
+if ! printf '%s\n' "$listing_keys" | grep -Eq '(^|/)minio-e2e/(blobs|trees|large|packs|indexes)/'; then
+  echo "MinIO E2E: host-prefixed content object が見つかりません" >&2
+  printf '%s\n' "$object_listing" >&2
+  exit 4
+fi
+if printf '%s\n' "$listing_keys" | grep -Eq '(^|/)e2e/(objects|blobs|trees|large|packs|indexes)/|^(objects|blobs|trees|large|packs|indexes)/'; then
+  echo "MinIO E2E: remote prefix直下に旧仕様のunprefixed content objectがあります" >&2
+  printf '%s\n' "$object_listing" >&2
+  exit 4
+fi
+if printf '%s\n' "$listing_keys" | grep -Eq '(^|/)e2e/(hosts/|metadata/export\.json)|^(hosts/|metadata/export\.json)'; then
+  echo "MinIO E2E: remote prefix直下に旧仕様のglobal metadataがあります" >&2
+  printf '%s\n' "$object_listing" >&2
+  exit 4
+fi
+
 "$mj_bin" --home "$home" remote check
 "$mj_bin" --home "$home" remote fsck
 "$mj_bin" --home "$home" remote hosts

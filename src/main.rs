@@ -185,9 +185,7 @@ use key_runtime::key_cmd;
 use large_runtime::large_cmd;
 use lifecycle_runtime::lifecycle_cmd;
 use mount_runtime::{hydrate_cmd, mount_cmd, unmount_cmd};
-use object_paths::{
-    large_chunk_base, remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
-};
+use object_paths::large_chunk_base;
 use operation_log::{
     OperationDetails, query_operations, record_op, record_op_with_details, rewrite_local_oplog,
 };
@@ -596,9 +594,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .transpose()?;
         let known_paths = root_known_paths(&conn, &root.id, parent_root_files.as_ref())?;
         let initial_root_scan = parent_root_files.is_none() && known_paths.is_empty();
-        let auto_track_policy =
-            AutoTrackPolicy::for_root(&scan_root_config, &known_paths, initial_root_scan)?;
-        let scan_result = scan_root(paths, &conn, &config, &scan_root_config, &auto_track_policy);
+        let scan_result =
+            AutoTrackPolicy::for_root(&scan_root_config, &known_paths, initial_root_scan).and_then(
+                |auto_track_policy| {
+                    scan_root(paths, &conn, &config, &scan_root_config, &auto_track_policy)
+                },
+            );
         let post_result = run_post_snapshot_hook(paths, &root);
         let scanned = match scan_result {
             Ok(scanned) => scanned,
@@ -806,7 +807,15 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
 
 fn snapshot_is_noop(parent: Option<&SnapshotManifest>, manifest: &SnapshotManifest) -> bool {
     parent
-        .map(|parent| parent.root_trees == manifest.root_trees)
+        .map(|parent| {
+            parent.root_trees.len() == manifest.root_trees.len()
+                && parent.root_trees.iter().all(|(root_id, previous)| {
+                    manifest.root_trees.get(root_id).is_some_and(|current| {
+                        previous.tree_id == current.tree_id
+                            && previous.file_count == current.file_count
+                    })
+                })
+        })
         .unwrap_or(false)
 }
 
@@ -824,7 +833,7 @@ fn reusable_local_object(paths: &Paths, key: &str) -> bool {
 fn snapshot_reuse_root_trees() -> bool {
     env::var("MAJUTSU_SNAPSHOT_REUSE_ROOT_TREES")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn prune_noop_snapshot_cache(paths: &Paths, conn: &Connection, config: &Config) {
@@ -999,7 +1008,14 @@ pub(crate) fn validate_clone_remote_snapshot_objects(
             continue;
         }
         let metadata_manifest = raw_snapshot_manifest_from_export(paths, snapshot)?;
-        for variant in remote_local_object_variants(paths, remote, &snapshot.manifest_key)? {
+        let variants = remote_local_object_variants(paths, remote, &snapshot.manifest_key)?;
+        if variants.is_empty() {
+            bail!(
+                "remote is missing snapshot manifest object {}",
+                snapshot.manifest_key
+            );
+        }
+        for variant in variants {
             let payload = hydrate_compact_snapshot_manifest_payload(
                 paths,
                 &snapshot.manifest_key,
@@ -1021,7 +1037,14 @@ pub(crate) fn validate_clone_remote_snapshot_objects(
             }
         }
         for (root_id, root_tree) in &metadata_manifest.root_trees {
-            for variant in remote_local_object_variants(paths, remote, &root_tree.tree_key)? {
+            let variants = remote_local_object_variants(paths, remote, &root_tree.tree_key)?;
+            if variants.is_empty() {
+                bail!(
+                    "remote is missing tree manifest object {}",
+                    root_tree.tree_key
+                );
+            }
+            for variant in variants {
                 let tree: TreeManifest =
                     serde_json::from_slice(&decode_object(paths, &variant.bytes)?).with_context(
                         || {
@@ -1491,6 +1514,13 @@ pub(crate) fn validate_clone_host_summary(
             export.config.host.name
         );
     }
+    let host_prefix = remote_host_prefix_from_summary(host);
+    let expected_host_prefix = remote_host_label(&export.config.host.name);
+    if host_prefix != expected_host_prefix {
+        bail!(
+            "remote host prefix {host_prefix} does not match metadata host name prefix {expected_host_prefix}"
+        );
+    }
     if host.current_snapshot.as_ref() != export.refs.get("current") {
         bail!("remote host current snapshot does not match metadata");
     }
@@ -1577,13 +1607,14 @@ pub(crate) fn validate_clone_remote_gc_mark(
     }
     let mark: GcMarkExport = serde_json::from_slice(&remote.get(&key)?)
         .with_context(|| format!("parse remote gc mark {key}"))?;
-    let mut expected = if matches!(remote, RemoteStore::S3(_)) {
-        s3_remote_live_object_keys_for_local(paths, export)?
-    } else {
-        remote_live_object_keys_for_local(paths, export)?
+    let mut expected = crate::fsck_runtime::expected_gc_mark_object_keys(paths, remote, export)?;
+    for alias in expected
+        .iter()
+        .flat_map(|key| canonical_remote_aliases(key))
+        .collect::<Vec<_>>()
+    {
+        expected.insert(alias);
     }
-    .into_iter()
-    .collect::<BTreeSet<_>>();
     for key in &mark.object_keys {
         if key.starts_with("objects/trees/nodes/") || key.starts_with("trees/nodes/") {
             expected.insert(key.clone());
@@ -1593,12 +1624,7 @@ pub(crate) fn validate_clone_remote_gc_mark(
     if let Some(issue) = mark
         .validation_issues(&host.id, export.refs.get("current"), &expected)
         .into_iter()
-        .find(|issue| {
-            !matches!(
-                issue,
-                RemoteGcMarkIssue::MissingLiveObject(_) | RemoteGcMarkIssue::UnexpectedObjectKey(_)
-            )
-        })
+        .find(|issue| !matches!(issue, RemoteGcMarkIssue::MissingLiveObject(_)))
     {
         bail!("{}", issue.message(&key, &host.id));
     }
@@ -1963,6 +1989,21 @@ pub(crate) fn download_local_object_from_remote(
             .with_context(|| format!("download {key} from {remote_key}"))?;
         return Ok(bytes);
     }
+    if let Some(bytes) = remote
+        .get_optional(key)
+        .with_context(|| format!("download {key} from {key}"))?
+    {
+        return Ok(bytes);
+    }
+    if let Some(alias) = canonical_remote_alias(key)
+        && alias != key
+        && let Some(bytes) = remote
+            .get_optional(&alias)
+            .with_context(|| format!("download {key} via canonical alias {alias}"))?
+    {
+        return canonical_remote_object_to_local_bytes(paths, key, &bytes)
+            .with_context(|| format!("decode canonical alias {alias} for {key}"));
+    }
     remote
         .get(key)
         .with_context(|| format!("download {key} from {key}"))
@@ -2149,7 +2190,6 @@ fn canonical_remote_object_to_local_bytes(
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
     if key.starts_with("objects/blobs/")
-        && is_snapshot_manifest_object_key(paths, key)?
         && let Some(bytes) = compact_snapshot_manifest_to_local_bytes(paths, bytes)?
     {
         return Ok(bytes);
@@ -3193,6 +3233,10 @@ fn is_permission_denied_error(err: &anyhow::Error) -> bool {
         {
             return true;
         }
+    }
+    let detail = format!("{err:#}");
+    if detail.contains("Permission denied") || detail.contains("os error 13") {
+        return true;
     }
     false
 }

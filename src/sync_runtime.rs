@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cache_runtime::{
     prune_synced_metadata_cache, prune_synced_payload_cache, remote_payload_index_contains,
-    remote_payload_key_index_for_host,
+    remote_payload_key_index, remote_payload_key_index_for_host,
 };
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
@@ -1234,14 +1234,14 @@ fn invalidate_root_size_remote_object_cache(paths: &Paths) -> Result<()> {
 
 fn sync_local_payload_cache_prune_enabled() -> bool {
     std::env::var("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn sync_local_metadata_cache_prune_enabled() -> bool {
     std::env::var("MAJUTSU_SYNC_LOCAL_METADATA_CACHE_PRUNE")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or_else(|_| sync_local_payload_cache_prune_enabled())
+        .unwrap_or(false)
 }
 
 fn metadata_export_for_remote(
@@ -1780,7 +1780,12 @@ fn sync_status_snapshot(
     let remote_keys = if options.prefer_head_checks() {
         None
     } else {
-        match remote_payload_key_index_for_host(remote, &host_label) {
+        let remote_index = if matches!(remote, RemoteStore::S3(_)) {
+            remote_payload_key_index_for_host(remote, &host_label)
+        } else {
+            remote_payload_key_index(remote)
+        };
+        match remote_index {
             Ok(keys) => Some(keys),
             Err(err) => {
                 eprintln!(
@@ -1798,8 +1803,10 @@ fn sync_status_snapshot(
             break;
         }
         checked += 1;
-        let available = if let Some(remote_keys) = remote_keys.as_ref() {
-            remote_payload_index_contains(remote_keys, key)
+        let available = if let Some(remote_keys) = remote_keys.as_ref()
+            && remote_payload_index_contains(remote_keys, key)
+        {
+            true
         } else {
             remote_object_available_for_paths(paths, remote, key)?
         };
@@ -1994,6 +2001,9 @@ fn build_gc_mark_export(
             .map(|key| host_remote_key(host_label, &key))
             .collect();
     }
+    if !export.chunks.is_empty() {
+        object_keys.push(host_remote_key(host_label, REMOTE_CHUNK_INDEX_SHARD_KEY));
+    }
     Ok(GcMarkExport::new(
         config.host.id.clone(),
         Utc::now(),
@@ -2131,6 +2141,9 @@ fn prune_remote_unreferenced_content_objects(
             .map(|key| host_remote_key(host_id, &key))
             .collect();
     }
+    if !export.chunks.is_empty() {
+        live.insert(host_remote_key(host_id, REMOTE_CHUNK_INDEX_SHARD_KEY));
+    }
     live.extend(remote_gc_mark_live_keys(remote, host_id)?);
     let delete_keys = remote_content_object_keys(remote, host_id)?
         .into_iter()
@@ -2210,7 +2223,7 @@ fn remote_content_object_keys(remote: &RemoteStore, host_id: &str) -> Result<BTr
         "objects/large/chunks/fixed/",
         "objects/large/chunks/fastcdc/",
     ] {
-        let prefix = if matches!(remote, RemoteStore::S3(_)) {
+        let prefix = if matches!(remote, RemoteStore::S3(_)) || prefix == "indexes/chunk-index/" {
             host_remote_key(host_id, prefix)
         } else {
             prefix.to_string()
@@ -2243,14 +2256,19 @@ fn prune_remote_legacy_canonical_objects(
         "objects/large/chunks/fixed/",
         "objects/large/chunks/fastcdc/",
     ] {
-        for key in remote.list(prefix)? {
+        let remote_prefix = host_remote_key(host_id, prefix);
+        for key in remote.list(&remote_prefix)? {
             if protected.contains(&key) {
                 continue;
             }
-            let Some(alias) = canonical_alias_for_legacy_key(&key) else {
+            let unprefixed = key
+                .strip_prefix(&format!("{host_id}/"))
+                .unwrap_or(key.as_str());
+            let Some(alias) = canonical_alias_for_legacy_key(unprefixed) else {
                 continue;
             };
-            if canonical_keys.contains(&alias) {
+            let remote_alias = host_remote_key(host_id, &alias);
+            if canonical_keys.contains(&remote_alias) {
                 candidates.insert(key);
             }
         }

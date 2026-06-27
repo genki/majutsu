@@ -1,4 +1,6 @@
-use crate::majutsu_store::{RemoteHostSummary, remote_host_label, select_remote_host};
+use crate::majutsu_store::{
+    RemoteHostSummary, host_remote_key, remote_host_label, select_remote_host,
+};
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::fs;
@@ -72,7 +74,13 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             &staging_paths.host,
             toml::to_string_pretty(&export.config.host)?,
         )?;
-        if let Some(recipients) = remote.get_optional("keys/recipients.toml")? {
+        let host_prefix = loaded
+            .selection
+            .host
+            .as_ref()
+            .map(remote_host_prefix_from_summary)
+            .unwrap_or_else(|| remote_host_label(&export.config.host.name));
+        if let Some(recipients) = clone_remote_recipients(&remote, &host_prefix)? {
             fs::write(staging_paths.home.join("keys/recipients.toml"), recipients)?;
         }
         if export.config.security.encryption != "none" {
@@ -118,12 +126,6 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         trace.mark("materialize objects");
         let mut conn = crate::open_db(&staging_paths)?;
         crate::import_metadata(&mut conn, &export)?;
-        let host_prefix = loaded
-            .selection
-            .host
-            .as_ref()
-            .map(remote_host_prefix_from_summary)
-            .unwrap_or_else(|| remote_host_label(&export.config.host.name));
         persist_export_remote_refs(&conn, &remote.describe(), &host_prefix, &export.refs)?;
         let imported_journals =
             import_remote_event_journals(&staging_paths, &remote, &host_prefix)?;
@@ -171,6 +173,14 @@ fn quarantine_remote_hooks(config: &mut crate::config::Config) -> usize {
         }
     }
     count
+}
+
+fn clone_remote_recipients(remote: &RemoteStore, host_prefix: &str) -> Result<Option<Vec<u8>>> {
+    let prefixed = host_remote_key(host_prefix, "keys/recipients.toml");
+    if let Some(recipients) = remote.get_optional(&prefixed)? {
+        return Ok(Some(recipients));
+    }
+    remote.get_optional("keys/recipients.toml")
 }
 
 struct CloneTrace {

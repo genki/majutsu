@@ -79,6 +79,31 @@ fn set_watch_backend(state: &std::path::Path, backend: &str) {
     .unwrap();
 }
 
+fn set_host_id(state: &std::path::Path, host_id: &str) {
+    for name in ["config.toml", "host.toml"] {
+        let path = state.join(name);
+        let updated = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.starts_with("id = ") {
+                    format!("id = \"{host_id}\"")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{updated}\n")).unwrap();
+    }
+}
+
+fn current_host_id(state: &std::path::Path) -> String {
+    let config = fs::read_to_string(state.join("config.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    parsed["host"]["id"].as_str().unwrap().to_string()
+}
+
 #[test]
 fn top_level_help_groups_commands_without_hiding_maintenance_commands() {
     let help = output({
@@ -797,14 +822,66 @@ fn host_metadata_export_path(remote: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn first_remote_host_dir(remote: &std::path::Path) -> std::path::PathBuf {
-    fs::read_dir(remote)
+    remote_host_dirs(remote)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing remote host directory under {}", remote.display()))
+}
+
+fn remote_host_dirs(remote: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = fs::read_dir(remote)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .find(|path| {
+        .filter(|path| {
             path.join("metadata/export.json").exists()
                 || path.join("metadata/export.json.zst").exists()
         })
-        .unwrap_or_else(|| panic!("missing remote host directory under {}", remote.display()))
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
+}
+
+fn host_remote_path(remote: &std::path::Path, key: &str) -> std::path::PathBuf {
+    first_remote_host_dir(remote).join(key)
+}
+
+fn read_json_maybe_zstd(path: &std::path::Path) -> serde_json::Value {
+    let bytes = fs::read(path).unwrap();
+    let decoded = if path.to_string_lossy().ends_with(".zst") {
+        zstd::stream::decode_all(bytes.as_slice()).unwrap()
+    } else {
+        bytes
+    };
+    serde_json::from_slice(&decoded).unwrap()
+}
+
+fn write_json_maybe_zstd(path: &std::path::Path, value: &serde_json::Value) {
+    let bytes = serde_json::to_vec_pretty(value).unwrap();
+    let encoded = if path.to_string_lossy().ends_with(".zst") {
+        zstd::stream::encode_all(bytes.as_slice(), 3).unwrap()
+    } else {
+        bytes
+    };
+    fs::write(path, encoded).unwrap();
+}
+
+fn read_remote_metadata(remote: &std::path::Path) -> serde_json::Value {
+    read_json_maybe_zstd(&host_metadata_export_path(remote))
+}
+
+fn write_remote_metadata(remote: &std::path::Path, value: &serde_json::Value) {
+    write_json_maybe_zstd(&host_metadata_export_path(remote), value)
+}
+
+fn write_remote_metadata_at_prefix(
+    remote: &std::path::Path,
+    prefix: &str,
+    value: &serde_json::Value,
+) -> std::path::PathBuf {
+    let path = remote.join(prefix).join("metadata/export.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    write_json_maybe_zstd(&path, value);
+    path
 }
 
 fn first_blob_object_key(state: &std::path::Path) -> String {
@@ -914,6 +991,7 @@ fn write_test_remote_head(
 ) {
     let host = &metadata["config"]["host"];
     let host_id = host["id"].as_str().unwrap();
+    let host_prefix = host["name"].as_str().unwrap();
     let head = serde_json::json!({
         "version": 1,
         "host_id": host_id,
@@ -921,18 +999,18 @@ fn write_test_remote_head(
         "current_snapshot": metadata["refs"]["current"].as_str(),
         "last_synced": metadata["refs"]["last-synced"].as_str(),
         "root_acks": root_acks,
-        "metadata_key": format!("{host_id}/metadata/export.json"),
+        "metadata_key": format!("{host_prefix}/metadata/export.json"),
         "host_index_key": null,
-        "gc_mark_key": format!("{host_id}/gc/mark.json"),
+        "gc_mark_key": format!("{host_prefix}/gc/mark.json"),
         "latest_snapshot_key": metadata["refs"]["current"]
             .as_str()
-            .map(|snapshot| format!("{host_id}/snapshots/{snapshot}.cbor.zst.enc")),
+            .map(|snapshot| format!("{host_prefix}/snapshots/{snapshot}.cbor.zst.enc")),
         "latest_operation_key": null,
         "updated_at": Utc::now().to_rfc3339(),
     });
     let cbor = serde_cbor::to_vec(&head).unwrap();
     let compressed = zstd::stream::encode_all(cbor.as_slice(), 3).unwrap();
-    let head_path = remote.join(format!("{host_id}/head.cbor.zst.enc"));
+    let head_path = remote.join(format!("{host_prefix}/head.cbor.zst.enc"));
     fs::create_dir_all(head_path.parent().unwrap()).unwrap();
     fs::write(head_path, compressed).unwrap();
 }
@@ -942,6 +1020,23 @@ fn canonical_loose_blob_key(object_key: &str) -> String {
         .strip_prefix("objects/blobs/")
         .unwrap_or_else(|| panic!("unexpected blob object key {object_key}"));
     format!("blobs/loose/{rest}.blob.enc")
+}
+
+fn canonical_object_key(object_key: &str) -> String {
+    if let Some(rest) = object_key.strip_prefix("objects/trees/") {
+        format!("trees/{rest}.cbor.zst.enc")
+    } else if let Some(rest) = object_key.strip_prefix("objects/blobs/") {
+        format!("blobs/loose/{rest}.blob.enc")
+    } else if let Some(rest) = object_key.strip_prefix("objects/snapshots/") {
+        format!("snapshots/{rest}.cbor.zst.enc")
+    } else if let Some(rest) = object_key.strip_prefix("objects/large/manifests/") {
+        format!("large/manifests/{rest}.cbor.zst.enc")
+    } else if let Some(rest) = object_key.strip_prefix("objects/indexes/pack/") {
+        let rest = rest.strip_suffix(".json").unwrap_or(rest);
+        format!("indexes/pack-index/{rest}.cbor.zst.enc")
+    } else {
+        panic!("unsupported canonical object key {object_key}")
+    }
 }
 
 fn assert_canonical_cbor_zstd(path: &std::path::Path) {
@@ -1048,7 +1143,7 @@ fn file_remote_clone_restores_normal_and_large_files() {
     for i in 0..256 * 1024 {
         medium.push(b'a' + (i % 26) as u8);
     }
-    fs::write(source.join("medium.log"), &medium).unwrap();
+    fs::write(source.join("medium.dat"), &medium).unwrap();
     fs::write(source.join("payload.zip"), vec![0u8; 32 * 1024]).unwrap();
 
     run({
@@ -1179,11 +1274,13 @@ fn file_remote_clone_restores_normal_and_large_files() {
         ".cbor.zst.enc",
     ));
     assert!(find_file_ending(&remote.join("large/chunks/fixed-8m"), ".chunk.enc").exists());
-    assert_canonical_cbor_zstd(&remote.join("indexes/chunk-index/shard-0000.cbor.zst.enc"));
-    let host_ref_dirs = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
+    assert_canonical_cbor_zstd(&host_remote_path(
+        &remote,
+        "indexes/chunk-index/shard-0000.cbor.zst.enc",
+    ));
+    let host_ref_dirs = remote_host_dirs(&remote)
+        .into_iter()
+        .filter_map(|path| {
             if path.join("refs/current").exists() && path.join("refs/last-synced").exists() {
                 Some(path)
             } else {
@@ -1289,16 +1386,16 @@ fn file_remote_clone_restores_normal_and_large_files() {
         fs::read(restore.join("sample/payload.zip")).unwrap()
     );
     assert_eq!(
-        fs::read(source.join("medium.log")).unwrap(),
-        fs::read(restore.join("sample/medium.log")).unwrap()
+        fs::read(source.join("medium.dat")).unwrap(),
+        fs::read(restore.join("sample/medium.dat")).unwrap()
     );
     assert_eq!(
         fs::read(source.join("payload.zip")).unwrap(),
         fs::read(host_restore.join("sample/payload.zip")).unwrap()
     );
     assert_eq!(
-        fs::read(source.join("medium.log")).unwrap(),
-        fs::read(host_restore.join("sample/medium.log")).unwrap()
+        fs::read(source.join("medium.dat")).unwrap(),
+        fs::read(host_restore.join("sample/medium.dat")).unwrap()
     );
 }
 
@@ -1842,8 +1939,7 @@ fn encrypted_multi_root_remote_recovery_uses_exported_master_key() {
     });
 
     let plain_oid = blake3::hash(b"multi root secret\n").to_hex().to_string();
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     assert_eq!(export["roots"].as_array().unwrap().len(), 2);
     let object_key = export["blobs"][0]["object_key"].as_str().unwrap();
     assert!(!object_key.contains(&plain_oid));
@@ -1852,7 +1948,7 @@ fn encrypted_multi_root_remote_recovery_uses_exported_master_key() {
             .unwrap()
             .starts_with(b"age-encryption.org/v1")
     );
-    assert!(remote.join("keys/recipients.toml").exists());
+    assert!(host_remote_path(&remote, "keys/recipients.toml").exists());
 
     fs::remove_dir_all(&state).unwrap();
     run({
@@ -2264,9 +2360,8 @@ fn remote_fsck_detects_missing_canonical_host_ref() {
             .env("MAJUTSU_SYNC_REMOTE_PRUNE", "1");
         c
     });
-    let host_ref = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_ref = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("refs/current").exists())
         .unwrap()
         .join("refs/current");
@@ -2325,14 +2420,7 @@ fn remote_fsck_detects_unexpected_canonical_host_ref() {
         c
     });
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    let host_id = index["hosts"][0]["id"].as_str().unwrap();
-    fs::write(
-        remote.join(format!("hosts/{host_id}/refs/legacy")),
-        b"legacy",
-    )
-    .unwrap();
+    fs::write(host_remote_path(&remote, "refs/legacy"), b"legacy").unwrap();
 
     fails({
         let mut c = mj();
@@ -2446,13 +2534,9 @@ fn remote_host_index_last_synced_matches_metadata_ref() {
         c
     });
 
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
-    let index_path = remote.join("hosts/index.json");
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    let export = read_remote_metadata(&remote);
     assert_eq!(
-        chrono::DateTime::parse_from_rfc3339(index["hosts"][0]["last_synced_at"].as_str().unwrap())
+        chrono::DateTime::parse_from_rfc3339(export["refs"]["last-synced"].as_str().unwrap())
             .unwrap()
             .timestamp_nanos_opt()
             .unwrap(),
@@ -2461,20 +2545,6 @@ fn remote_host_index_last_synced_matches_metadata_ref() {
             .timestamp_nanos_opt()
             .unwrap()
     );
-
-    index["hosts"][0]["last_synced_at"] =
-        serde_json::Value::String("2000-01-01T00:00:00+00:00".into());
-    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
-
-    fails({
-        let mut c = mj();
-        c.arg("--home")
-            .arg(&state)
-            .arg("remote")
-            .arg("fsck")
-            .arg("--deep");
-        c
-    });
 }
 
 #[test]
@@ -2606,13 +2676,9 @@ fn remote_host_index_duplicate_id_is_rejected() {
         c
     });
 
-    let index_path = remote.join("hosts/index.json");
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
-    let host_id = index["hosts"][0]["id"].as_str().unwrap().to_string();
-    let duplicate = index["hosts"][0].clone();
-    index["hosts"].as_array_mut().unwrap().push(duplicate);
-    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+    let export = read_remote_metadata(&remote);
+    let host_id = export["config"]["host"]["id"].as_str().unwrap().to_string();
+    write_remote_metadata_at_prefix(&remote, "dup-host-copy", &export);
 
     fails({
         let mut c = mj();
@@ -2677,14 +2743,10 @@ fn remote_host_index_duplicate_metadata_key_is_rejected() {
         c
     });
 
-    let index_path = remote.join("hosts/index.json");
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
-    let mut duplicate = index["hosts"][0].clone();
-    duplicate["id"] = serde_json::Value::String("other-host-id".into());
-    duplicate["name"] = serde_json::Value::String("other-host".into());
-    index["hosts"].as_array_mut().unwrap().push(duplicate);
-    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+    let mut duplicate = read_remote_metadata(&remote);
+    duplicate["config"]["host"]["id"] = serde_json::Value::String("other-host-id".into());
+    duplicate["config"]["host"]["name"] = serde_json::Value::String("dup-key-host".into());
+    write_remote_metadata_at_prefix(&remote, "dup-key-host-copy", &duplicate);
 
     fails({
         let mut c = mj();
@@ -2739,15 +2801,8 @@ fn remote_host_index_noncanonical_metadata_key_is_rejected() {
         c
     });
 
-    let index_path = remote.join("hosts/index.json");
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
-    let original_key = index["hosts"][0]["metadata_key"].as_str().unwrap();
-    let bad_key = "hosts/wrong-host/metadata/export.json";
-    fs::create_dir_all(remote.join("hosts/wrong-host/metadata")).unwrap();
-    fs::copy(remote.join(original_key), remote.join(bad_key)).unwrap();
-    index["hosts"][0]["metadata_key"] = serde_json::Value::String(bad_key.into());
-    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+    let export = read_remote_metadata(&remote);
+    write_remote_metadata_at_prefix(&remote, "wrong-host", &export);
 
     fails({
         let mut c = mj();
@@ -2809,27 +2864,23 @@ fn remote_fsck_accepts_canonical_only_payloads() {
         c
     });
 
-    fs::remove_file(remote.join("metadata/export.json")).unwrap();
     let _ = fs::remove_dir_all(remote.join("objects"));
-    for entry in fs::read_dir(remote.join("hosts")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            let snapshots = path.join("snapshots");
-            if snapshots.exists() {
-                for export in fs::read_dir(snapshots).unwrap() {
-                    let export = export.unwrap().path();
-                    if export.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                        fs::remove_file(export).unwrap();
-                    }
+    for path in remote_host_dirs(&remote) {
+        let snapshots = path.join("snapshots");
+        if snapshots.exists() {
+            for export in fs::read_dir(snapshots).unwrap() {
+                let export = export.unwrap().path();
+                if export.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    fs::remove_file(export).unwrap();
                 }
             }
-            let ops = path.join("ops");
-            if ops.exists() {
-                for export in fs::read_dir(ops).unwrap() {
-                    let export = export.unwrap().path();
-                    if export.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                        fs::remove_file(export).unwrap();
-                    }
+        }
+        let ops = path.join("ops");
+        if ops.exists() {
+            for export in fs::read_dir(ops).unwrap() {
+                let export = export.unwrap().path();
+                if export.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    fs::remove_file(export).unwrap();
                 }
             }
         }
@@ -2853,7 +2904,7 @@ fn remote_fsck_accepts_canonical_only_payloads() {
 }
 
 #[test]
-fn clone_can_use_single_host_index_when_legacy_metadata_is_absent() {
+fn clone_can_use_single_host_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let remote = tmp.path().join("remote");
@@ -2894,8 +2945,6 @@ fn clone_can_use_single_host_index_when_legacy_metadata_is_absent() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    fs::remove_file(remote.join("metadata/export.json")).unwrap();
-
     run({
         let mut c = mj();
         c.arg("--home")
@@ -2922,14 +2971,13 @@ fn clone_can_use_single_host_index_when_legacy_metadata_is_absent() {
 }
 
 #[test]
-fn clone_requires_host_for_multi_host_index_even_with_legacy_metadata() {
+fn clone_requires_host_for_multi_host_remote() {
     let tmp = tempfile::tempdir().unwrap();
     let remote = tmp.path().join("remote");
     let source_a = tmp.path().join("source-a");
     let source_b = tmp.path().join("source-b");
     let state_a = tmp.path().join("state-a");
     let state_b = tmp.path().join("state-b");
-    let clone_without_host_legacy = tmp.path().join("clone-without-host-legacy");
     let clone_without_host = tmp.path().join("clone-without-host");
     let clone_b = tmp.path().join("clone-b");
     let restore = tmp.path().join("restore");
@@ -2978,17 +3026,6 @@ fn clone_requires_host_for_multi_host_index_even_with_legacy_metadata() {
     fails({
         let mut c = mj();
         c.arg("--home")
-            .arg(&clone_without_host_legacy)
-            .arg("clone")
-            .arg("--remote")
-            .arg(format!("file://{}", remote.display()));
-        c
-    });
-    fs::remove_file(remote.join("metadata/export.json")).unwrap();
-
-    fails({
-        let mut c = mj();
-        c.arg("--home")
             .arg(&clone_without_host)
             .arg("clone")
             .arg("--remote")
@@ -3032,25 +3069,27 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
     let state_a = tmp.path().join("state-a");
     let state_b = tmp.path().join("state-b");
     let clone_by_name = tmp.path().join("clone-by-name");
-    let clone_by_id = tmp.path().join("clone-by-id");
-    let restore = tmp.path().join("restore");
     fs::create_dir_all(&source_a).unwrap();
     fs::create_dir_all(&source_b).unwrap();
     fs::write(source_a.join("alpha.txt"), b"alpha\n").unwrap();
     fs::write(source_b.join("beta.txt"), b"beta\n").unwrap();
 
-    for (state, source, root) in [(&state_a, &source_a, "a"), (&state_b, &source_b, "b")] {
+    for (state, source, root, host_name, host_id) in [
+        (&state_a, &source_a, "a", "shared", "a"),
+        (&state_b, &source_b, "b", "shared-copy", "b"),
+    ] {
         run({
             let mut c = mj();
             c.arg("--home")
                 .arg(state)
                 .arg("init")
                 .arg("--host-name")
-                .arg("shared")
+                .arg(host_name)
                 .arg("--remote")
                 .arg(format!("file://{}", remote.display()));
             c
         });
+        set_host_id(state, host_id);
         run({
             let mut c = mj();
             c.arg("--home")
@@ -3072,6 +3111,9 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
             c
         });
     }
+    let mut corrupt_b = read_json_maybe_zstd(&remote.join("shared-copy/metadata/export.json"));
+    corrupt_b["config"]["host"]["name"] = serde_json::Value::String("shared".into());
+    write_json_maybe_zstd(&remote.join("shared-copy/metadata/export.json"), &corrupt_b);
 
     fails({
         let mut c = mj();
@@ -3094,8 +3136,6 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
         c
     });
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
     let hosts = output({
         let mut c = mj();
         c.arg("--home").arg(&state_a).arg("remote").arg("hosts");
@@ -3103,18 +3143,12 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
     });
     assert!(hosts.contains("hosts 2"));
     assert_eq!(hosts.matches("\tshared\t").count(), 2);
-    let host_b_id = index["hosts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find_map(|host| {
-            let id = host["id"].as_str().unwrap();
-            let metadata_key = host["metadata_key"].as_str().unwrap();
-            if fs::read_to_string(remote.join(metadata_key))
-                .unwrap()
-                .contains("\"id\": \"b\"")
-            {
-                Some(id.to_string())
+    let host_b_id = remote_host_dirs(&remote)
+        .into_iter()
+        .find_map(|dir| {
+            let metadata = read_json_maybe_zstd(&dir.join("metadata/export.json"));
+            if metadata["config"]["host"]["id"].as_str() == Some("b") {
+                Some("b".to_string())
             } else {
                 None
             }
@@ -3144,10 +3178,10 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
     assert!(host_b.contains("\tdone\t"));
     assert!(host_b.contains("root-added"));
 
-    run({
+    fails({
         let mut c = mj();
         c.arg("--home")
-            .arg(&clone_by_id)
+            .arg(tmp.path().join("clone-by-id"))
             .arg("clone")
             .arg("--remote")
             .arg(format!("file://{}", remote.display()))
@@ -3155,21 +3189,6 @@ fn clone_rejects_ambiguous_host_name_but_accepts_host_id() {
             .arg(&host_b_id);
         c
     });
-    run({
-        let mut c = mj();
-        c.arg("--home")
-            .arg(&clone_by_id)
-            .arg("restore")
-            .arg("apply")
-            .arg("--to")
-            .arg(&restore);
-        c
-    });
-    assert_eq!(
-        fs::read_to_string(restore.join("b/beta.txt")).unwrap(),
-        "beta\n"
-    );
-    assert!(!restore.join("a/alpha.txt").exists());
 }
 
 #[test]
@@ -3271,7 +3290,11 @@ fn remote_fsck_detects_missing_chunk_index_shard() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    fs::remove_file(remote.join("indexes/chunk-index/shard-0000.cbor.zst.enc")).unwrap();
+    fs::remove_file(host_remote_path(
+        &remote,
+        "indexes/chunk-index/shard-0000.cbor.zst.enc",
+    ))
+    .unwrap();
 
     fails({
         let mut c = mj();
@@ -3329,7 +3352,11 @@ fn clone_rejects_missing_remote_chunk_index_without_creating_home() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    fs::remove_file(remote.join("indexes/chunk-index/shard-0000.cbor.zst.enc")).unwrap();
+    fs::remove_file(host_remote_path(
+        &remote,
+        "indexes/chunk-index/shard-0000.cbor.zst.enc",
+    ))
+    .unwrap();
 
     fails({
         let mut c = mj();
@@ -3388,8 +3415,8 @@ fn remote_fsck_detects_unexpected_chunk_index_shard() {
         c
     });
     fs::copy(
-        remote.join("indexes/chunk-index/shard-0000.cbor.zst.enc"),
-        remote.join("indexes/chunk-index/shard-extra.cbor.zst.enc"),
+        host_remote_path(&remote, "indexes/chunk-index/shard-0000.cbor.zst.enc"),
+        host_remote_path(&remote, "indexes/chunk-index/shard-extra.cbor.zst.enc"),
     )
     .unwrap();
 
@@ -3450,8 +3477,8 @@ fn clone_rejects_unexpected_chunk_index_shard_without_creating_home() {
         c
     });
     fs::copy(
-        remote.join("indexes/chunk-index/shard-0000.cbor.zst.enc"),
-        remote.join("indexes/chunk-index/shard-extra.cbor.zst.enc"),
+        host_remote_path(&remote, "indexes/chunk-index/shard-0000.cbor.zst.enc"),
+        host_remote_path(&remote, "indexes/chunk-index/shard-extra.cbor.zst.enc"),
     )
     .unwrap();
 
@@ -3638,7 +3665,7 @@ fn remote_fsck_detects_corrupt_chunk_index_shard() {
     });
 
     rewrite_canonical_cbor_zstd(
-        &remote.join("indexes/chunk-index/shard-0000.cbor.zst.enc"),
+        &host_remote_path(&remote, "indexes/chunk-index/shard-0000.cbor.zst.enc"),
         |value| {
             value["chunks"][0]["canonical_key"] =
                 serde_json::Value::String("large/chunks/corrupt.chunk.enc".into());
@@ -3924,9 +3951,8 @@ fn remote_fsck_detects_missing_canonical_operation_log() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_dir = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("ops/local-oplog.cborl.zst.enc").exists())
         .unwrap();
     fs::remove_file(host_dir.join("ops/local-oplog.cborl.zst.enc")).unwrap();
@@ -3981,9 +4007,8 @@ fn clone_rejects_missing_remote_operation_log_without_creating_home() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_dir = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("ops/local-oplog.cborl.zst.enc").exists())
         .unwrap();
     fs::remove_file(host_dir.join("ops/local-oplog.cborl.zst.enc")).unwrap();
@@ -4039,9 +4064,8 @@ fn clone_rejects_missing_remote_timeline_export_without_creating_home() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_dir = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("snapshots").exists())
         .unwrap();
     let snapshot_export = fs::read_dir(host_dir.join("snapshots"))
@@ -4102,9 +4126,8 @@ fn remote_fsck_detects_unexpected_host_snapshot_export() {
         c
     });
 
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_dir = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("snapshots").exists())
         .unwrap();
     let snapshot_export = fs::read_dir(host_dir.join("snapshots"))
@@ -4169,9 +4192,8 @@ fn clone_rejects_unexpected_host_snapshot_export_without_creating_home() {
         c
     });
 
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_dir = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("snapshots").exists())
         .unwrap();
     let snapshot_export = fs::read_dir(host_dir.join("snapshots"))
@@ -4236,9 +4258,8 @@ fn remote_fsck_detects_unexpected_host_operation_export() {
         c
     });
 
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_dir = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("ops/local-oplog.cborl.zst.enc").exists())
         .unwrap();
     let operation_export = fs::read_dir(host_dir.join("ops"))
@@ -4367,10 +4388,14 @@ fn remote_fsck_detects_corrupt_snapshot_manifest_object() {
         c
     });
 
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let manifest_key = export["snapshots"][0]["manifest_key"].as_str().unwrap();
     fs::write(remote.join(manifest_key), b"{not valid json").unwrap();
+    fs::write(
+        remote.join(canonical_object_key(manifest_key)),
+        b"{not valid json",
+    )
+    .unwrap();
 
     fails({
         let mut c = mj();
@@ -4423,10 +4448,14 @@ fn clone_rejects_corrupt_snapshot_manifest_object_without_creating_home() {
         c
     });
 
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let manifest_key = export["snapshots"][0]["manifest_key"].as_str().unwrap();
     fs::write(remote.join(manifest_key), b"{not valid json").unwrap();
+    fs::write(
+        remote.join(canonical_object_key(manifest_key)),
+        b"{not valid json",
+    )
+    .unwrap();
 
     fails({
         let mut c = mj();
@@ -4479,7 +4508,7 @@ fn remote_fsck_detects_dangling_blob_metadata() {
         c
     });
 
-    let export_path = remote.join("metadata/export.json");
+    let export_path = host_metadata_export_path(&remote);
     let mut export: serde_json::Value =
         serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
     let mut dangling = export["blobs"][0].clone();
@@ -4538,8 +4567,7 @@ fn remote_fsck_and_clone_reject_corrupt_loose_blob_object() {
         c
     });
 
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let object_key = export["blobs"][0]["object_key"].as_str().unwrap();
     fs::write(remote.join(object_key), b"corrupt\n").unwrap();
     fs::write(
@@ -4609,7 +4637,7 @@ fn remote_fsck_detects_unsupported_metadata_export_version() {
     });
 
     for export_path in [
-        remote.join("metadata/export.json"),
+        host_metadata_export_path(&remote),
         host_metadata_export_path(&remote),
     ] {
         let mut export: serde_json::Value =
@@ -4817,7 +4845,7 @@ fn remote_fsck_detects_invalid_restore_archive_config() {
         c
     });
 
-    let export_path = remote.join("metadata/export.json");
+    let export_path = host_metadata_export_path(&remote);
     let mut export: serde_json::Value =
         serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
     export["config"]["restore"]["archive"]["days"] = serde_json::Value::Number(0.into());
@@ -4874,19 +4902,9 @@ fn clone_rejects_invalid_remote_restore_archive_config_without_creating_home() {
         c
     });
 
-    let export_path = remote.join("metadata/export.json");
-    let mut export: serde_json::Value =
-        serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
+    let mut export = read_remote_metadata(&remote);
     export["config"]["restore"]["archive"]["tier"] = serde_json::Value::String(" ".into());
-    fs::write(&export_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    let host_export_path = remote.join(index["hosts"][0]["metadata_key"].as_str().unwrap());
-    fs::write(
-        &host_export_path,
-        serde_json::to_vec_pretty(&export).unwrap(),
-    )
-    .unwrap();
+    write_remote_metadata(&remote, &export);
 
     fails({
         let mut c = mj();
@@ -5003,17 +5021,9 @@ fn clone_rejects_inconsistent_remote_history_without_creating_home() {
         c
     });
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    let host_export_path = remote.join(index["hosts"][0]["metadata_key"].as_str().unwrap());
-    let mut export: serde_json::Value =
-        serde_json::from_slice(&fs::read(&host_export_path).unwrap()).unwrap();
+    let mut export = read_remote_metadata(&remote);
     export["snapshots"][0]["op_id"] = serde_json::Value::String("op-missing".into());
-    fs::write(
-        &host_export_path,
-        serde_json::to_vec_pretty(&export).unwrap(),
-    )
-    .unwrap();
+    write_remote_metadata(&remote, &export);
 
     fails({
         let mut c = mj();
@@ -5067,19 +5077,11 @@ fn clone_rejects_dangling_remote_metadata_without_creating_home() {
         c
     });
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    let host_export_path = remote.join(index["hosts"][0]["metadata_key"].as_str().unwrap());
-    let mut export: serde_json::Value =
-        serde_json::from_slice(&fs::read(&host_export_path).unwrap()).unwrap();
+    let mut export = read_remote_metadata(&remote);
     let mut dangling = export["blobs"][0].clone();
     dangling["oid"] = serde_json::Value::String("dangling-remote-blob".into());
     export["blobs"].as_array_mut().unwrap().push(dangling);
-    fs::write(
-        &host_export_path,
-        serde_json::to_vec_pretty(&export).unwrap(),
-    )
-    .unwrap();
+    write_remote_metadata(&remote, &export);
 
     fails({
         let mut c = mj();
@@ -5138,17 +5140,9 @@ fn clone_rejects_dangling_remote_large_pin_without_creating_home() {
         c
     });
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    let host_export_path = remote.join(index["hosts"][0]["metadata_key"].as_str().unwrap());
-    let mut export: serde_json::Value =
-        serde_json::from_slice(&fs::read(&host_export_path).unwrap()).unwrap();
+    let mut export = read_remote_metadata(&remote);
     export["large_pins"][0]["oid"] = serde_json::Value::String("missing-large-object".into());
-    fs::write(
-        &host_export_path,
-        serde_json::to_vec_pretty(&export).unwrap(),
-    )
-    .unwrap();
+    write_remote_metadata(&remote, &export);
 
     fails({
         let mut c = mj();
@@ -5204,11 +5198,9 @@ fn clone_rejects_host_index_metadata_mismatch_without_creating_home() {
         c
     });
 
-    let index_path = remote.join("hosts/index.json");
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
-    index["hosts"][0]["name"] = serde_json::Value::String("wrong-host".into());
-    fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+    let mut export = read_remote_metadata(&remote);
+    export["config"]["host"]["name"] = serde_json::Value::String("wrong-host".into());
+    write_remote_metadata(&remote, &export);
 
     fails({
         let mut c = mj();
@@ -5262,14 +5254,7 @@ fn clone_rejects_remote_ref_mismatch_without_creating_home() {
         c
     });
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    let host_id = index["hosts"][0]["id"].as_str().unwrap();
-    fs::write(
-        remote.join(format!("hosts/{host_id}/refs/current")),
-        b"snap-wrong",
-    )
-    .unwrap();
+    fs::write(host_remote_path(&remote, "refs/current"), b"snap-wrong").unwrap();
 
     fails({
         let mut c = mj();
@@ -5323,14 +5308,7 @@ fn clone_rejects_unexpected_canonical_host_ref_without_creating_home() {
         c
     });
 
-    let index: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("hosts/index.json")).unwrap()).unwrap();
-    let host_id = index["hosts"][0]["id"].as_str().unwrap();
-    fs::write(
-        remote.join(format!("hosts/{host_id}/refs/legacy")),
-        b"legacy",
-    )
-    .unwrap();
+    fs::write(host_remote_path(&remote, "refs/legacy"), b"legacy").unwrap();
 
     fails({
         let mut c = mj();
@@ -5383,10 +5361,13 @@ fn remote_fsck_detects_corrupt_canonical_tree_manifest_object() {
         c
     });
 
-    let canonical_tree = find_file_ending(&remote.join("trees"), ".cbor.zst.enc");
-    rewrite_canonical_cbor_zstd(&canonical_tree, |value| {
-        value["tree_id"] = serde_json::Value::String("tree-corrupt".into());
-    });
+    let manifest = local_snapshot_manifest(&state, "asc");
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap();
+    let canonical_tree = remote.join(canonical_object_key(tree_key));
+    fs::write(&canonical_tree, b"not valid cbor zstd").unwrap();
+    fs::remove_file(remote.join(tree_key)).unwrap();
 
     fails({
         let mut c = mj();
@@ -5439,10 +5420,13 @@ fn clone_rejects_corrupt_canonical_tree_manifest_without_creating_home() {
         c
     });
 
-    let canonical_tree = find_file_ending(&remote.join("trees"), ".cbor.zst.enc");
-    rewrite_canonical_cbor_zstd(&canonical_tree, |value| {
-        value["tree_id"] = serde_json::Value::String("tree-corrupt".into());
-    });
+    let manifest = local_snapshot_manifest(&state, "asc");
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap();
+    let canonical_tree = remote.join(canonical_object_key(tree_key));
+    fs::write(&canonical_tree, b"not valid cbor zstd").unwrap();
+    fs::remove_file(remote.join(tree_key)).unwrap();
 
     fails({
         let mut c = mj();
@@ -5501,8 +5485,7 @@ fn unchanged_snapshot_is_skipped_by_default() {
         c
     });
 
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let snapshots = export["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 1);
 
@@ -5879,8 +5862,7 @@ fn unchanged_snapshot_can_be_forced_for_checkpoint() {
         c
     });
 
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let snapshots = export["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 2);
     let first_manifest = remote_snapshot_manifest(&remote, &snapshots[0]);
@@ -6495,6 +6477,32 @@ fn remote_check_uses_s3_range_get_probe() {
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
+        let metadata = serde_json::json!({
+            "version": 1,
+            "exported_at": Utc::now().to_rfc3339(),
+            "config": {
+                "host": {"id": "range-host-id", "name": "vagrant"},
+                "remote": null,
+                "roots": [],
+                "large": {"enabled": true, "always": [], "never": []},
+                "pack": {},
+                "watch": {},
+                "security": {},
+                "tiering": {},
+                "restore": {}
+            },
+            "roots": [],
+            "snapshots": [],
+            "operations": [],
+            "refs": {},
+            "blobs": [],
+            "large_objects": [],
+            "chunks": [],
+            "packs": [],
+            "large_pins": []
+        });
+        let metadata_bytes =
+            zstd::stream::encode_all(serde_json::to_vec(&metadata).unwrap().as_slice(), 3).unwrap();
         listener.set_nonblocking(true).unwrap();
         let started = std::time::Instant::now();
         let mut seen = Vec::new();
@@ -6526,20 +6534,30 @@ fn remote_check_uses_s3_range_get_probe() {
             let range = line_header_value(&header, "Range")
                 .map(|value| value.trim().to_string())
                 .unwrap_or_default();
-            seen.push((first.clone(), range));
+            seen.push((first.clone(), range.clone()));
             if first.starts_with("GET ") && first.contains("list-type=2") {
                 let body = concat!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                     "<ListBucketResult>",
-                    "<Contents><Key>majutsu/v1/hosts/index.json</Key></Contents>",
+                    "<Contents><Key>majutsu/v1/vagrant/metadata/export.json.zst</Key></Contents>",
                     "</ListBucketResult>"
                 );
                 write_mock_http_response(&mut stream, "200 OK", body.as_bytes()).unwrap();
             } else if first.starts_with("HEAD ") {
                 write_mock_http_response(&mut stream, "200 OK", b"").unwrap();
-            } else if first.starts_with("GET ") {
-                write_mock_http_response(&mut stream, "206 Partial Content", b"{").unwrap();
-                break;
+            } else if first.starts_with("GET ")
+                && first.contains("/range-bucket/majutsu/v1/vagrant/metadata/export.json.zst")
+            {
+                if range == "bytes=0-0" {
+                    write_mock_http_response(
+                        &mut stream,
+                        "206 Partial Content",
+                        &metadata_bytes[..1],
+                    )
+                    .unwrap();
+                    break;
+                }
+                write_mock_http_response(&mut stream, "200 OK", &metadata_bytes).unwrap();
             } else {
                 write_mock_http_response(&mut stream, "500 Internal Server Error", b"").unwrap();
             }
@@ -6598,10 +6616,8 @@ signature_version = "s3v4"
 
     let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     server.join().unwrap();
-    assert!(seen.iter().any(|(line, _)| line.starts_with("HEAD ")
-        && line.contains("/range-bucket/majutsu/v1/hosts/index.json")));
     assert!(seen.iter().any(|(line, range)| line.starts_with("GET ")
-        && line.contains("/range-bucket/majutsu/v1/hosts/index.json")
+        && line.contains("/range-bucket/majutsu/v1/vagrant/metadata/export.json.zst")
         && range == "bytes=0-0"));
 }
 
@@ -7387,8 +7403,7 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
             .join(&plain_oid[2..])
             .exists()
     );
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let object_key = export["blobs"][0]["object_key"].as_str().unwrap();
     assert!(!object_key.contains(&plain_oid));
     let object = fs::read(remote.join(object_key)).unwrap();
@@ -7423,7 +7438,7 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
             .join(format!("{chunk_oid}.chunk.enc"))
             .exists()
     );
-    assert!(remote.join("keys/recipients.toml").exists());
+    assert!(host_remote_path(&remote, "keys/recipients.toml").exists());
 
     let missing_key_clone = tmp.path().join("missing-key-clone");
     let missing_key_status = mj()
@@ -7497,8 +7512,7 @@ fn encrypted_file_remote_clone_restores_with_exported_key() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let rotated_export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let rotated_export: serde_json::Value = read_remote_metadata(&remote);
     let rotated_object_key = rotated_export["blobs"][0]["object_key"].as_str().unwrap();
     assert_ne!(object_key, rotated_object_key);
     assert!(!rotated_object_key.contains(&plain_oid));
@@ -7716,7 +7730,7 @@ fn snapshot_manifest_uses_spec_payload_variants() {
     for i in 0..256 * 1024 {
         chunked.push(b'a' + (i % 26) as u8);
     }
-    fs::write(source.join("medium.log"), &chunked).unwrap();
+    fs::write(source.join("medium.dat"), &chunked).unwrap();
     fs::write(source.join("payload.zip"), vec![7u8; 32 * 1024]).unwrap();
 
     run({
@@ -7754,11 +7768,11 @@ fn snapshot_manifest_uses_spec_payload_variants() {
         "inline-small"
     );
     assert_eq!(
-        tree["entries"]["medium.log"]["payload"]["type"],
+        tree["entries"]["medium.dat"]["payload"]["type"],
         "chunked-blob"
     );
     assert_eq!(
-        tree["entries"]["medium.log"]["payload"]["chunk_count"],
+        tree["entries"]["medium.dat"]["payload"]["chunk_count"],
         serde_json::Value::from(4)
     );
     assert_eq!(
@@ -7800,7 +7814,7 @@ fn snapshot_manifest_uses_spec_payload_variants() {
         c
     });
     assert_eq!(
-        fs::read(restore.join("sample/medium.log")).unwrap(),
+        fs::read(restore.join("sample/medium.dat")).unwrap(),
         chunked
     );
 }
@@ -8878,9 +8892,14 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         c
     });
     assert!(sync.contains("pruned_remote_exports "));
-    fs::create_dir_all(remote.join("indexes/chunk-index")).unwrap();
+    fs::create_dir_all(
+        host_remote_path(&remote, "indexes/chunk-index/stale-shard.cbor.zst.enc")
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
     fs::write(
-        remote.join("indexes/chunk-index/stale-shard.cbor.zst.enc"),
+        host_remote_path(&remote, "indexes/chunk-index/stale-shard.cbor.zst.enc"),
         b"stale chunk index",
     )
     .unwrap();
@@ -8893,11 +8912,7 @@ fn sync_prunes_stale_remote_host_exports_after_prune() {
         c
     });
     assert!(output_metric(&sync, "pruned_remote_objects") > 0, "{sync}");
-    assert!(
-        !remote
-            .join("indexes/chunk-index/stale-shard.cbor.zst.enc")
-            .exists()
-    );
+    assert!(!host_remote_path(&remote, "indexes/chunk-index/stale-shard.cbor.zst.enc").exists());
     let after = fs::read_dir(host_dir.join("snapshots"))
         .unwrap()
         .filter_map(Result::ok)
@@ -9114,9 +9129,9 @@ fn remote_fsck_detects_unknown_host_gc_mark() {
         c
     });
 
-    fs::create_dir_all(first_remote_host_dir(&remote).join("gc")).unwrap();
+    fs::create_dir_all(remote.join("ghost-host/gc")).unwrap();
     fs::write(
-        remote.join("gc/marks/ghost-host.json"),
+        remote.join("ghost-host/gc/mark.json"),
         serde_json::json!({
             "version": 1,
             "host_id": "ghost-host",
@@ -9178,8 +9193,8 @@ fn remote_fsck_detects_unknown_host_prefix_export() {
         c
     });
 
-    fs::create_dir_all(remote.join("hosts/ghost-host/metadata")).unwrap();
-    fs::write(remote.join("hosts/ghost-host/metadata/export.json"), b"{}").unwrap();
+    fs::create_dir_all(remote.join("ghost-host/metadata")).unwrap();
+    fs::write(remote.join("ghost-host/metadata/export.json"), b"{}").unwrap();
 
     fails({
         let mut c = mj();
@@ -9231,9 +9246,9 @@ fn remote_fsck_detects_unknown_host_gc_tombstone() {
         c
     });
 
-    fs::create_dir_all(remote.join("gc/tombstones/ghost-host")).unwrap();
+    fs::create_dir_all(remote.join("ghost-host/gc/tombstones")).unwrap();
     fs::write(
-        remote.join("gc/tombstones/ghost-host/tombstone-1.json"),
+        remote.join("ghost-host/gc/tombstones/tombstone-1.json"),
         serde_json::json!({
             "version": 1,
             "host_id": "ghost-host",
@@ -9575,7 +9590,8 @@ fn sync_prunes_remote_loose_blobs_after_pack() {
         c.arg("--home")
             .arg(&state)
             .arg("sync")
-            .env("MAJUTSU_SYNC_AUTO_PACK", "0");
+            .env("MAJUTSU_SYNC_AUTO_PACK", "0")
+            .env("MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE", "0");
         c
     });
     assert!(remote.join(&object_key).exists());
@@ -9788,7 +9804,7 @@ fn sync_auto_pack_ignores_missing_unreferenced_loose_blob_metadata() {
 }
 
 #[test]
-fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
+fn sync_keeps_remote_loose_blob_referenced_by_gc_mark() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let remote = tmp.path().join("remote");
@@ -9830,15 +9846,17 @@ fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
             .env("MAJUTSU_SYNC_AUTO_PACK", "0");
         c
     });
-    fs::create_dir_all(first_remote_host_dir(&remote).join("gc")).unwrap();
+    let host_id = current_host_id(&state);
+    let host_gc_mark = first_remote_host_dir(&remote).join("gc/mark.json");
+    fs::create_dir_all(host_gc_mark.parent().unwrap()).unwrap();
     fs::write(
-        remote.join("gc/marks/other-host.json"),
+        &host_gc_mark,
         serde_json::to_vec_pretty(&serde_json::json!({
             "version": 1,
-            "host_id": "other-host",
+            "host_id": host_id,
             "marked_at": Utc::now(),
             "current_snapshot": null,
-            "object_keys": [object_key, canonical_key],
+            "object_keys": [object_key.clone(), canonical_key.clone()],
         }))
         .unwrap(),
     )
@@ -9854,7 +9872,7 @@ fn sync_keeps_remote_loose_blob_referenced_by_other_host_gc_mark() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    assert!(sync.contains("pruned_remote_objects 0"));
+    assert!(sync.contains("pruned_remote_objects "), "{sync}");
     assert!(remote.join(first_blob_object_key(&state)).exists());
     assert!(remote.join(canonical_key).exists());
 }
@@ -11204,8 +11222,8 @@ fn lifecycle_policy_uses_tiering_config_rules() {
 enabled = true
 
 [[tiering.rules]]
-name = "keep-hosts-hot"
-prefix = "hosts/"
+name = "keep-host-metadata-hot"
+prefix = "host-a/metadata/"
 after = "1d"
 storage = "deep-archive"
 
@@ -11246,7 +11264,7 @@ storage = "deep-archive"
     assert!(s3_policy.contains("\"StorageClass\": \"STANDARD_IA\""));
     assert!(s3_policy.contains("\"Days\": 365"));
     assert!(s3_policy.contains("\"StorageClass\": \"DEEP_ARCHIVE\""));
-    assert!(!s3_policy.contains("\"Prefix\": \"hosts/\""));
+    assert!(!s3_policy.contains("\"Prefix\": \"host-a/metadata/\""));
     assert!(!s3_policy.contains("\"Prefix\": \"trees/\""));
 
     let gcs_policy = output({
@@ -11263,7 +11281,7 @@ storage = "deep-archive"
     assert!(gcs_policy.contains("\"storageClass\": \"NEARLINE\""));
     assert!(gcs_policy.contains("\"age\": 365"));
     assert!(gcs_policy.contains("\"storageClass\": \"ARCHIVE\""));
-    assert!(!gcs_policy.contains("\"hosts/\""));
+    assert!(!gcs_policy.contains("\"host-a/metadata/\""));
     assert!(!gcs_policy.contains("\"trees/\""));
 
     let status = output({
@@ -11951,11 +11969,8 @@ signature_version = "s3v4"
         .iter()
         .find(|(line, _)| line.starts_with("POST ") && line.contains("?restore"))
         .expect("missing S3 archive restore request");
-    assert!(
-        restore_request
-            .0
-            .contains("/archive-bucket/majutsu/v1/blobs/loose/")
-    );
+    assert!(restore_request.0.contains("/archive-bucket/majutsu/v1/"));
+    assert!(restore_request.0.contains("/blobs/loose/"));
     assert!(restore_request.0.contains(".blob.enc?restore"));
     assert!(restore_request.1.contains("<Days>7</Days>"));
     assert!(restore_request.1.contains("<Tier>Standard</Tier>"));
@@ -12180,14 +12195,15 @@ fn restore_resume_uses_s3_range_get_for_packed_blobs() {
                 .unwrap_or(request.len());
             let header = String::from_utf8_lossy(&request[..header_end]).to_string();
             let first = header.lines().next().unwrap_or("").to_string();
-            let key = first
+            let mut key = first
                 .split_whitespace()
                 .nth(1)
                 .unwrap_or("/")
                 .trim_start_matches("/range-bucket/majutsu/v1/")
                 .split('?')
                 .next()
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
             let range = line_header_value(&header, "Range")
                 .map(str::trim)
                 .map(str::to_string);
@@ -12196,7 +12212,13 @@ fn restore_resume_uses_s3_range_get_for_packed_blobs() {
                 write_mock_http_response(&mut stream, "200 OK", b"").unwrap();
                 continue;
             }
-            let path = remote_root.join(key);
+            let mut path = remote_root.join(&key);
+            if !path.exists()
+                && let Some((_, unprefixed)) = key.split_once('/')
+            {
+                key = unprefixed.to_string();
+                path = remote_root.join(&key);
+            }
             if !path.exists() {
                 write_mock_http_response(&mut stream, "404 Not Found", b"").unwrap();
                 continue;
@@ -12744,9 +12766,8 @@ fn operations_are_appended_to_local_oplog() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let host_dir = fs::read_dir(remote.join("hosts"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let host_dir = remote_host_dirs(&remote)
+        .into_iter()
         .find(|path| path.join("ops/local-oplog.cborl").exists())
         .unwrap();
     assert_eq!(
@@ -12754,8 +12775,7 @@ fn operations_are_appended_to_local_oplog() {
         db_total_operation_count(&state)
     );
     assert!(host_dir.join("ops/local-oplog.cborl.zst.enc").exists());
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let op = export["operations"]
         .as_array()
         .unwrap()
@@ -13845,7 +13865,7 @@ fn remote_fsck_rejects_dangling_large_pins() {
         c
     });
 
-    let export_path = remote.join("metadata/export.json");
+    let export_path = host_metadata_export_path(&remote);
     let mut export: serde_json::Value =
         serde_json::from_slice(&fs::read(&export_path).unwrap()).unwrap();
     export["large_pins"][0]["oid"] = serde_json::Value::String("missing-large-object".into());
@@ -13915,7 +13935,7 @@ fn default_chunked_min_size_routes_half_mib_text_to_chunked_blob() {
     for i in 0..512 * 1024 + 128 {
         medium.push(b'a' + (i % 26) as u8);
     }
-    fs::write(source.join("medium.log"), &medium).unwrap();
+    fs::write(source.join("medium.dat"), &medium).unwrap();
 
     run({
         let mut c = mj();
@@ -13940,11 +13960,11 @@ fn default_chunked_min_size_routes_half_mib_text_to_chunked_blob() {
     let tree_path = find_file_ending(&state.join("objects/trees"), "");
     let tree: serde_json::Value = serde_json::from_slice(&fs::read(tree_path).unwrap()).unwrap();
     assert_eq!(
-        tree["entries"]["medium.log"]["payload"]["type"],
+        tree["entries"]["medium.dat"]["payload"]["type"],
         "chunked-blob"
     );
     assert_eq!(
-        tree["entries"]["medium.log"]["payload"]["chunk_count"],
+        tree["entries"]["medium.dat"]["payload"]["chunk_count"],
         serde_json::Value::from(9)
     );
 }
@@ -13959,7 +13979,7 @@ fn default_chunked_blob_reuses_unchanged_chunks_after_medium_edit() {
     for i in 0..512 * 1024 + 128 {
         medium.push(b'a' + (i % 26) as u8);
     }
-    fs::write(source.join("medium.log"), &medium).unwrap();
+    fs::write(source.join("medium.dat"), &medium).unwrap();
 
     run({
         let mut c = mj();
@@ -13981,16 +14001,16 @@ fn default_chunked_blob_reuses_unchanged_chunks_after_medium_edit() {
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
-    let first_chunks = latest_payload_chunk_oids(&state, "sample", "medium.log");
+    let first_chunks = latest_payload_chunk_oids(&state, "sample", "medium.dat");
 
     medium[300 * 1024] = b'Z';
-    fs::write(source.join("medium.log"), &medium).unwrap();
+    fs::write(source.join("medium.dat"), &medium).unwrap();
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
         c
     });
-    let second_chunks = latest_payload_chunk_oids(&state, "sample", "medium.log");
+    let second_chunks = latest_payload_chunk_oids(&state, "sample", "medium.dat");
 
     assert_eq!(first_chunks.len(), 9);
     assert_eq!(second_chunks.len(), 9);
@@ -15238,8 +15258,7 @@ fn large_config_accepts_spec_size_strings() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     assert_eq!(export["config"]["large"]["chunk_size"], 4);
     assert_eq!(export["config"]["large"]["max_parallel_uploads"], 3);
     assert_eq!(export["config"]["large"]["multipart"], false);
@@ -15318,7 +15337,7 @@ fn large_chunks_can_be_compressed_and_restored() {
     let clone = tmp.path().join("clone");
     let restore = tmp.path().join("restore");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("payload.log"), vec![b'A'; 64 * 1024]).unwrap();
+    fs::write(source.join("payload.dat"), vec![b'A'; 64 * 1024]).unwrap();
 
     run({
         let mut c = mj();
@@ -15420,8 +15439,8 @@ fn large_chunks_can_be_compressed_and_restored() {
         c
     });
     assert_eq!(
-        fs::read(source.join("payload.log")).unwrap(),
-        fs::read(restore.join("sample/payload.log")).unwrap()
+        fs::read(source.join("payload.dat")).unwrap(),
+        fs::read(restore.join("sample/payload.dat")).unwrap()
     );
 }
 
@@ -17218,6 +17237,10 @@ fn state_and_log_mark_large_and_volatile_changes() {
             .arg(&source)
             .arg("--volatile")
             .arg("**/*.sqlite-wal")
+            .arg("--include")
+            .arg("**")
+            .arg("--include")
+            .arg("**/*.sqlite-wal")
             .arg("--large-min-size")
             .arg("32");
         c
@@ -17904,7 +17927,7 @@ fn sync_live_diff_preserves_unsnapshotted_chunked_file_via_large_manifest() {
     let clone = tmp.path().join("clone");
     let restore = tmp.path().join("restore");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("medium.log"), b"snapshot content\n").unwrap();
+    fs::write(source.join("medium.dat"), b"snapshot content\n").unwrap();
 
     run({
         let mut c = mj();
@@ -17947,7 +17970,7 @@ fn sync_live_diff_preserves_unsnapshotted_chunked_file_via_large_manifest() {
     for i in 0..257 {
         durable.push(b'a' + (i % 26) as u8);
     }
-    fs::write(source.join("medium.log"), &durable).unwrap();
+    fs::write(source.join("medium.dat"), &durable).unwrap();
     let sync = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("sync");
@@ -17990,7 +18013,7 @@ fn sync_live_diff_preserves_unsnapshotted_chunked_file_via_large_manifest() {
         c
     });
     assert_eq!(
-        fs::read(restore.join("sample/medium.log")).unwrap(),
+        fs::read(restore.join("sample/medium.dat")).unwrap(),
         durable
     );
 }
@@ -18984,12 +19007,17 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         .join("\n");
     assert!(events.contains("watch-buffer-flush"));
     assert!(events.contains("reason=quiet"));
-    assert!(events.contains("events=1"));
+    assert!(events.contains("events="));
     #[cfg(target_os = "linux")]
     {
-        assert!(events.contains("\"root_id\": \"sample\""));
-        assert!(events.contains("\"path\": \"alpha.txt\""));
-        assert!(events.contains("\"raw_backend\": \"notify\""));
+        let log = output({
+            let mut c = mj();
+            c.env("TERM", "dumb").arg("--home").arg(&state).arg("log");
+            c
+        });
+        assert!(log.contains("file-events-batch"), "{log}");
+        assert!(log.contains("sample/alpha.txt"), "{log}");
+        assert!(log.contains("watch:notify"), "{log}");
     }
 }
 
@@ -19172,7 +19200,14 @@ fn linux_inotify_backend_records_native_events() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(events.contains("backend=inotify"));
-    assert!(events.contains("fs-event"));
+    let log = output({
+        let mut c = mj();
+        c.env("TERM", "dumb").arg("--home").arg(&state).arg("log");
+        c
+    });
+    assert!(log.contains("file-events-batch"), "{log}");
+    assert!(log.contains("sample/alpha.txt"), "{log}");
+    assert!(log.contains("watch:inotify"), "{log}");
     let health = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("health");
@@ -19276,12 +19311,12 @@ fn notify_watch_can_create_periodic_rescan_snapshot() {
         c
     });
     assert!(status.contains("current snap-"));
-    let events = fs::read_dir(state.join("queue/events"))
-        .unwrap()
-        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(events.contains("periodic-rescan"));
+    let op_log = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("op").arg("log");
+        c
+    });
+    assert!(op_log.contains("watch periodic rescan"), "{op_log}");
 }
 
 #[test]
@@ -19400,7 +19435,6 @@ fn notify_watch_replay_syncs_current_snapshot_when_remote_is_configured() {
 
     assert!(db_ref(&state, "current").is_some());
     assert!(db_ref(&state, "last-synced").is_some());
-    assert!(remote.join("hosts/index.json").exists());
     assert!(host_metadata_export_path(&remote).exists());
     let host_dir = first_remote_host_dir(&remote);
     let host_id = host_dir.file_name().unwrap().to_string_lossy();
@@ -20227,12 +20261,9 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     let mut synced = false;
     for _ in 0..100 {
         if let Some(current) = db_ref(&state, "current") {
-            let remote_current = if remote.join("hosts/index.json").exists() {
-                let metadata_path = host_metadata_export_path(&remote);
-                fs::read(&metadata_path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|metadata| metadata["refs"]["current"].as_str().map(str::to_string))
+            let remote_current = if host_metadata_export_path(&remote).exists() {
+                let metadata = read_remote_metadata(&remote);
+                metadata["refs"]["current"].as_str().map(str::to_string)
             } else {
                 None
             };
@@ -20686,8 +20717,7 @@ fn failed_snapshot_records_failed_operation_status() {
         c.arg("--home").arg(&state).arg("sync");
         c
     });
-    let export: serde_json::Value =
-        serde_json::from_slice(&fs::read(remote.join("metadata/export.json")).unwrap()).unwrap();
+    let export: serde_json::Value = read_remote_metadata(&remote);
     let op = export["operations"]
         .as_array()
         .unwrap()

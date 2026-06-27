@@ -1537,11 +1537,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path().join("home"));
         let (tx, rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         tx.send(Ok(test_event("a.txt"))).unwrap();
-        thread::spawn(move || {
+        let sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             tx.send(Ok(test_event("b.txt"))).unwrap();
-            thread::sleep(Duration::from_millis(300));
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
         });
 
         let outcome = drain_watch_event_buffer(
@@ -1558,6 +1559,8 @@ mod tests {
             &[],
         )
         .unwrap();
+        release_tx.send(()).unwrap();
+        sender.join().unwrap();
 
         assert_eq!(outcome.reason, "quiet");
         assert_eq!(outcome.events, 3);

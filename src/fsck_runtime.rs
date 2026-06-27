@@ -1,7 +1,7 @@
 use crate::majutsu_core::{
     ConfigRootIssue, HistoryGraphIssue, HostFileIssue, LargeManifest, LiveMetadataReferences,
     MetadataReferenceIssue, OperationLogComparisonIssue, OperationLogEntry as OperationExport,
-    OperationLogEntryIssue, SnapshotExport, SnapshotManifest, TreeManifest,
+    OperationLogEntryIssue, SnapshotExport, SnapshotManifest, TreeManifest, TreeNodeManifest,
     config_root_consistency_issues, decode_operation_log, history_graph_issues, host_file_issues,
     metadata_reference_issues, operation_log_comparison_issues, operation_log_entry_matches,
     payload_blob_ref, payload_large_ref, snapshot_export_matches, snapshot_manifest_matches,
@@ -39,8 +39,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::cache_runtime::{
-    payload_cache_key_set, prune_synced_metadata_cache, prune_synced_payload_cache,
-    remote_payload_index_contains, remote_payload_key_index_for_host,
+    prune_synced_metadata_cache, prune_synced_payload_cache, remote_payload_index_contains,
+    remote_payload_key_index, remote_payload_key_index_for_host,
 };
 use crate::cli::FsckArgs;
 use crate::config::{
@@ -236,7 +236,6 @@ struct PayloadValidationContext<'a> {
     paths: &'a Paths,
     remote_payload_keys: Option<&'a BTreeSet<String>>,
     remote: Option<&'a RemoteStore>,
-    payload_cache_keys: &'a BTreeSet<String>,
     scope: Option<&'a FsckScope>,
     options: &'a FsckOptions,
 }
@@ -255,7 +254,6 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         backfill_snapshot_payload_indexes(paths, &conn, &export, &options)?;
         return Ok(());
     }
-    let payload_cache_keys = payload_cache_key_set(&export);
     let scope = if !options.quick {
         build_fsck_scope(paths, &conn, &export, &options)?
     } else {
@@ -271,10 +269,15 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         options.phase("remote-payload-index")?;
     }
     let remote_payload_keys = if use_remote_payload_index {
-        Some(remote_payload_key_index_for_host(
-            remote.as_ref().expect("remote exists"),
-            &remote_host_label(&config.host.name),
-        )?)
+        let remote = remote.as_ref().expect("remote exists");
+        if matches!(remote, RemoteStore::S3(_)) {
+            Some(remote_payload_key_index_for_host(
+                remote,
+                &remote_host_label(&config.host.name),
+            )?)
+        } else {
+            Some(remote_payload_key_index(remote)?)
+        }
     } else {
         None
     };
@@ -294,7 +297,6 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
         paths,
         remote_payload_keys: remote_payload_keys.as_ref(),
         remote: remote.as_ref(),
-        payload_cache_keys: &payload_cache_keys,
         scope: scope.as_ref(),
         options: &options,
     };
@@ -1087,11 +1089,10 @@ fn payload_cache_available_remotely(
     context: &PayloadValidationContext<'_>,
     key: &str,
 ) -> Result<bool> {
-    if !context.payload_cache_keys.contains(key) {
-        return Ok(false);
-    }
-    if let Some(remote_payload_keys) = context.remote_payload_keys {
-        return Ok(remote_payload_index_contains(remote_payload_keys, key));
+    if let Some(remote_payload_keys) = context.remote_payload_keys
+        && remote_payload_index_contains(remote_payload_keys, key)
+    {
+        return Ok(true);
     }
     let Some(remote) = context.remote else {
         return Ok(false);
@@ -1947,13 +1948,16 @@ pub(crate) fn validate_remote_gc_records(
                 return validate_remote_gc_tombstones(remote, host_id, missing);
             }
         };
+        let expected_mark_host_id = export.config.host.id.as_str();
         if compact_head_authoritative {
-            validate_compact_remote_gc_mark(&mark_key, host_id, &mark, missing);
+            validate_compact_remote_gc_mark(&mark_key, expected_mark_host_id, &mark, missing);
         } else {
             let expected = expected_gc_mark_object_keys(paths, remote, export)?;
-            for issue in mark.validation_issues(host_id, export.refs.get("current"), &expected) {
+            for issue in
+                mark.validation_issues(expected_mark_host_id, export.refs.get("current"), &expected)
+            {
                 *missing += 1;
-                eprintln!("{}", issue.message(&mark_key, host_id));
+                eprintln!("{}", issue.message(&mark_key, expected_mark_host_id));
             }
         }
     }
@@ -1962,7 +1966,7 @@ pub(crate) fn validate_remote_gc_records(
 
 fn validate_compact_remote_gc_mark(
     mark_key: &str,
-    host_id: &str,
+    expected_host_id: &str,
     mark: &GcMarkExport,
     missing: &mut usize,
 ) {
@@ -1970,11 +1974,11 @@ fn validate_compact_remote_gc_mark(
         *missing += 1;
         eprintln!("unsupported remote gc mark version {mark_key}");
     }
-    if mark.host_id != host_id {
+    if mark.host_id != expected_host_id {
         *missing += 1;
         eprintln!(
             "remote gc mark host id {} does not match {}",
-            mark.host_id, host_id
+            mark.host_id, expected_host_id
         );
     }
     if mark.has_duplicate_object_keys() {
@@ -1983,20 +1987,34 @@ fn validate_compact_remote_gc_mark(
     }
 }
 
-fn expected_gc_mark_object_keys(
+pub(crate) fn expected_gc_mark_object_keys(
     paths: &Paths,
     remote: &RemoteStore,
     export: &crate::MetadataExport,
 ) -> Result<BTreeSet<String>> {
     let export = export_with_hydrated_remote_snapshot_manifests(paths, remote, export)?;
     if matches!(remote, RemoteStore::S3(_)) {
-        return Ok(s3_remote_live_object_keys_for_local(paths, &export)?
+        let mut expected = s3_remote_live_object_keys_for_local(paths, &export)?
             .into_iter()
-            .collect());
+            .collect::<BTreeSet<_>>();
+        if !export.chunks.is_empty() {
+            expected.insert(host_remote_key(
+                &remote_host_label(&export.config.host.name),
+                REMOTE_CHUNK_INDEX_SHARD_KEY,
+            ));
+        }
+        return Ok(expected);
     }
-    Ok(remote_live_object_keys_for_local(paths, &export)?
+    let mut expected = remote_live_object_keys_for_local(paths, &export)?
         .into_iter()
-        .collect())
+        .collect::<BTreeSet<_>>();
+    if !export.chunks.is_empty() {
+        expected.insert(host_remote_key(
+            &remote_host_label(&export.config.host.name),
+            REMOTE_CHUNK_INDEX_SHARD_KEY,
+        ));
+    }
+    Ok(expected)
 }
 
 fn export_with_hydrated_remote_snapshot_manifests(
@@ -2016,11 +2034,72 @@ fn export_with_hydrated_remote_snapshot_manifests(
                     snapshot.manifest_key
                 )
             })?;
-        let manifest: SnapshotManifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse remote snapshot manifest {}", snapshot.manifest_key))?;
+        let manifest: SnapshotManifest =
+            serde_json::from_slice(&crate::decode_object(paths, &bytes)?).with_context(|| {
+                format!("parse remote snapshot manifest {}", snapshot.manifest_key)
+            })?;
+        hydrate_snapshot_manifest_metadata(paths, remote, &manifest)?;
         snapshot.manifest_json = serde_json::to_string(&manifest)?;
     }
     Ok(export)
+}
+
+fn hydrate_snapshot_manifest_metadata(
+    paths: &Paths,
+    remote: &RemoteStore,
+    manifest: &SnapshotManifest,
+) -> Result<()> {
+    for root_tree in manifest.root_trees.values() {
+        hydrate_tree_metadata(paths, remote, &root_tree.tree_key)?;
+    }
+    Ok(())
+}
+
+fn hydrate_tree_metadata(paths: &Paths, remote: &RemoteStore, tree_key: &str) -> Result<()> {
+    let tree_bytes = hydrate_metadata_object(paths, remote, tree_key)?;
+    let tree: TreeManifest = serde_json::from_slice(&crate::decode_object(paths, &tree_bytes)?)
+        .with_context(|| format!("parse remote tree manifest {tree_key}"))?;
+    if let Some(root_node) = &tree.root_node {
+        hydrate_tree_node_metadata(paths, remote, &root_node.node_key)?;
+    }
+    for node in tree.subtree_nodes.values() {
+        hydrate_tree_node_metadata(paths, remote, &node.node_key)?;
+    }
+    for record in tree.entries.values() {
+        if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
+            let _ = hydrate_metadata_object(paths, remote, manifest_key)?;
+        }
+    }
+    Ok(())
+}
+
+fn hydrate_tree_node_metadata(paths: &Paths, remote: &RemoteStore, node_key: &str) -> Result<()> {
+    let node_bytes = hydrate_metadata_object(paths, remote, node_key)?;
+    let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &node_bytes)?)
+        .with_context(|| format!("parse remote tree node {node_key}"))?;
+    for record in node.entries.values() {
+        if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
+            let _ = hydrate_metadata_object(paths, remote, manifest_key)?;
+        }
+    }
+    for child in node.child_nodes.values() {
+        hydrate_tree_node_metadata(paths, remote, &child.node_key)?;
+    }
+    Ok(())
+}
+
+fn hydrate_metadata_object(paths: &Paths, remote: &RemoteStore, key: &str) -> Result<Vec<u8>> {
+    let local = paths.home.join(key);
+    if local.exists() {
+        return fs::read(local).with_context(|| format!("read local metadata object {key}"));
+    }
+    let bytes = crate::download_local_object_from_remote(paths, remote, key)
+        .with_context(|| format!("download remote metadata object {key}"))?;
+    if let Some(parent) = local.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&local, &bytes).with_context(|| format!("write hydrated metadata object {key}"))?;
+    Ok(bytes)
 }
 
 fn validate_remote_gc_tombstones(
@@ -2674,6 +2753,23 @@ pub(crate) fn remote_fsck_with_options(
                 }
             }
         }
+        let known_host_prefixes = index
+            .hosts
+            .iter()
+            .map(|host| remote_host_prefix_from_metadata_key(&host.metadata_key, &host.name))
+            .collect::<BTreeSet<_>>();
+        for key in remote.list("")? {
+            let Some((prefix, rest)) = key.split_once('/') else {
+                continue;
+            };
+            if known_host_prefixes.contains(prefix) {
+                continue;
+            }
+            if rest == "gc/mark.json" || rest.starts_with("gc/tombstones/") {
+                missing += 1;
+                eprintln!("remote gc artifact has no host metadata {key}");
+            }
+        }
         for host in &index.hosts {
             verified_hosts += 1;
             let host_prefix = remote_host_prefix_from_metadata_key(&host.metadata_key, &host.name);
@@ -2702,6 +2798,13 @@ pub(crate) fn remote_fsck_with_options(
                 &mut payload_budget,
                 &mut missing,
             )?;
+            let expected_host_prefix = remote_host_label(&export.config.host.name);
+            if host_prefix != expected_host_prefix {
+                missing += 1;
+                eprintln!(
+                    "remote host prefix {host_prefix} does not match metadata host name prefix {expected_host_prefix}"
+                );
+            }
             if export.config.host.id != host.id {
                 missing += 1;
                 eprintln!(

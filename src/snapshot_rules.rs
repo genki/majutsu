@@ -431,20 +431,105 @@ pub fn root_record_is_managed(
     if is_volatile_excluded(root, rel) {
         return false;
     }
-    !is_ignored(ignore, rel, is_dir)
+    if is_ignored(ignore, rel, is_dir) {
+        return include_override_matches_path(&root.include, rel)
+            || (!has_ignored_parent(ignore, rel)
+                && explicit_non_catchall_include_matches_path(&root.include, rel));
+    }
+    true
 }
 
 pub fn root_dir_allows_descend(root: &RootConfig, ignore: &Gitignore, rel: &Path) -> bool {
     if explicitly_untracked(root, rel) {
         return false;
     }
-    if include_allows_descend(&root.include, rel)
-        && !is_volatile_excluded(root, rel)
-        && !is_ignored(ignore, rel, true)
-    {
+    if explicit_track_may_match_inside_dir(root, rel) {
         return true;
     }
-    explicit_track_may_match_inside_dir(root, rel) || !root.explicit_track.is_empty()
+    let volatile_excluded = is_volatile_excluded(root, rel);
+    if is_ignored(ignore, rel, true) {
+        return !volatile_excluded && include_override_may_match_inside_dir(&root.include, rel);
+    }
+    if include_allows_descend(&root.include, rel) && !volatile_excluded {
+        return true;
+    }
+    !root.explicit_track.is_empty()
+}
+
+fn include_override_matches_path(patterns: &[String], rel: &Path) -> bool {
+    let rel = path_to_slash(rel);
+    patterns.iter().any(|pattern| {
+        include_pattern_can_override_exclude(pattern) && path_pattern_match(pattern, &rel)
+    })
+}
+
+fn explicit_non_catchall_include_matches_path(patterns: &[String], rel: &Path) -> bool {
+    let rel = path_to_slash(rel);
+    patterns
+        .iter()
+        .any(|pattern| !is_catch_all_include_pattern(pattern) && path_pattern_match(pattern, &rel))
+}
+
+fn include_override_may_match_inside_dir(patterns: &[String], rel: &Path) -> bool {
+    let dir = path_to_slash(rel);
+    let dir = dir.trim_matches('/');
+    !dir.is_empty()
+        && patterns.iter().any(|pattern| {
+            include_pattern_can_descend_excluded_dir(pattern, dir)
+                && include_pattern_may_match_inside_dir(pattern, dir)
+        })
+}
+
+fn include_pattern_can_override_exclude(pattern: &str) -> bool {
+    let pattern = pattern.trim().trim_start_matches('/');
+    if pattern.is_empty() || is_catch_all_include_pattern(pattern) {
+        return false;
+    }
+    if !pattern_has_glob_meta(pattern) {
+        return true;
+    }
+    let Some((first, _)) = pattern.split_once('/') else {
+        return false;
+    };
+    !pattern_has_glob_meta(first)
+}
+
+fn include_pattern_can_descend_excluded_dir(pattern: &str, dir: &str) -> bool {
+    let pattern = pattern.trim().trim_start_matches('/');
+    if pattern.is_empty() || is_catch_all_include_pattern(pattern) {
+        return false;
+    }
+    let first = pattern
+        .split('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    if first.is_empty() || first == "**" || pattern_has_glob_meta(first) {
+        return false;
+    }
+    let literal_prefix = pattern
+        .split(['*', '?', '['])
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    !literal_prefix.is_empty()
+        && (literal_prefix == dir
+            || literal_prefix.starts_with(&format!("{dir}/"))
+            || dir.starts_with(&format!("{literal_prefix}/")))
+}
+
+fn has_ignored_parent(ignore: &Gitignore, rel: &Path) -> bool {
+    let mut parent = rel.parent();
+    while let Some(path) = parent {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        if ignore.matched_path_or_any_parents(path, true).is_ignore() {
+            return true;
+        }
+        parent = path.parent();
+    }
+    false
 }
 
 fn path_list_covers(patterns: &[String], rel: &Path) -> bool {

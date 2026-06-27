@@ -493,8 +493,8 @@ fn cache_prune_evicts_synced_payload_cache_and_restore_hydrates() {
         .and_then(|value| value.parse::<u64>().ok())
         .expect("sync should report pruned_metadata_cache_objects");
     assert!(
-        pruned_metadata > 0,
-        "sync should prune synced metadata cache\n{sync_stdout}"
+        pruned_metadata == 0,
+        "sync should keep synced metadata cache unless explicitly requested\n{sync_stdout}"
     );
 
     let stat = run_mj(&home, ["cache", "stat"]);
@@ -511,8 +511,43 @@ fn cache_prune_evicts_synced_payload_cache_and_restore_hydrates() {
 
     let tree_key = first_tree_object_key(&home);
     assert!(
+        home.join(&tree_key).exists(),
+        "sync should keep metadata cache by default"
+    );
+    let metadata_stat = run_mj(&home, ["cache", "stat", "--metadata"]);
+    let metadata_stat_stdout = String::from_utf8_lossy(&metadata_stat.stdout).to_string();
+    assert_success(metadata_stat, "cache stat --metadata before metadata prune");
+    assert!(
+        !metadata_stat_stdout.contains("metadata_cache_candidates 0"),
+        "sync should keep synced metadata cache candidates by default\n{metadata_stat_stdout}"
+    );
+
+    let sync = run_mj_with_env(
+        &home,
+        ["sync"],
+        &[("MAJUTSU_SYNC_LOCAL_METADATA_CACHE_PRUNE", "1".into())],
+    );
+    if !sync.status.success() {
+        panic!(
+            "sync metadata prune が失敗しました\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            sync.status.code(),
+            String::from_utf8_lossy(&sync.stdout),
+            String::from_utf8_lossy(&sync.stderr)
+        );
+    }
+    let sync_stdout = String::from_utf8_lossy(&sync.stdout);
+    let pruned_metadata = sync_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("pruned_metadata_cache_objects "))
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("sync should report pruned_metadata_cache_objects");
+    assert!(
+        pruned_metadata > 0,
+        "sync should prune synced metadata cache when explicitly requested\n{sync_stdout}"
+    );
+    assert!(
         !home.join(&tree_key).exists(),
-        "sync should prune synced tree manifest locally"
+        "sync metadata prune should remove synced tree manifest locally"
     );
     let metadata_stat = run_mj(&home, ["cache", "stat", "--metadata"]);
     let metadata_stat_stdout = String::from_utf8_lossy(&metadata_stat.stdout).to_string();

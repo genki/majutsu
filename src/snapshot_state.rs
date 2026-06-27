@@ -151,20 +151,8 @@ fn read_snapshot_manifest_object_raw(
     id: &str,
     manifest_key: &str,
 ) -> Result<Vec<u8>> {
-    let local = paths.home.join(manifest_key);
-    let bytes = match fs::read(&local) {
-        Ok(bytes) => bytes,
-        Err(local_err) => {
-            hydrate_snapshot_manifest_from_remote(paths, manifest_key).with_context(|| {
-                format!("read snapshot manifest object {id} {manifest_key}: {local_err}")
-            })?;
-            fs::read(&local).with_context(|| {
-                format!("read hydrated snapshot manifest object {id} {manifest_key}")
-            })?
-        }
-    };
-    crate::decode_object(paths, &bytes)
-        .with_context(|| format!("decode snapshot manifest object {id} {manifest_key}"))
+    crate::read_object(paths, manifest_key)
+        .with_context(|| format!("read snapshot manifest object {id} {manifest_key}"))
 }
 
 pub(crate) fn load_root_tree_entries(
@@ -257,7 +245,7 @@ fn hydrate_snapshot_manifest_from_remote(paths: &Paths, manifest_key: &str) -> R
         return Ok(());
     };
     let remote = crate::remote_store::open_remote(remote_config)?;
-    if !crate::remote_object_available(&remote, manifest_key)? {
+    if !crate::remote_object_available_for_paths(paths, &remote, manifest_key)? {
         return Ok(());
     }
     let bytes = crate::download_local_object_from_remote(paths, &remote, manifest_key)?;

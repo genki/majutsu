@@ -383,6 +383,13 @@ fn validate_quick_host_metadata(
         );
     }
     let host_prefix = remote_host_prefix(host);
+    let expected_host_prefix = remote_host_label(&export.config.host.name);
+    if host_prefix != expected_host_prefix {
+        *missing += 1;
+        eprintln!(
+            "remote host prefix {host_prefix} does not match metadata host name prefix {expected_host_prefix}"
+        );
+    }
     let head = read_remote_head(paths, remote, &host_prefix)?;
     let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
     let current = export.refs.get("current");
@@ -492,7 +499,14 @@ fn validate_quick_host_metadata(
             }
         }
     }
-    validate_quick_gc_records(remote, &host_prefix, current, head.as_ref(), missing)
+    validate_quick_gc_records(
+        remote,
+        &host_prefix,
+        &host.id,
+        current,
+        head.as_ref(),
+        missing,
+    )
 }
 
 fn remote_host_prefix(host: &RemoteHostSummary) -> String {
@@ -598,6 +612,7 @@ fn remote_current_snapshot_manifest(
 fn validate_quick_gc_records(
     remote: &RemoteStore,
     host_id: &str,
+    expected_mark_host_id: &str,
     current: Option<&String>,
     head: Option<&RemoteHeadExport>,
     missing: &mut usize,
@@ -623,11 +638,11 @@ fn validate_quick_gc_records(
         *missing += 1;
         eprintln!("unsupported remote gc mark version {mark_key}");
     }
-    if mark.host_id != host_id {
+    if mark.host_id != expected_mark_host_id {
         *missing += 1;
         eprintln!(
             "remote gc mark host id {} does not match {}",
-            mark.host_id, host_id
+            mark.host_id, expected_mark_host_id
         );
     }
     if mark.current_snapshot.as_ref() != current && !compact_head_authoritative {

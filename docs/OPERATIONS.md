@@ -474,11 +474,10 @@ hydrate する。`mj fsck` は remote に存在する payload cache 欠落を正
 metadata cache を prune した場合、full fsck は必要な tree manifest を remote から hydrate して検査する。
 remote 未同期の payload / metadata 欠落は引き続き異常として扱う。
 
-`mj sync` は同期完了後、remote に存在することを確認できる payload cache と tree metadata cache を
-既定で自動 prune する。調査目的で同期後の cache を残したい場合は
-`MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE=0` または
-`MAJUTSU_SYNC_LOCAL_METADATA_CACHE_PRUNE=0` を指定する。metadata cache prune は明示指定がない場合、
-payload cache prune の有効/無効に追従する。
+`mj sync` は同期完了後、remote に存在することを確認できる payload cache を既定で自動 prune する。
+tree metadata cache は `mj state`、`mj log`、`mj root size` などのCLI応答性に寄与するため既定では保持する。
+調査目的で同期後の payload cache を残したい場合は `MAJUTSU_SYNC_LOCAL_PAYLOAD_CACHE_PRUNE=0` を指定する。
+metadata cache も同期後に削除したい場合は `MAJUTSU_SYNC_LOCAL_METADATA_CACHE_PRUNE=1` を指定する。
 
 remote が設定されている通常の `mj fsck` は、検査のため一時的に hydrate した同期済み
 payload cache と tree metadata を成功後に自動 prune する。未同期、または remote に存在しない
