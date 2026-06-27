@@ -5070,17 +5070,40 @@ fn operation_file_changes(
         return Ok(Vec::new());
     };
     let Some(after) = load_snapshot_header_by_id_optional(paths, conn, after_id)? else {
-        return Ok(Vec::new());
+        return Ok(snapshot_metadata_unavailable_changes(
+            root, after_id, "after",
+        ));
     };
     let before = if let Some(before_id) = op.before_snapshot.as_deref() {
         match load_snapshot_header_by_id_optional(paths, conn, before_id)? {
             Some(snapshot) => Some(snapshot),
-            None => return Ok(Vec::new()),
+            None => {
+                return Ok(snapshot_metadata_unavailable_changes(
+                    root, before_id, "before",
+                ));
+            }
         }
     } else {
         None
     };
     snapshot_file_changes(paths, before.as_ref(), &after, root, full, configured_roots)
+}
+
+fn snapshot_metadata_unavailable_changes(
+    root: Option<&str>,
+    snapshot_id: &str,
+    position: &str,
+) -> Vec<FileChange> {
+    if root.is_some() {
+        return Vec::new();
+    }
+    vec![FileChange::warning(
+        "M",
+        format!(
+            "** (snapshot metadata unavailable for {position} {snapshot_id}; use `mj fsck` and `mj log --operations`)"
+        ),
+        format!("snapshot metadata unavailable: {position} {snapshot_id}"),
+    )]
 }
 
 fn snapshot_file_changes(

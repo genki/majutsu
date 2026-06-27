@@ -8068,6 +8068,74 @@ fn log_root_filter_skips_operations_with_pruned_snapshot_metadata() {
 }
 
 #[test]
+fn log_reports_pruned_snapshot_metadata_without_root_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let before_snapshot: String = conn
+        .query_row(
+            "select before_snapshot
+             from operations
+             where kind='manual-snapshot'
+               and before_snapshot is not null
+               and after_snapshot is not null
+             order by rowid desc
+             limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute("delete from snapshots where id=?1", [&before_snapshot])
+        .unwrap();
+    drop(conn);
+
+    let log = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("20")
+            .arg("--full");
+        c
+    });
+    assert!(log.contains("manual-snapshot"), "{log}");
+    assert!(log.contains("snapshot metadata unavailable"), "{log}");
+    assert!(log.contains("[metadata-unavailable]"), "{log}");
+}
+
+#[test]
 fn prune_dry_run_and_gc_are_safe_entry_points() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
