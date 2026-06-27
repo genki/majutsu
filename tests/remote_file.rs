@@ -15160,6 +15160,84 @@ fn root_size_reports_full_totals_when_remote_summary_is_missing() {
 }
 
 #[test]
+fn sync_root_size_summary_uses_remote_encoded_sizes_for_large_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("compressible.bin"), vec![b'x'; 1024 * 1024]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--large-min-size")
+            .arg("4")
+            .arg("--large-chunking")
+            .arg("fixed")
+            .arg("--large-chunk-size")
+            .arg("65536");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync").arg("--wait");
+        c
+    });
+
+    let cached: serde_json::Value = serde_json::from_str(&output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--json");
+        c
+    }))
+    .unwrap();
+    let exact: serde_json::Value = serde_json::from_str(&output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("size")
+            .arg("--no-remote-cache")
+            .arg("--json");
+        c
+    }))
+    .unwrap();
+
+    assert_eq!(
+        cached["totals"]["current_backend_bytes"], exact["totals"]["current_backend_bytes"],
+        "cached summary must use remote encoded sizes"
+    );
+    assert!(
+        cached["totals"]["current_backend_bytes"].as_u64().unwrap() < 1024 * 1024,
+        "{}",
+        serde_json::to_string_pretty(&cached["totals"]).unwrap()
+    );
+}
+
+#[test]
 fn root_add_rejects_duplicate_id_without_overwriting_existing_root() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

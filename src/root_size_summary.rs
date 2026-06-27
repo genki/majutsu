@@ -9,6 +9,8 @@ use crate::majutsu_core::{
     FileRecord, LargeManifest, Payload, SnapshotExport, SnapshotManifest, TreeManifest,
     TreeNodeManifest, payload_blob_ref,
 };
+use crate::majutsu_store::{canonical_remote_alias, host_remote_key, remote_host_label};
+use crate::remote_store::{RemoteObjectStat, RemoteStore};
 use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
 
 const ROOT_SIZE_SUMMARY_VERSION: u32 = 1;
@@ -78,14 +80,51 @@ struct PackedBlobSizeRef {
     pack_len: u64,
 }
 
+struct SummaryRemoteSizes {
+    sizes: BTreeMap<String, u64>,
+    is_s3_remote: bool,
+    host_prefix: String,
+}
+
+impl SummaryRemoteSizes {
+    fn new(config: &Config, remote: &RemoteStore, objects: &[RemoteObjectStat]) -> Self {
+        Self {
+            sizes: objects
+                .iter()
+                .map(|object| (object.key.clone(), object.size))
+                .collect(),
+            is_s3_remote: matches!(remote, RemoteStore::S3(_)),
+            host_prefix: remote_host_label(&config.host.name),
+        }
+    }
+}
+
+struct SummaryResolvedKeys {
+    found: BTreeSet<String>,
+    bytes: u64,
+    missing: usize,
+}
+
 pub(crate) fn root_size_summary_key(host_id: &str) -> String {
     format!("{host_id}/root-size-summary.cbor.zst.enc")
 }
 
-pub(crate) fn build_root_size_summary(
+pub(crate) fn build_root_size_summary_with_remote_objects(
     paths: &Paths,
     config: &Config,
     export: &MetadataExport,
+    remote: &RemoteStore,
+    remote_objects: &[RemoteObjectStat],
+) -> Result<Option<RootSizeSummary>> {
+    let remote_sizes = SummaryRemoteSizes::new(config, remote, remote_objects);
+    build_root_size_summary_inner(paths, config, export, Some(&remote_sizes))
+}
+
+fn build_root_size_summary_inner(
+    paths: &Paths,
+    config: &Config,
+    export: &MetadataExport,
+    remote_sizes: Option<&SummaryRemoteSizes>,
 ) -> Result<Option<RootSizeSummary>> {
     let Some(current) = export.refs.get("current") else {
         return Ok(None);
@@ -126,17 +165,19 @@ pub(crate) fn build_root_size_summary(
         }
     }
 
-    for (root_id, records) in &manifest.roots {
-        let stat = stats.entry(root_id.clone()).or_default();
-        for record in records {
-            match record.kind.as_str() {
-                "directory" => stat.dirs += 1,
-                _ => {
-                    stat.files += 1;
-                    stat.client_bytes = stat.client_bytes.saturating_add(record.size);
+    if should_scan_legacy_roots(&manifest) {
+        for (root_id, records) in &manifest.roots {
+            let stat = stats.entry(root_id.clone()).or_default();
+            for record in records {
+                match record.kind.as_str() {
+                    "directory" => stat.dirs += 1,
+                    _ => {
+                        stat.files += 1;
+                        stat.client_bytes = stat.client_bytes.saturating_add(record.size);
+                    }
                 }
+                add_payload_keys(paths, &packed_blobs, &record.payload, stat)?;
             }
-            add_payload_keys(paths, &packed_blobs, &record.payload, stat)?;
         }
     }
 
@@ -148,19 +189,29 @@ pub(crate) fn build_root_size_summary(
     let mut unique_packed_payload_oids = BTreeSet::new();
     let mut unique_packed_slice_bytes = 0u64;
     for (root, stat) in stats {
-        let payload_bytes = sum_known_sizes(paths, &known_object_sizes, &stat.payload_keys);
-        let metadata_bytes = sum_local_sizes(paths, &stat.metadata_keys);
-        let packed_payload_bytes =
-            sum_known_sizes(paths, &known_object_sizes, &stat.packed_payload_keys);
-        let all_keys = stat
-            .payload_keys
-            .union(&stat.metadata_keys)
+        let payload_keys =
+            resolve_summary_keys(paths, &known_object_sizes, &stat.payload_keys, remote_sizes);
+        let metadata_keys = resolve_summary_keys(
+            paths,
+            &known_object_sizes,
+            &stat.metadata_keys,
+            remote_sizes,
+        );
+        let packed_payload_keys = resolve_summary_keys(
+            paths,
+            &known_object_sizes,
+            &stat.packed_payload_keys,
+            remote_sizes,
+        );
+        let all_keys = payload_keys
+            .found
+            .union(&metadata_keys.found)
             .cloned()
             .collect::<BTreeSet<_>>();
         unique_keys.extend(all_keys.iter().cloned());
-        unique_payload_keys.extend(stat.payload_keys.iter().cloned());
-        unique_metadata_keys.extend(stat.metadata_keys.iter().cloned());
-        unique_packed_payload_keys.extend(stat.packed_payload_keys.iter().cloned());
+        unique_payload_keys.extend(payload_keys.found.iter().cloned());
+        unique_metadata_keys.extend(metadata_keys.found.iter().cloned());
+        unique_packed_payload_keys.extend(packed_payload_keys.found.iter().cloned());
         for oid in &stat.packed_payload_oids {
             if unique_packed_payload_oids.insert(oid.clone())
                 && let Some(packed) = packed_blobs.get(oid)
@@ -169,7 +220,10 @@ pub(crate) fn build_root_size_summary(
                     unique_packed_slice_bytes.saturating_add(packed.pack_len);
             }
         }
-        let backend_bytes = sum_known_sizes(paths, &known_object_sizes, &all_keys);
+        let payload_bytes = payload_keys.bytes;
+        let metadata_bytes = metadata_keys.bytes;
+        let packed_payload_bytes = packed_payload_keys.bytes;
+        let backend_bytes = sum_summary_keys(paths, &known_object_sizes, &all_keys, remote_sizes);
         let used_bytes = backend_bytes
             .saturating_sub(packed_payload_bytes)
             .saturating_add(stat.packed_slice_bytes);
@@ -183,17 +237,32 @@ pub(crate) fn build_root_size_summary(
             payload_bytes,
             metadata_bytes,
             backend_objects: all_keys.len(),
-            missing_objects: missing_objects(paths, &known_object_sizes, &all_keys),
+            missing_objects: payload_keys.missing + metadata_keys.missing,
         });
     }
     rows.sort_by(|left, right| left.root.cmp(&right.root));
 
-    let current_backend_bytes = sum_known_sizes(paths, &known_object_sizes, &unique_keys);
-    let payload_bytes = sum_known_sizes(paths, &known_object_sizes, &unique_payload_keys);
-    let metadata_bytes = sum_local_sizes(paths, &unique_metadata_keys);
+    let current_backend_bytes =
+        sum_summary_keys(paths, &known_object_sizes, &unique_keys, remote_sizes);
+    let payload_bytes = sum_summary_keys(
+        paths,
+        &known_object_sizes,
+        &unique_payload_keys,
+        remote_sizes,
+    );
+    let metadata_bytes = sum_summary_keys(
+        paths,
+        &known_object_sizes,
+        &unique_metadata_keys,
+        remote_sizes,
+    );
     let row_used_bytes = rows.iter().map(|row| row.used_bytes).sum();
-    let packed_payload_bytes =
-        sum_known_sizes(paths, &known_object_sizes, &unique_packed_payload_keys);
+    let packed_payload_bytes = sum_summary_keys(
+        paths,
+        &known_object_sizes,
+        &unique_packed_payload_keys,
+        remote_sizes,
+    );
     let unique_used_bytes = current_backend_bytes
         .saturating_sub(packed_payload_bytes)
         .saturating_add(unique_packed_slice_bytes);
@@ -390,6 +459,69 @@ fn payload_large_manifest(payload: &Payload) -> Option<(&str, usize)> {
     }
 }
 
+fn should_scan_legacy_roots(manifest: &SnapshotManifest) -> bool {
+    manifest.root_trees.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::resolve_paths;
+    use crate::majutsu_core::RootSnapshot;
+    use chrono::Utc;
+
+    #[test]
+    fn summary_sizes_prefer_remote_canonical_size_over_logical_chunk_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        let key = "objects/large/chunks/fixed/chunk-1".to_string();
+        let mut keys = BTreeSet::new();
+        keys.insert(key.clone());
+        let known_sizes = BTreeMap::from([(key, 1024_u64 * 1024)]);
+        let remote_sizes = SummaryRemoteSizes {
+            sizes: BTreeMap::from([(
+                "vagrant/large/chunks/fixed-8m/chunk-1.chunk.enc".to_string(),
+                123_u64,
+            )]),
+            is_s3_remote: true,
+            host_prefix: "vagrant".to_string(),
+        };
+
+        let resolved = resolve_summary_keys(&paths, &known_sizes, &keys, Some(&remote_sizes));
+
+        assert_eq!(resolved.bytes, 123);
+        assert_eq!(resolved.missing, 0);
+        assert!(
+            resolved
+                .found
+                .contains("vagrant/large/chunks/fixed-8m/chunk-1.chunk.enc")
+        );
+    }
+
+    #[test]
+    fn legacy_roots_are_scanned_only_when_tree_manifest_is_absent() {
+        let mut manifest = SnapshotManifest {
+            snapshot_id: "snap-test".into(),
+            parent: None,
+            op_id: "op-test".into(),
+            timestamp: Utc::now(),
+            roots: BTreeMap::new(),
+            root_trees: BTreeMap::new(),
+        };
+        assert!(should_scan_legacy_roots(&manifest));
+
+        manifest.root_trees.insert(
+            "sample".into(),
+            RootSnapshot {
+                tree_id: "tree-test".into(),
+                tree_key: "objects/trees/tree-test.json".into(),
+                file_count: 1,
+            },
+        );
+        assert!(!should_scan_legacy_roots(&manifest));
+    }
+}
+
 fn packed_blob_size_refs(paths: &Paths) -> Result<BTreeMap<String, PackedBlobSizeRef>> {
     let conn = crate::open_db(paths)?;
     let mut stmt = conn.prepare(
@@ -415,13 +547,6 @@ fn packed_blob_size_refs(paths: &Paths) -> Result<BTreeMap<String, PackedBlobSiz
     Ok(packed)
 }
 
-fn sum_local_sizes(paths: &Paths, keys: &BTreeSet<String>) -> u64 {
-    keys.iter()
-        .filter_map(|key| fs::metadata(paths.home.join(key)).ok())
-        .map(|metadata| metadata.len())
-        .sum()
-}
-
 fn known_payload_object_sizes(paths: &Paths) -> Result<BTreeMap<String, u64>> {
     let conn = crate::open_db(paths)?;
     let mut sizes = BTreeMap::new();
@@ -433,40 +558,86 @@ fn known_payload_object_sizes(paths: &Paths) -> Result<BTreeMap<String, u64>> {
         let (key, size) = row?;
         sizes.insert(key, size);
     }
-    let mut chunk_stmt = conn.prepare("select object_key, size from chunks")?;
-    let chunk_rows = chunk_stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-    })?;
-    for row in chunk_rows {
-        let (key, size) = row?;
-        sizes.insert(key, size);
-    }
     Ok(sizes)
 }
 
-fn sum_known_sizes(
+fn resolve_summary_keys(
     paths: &Paths,
     known_sizes: &BTreeMap<String, u64>,
     keys: &BTreeSet<String>,
+    remote_sizes: Option<&SummaryRemoteSizes>,
+) -> SummaryResolvedKeys {
+    let mut found = BTreeSet::new();
+    let mut bytes = 0u64;
+    let mut missing = 0usize;
+    for key in keys {
+        if let Some(remote_sizes) = remote_sizes {
+            let Some(remote_key) = summary_remote_key_candidates(key, remote_sizes)
+                .into_iter()
+                .find(|candidate| remote_sizes.sizes.contains_key(candidate))
+            else {
+                missing += 1;
+                continue;
+            };
+            bytes = bytes.saturating_add(remote_sizes.sizes.get(&remote_key).copied().unwrap_or(0));
+            found.insert(remote_key);
+            continue;
+        }
+        if local_or_known_size(paths, known_sizes, key).is_some() {
+            found.insert(key.clone());
+        } else {
+            missing += 1;
+        }
+    }
+    if remote_sizes.is_none() {
+        bytes = sum_summary_keys(paths, known_sizes, &found, None);
+    }
+    SummaryResolvedKeys {
+        found,
+        bytes,
+        missing,
+    }
+}
+
+fn sum_summary_keys(
+    paths: &Paths,
+    known_sizes: &BTreeMap<String, u64>,
+    keys: &BTreeSet<String>,
+    remote_sizes: Option<&SummaryRemoteSizes>,
 ) -> u64 {
+    if let Some(remote_sizes) = remote_sizes {
+        return keys
+            .iter()
+            .filter_map(|key| remote_sizes.sizes.get(key).copied())
+            .sum();
+    }
     keys.iter()
-        .map(|key| {
-            known_sizes.get(key).copied().unwrap_or_else(|| {
-                fs::metadata(paths.home.join(key))
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0)
-            })
-        })
+        .filter_map(|key| local_or_known_size(paths, known_sizes, key))
         .sum()
 }
 
-fn missing_objects(
+fn local_or_known_size(
     paths: &Paths,
     known_sizes: &BTreeMap<String, u64>,
-    keys: &BTreeSet<String>,
-) -> usize {
-    keys.iter()
-        .filter(|key| !known_sizes.contains_key(*key))
-        .filter(|key| fs::metadata(paths.home.join(key)).is_err())
-        .count()
+    key: &str,
+) -> Option<u64> {
+    if let Some(size) = known_sizes.get(key).copied() {
+        return Some(size);
+    }
+    fs::metadata(paths.home.join(key))
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+fn summary_remote_key_candidates(key: &str, remote_sizes: &SummaryRemoteSizes) -> Vec<String> {
+    let alias = canonical_remote_alias(key).filter(|alias| alias != key);
+    match (remote_sizes.is_s3_remote, alias) {
+        (true, Some(alias)) => vec![
+            host_remote_key(&remote_sizes.host_prefix, &alias),
+            host_remote_key(&remote_sizes.host_prefix, key),
+        ],
+        (true, None) => vec![host_remote_key(&remote_sizes.host_prefix, key)],
+        (false, Some(alias)) => vec![key.to_string(), alias],
+        (false, None) => vec![key.to_string()],
+    }
 }

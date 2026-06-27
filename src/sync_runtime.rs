@@ -47,8 +47,8 @@ use crate::queue_runtime::{
 use crate::remote_runtime::repair_missing_referenced_objects;
 use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
 use crate::root_size_summary::{
-    RootSizeSummary, build_root_size_summary, encode_root_size_summary, root_size_summary_key,
-    write_cached_root_size_summary,
+    RootSizeSummary, build_root_size_summary_with_remote_objects, encode_root_size_summary,
+    root_size_summary_key, write_cached_root_size_summary,
 };
 use crate::root_state::roots;
 use crate::snapshot_state::{current_snapshot, load_snapshot_by_id};
@@ -861,8 +861,13 @@ fn enqueue_and_drain_sync(
     trace.mark("content queue");
     enqueue_gc_mark_if_needed(paths, remote, &host_label, config, &content_export)?;
     trace.mark("gc mark");
+    let mut upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    trace.mark("drain content queue");
+
     let mut root_size_summary_cache = None::<RootSizeSummary>;
-    match build_root_size_summary(paths, config, &remote_export) {
+    match root_size_summary_remote_objects(remote, &host_label).and_then(|objects| {
+        build_root_size_summary_with_remote_objects(paths, config, &remote_export, remote, &objects)
+    }) {
         Ok(Some(summary)) => {
             let key = root_size_summary_key(&host_label);
             let fingerprint = payload_fingerprint(&serde_json::to_vec(&summary)?);
@@ -879,7 +884,11 @@ fn enqueue_and_drain_sync(
             eprintln!("warning: skipped root size summary publish: {err:#}");
         }
     }
-    let upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    let summary_upload_drain =
+        drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    upload_drain.uploaded += summary_upload_drain.uploaded;
+    upload_drain.uploaded_bytes += summary_upload_drain.uploaded_bytes;
+    upload_drain.skipped += summary_upload_drain.skipped;
     let acknowledged_remote_journal =
         acknowledge_remote_event_journal_uploads(paths, remote, &host_label)?;
     let compacted_event_journal = crate::queue_runtime::compact_event_journal_force(paths)?;
@@ -1032,6 +1041,18 @@ fn remote_upload_key(remote: &RemoteStore, host_id: &str, key: &str) -> String {
 
 fn s3_prefers_canonical_remote_only(key: &str) -> bool {
     prefer_s3_canonical_remote_only(key)
+}
+
+fn root_size_summary_remote_objects(
+    remote: &RemoteStore,
+    host_label: &str,
+) -> Result<Vec<crate::remote_store::RemoteObjectStat>> {
+    let prefix = if matches!(remote, RemoteStore::S3(_)) {
+        format!("{host_label}/")
+    } else {
+        String::new()
+    };
+    remote.list_with_sizes(&prefix)
 }
 
 fn content_object_fingerprint(key: &str) -> String {

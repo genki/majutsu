@@ -406,9 +406,11 @@ fn current_snapshot_blob_oids(paths: &Paths, conn: &Connection) -> Result<BTreeS
             Ok(())
         })?;
     }
-    for records in manifest.roots.values() {
-        for record in records {
-            add_record_blob_oid(record, &mut oids);
+    if manifest.root_trees.is_empty() {
+        for records in manifest.roots.values() {
+            for record in records {
+                add_record_blob_oid(record, &mut oids);
+            }
         }
     }
     Ok(oids)
