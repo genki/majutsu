@@ -1074,6 +1074,7 @@ fn raw_snapshot_manifest_from_export(
     if !snapshot.manifest_json.trim().is_empty() {
         return Ok(serde_json::from_str(&snapshot.manifest_json)?);
     }
+    crate::util::validate_local_object_key(&snapshot.manifest_key)?;
     let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
     Ok(serde_json::from_slice(&decode_object(paths, &bytes)?)?)
 }
@@ -1811,6 +1812,7 @@ pub(crate) fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
         issues.push(format_history_graph_issue(issue));
     }
     validate_clone_metadata_references(export, &mut issues);
+    validate_clone_metadata_object_keys_into(export, &mut issues);
     validate_clone_large_pin_metadata_into(export, &mut issues);
     if issues.is_empty() {
         return Ok(());
@@ -1827,6 +1829,64 @@ pub(crate) fn validate_clone_metadata(export: &MetadataExport) -> Result<()> {
         String::new()
     };
     bail!("remote metadata is inconsistent and cannot be cloned: {sample}{suffix}")
+}
+
+pub(crate) fn validate_clone_metadata_object_keys(export: &MetadataExport) -> Result<()> {
+    let mut issues = Vec::new();
+    validate_clone_metadata_object_keys_into(export, &mut issues);
+    if issues.is_empty() {
+        return Ok(());
+    }
+    bail!("{}", issues.remove(0))
+}
+
+fn validate_clone_metadata_object_keys_into(export: &MetadataExport, issues: &mut Vec<String>) {
+    for snapshot in &export.snapshots {
+        if let Err(err) = crate::util::validate_local_object_key(&snapshot.manifest_key) {
+            issues.push(format!(
+                "snapshot {} has invalid manifest object key {}: {err}",
+                snapshot.id, snapshot.manifest_key
+            ));
+        }
+    }
+    for blob in &export.blobs {
+        if let Err(err) = crate::util::validate_local_object_key(&blob.object_key) {
+            issues.push(format!(
+                "blob {} has invalid object key {}: {err}",
+                blob.oid, blob.object_key
+            ));
+        }
+    }
+    for large in &export.large_objects {
+        if let Err(err) = crate::util::validate_local_object_key(&large.manifest_key) {
+            issues.push(format!(
+                "large object {} has invalid manifest key {}: {err}",
+                large.oid, large.manifest_key
+            ));
+        }
+    }
+    for chunk in &export.chunks {
+        if let Err(err) = crate::util::validate_local_object_key(&chunk.object_key) {
+            issues.push(format!(
+                "large chunk {} has invalid object key {}: {err}",
+                chunk.oid, chunk.object_key
+            ));
+        }
+    }
+    for pack in &export.packs {
+        if let Err(err) = crate::util::validate_local_object_key(&pack.pack_key) {
+            issues.push(format!(
+                "pack {} has invalid pack key {}: {err}",
+                pack.pack_id, pack.pack_key
+            ));
+        }
+        if let Err(err) = crate::util::validate_local_object_key(&pack.index_key) {
+            issues.push(format!(
+                "pack {} has invalid index key {}: {err}",
+                pack.pack_id, pack.index_key
+            ));
+        }
+    }
 }
 
 pub(crate) fn validate_clone_large_pin_metadata(export: &MetadataExport) -> Result<()> {
@@ -1971,6 +2031,7 @@ pub(crate) fn download_local_object_from_remote(
     remote: &RemoteStore,
     key: &str,
 ) -> Result<Vec<u8>> {
+    crate::util::validate_local_object_key(key)?;
     if matches!(remote, RemoteStore::S3(_)) {
         let config = read_config(paths)?;
         let host_prefix = remote_host_label(&config.host.name);
@@ -2010,6 +2071,7 @@ pub(crate) fn download_local_object_from_remote(
 }
 
 pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Result<bool> {
+    crate::util::validate_local_object_key(key)?;
     let dest = paths.home.join(key);
     if dest.exists() {
         return Ok(true);
@@ -2028,9 +2090,7 @@ pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Resu
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = dest.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &dest)?;
+    crate::atomic_io::write_atomic(&dest, &bytes)?;
     Ok(true)
 }
 
@@ -2056,6 +2116,12 @@ pub(crate) fn hydrate_local_objects_from_remote(
     keys: Vec<String>,
 ) -> Result<HydrateStats> {
     let mut keys = keys
+        .into_iter()
+        .map(|key| {
+            crate::util::validate_local_object_key(&key)?;
+            Ok(key)
+        })
+        .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|key| !paths.home.join(key).exists())
         .collect::<Vec<_>>();
@@ -2152,6 +2218,7 @@ fn hydrate_one_local_object_from_remote(
     remote: &RemoteStore,
     key: &str,
 ) -> Result<HydrateStats> {
+    crate::util::validate_local_object_key(key)?;
     let dest = paths.home.join(key);
     if dest.exists() {
         return Ok(HydrateStats::default());
@@ -2163,10 +2230,8 @@ fn hydrate_one_local_object_from_remote(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = dest.with_extension(format!("{}.tmp", Uuid::new_v4()));
     let write_started = std::time::Instant::now();
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &dest)?;
+    crate::atomic_io::write_atomic(&dest, &bytes)?;
     let write_ms = write_started.elapsed().as_millis();
     Ok(HydrateStats {
         hydrated: 1,
@@ -4348,6 +4413,27 @@ pub(crate) fn store_encoded_object_bytes(
     bytes: &[u8],
 ) -> Result<String> {
     let storage_id = object_storage_id(paths, oid)?;
+    store_encoded_object_bytes_with_storage_id(paths, base, oid, &storage_id, bytes)
+}
+
+pub(crate) fn store_encoded_object_bytes_with_key_hex(
+    paths: &Paths,
+    base: &Path,
+    oid: &str,
+    key_hex: &str,
+    bytes: &[u8],
+) -> Result<String> {
+    let storage_id = object_storage_id_with_key_hex(paths, oid, key_hex)?;
+    store_encoded_object_bytes_with_storage_id(paths, base, oid, &storage_id, bytes)
+}
+
+fn store_encoded_object_bytes_with_storage_id(
+    paths: &Paths,
+    base: &Path,
+    _oid: &str,
+    storage_id: &str,
+    bytes: &[u8],
+) -> Result<String> {
     let (a, b) = storage_id.split_at(2);
     let dir = base.join(a);
     fs::create_dir_all(&dir)?;
@@ -4376,6 +4462,13 @@ fn object_storage_id(paths: &Paths, oid: &str) -> Result<String> {
         return Ok(oid.to_string());
     }
     let key_hex = read_master_key(paths)?;
+    object_storage_id_with_key_hex(paths, oid, &key_hex)
+}
+
+fn object_storage_id_with_key_hex(paths: &Paths, oid: &str, key_hex: &str) -> Result<String> {
+    if !object_keys_are_hmac(paths)? {
+        return Ok(oid.to_string());
+    }
     let key_bytes = hex::decode(key_hex.trim())?;
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key_bytes)?;
     mac.update(b"majutsu-object-key-v1\0");
@@ -4565,7 +4658,22 @@ pub(crate) fn encode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+pub(crate) fn encode_object_with_master_key_hex(
+    paths: &Paths,
+    bytes: &[u8],
+    mode: EncryptionMode,
+    master_key_hex: &str,
+) -> Result<Vec<u8>> {
+    crate::majutsu_crypto::encode_object_with_master_key_hex(
+        bytes,
+        mode,
+        master_key_hex,
+        &recipients_path(paths),
+    )
+}
+
 pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
+    crate::util::validate_local_object_key(key)?;
     let path = paths.home.join(key);
     if !path.exists() {
         hydrate_local_object_from_remote(paths, key)
@@ -4664,7 +4772,32 @@ pub(crate) fn read_blob_payload(
 }
 
 pub(crate) fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
-    crate::majutsu_crypto::decode_object(bytes, &paths.master_key, &recipients_path(paths))
+    let recipients = recipients_path(paths);
+    match crate::majutsu_crypto::decode_object(bytes, &paths.master_key, &recipients) {
+        Ok(decoded) => Ok(decoded),
+        Err(first) => {
+            for fallback in [
+                key_rotation_pending_path(paths),
+                key_rotation_previous_path(paths),
+            ] {
+                if fallback.exists()
+                    && let Ok(decoded) =
+                        crate::majutsu_crypto::decode_object(bytes, &fallback, &recipients)
+                {
+                    return Ok(decoded);
+                }
+            }
+            Err(first)
+        }
+    }
+}
+
+pub(crate) fn key_rotation_pending_path(paths: &Paths) -> PathBuf {
+    paths.master_key.with_extension("key.pending")
+}
+
+pub(crate) fn key_rotation_previous_path(paths: &Paths) -> PathBuf {
+    paths.master_key.with_extension("key.prev")
 }
 
 pub(crate) fn recipients_path(paths: &Paths) -> PathBuf {
@@ -5001,6 +5134,28 @@ mod tests {
         assert!(remote.put_if_absent("objects/test", b"first").unwrap());
         assert!(!remote.put_if_absent("objects/test", b"second").unwrap());
         assert_eq!(remote.get("objects/test").unwrap(), b"first");
+    }
+
+    #[test]
+    fn file_remote_put_file_if_absent_does_not_leave_partial_object_on_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = RemoteStore::File(FileRemote {
+            root: tmp.path().join("remote"),
+        });
+        let missing = tmp.path().join("missing-source");
+
+        let err = remote
+            .put_file_if_absent("objects/test", &missing)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("No such file")
+                || err.to_string().contains("not found")
+                || err
+                    .to_string()
+                    .contains("指定されたファイルが見つかりません"),
+            "{err:#}"
+        );
+        assert!(!tmp.path().join("remote/objects/test").exists());
     }
 
     #[test]

@@ -132,6 +132,39 @@ pub(crate) fn stable_read_in_root(root: &Path, rel: &Path, mode: &str) -> Result
     stable_read_in_root_platform(root, rel, mode)
 }
 
+pub(crate) fn validate_local_object_key(key: &str) -> Result<()> {
+    validate_slash_relative_key(key)?;
+    if !key.starts_with("objects/") {
+        bail!("local object key must start with objects/: {key}");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_slash_relative_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        bail!("object key must not be empty");
+    }
+    if key.contains('\\') {
+        bail!("object key must use '/' separators only: {key}");
+    }
+    let path = Path::new(key);
+    if path.is_absolute() {
+        bail!("object key must be relative: {key}");
+    }
+    for part in key.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            bail!("object key must not contain empty, '.', or '..' components: {key}");
+        }
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => bail!("object key must not contain prefixes or root separators: {key}"),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn stable_open_file_in_root(root: &Path, rel: &Path) -> Result<(File, fs::Metadata)> {
     validate_relative_components(rel)?;
@@ -497,5 +530,23 @@ mod tests {
                 .contains("decoded test metadata exceeds limit"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn validate_local_object_key_rejects_path_traversal() {
+        for key in [
+            "",
+            "refs/current",
+            "../escape",
+            "objects/../escape",
+            "objects//blob",
+            "objects/./blob",
+            "/tmp/escape",
+            r"objects\blob",
+            r"C:\escape",
+        ] {
+            assert!(validate_local_object_key(key).is_err(), "{key}");
+        }
+        assert!(validate_local_object_key("objects/blobs/aa/bb").is_ok());
     }
 }

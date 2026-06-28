@@ -616,7 +616,7 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
 }
 
 pub(crate) fn write_config(paths: &Paths, config: &Config) -> Result<()> {
-    fs::write(&paths.config, toml::to_string_pretty(config)?)?;
+    crate::atomic_io::write_atomic(&paths.config, toml::to_string_pretty(config)?.as_bytes())?;
     Ok(())
 }
 
@@ -779,7 +779,7 @@ fn duration_value_millis(value: DurationValue) -> Result<u64> {
 fn duration_value_seconds(value: DurationValue) -> Result<u64> {
     match value {
         DurationValue::Integer(value) => Ok(value),
-        DurationValue::String(value) => Ok(parse_duration_millis(&value)? / 1000),
+        DurationValue::String(value) => Ok(parse_duration_millis(&value)?.div_ceil(1000)),
     }
 }
 
@@ -913,4 +913,25 @@ fn default_tiering_rules() -> Vec<TieringRule> {
             storage: rule.storage,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seconds_duration_strings_round_subsecond_up_without_disabling() {
+        assert_eq!(
+            duration_value_seconds(DurationValue::String("500ms".into())).unwrap(),
+            1
+        );
+        assert_eq!(
+            duration_value_seconds(DurationValue::String("1500ms".into())).unwrap(),
+            2
+        );
+        assert_eq!(
+            duration_value_seconds(DurationValue::String("0s".into())).unwrap(),
+            0
+        );
+    }
 }

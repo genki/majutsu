@@ -72,12 +72,6 @@ pub(crate) struct FileRemote {
     pub(crate) root: PathBuf,
 }
 
-fn file_remote_fsync_enabled() -> bool {
-    std::env::var("MAJUTSU_FSYNC_REMOTE_FILE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
 fn s3_timeout_secs_env(name: &str, default: u64) -> Result<u64> {
     match env::var(name) {
         Ok(value) => value
@@ -293,6 +287,76 @@ pub(crate) struct RemoteObjectStat {
 
 pub(crate) fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
     open_remote_with_upload_policy(config, true, default_large_max_parallel_uploads())
+}
+
+fn file_remote_path(root: &Path, key: &str) -> Result<PathBuf> {
+    crate::util::validate_slash_relative_key(key)?;
+    Ok(root.join(key))
+}
+
+fn file_remote_put_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_io::write_atomic(path, bytes)
+}
+
+fn file_remote_put_file_atomic(path: &Path, source: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_io::write_atomic_with(path, |out| {
+        let mut input = File::open(source)?;
+        std::io::copy(&mut input, out)?;
+        Ok(())
+    })
+}
+
+fn file_remote_put_if_absent_atomic(
+    path: &Path,
+    write_contents: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = file_remote_tmp_path(path);
+    let mut tmp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("create temporary remote object {}", tmp.display()))?;
+    let result = (|| -> Result<bool> {
+        write_contents(&mut tmp_file)?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
+        match fs::hard_link(&tmp, path) {
+            Ok(()) => {
+                fs::remove_file(&tmp)?;
+                crate::atomic_io::fsync_parent_dir(path)?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&tmp)?;
+                Ok(false)
+            }
+            Err(err) => {
+                Err(err).with_context(|| format!("publish remote object {}", path.display()))
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn file_remote_tmp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "object".to_string());
+    parent.join(format!(".{file_name}.mjtmp-{}", uuid::Uuid::new_v4()))
 }
 
 pub(crate) fn remote_config_diagnostics(config: &RemoteConfig) -> Result<Vec<(String, String)>> {
@@ -580,12 +644,8 @@ impl RemoteStore {
     pub(crate) fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
         match self {
             RemoteStore::File(remote) => {
-                let path = remote.root.join(key);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(path, bytes)?;
-                Ok(())
+                let path = file_remote_path(&remote.root, key)?;
+                file_remote_put_atomic(&path, bytes)
             }
             RemoteStore::S3(remote) => remote.put(key, bytes),
         }
@@ -594,12 +654,8 @@ impl RemoteStore {
     pub(crate) fn put_file(&self, key: &str, source: &Path) -> Result<()> {
         match self {
             RemoteStore::File(remote) => {
-                let path = remote.root.join(key);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(source, path)?;
-                Ok(())
+                let path = file_remote_path(&remote.root, key)?;
+                file_remote_put_file_atomic(&path, source)
             }
             RemoteStore::S3(remote) => remote.put_file(key, source),
         }
@@ -608,25 +664,11 @@ impl RemoteStore {
     pub(crate) fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
         match self {
             RemoteStore::File(remote) => {
-                let path = remote.root.join(key);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                {
-                    Ok(mut file) => {
-                        file.write_all(bytes)?;
-                        if file_remote_fsync_enabled() {
-                            file.sync_all()?;
-                        }
-                        Ok(true)
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                    Err(err) => Err(err.into()),
-                }
+                let path = file_remote_path(&remote.root, key)?;
+                file_remote_put_if_absent_atomic(&path, |file| {
+                    file.write_all(bytes)?;
+                    Ok(())
+                })
             }
             RemoteStore::S3(remote) => remote.put_if_absent(key, bytes),
         }
@@ -635,26 +677,12 @@ impl RemoteStore {
     pub(crate) fn put_file_if_absent(&self, key: &str, source: &Path) -> Result<bool> {
         match self {
             RemoteStore::File(remote) => {
-                let path = remote.root.join(key);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                {
-                    Ok(mut out) => {
-                        let mut input = File::open(source)?;
-                        std::io::copy(&mut input, &mut out)?;
-                        if file_remote_fsync_enabled() {
-                            out.sync_all()?;
-                        }
-                        Ok(true)
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                    Err(err) => Err(err.into()),
-                }
+                let path = file_remote_path(&remote.root, key)?;
+                file_remote_put_if_absent_atomic(&path, |out| {
+                    let mut input = File::open(source)?;
+                    std::io::copy(&mut input, out)?;
+                    Ok(())
+                })
             }
             RemoteStore::S3(remote) => remote.put_file_if_absent(key, source),
         }
@@ -662,14 +690,14 @@ impl RemoteStore {
 
     pub(crate) fn get(&self, key: &str) -> Result<Vec<u8>> {
         match self {
-            RemoteStore::File(remote) => Ok(fs::read(remote.root.join(key))?),
+            RemoteStore::File(remote) => Ok(fs::read(file_remote_path(&remote.root, key)?)?),
             RemoteStore::S3(remote) => remote.get(key),
         }
     }
 
     pub(crate) fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>> {
         match self {
-            RemoteStore::File(remote) => match fs::read(remote.root.join(key)) {
+            RemoteStore::File(remote) => match fs::read(file_remote_path(&remote.root, key)?) {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(err)
                     if matches!(
@@ -688,7 +716,7 @@ impl RemoteStore {
     pub(crate) fn delete(&self, key: &str) -> Result<()> {
         match self {
             RemoteStore::File(remote) => {
-                let path = remote.root.join(key);
+                let path = file_remote_path(&remote.root, key)?;
                 if path.exists() {
                     fs::remove_file(path)?;
                 }
@@ -701,7 +729,7 @@ impl RemoteStore {
     pub(crate) fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Vec<u8>> {
         match self {
             RemoteStore::File(remote) => {
-                let mut file = File::open(remote.root.join(key))?;
+                let mut file = File::open(file_remote_path(&remote.root, key)?)?;
                 file.seek(SeekFrom::Start(start))?;
                 let mut limited = Vec::with_capacity(len as usize);
                 let mut take = file.take(len);
@@ -714,7 +742,7 @@ impl RemoteStore {
 
     pub(crate) fn exists(&self, key: &str) -> Result<bool> {
         match self {
-            RemoteStore::File(remote) => Ok(remote.root.join(key).exists()),
+            RemoteStore::File(remote) => Ok(file_remote_path(&remote.root, key)?.exists()),
             RemoteStore::S3(remote) => remote.exists(key),
         }
     }

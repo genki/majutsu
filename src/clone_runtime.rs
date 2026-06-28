@@ -19,7 +19,9 @@ use crate::object_paths::local_object_keys;
 use crate::queue_runtime::import_remote_event_journals;
 use crate::remote_runtime::read_remote_host_index;
 use crate::remote_store::{RemoteStore, open_remote};
-use crate::util::{REMOTE_METADATA_DECODE_LIMIT, zstd_decode_all_limited};
+use crate::util::{
+    REMOTE_METADATA_DECODE_LIMIT, validate_local_object_key, zstd_decode_all_limited,
+};
 
 pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let trace = CloneTrace::new();
@@ -61,6 +63,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
         loaded.selection.host_index,
         &export,
     )?;
+    crate::validate_clone_metadata_object_keys(&export)?;
     crate::validate_clone_large_pin_metadata(&export)?;
     if !compact_snapshot_metadata {
         crate::validate_clone_metadata(&export)?;
@@ -70,9 +73,9 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
     let clone_result = (|| -> Result<()> {
         crate::create_layout(&staging_paths)?;
         write_config(&staging_paths, &export.config)?;
-        fs::write(
+        crate::atomic_io::write_atomic(
             &staging_paths.host,
-            toml::to_string_pretty(&export.config.host)?,
+            toml::to_string_pretty(&export.config.host)?.as_bytes(),
         )?;
         let host_prefix = loaded
             .selection
@@ -81,7 +84,10 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             .map(remote_host_prefix_from_summary)
             .unwrap_or_else(|| remote_host_label(&export.config.host.name));
         if let Some(recipients) = clone_remote_recipients(&remote, &host_prefix)? {
-            fs::write(staging_paths.home.join("keys/recipients.toml"), recipients)?;
+            crate::atomic_io::write_atomic(
+                &staging_paths.home.join("keys/recipients.toml"),
+                &recipients,
+            )?;
         }
         if export.config.security.encryption != "none" {
             let key = env::var("MAJUTSU_MASTER_KEY")
@@ -367,6 +373,7 @@ fn materialize_keys(paths: &Paths, remote: &RemoteStore, keys: Vec<String>) -> R
 }
 
 fn materialize_one_key(paths: &Paths, remote: &RemoteStore, key: &str) -> Result<()> {
+    validate_local_object_key(key)?;
     let dest = paths.home.join(key);
     if dest.exists() {
         return Ok(());
@@ -376,12 +383,19 @@ fn materialize_one_key(paths: &Paths, remote: &RemoteStore, key: &str) -> Result
     }
     let bytes = crate::download_local_object_from_remote(paths, remote, key)
         .with_context(|| format!("download clone object {key}"))?;
-    fs::write(&dest, bytes).with_context(|| format!("write clone object {key}"))?;
+    crate::atomic_io::write_atomic(&dest, &bytes)
+        .with_context(|| format!("write clone object {key}"))?;
     Ok(())
 }
 
 fn materialize_keys_parallel(paths: &Paths, remote: &RemoteStore, keys: Vec<String>) -> Result<()> {
     let keys = keys
+        .into_iter()
+        .map(|key| {
+            validate_local_object_key(&key)?;
+            Ok(key)
+        })
+        .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|key| !paths.home.join(key).exists())
         .collect::<Vec<_>>();

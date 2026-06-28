@@ -13708,6 +13708,63 @@ fn clone_rejects_unsupported_metadata_export_version_without_creating_home() {
 }
 
 #[test]
+fn clone_rejects_remote_metadata_object_key_escape_without_writing_staging_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let clone_state = tmp.path().join("clone-state");
+    let escaped = tmp.path().join("escaped");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let mut export = read_remote_metadata(&remote);
+    export["snapshots"][0]["manifest_key"] = serde_json::Value::String("../escaped".into());
+    write_remote_metadata(&remote, &export);
+
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&clone_state)
+            .arg("clone")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    assert!(!clone_state.exists());
+    assert!(!escaped.exists());
+}
+
+#[test]
 fn fsck_detects_broken_history_graph() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

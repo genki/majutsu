@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::config::{MetadataExport, Paths};
 use crate::majutsu_store::{canonical_remote_alias, canonical_remote_aliases};
-use crate::util::path_to_slash;
+use crate::util::{path_to_slash, validate_local_object_key};
 use std::fs;
 
 pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<String>> {
@@ -120,6 +120,7 @@ fn snapshot_manifest_for_object_keys(
     if !snapshot.manifest_json.trim().is_empty() {
         return Ok(serde_json::from_str(&snapshot.manifest_json)?);
     }
+    validate_local_object_key(&snapshot.manifest_key)?;
     let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
@@ -127,6 +128,7 @@ fn snapshot_manifest_for_object_keys(
 }
 
 fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeManifest> {
+    validate_local_object_key(tree_key)?;
     let bytes = fs::read(paths.home.join(tree_key))?;
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
@@ -134,6 +136,7 @@ fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeMa
 }
 
 fn large_manifest_for_object_keys(paths: &Paths, manifest_key: &str) -> Result<LargeManifest> {
+    validate_local_object_key(manifest_key)?;
     let bytes = fs::read(paths.home.join(manifest_key))?;
     Ok(serde_json::from_slice(&crate::decode_object(
         paths, &bytes,
@@ -148,6 +151,7 @@ fn tree_entries_for_object_keys(
         return Ok(tree.entries.clone());
     }
     let root_node = tree.root_node.as_ref().expect("checked above");
+    validate_local_object_key(&root_node.node_key)?;
     let bytes = fs::read(paths.home.join(&root_node.node_key))?;
     let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
     tree_entries_from_node_for_object_keys(paths, node)
@@ -159,6 +163,7 @@ fn tree_entries_from_node_for_object_keys(
 ) -> Result<BTreeMap<String, FileRecord>> {
     let mut entries = node.entries;
     for child in node.child_nodes.values() {
+        validate_local_object_key(&child.node_key)?;
         let bytes = fs::read(paths.home.join(&child.node_key))?;
         let child_node: TreeNodeManifest =
             serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
@@ -168,6 +173,7 @@ fn tree_entries_from_node_for_object_keys(
 }
 
 fn push_child_tree_node_keys(paths: &Paths, keys: &mut Vec<String>, node_key: &str) -> Result<()> {
+    validate_local_object_key(node_key)?;
     let bytes = fs::read(paths.home.join(node_key))?;
     let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
     for child in node.child_nodes.values() {

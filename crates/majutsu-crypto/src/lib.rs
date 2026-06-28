@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const ENC_MAGIC: &[u8] = b"MJENC1\n";
 const AGE_MAGIC: &[u8] = b"age-encryption.org/v1";
@@ -102,6 +102,28 @@ pub fn encode_object(
     }
 }
 
+pub fn encode_object_with_master_key_hex(
+    bytes: &[u8],
+    encryption: EncryptionMode,
+    master_key_hex: &str,
+    recipients_path: &Path,
+) -> Result<Vec<u8>> {
+    validate_key_hex(master_key_hex)?;
+    match encryption {
+        EncryptionMode::None => Ok(bytes.to_vec()),
+        EncryptionMode::Age => {
+            if let Some(ciphertext) = age_encrypt_object(recipients_path, bytes)? {
+                Ok(ciphertext)
+            } else {
+                encode_legacy_envelope_with_key_hex(bytes, master_key_hex)
+            }
+        }
+        EncryptionMode::ChaCha20Poly1305 => {
+            encode_legacy_envelope_with_key_hex(bytes, master_key_hex)
+        }
+    }
+}
+
 pub fn decode_object(
     bytes: &[u8],
     master_key_path: &Path,
@@ -147,8 +169,60 @@ pub fn write_master_key(master_key_path: &Path, hex_key: &str) -> Result<()> {
         fs::create_dir_all(parent)?;
         restrict_key_parent_permissions(parent)?;
     }
-    fs::write(master_key_path, format!("{}\n", hex_key.trim()))?;
+    write_key_atomic(master_key_path, format!("{}\n", hex_key.trim()).as_bytes())?;
     restrict_key_file_permissions(master_key_path)?;
+    Ok(())
+}
+
+fn write_key_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = key_tmp_path(path);
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("create temporary key file {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        restrict_key_file_permissions(&tmp)?;
+        drop(file);
+        fs::rename(&tmp, path).with_context(|| format!("replace key file {}", path.display()))?;
+        sync_parent_dir(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn key_tmp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "master.key".to_string());
+    parent.join(format!(
+        ".{file_name}.mjtmp-{}",
+        random_key_hex().unwrap_or_default()
+    ))
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("sync key directory {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -207,6 +281,10 @@ pub fn ensure_age_keyring(recipients_path: &Path) -> Result<()> {
 
 fn encode_legacy_envelope(bytes: &[u8], master_key_path: &Path) -> Result<Vec<u8>> {
     let key_hex = read_master_key(master_key_path)?;
+    encode_legacy_envelope_with_key_hex(bytes, &key_hex)
+}
+
+fn encode_legacy_envelope_with_key_hex(bytes: &[u8], key_hex: &str) -> Result<Vec<u8>> {
     let key_bytes = hex::decode(key_hex.trim())?;
     let key = Key::from_slice(&key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
