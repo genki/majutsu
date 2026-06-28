@@ -39,19 +39,24 @@ mj version --json
 ## State and diff inspection
 
 `mj state` prints a Git `status -s`-style view of managed file changes.
-Without a reference it compares the first snapshot with the live filesystem, so
-every file that became added, modified, or deleted since the root entered
-Majutsu is visible. Passing a reference narrows the basis to a snapshot,
-operation id, absolute time, or relative time.
+Without a reference it treats the reference as infinite past and shows the
+lifecycle of every tracked path since the root was registered: live tracked
+paths appear as `A`, deleted tracked paths appear as `D`, and explicitly
+untracked paths are hidden. Passing a reference compares that snapshot,
+operation id, absolute time, or relative time with the live filesystem.
+Rows are ordered by newest tracked operation time first. When `-U/--untrack`
+is enabled, `?` rows are treated as the newest rows and appear at the top.
 
 ```sh
 mj state
 mj state 1d
 mj state 1d -r home-notes
-mj state 03:40 -r home-notes --diff
+mj state 03:40 -r home-notes -d
 mj state op-123456789abc -g
-mj state --deleted
+mj state -D
 mj state --status A,M
+mj state -r home-notes -U --status '?'
+mj state -r home-notes -- src README.md
 mj track path/to/file
 mj untrack path/to/file
 ```
@@ -63,6 +68,7 @@ A  added file
 M  content or restore-significant change
 D  deleted file
 m  metadata-only change, shown only with --meta
+?  untracked live file, shown only with -U/--untrack
 ```
 
 Metadata-only changes such as directory mtime updates are hidden by default so
@@ -73,21 +79,25 @@ when mode, owner, xattrs, or directory mtime changes matter:
 mj state 1d -r home-notes --meta
 ```
 
-`--diff` appends colored unified-diff-style lines after each changed text file.
+`-d/--diff` appends colored unified-diff-style hunks after each changed text file.
 Binary, special, and files larger than 1 MiB keep the status row but omit the
 diff body.
 
-Use `--deleted` to list only paths that are still managed in the basis snapshot
-but no longer exist in the live root. It is equivalent to `--status D`.
+Use `-D/--deleted` to list only paths that are still managed but no longer
+exist in the live root. It is equivalent to `--status D`.
 Use `-s/--status` for arbitrary status filtering; it may be repeated or
-comma-separated.
+comma-separated. Add `-- <path>...` to limit output to matching files or
+subtrees, following the same root-relative style as Git pathspecs.
 
 ```sh
 mj state --deleted
+mj state -D -r home-notes
 mj state --deleted -r home-notes
 mj state --status D
 mj state --status A,M
 mj state -s A -s D
+mj state 1d -r home-notes -- src
+mj state -g -- home-notes/src
 ```
 
 `mj track` and `mj untrack` separate deletion from management changes.
@@ -97,6 +107,11 @@ journal point. `mj untrack <path>` is the explicit operation for removing a
 path from future snapshots and backend retention. It does not delete the working
 file. `mj track <path>` explicitly brings a path back under management, including
 paths that would otherwise be excluded by root rules.
+
+When running inside a configured root, or when `-r/--root` selects exactly one
+root, `mj state -U` also lists untracked live files as `?`. Untracked
+directories are summarized as one `?/dir/` row and are not expanded
+recursively.
 
 ```sh
 mj track notes/keep.md
@@ -115,6 +130,8 @@ Show recent managed file changes:
 ```sh
 mj log
 mj log --root home-notes
+mj log --root home-notes -- src
+mj log -- home-notes/src
 ```
 
 Inspect operation records:

@@ -15,6 +15,7 @@ use crossterm::queue;
 use crossterm::terminal::{self, ClearType};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -45,7 +46,9 @@ use crate::queue_runtime::{
     upload_queue_stats,
 };
 use crate::remote_store::open_remote;
-use crate::root_state::{roots, tombstone_tracked_paths_for_root, untracked_paths_for_root};
+use crate::root_state::{
+    roots, tombstone_tracked_paths_for_root, tracked_paths_for_root, untracked_paths_for_root,
+};
 use crate::snapshot_rules::{
     build_ignore, is_volatile, root_dir_allows_descend, root_record_is_managed,
 };
@@ -1467,30 +1470,41 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let current = current_snapshot(&conn)?;
     let configured_roots = roots(&conn)?;
     let state_scope = resolve_state_scope(&configured_roots, &args)?;
+    if args.untrack && !state_scope.single_root_context {
+        bail!("mj state --untrack requires --root or running inside a configured root");
+    }
     let filter = StateChangeFilter::from_args(&args)?;
+    let path_matcher =
+        PathspecMatcher::for_state(&args.pathspecs, &configured_roots, &state_scope)?;
     let basis_set = if let Some(reference) = args.reference.as_deref() {
         StateBasisSet::from_single(
             resolve_state_basis_optional(paths, &conn, reference)?,
             &state_scope.roots,
         )
     } else {
-        default_state_basis_set(paths, &conn, &state_scope.roots)?
+        StateBasisSet {
+            explicit_reference: false,
+            entries: Vec::new(),
+        }
     };
-    if !basis_set.entries.is_empty() && !args.json {
-        stream_state_short_changes(
-            paths,
-            &conn,
-            &basis_set,
-            &state_scope,
-            StateChangeOptions {
-                show_diff: args.diff,
-                include_meta: args.meta,
-                filter,
-            },
-        )?;
+    let options = StateChangeOptions {
+        show_diff: args.diff,
+        include_meta: args.meta,
+        include_untracked: args.untrack,
+        filter,
+        path_matcher,
+        local_root: state_scope.local_root.clone(),
+        reference_since: basis_set.reference_since(),
+    };
+    if args.reference.is_none() && !args.json {
+        stream_state_lifecycle_changes(paths, &conn, &state_scope, options)?;
         return Ok(());
     }
-    if basis_set.entries.is_empty() && !args.json {
+    if !basis_set.entries.is_empty() && !args.json {
+        stream_state_short_changes(paths, &conn, &basis_set, &state_scope, options)?;
+        return Ok(());
+    }
+    if args.reference.is_some() && basis_set.entries.is_empty() && !args.json {
         return Ok(());
     }
     let active_branch = ref_value_for_state(&conn, "current-branch")?;
@@ -1508,11 +1522,30 @@ pub(crate) fn state_cmd(paths: &Paths, args: StateArgs) -> Result<()> {
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let daemon = daemon_health(paths)?;
-    let changes = if !basis_set.entries.is_empty() {
+    let changes = if args.reference.is_none() {
         Some(state_change_report(
-            state_live_file_changes_for_basis_set(paths, &basis_set, false, args.meta)?,
+            state_lifecycle_file_changes(
+                paths,
+                &conn,
+                &state_scope.roots,
+                state_scope.local_paths,
+                args.meta,
+                args.untrack,
+            )?,
             current.as_deref().unwrap_or("(none)").to_string(),
-            &filter,
+            &options,
+        ))
+    } else if !basis_set.entries.is_empty() {
+        Some(state_change_report(
+            state_live_file_changes_for_basis_set(
+                paths,
+                &basis_set,
+                false,
+                args.meta,
+                args.untrack,
+            )?,
+            current.as_deref().unwrap_or("(none)").to_string(),
+            &options,
         ))
     } else {
         None
@@ -2196,6 +2229,25 @@ impl StateBasisSet {
             })
             .collect()
     }
+
+    fn reference_since(&self) -> Option<String> {
+        if !self.explicit_reference {
+            return None;
+        }
+        let first = self.entries.first()?.basis.reference_since()?;
+        self.entries
+            .iter()
+            .all(|entry| entry.basis.reference_since().as_deref() == Some(first.as_str()))
+            .then_some(first)
+    }
+}
+
+impl StateBasis {
+    fn reference_since(&self) -> Option<String> {
+        matches!(self.kind.as_str(), "local-time" | "relative-time" | "time")
+            .then(|| self.resolved_at.clone())
+            .flatten()
+    }
 }
 
 #[derive(Serialize)]
@@ -2204,6 +2256,7 @@ struct StateChangeReport {
     added: usize,
     modified: usize,
     deleted: usize,
+    untracked: usize,
     total: usize,
     files: Vec<StateFileChange>,
 }
@@ -2232,8 +2285,8 @@ impl StateChangeFilter {
                 if status.is_empty() {
                     continue;
                 }
-                if !matches!(status, "A" | "M" | "D" | "m") {
-                    bail!("invalid state status filter: {status}; expected one of A, M, D, m");
+                if !matches!(status, "A" | "M" | "D" | "m" | "?") {
+                    bail!("invalid state status filter: {status}; expected one of A, M, D, m, ?");
                 }
                 statuses.insert(status.to_string());
             }
@@ -2254,33 +2307,221 @@ impl StateChangeFilter {
     }
 }
 
+#[derive(Clone, Default)]
+struct PathspecMatcher {
+    specs: Vec<Pathspec>,
+}
+
+#[derive(Clone)]
+struct Pathspec {
+    root: Option<String>,
+    path: String,
+}
+
+impl PathspecMatcher {
+    fn for_state(raw_specs: &[PathBuf], roots: &[RootConfig], scope: &StateScope) -> Result<Self> {
+        let single_root = scope.single_root_id();
+        let cwd_prefix = scope.cwd_root_prefix.as_deref();
+        Self::from_raw(
+            raw_specs,
+            roots,
+            single_root,
+            cwd_prefix,
+            !scope.single_root_context,
+        )
+    }
+
+    fn for_log(raw_specs: &[PathBuf], roots: &[RootConfig], root: Option<&str>) -> Result<Self> {
+        let selected_root_prefix = if let Some(root_id) = root {
+            roots
+                .iter()
+                .find(|configured| configured.id == root_id)
+                .map(current_root_prefix)
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let cwd_root = if root.is_none() {
+            infer_current_root_with_prefix(roots)?.map(|(root, prefix)| (root.id, prefix))
+        } else {
+            None
+        };
+        let single_root = root
+            .map(str::to_string)
+            .or_else(|| cwd_root.as_ref().map(|(root_id, _)| root_id.clone()));
+        let cwd_prefix = selected_root_prefix.as_deref().or_else(|| {
+            cwd_root
+                .as_ref()
+                .map(|(_, prefix)| prefix.as_str())
+                .filter(|_| root.is_none())
+        });
+        Self::from_raw(
+            raw_specs,
+            roots,
+            single_root.as_deref(),
+            cwd_prefix,
+            single_root.is_none(),
+        )
+    }
+
+    fn from_raw(
+        raw_specs: &[PathBuf],
+        roots: &[RootConfig],
+        single_root: Option<&str>,
+        cwd_prefix: Option<&str>,
+        global_display: bool,
+    ) -> Result<Self> {
+        let mut specs = Vec::new();
+        for raw in raw_specs {
+            if raw.is_absolute() {
+                specs.push(resolve_absolute_pathspec(raw, roots)?);
+                continue;
+            }
+            let normalized = normalize_pathspec(raw);
+            if let Some(root_id) = single_root {
+                let path = strip_root_prefix(&normalized, root_id)
+                    .unwrap_or_else(|| join_slash(cwd_prefix.unwrap_or_default(), &normalized));
+                specs.push(Pathspec {
+                    root: Some(root_id.to_string()),
+                    path,
+                });
+            } else if global_display {
+                specs.push(Pathspec {
+                    root: None,
+                    path: normalized,
+                });
+            } else {
+                specs.push(Pathspec {
+                    root: single_root.map(str::to_string),
+                    path: join_slash(cwd_prefix.unwrap_or_default(), &normalized),
+                });
+            }
+        }
+        Ok(Self { specs })
+    }
+
+    fn allows_display_path(&self, display_path: &str, local_root: Option<&str>) -> bool {
+        if self.specs.is_empty() {
+            return true;
+        }
+        let (candidate_root, candidate_rel) = if let Some(root) = local_root {
+            (Some(root), display_path)
+        } else if let Some((root, rel)) = display_path.split_once('/') {
+            (Some(root), rel)
+        } else {
+            (None, display_path)
+        };
+        self.specs.iter().any(|spec| match spec.root.as_deref() {
+            Some(root) => {
+                candidate_root == Some(root) && pathspec_matches(candidate_rel, &spec.path)
+            }
+            None => pathspec_matches(display_path, &spec.path),
+        })
+    }
+}
+
+fn normalize_pathspec(path: &Path) -> String {
+    let mut value = path_to_slash(path);
+    while value == "." || value.starts_with("./") {
+        if value == "." {
+            value.clear();
+            break;
+        }
+        value = value[2..].to_string();
+    }
+    while value.ends_with('/') {
+        value.pop();
+    }
+    value
+}
+
+fn resolve_absolute_pathspec(path: &Path, roots: &[RootConfig]) -> Result<Pathspec> {
+    let canonical = absolutize_existing_path(path)?;
+    let mut matches = roots
+        .iter()
+        .filter(|root| root.status == "active")
+        .filter_map(|root| {
+            let root_path = absolutize_existing_path(&root.path).ok()?;
+            if canonical.starts_with(&root_path) {
+                let rel = canonical.strip_prefix(&root_path).ok()?;
+                Some((
+                    root_path.components().count(),
+                    root.id.clone(),
+                    normalize_pathspec(rel),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(depth, _, _)| *depth);
+    let Some((_, root, path)) = matches.pop() else {
+        bail!("pathspec is outside configured roots: {}", path.display());
+    };
+    Ok(Pathspec {
+        root: Some(root),
+        path,
+    })
+}
+
+fn strip_root_prefix(path: &str, root_id: &str) -> Option<String> {
+    path.strip_prefix(root_id)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
+}
+
+fn join_slash(prefix: &str, path: &str) -> String {
+    match (prefix.is_empty(), path.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => path.to_string(),
+        (false, true) => prefix.to_string(),
+        (false, false) => format!("{prefix}/{path}"),
+    }
+}
+
+fn pathspec_matches(candidate: &str, spec: &str) -> bool {
+    spec.is_empty() || candidate == spec || candidate.starts_with(&format!("{spec}/"))
+}
+
 #[derive(Clone)]
 struct StateChangeOptions {
     show_diff: bool,
     include_meta: bool,
+    include_untracked: bool,
     filter: StateChangeFilter,
+    path_matcher: PathspecMatcher,
+    local_root: Option<String>,
+    reference_since: Option<String>,
 }
 
 fn state_change_report(
-    changes: Vec<FileChange>,
+    mut changes: Vec<FileChange>,
     current_snapshot: String,
-    filter: &StateChangeFilter,
+    options: &StateChangeOptions,
 ) -> StateChangeReport {
+    sort_state_changes(&mut changes);
     let mut files = Vec::with_capacity(changes.len());
     let mut added = 0usize;
     let mut modified = 0usize;
     let mut deleted = 0usize;
+    let mut untracked = 0usize;
     for change in changes {
-        if !filter.allows(change.status) {
+        if !options.allows(&change) {
             continue;
         }
         match change.status {
             "A" => added += 1,
             "M" => modified += 1,
             "D" => deleted += 1,
+            "?" => untracked += 1,
             _ => {}
         }
-        let (root, path) = split_state_change_path(&change.path);
+        let (root, path) = if let Some(root) = options.local_root.as_ref() {
+            (root.clone(), change.path.clone())
+        } else {
+            split_state_change_path(&change.path)
+        };
         files.push(StateFileChange {
             status: change.status.to_string(),
             root,
@@ -2293,7 +2534,23 @@ fn state_change_report(
         added,
         modified,
         deleted,
+        untracked,
         files,
+    }
+}
+
+impl StateChangeOptions {
+    fn allows(&self, change: &FileChange) -> bool {
+        self.filter.allows(change.status)
+            && self
+                .path_matcher
+                .allows_display_path(&change.path, self.local_root.as_deref())
+            && self.reference_since.as_deref().is_none_or(|since| {
+                change
+                    .order_time
+                    .as_deref()
+                    .is_none_or(|time| time >= since)
+            })
     }
 }
 
@@ -2365,7 +2622,28 @@ fn stream_state_short_changes(
 }
 
 fn stream_state_lines_direct(rx: mpsc::Receiver<LogProducerMessage>) -> Result<()> {
+    stream_state_lines_direct_with_initial(Vec::new(), rx)
+}
+
+fn stream_state_lines_direct_with_initial(
+    initial: Vec<String>,
+    rx: mpsc::Receiver<LogProducerMessage>,
+) -> Result<()> {
     let mut stdout = io::stdout();
+    for line in initial {
+        if let Err(err) = writeln!(stdout, "{line}") {
+            if err.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+    }
+    if let Err(err) = stdout.flush() {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(err.into());
+    }
     for message in rx {
         match message {
             LogProducerMessage::Line(line) => {
@@ -2392,8 +2670,8 @@ fn stream_state_lines_direct(rx: mpsc::Receiver<LogProducerMessage>) -> Result<(
 fn stream_state_lines_viewer(rx: mpsc::Receiver<LogProducerMessage>) -> Result<()> {
     let height = terminal_height();
     let mut lines = Vec::new();
-    let mut done = false;
-    let max_wait = StdDuration::from_millis(2000);
+    let mut overflowed = false;
+    let max_wait = StdDuration::from_millis(150);
     let started = std::time::Instant::now();
     while lines.len() <= height {
         let elapsed = started.elapsed();
@@ -2404,25 +2682,24 @@ fn stream_state_lines_viewer(rx: mpsc::Receiver<LogProducerMessage>) -> Result<(
         match rx.recv_timeout(timeout) {
             Ok(LogProducerMessage::Line(line)) => {
                 lines.push(line);
+                if lines.len() > height {
+                    overflowed = true;
+                    break;
+                }
             }
             Ok(LogProducerMessage::Done) => {
-                done = true;
                 break;
             }
             Ok(LogProducerMessage::Error(err)) => bail!("{err}"),
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                done = true;
                 break;
             }
         }
     }
 
-    if done && lines.len() <= height {
-        for line in lines {
-            println!("{line}");
-        }
-        return Ok(());
+    if !overflowed {
+        return stream_state_lines_direct_with_initial(lines, rx);
     }
 
     run_log_viewer(lines, rx, "mj state")
@@ -2438,6 +2715,16 @@ fn split_state_change_path(path: &str) -> (String, String) {
 struct StateScope {
     roots: Vec<RootConfig>,
     local_paths: bool,
+    local_root: Option<String>,
+    cwd_root_prefix: Option<String>,
+    single_root_context: bool,
+    selected_root: Option<String>,
+}
+
+impl StateScope {
+    fn single_root_id(&self) -> Option<&str> {
+        self.selected_root.as_deref().or(self.local_root.as_deref())
+    }
 }
 
 fn resolve_state_scope(roots: &[RootConfig], args: &StateArgs) -> Result<StateScope> {
@@ -2446,17 +2733,26 @@ fn resolve_state_scope(roots: &[RootConfig], args: &StateArgs) -> Result<StateSc
             .iter()
             .find(|root| root.id == selected)
             .ok_or_else(|| anyhow!("unknown root: {selected}"))?;
+        let cwd_root_prefix = current_root_prefix(root)?;
         return Ok(StateScope {
             roots: vec![root.clone()],
             local_paths: false,
+            local_root: None,
+            cwd_root_prefix,
+            single_root_context: true,
+            selected_root: Some(root.id.clone()),
         });
     }
     if !args.global
-        && let Some(root) = infer_current_root(roots)?
+        && let Some((root, prefix)) = infer_current_root_with_prefix(roots)?
     {
         return Ok(StateScope {
-            roots: vec![root],
+            roots: vec![root.clone()],
             local_paths: true,
+            local_root: Some(root.id),
+            cwd_root_prefix: Some(prefix),
+            single_root_context: true,
+            selected_root: None,
         });
     }
     Ok(StateScope {
@@ -2466,10 +2762,14 @@ fn resolve_state_scope(roots: &[RootConfig], args: &StateArgs) -> Result<StateSc
             .cloned()
             .collect(),
         local_paths: false,
+        local_root: None,
+        cwd_root_prefix: None,
+        single_root_context: false,
+        selected_root: None,
     })
 }
 
-fn infer_current_root(roots: &[RootConfig]) -> Result<Option<RootConfig>> {
+fn infer_current_root_with_prefix(roots: &[RootConfig]) -> Result<Option<(RootConfig, String)>> {
     let cwd = std::env::current_dir()?;
     let mut matches = roots
         .iter()
@@ -2477,14 +2777,29 @@ fn infer_current_root(roots: &[RootConfig]) -> Result<Option<RootConfig>> {
         .filter_map(|root| {
             let root_path = absolutize_existing_path(&root.path).ok()?;
             if cwd.starts_with(&root_path) {
-                Some((root_path.components().count(), root.clone()))
+                let rel = cwd.strip_prefix(&root_path).ok()?;
+                Some((
+                    root_path.components().count(),
+                    root.clone(),
+                    normalize_pathspec(rel),
+                ))
             } else {
                 None
             }
         })
         .collect::<Vec<_>>();
-    matches.sort_by_key(|(depth, _)| *depth);
-    Ok(matches.pop().map(|(_, root)| root))
+    matches.sort_by_key(|(depth, _, _)| *depth);
+    Ok(matches.pop().map(|(_, root, prefix)| (root, prefix)))
+}
+
+fn current_root_prefix(root: &RootConfig) -> Result<Option<String>> {
+    let cwd = std::env::current_dir()?;
+    let root_path = absolutize_existing_path(&root.path)?;
+    if cwd.starts_with(&root_path) {
+        Ok(Some(normalize_pathspec(cwd.strip_prefix(&root_path)?)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn absolutize_existing_path(path: &Path) -> Result<PathBuf> {
@@ -2503,6 +2818,7 @@ fn state_live_file_changes_for_basis_set(
     basis_set: &StateBasisSet,
     local_paths: bool,
     include_meta: bool,
+    include_untracked: bool,
 ) -> Result<Vec<FileChange>> {
     let conn = crate::open_db(paths)?;
     let mut snapshots = BTreeMap::<String, SnapshotManifest>::new();
@@ -2523,8 +2839,10 @@ fn state_live_file_changes_for_basis_set(
             &entry.root,
             local_paths,
             include_meta,
+            include_untracked,
         )?);
     }
+    sort_state_changes(&mut changes);
     Ok(changes)
 }
 
@@ -2534,9 +2852,11 @@ fn state_live_file_changes_for_root(
     root: &RootConfig,
     local_paths: bool,
     include_meta: bool,
+    include_untracked: bool,
 ) -> Result<Vec<FileChange>> {
     let conn = crate::open_db(paths)?;
     let untracked_paths = untracked_paths_for_root(&conn, &root.id)?;
+    let path_times = tracked_path_times_for_root(&conn, &root.id)?;
     let mut from_files = root_file_map(paths, Some(from), &root.id)?;
     from_files.retain(|path, _| !untracked_paths.contains(path));
     for path in tombstone_tracked_paths_for_root(&conn, root)? {
@@ -2549,6 +2869,8 @@ fn state_live_file_changes_for_root(
     }
     let mut live_files = scan_live_root_for_state(root)?;
     live_files.retain(|path, _| !untracked_paths.contains(path));
+    let mut known_files_for_untracked = from_files.keys().cloned().collect::<BTreeSet<_>>();
+    known_files_for_untracked.extend(live_files.keys().cloned());
     let mut paths_all = from_files.keys().cloned().collect::<Vec<_>>();
     paths_all.extend(
         live_files
@@ -2565,42 +2887,61 @@ fn state_live_file_changes_for_root(
             format!("{}/{}", root.id, path)
         };
         match (from_files.get(&path), live_files.get(&path)) {
-            (None, Some(live)) => changes.push(FileChange::from_record(
-                "A",
-                display_path,
-                Some(root),
-                &path,
-                Some(live),
-            )),
-            (Some(previous), None) => changes.push(FileChange::from_record(
-                "D",
-                display_path,
-                Some(root),
-                &path,
-                Some(previous),
-            )),
+            (None, Some(live)) => {
+                let order_time = added_state_order_time(path_times.get(&path), live);
+                changes.push(
+                    FileChange::from_record("A", display_path, Some(root), &path, Some(live))
+                        .with_state_order(1, order_time),
+                );
+            }
+            (Some(previous), None) => changes.push(
+                FileChange::from_record("D", display_path, Some(root), &path, Some(previous))
+                    .with_state_order(1, deleted_state_order_time(path_times.get(&path), previous)),
+            ),
             (Some(a), Some(b)) => match state_record_change_status(a, b) {
-                Some("M") => changes.push(FileChange::from_records(
-                    "M",
-                    display_path,
-                    Some(root),
-                    &path,
-                    Some(a),
-                    Some(b),
-                )),
-                Some("m") if include_meta => changes.push(FileChange::from_records(
-                    "m",
-                    display_path,
-                    Some(root),
-                    &path,
-                    Some(a),
-                    Some(b),
-                )),
+                Some("M") => {
+                    let order_time = modified_state_order_time(b);
+                    changes.push(
+                        FileChange::from_records(
+                            "M",
+                            display_path,
+                            Some(root),
+                            &path,
+                            Some(a),
+                            Some(b),
+                        )
+                        .with_state_order(1, order_time),
+                    );
+                }
+                Some("m") if include_meta => {
+                    let order_time = modified_state_order_time(b);
+                    changes.push(
+                        FileChange::from_records(
+                            "m",
+                            display_path,
+                            Some(root),
+                            &path,
+                            Some(a),
+                            Some(b),
+                        )
+                        .with_state_order(1, order_time),
+                    );
+                }
                 _ => {}
             },
             _ => {}
         }
     }
+    if include_untracked {
+        append_state_untracked_changes(
+            root,
+            local_paths,
+            &known_files_for_untracked,
+            &untracked_paths,
+            &mut changes,
+        )?;
+    }
+    sort_state_changes(&mut changes);
     Ok(changes)
 }
 
@@ -2615,6 +2956,7 @@ fn state_stream_live_file_changes_for_root(
     let mut from_files = root_file_map_by_snapshot_id(paths, snapshot_id, &root.id)?;
     let conn = crate::open_db(paths)?;
     let untracked_paths = untracked_paths_for_root(&conn, &root.id)?;
+    let path_times = tracked_path_times_for_root(&conn, &root.id)?;
     from_files.retain(|path, _| !untracked_paths.contains(path));
     for path in tombstone_tracked_paths_for_root(&conn, root)? {
         if !state_record_path_is_file_relative(&path) {
@@ -2624,45 +2966,45 @@ fn state_stream_live_file_changes_for_root(
             .entry(path.clone())
             .or_insert_with(|| tracked_tombstone_record(root, path));
     }
+    let mut known_files_for_untracked = from_files.keys().cloned().collect::<BTreeSet<_>>();
+    let mut seen_live_paths = BTreeSet::new();
+    let mut records = Vec::new();
     scan_live_root_for_state_each(root, false, |path, live| {
         if untracked_paths.contains(&path) {
             return Ok(());
         }
+        seen_live_paths.insert(path.clone());
         let display_path = state_display_path(root, &path, local_paths);
         match from_files.remove(&path) {
             None => {
-                if !options.filter.allows("A") {
-                    return Ok(());
-                }
-                let diff = state_live_change_diff(
-                    paths,
-                    root,
-                    &path,
-                    None,
-                    Some(&live),
-                    options.show_diff,
-                )?;
-                emit(
-                    FileChange::from_record("A", display_path, Some(root), &path, Some(&live)),
-                    diff,
-                )?
+                let order_time = added_state_order_time(path_times.get(&path), &live);
+                records.push(StateFileChangeRecord {
+                    change: FileChange::from_record(
+                        "A",
+                        display_path,
+                        Some(root),
+                        &path,
+                        Some(&live),
+                    )
+                    .with_state_order(1, order_time),
+                    previous: None,
+                    current: Some(live),
+                });
             }
             Some(previous) if previous.kind == "tombstone" => {
-                if !options.filter.allows("A") {
-                    return Ok(());
-                }
-                let diff = state_live_change_diff(
-                    paths,
-                    root,
-                    &path,
-                    None,
-                    Some(&live),
-                    options.show_diff,
-                )?;
-                emit(
-                    FileChange::from_record("A", display_path, Some(root), &path, Some(&live)),
-                    diff,
-                )?
+                let order_time = added_state_order_time(path_times.get(&path), &live);
+                records.push(StateFileChangeRecord {
+                    change: FileChange::from_record(
+                        "A",
+                        display_path,
+                        Some(root),
+                        &path,
+                        Some(&live),
+                    )
+                    .with_state_order(1, order_time),
+                    previous: None,
+                    current: Some(live),
+                });
             }
             Some(previous) => {
                 let fast_status = state_stream_record_fast_status(&previous, &live);
@@ -2670,66 +3012,523 @@ fn state_stream_live_file_changes_for_root(
                     || (fast_status != Some("M")
                         && state_stream_payload_changed(root, &path, &previous)?);
                 if content_changed {
-                    if !options.filter.allows("M") {
-                        return Ok(());
-                    }
-                    let diff = state_live_change_diff(
-                        paths,
-                        root,
+                    let order_time = modified_state_order_time(&live);
+                    let change = FileChange::from_records(
+                        "M",
+                        display_path,
+                        Some(root),
                         &path,
                         Some(&previous),
                         Some(&live),
-                        options.show_diff,
-                    )?;
-                    emit(
-                        FileChange::from_records(
-                            "M",
-                            display_path,
-                            Some(root),
-                            &path,
-                            Some(&previous),
-                            Some(&live),
-                        ),
-                        diff,
-                    )?
-                } else if fast_status == Some("m")
-                    && options.include_meta
-                    && options.filter.allows("m")
-                {
-                    emit(
-                        FileChange::from_records(
-                            "m",
-                            display_path,
-                            Some(root),
-                            &path,
-                            Some(&previous),
-                            Some(&live),
-                        ),
-                        Vec::new(),
-                    )?
+                    )
+                    .with_state_order(1, order_time);
+                    records.push(StateFileChangeRecord {
+                        change,
+                        previous: Some(previous),
+                        current: Some(live),
+                    });
+                } else if fast_status == Some("m") && options.include_meta {
+                    let order_time = modified_state_order_time(&live);
+                    let change = FileChange::from_records(
+                        "m",
+                        display_path,
+                        Some(root),
+                        &path,
+                        Some(&previous),
+                        Some(&live),
+                    )
+                    .with_state_order(1, order_time);
+                    records.push(StateFileChangeRecord {
+                        change,
+                        previous: Some(previous),
+                        current: Some(live),
+                    });
                 }
             }
         }
         Ok(())
     })?;
+    known_files_for_untracked.extend(seen_live_paths);
     for (path, previous) in &from_files {
-        if !options.filter.allows("D") {
+        let change = FileChange::from_record(
+            "D",
+            state_display_path(root, path, local_paths),
+            Some(root),
+            path,
+            Some(previous),
+        )
+        .with_state_order(1, deleted_state_order_time(path_times.get(path), previous));
+        records.push(StateFileChangeRecord {
+            change,
+            previous: Some(previous.clone()),
+            current: None,
+        });
+    }
+    if options.include_untracked {
+        let mut untracked_changes = Vec::new();
+        append_state_untracked_changes(
+            root,
+            local_paths,
+            &known_files_for_untracked,
+            &untracked_paths,
+            &mut untracked_changes,
+        )?;
+        for change in untracked_changes {
+            records.push(StateFileChangeRecord {
+                change,
+                previous: None,
+                current: None,
+            });
+        }
+    }
+    sort_state_change_records(&mut records);
+    for record in records {
+        if !options.allows(&record.change) {
             continue;
         }
-        let diff =
-            state_live_change_diff(paths, root, path, Some(previous), None, options.show_diff)?;
-        emit(
-            FileChange::from_record(
-                "D",
-                state_display_path(root, path, local_paths),
-                Some(root),
-                path,
-                Some(previous),
-            ),
-            diff,
+        let diff = state_live_change_diff(
+            paths,
+            root,
+            state_change_rel_path(&record.change.path, root, local_paths),
+            record.previous.as_ref(),
+            record.current.as_ref(),
+            options.show_diff && record.change.status != "?",
         )?;
+        emit(record.change, diff)?;
     }
     Ok(())
+}
+
+struct StateFileChangeRecord {
+    change: FileChange,
+    previous: Option<FileRecord>,
+    current: Option<FileRecord>,
+}
+
+fn stream_state_lifecycle_changes(
+    paths: &Paths,
+    conn: &Connection,
+    scope: &StateScope,
+    options: StateChangeOptions,
+) -> Result<()> {
+    let _ = conn;
+    let roots = scope.roots.clone();
+    let local_paths = scope.local_paths;
+    let paths = paths.clone();
+    let (tx, rx) = mpsc::channel::<LogProducerMessage>();
+    thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let ui = StatusUi::new();
+            let mut all_records = Vec::<(RootConfig, StateFileChangeRecord)>::new();
+            for root in roots {
+                let records = state_lifecycle_file_change_records_for_root(
+                    &paths,
+                    &root,
+                    local_paths,
+                    options.include_meta,
+                    options.include_untracked,
+                )?;
+                all_records.extend(records.into_iter().map(|record| (root.clone(), record)));
+            }
+            all_records.sort_by(|(_, a), (_, b)| compare_state_change_order(&a.change, &b.change));
+            for (root, record) in all_records {
+                if !options.allows(&record.change) {
+                    continue;
+                }
+                let diff = state_live_change_diff(
+                    &paths,
+                    &root,
+                    state_change_rel_path(&record.change.path, &root, local_paths),
+                    record.previous.as_ref(),
+                    record.current.as_ref(),
+                    options.show_diff && record.change.status != "?",
+                )?;
+                let line = format!(
+                    " {} {}{}",
+                    color_change_status(&ui, record.change.status),
+                    color_root_path(&ui, &record.change.path, local_paths),
+                    format_change_tags(&ui, &record.change)
+                );
+                tx.send(LogProducerMessage::Line(line))
+                    .map_err(|err| anyhow!("send state line: {err}"))?;
+                for diff_line in diff {
+                    let line = color_state_diff_line(&ui, &diff_line);
+                    tx.send(LogProducerMessage::Line(line))
+                        .map_err(|err| anyhow!("send state diff line: {err}"))?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            let _ = tx.send(LogProducerMessage::Error(format!("{err:#}")));
+        }
+        let _ = tx.send(LogProducerMessage::Done);
+    });
+
+    if should_use_log_viewer() {
+        stream_state_lines_viewer(rx)
+    } else {
+        stream_state_lines_direct(rx)
+    }
+}
+
+fn state_lifecycle_file_changes(
+    paths: &Paths,
+    conn: &Connection,
+    roots: &[RootConfig],
+    local_paths: bool,
+    include_meta: bool,
+    include_untracked: bool,
+) -> Result<Vec<FileChange>> {
+    let _ = conn;
+    let mut changes = Vec::new();
+    for root in roots {
+        changes.extend(
+            state_lifecycle_file_change_records_for_root(
+                paths,
+                root,
+                local_paths,
+                include_meta,
+                include_untracked,
+            )?
+            .into_iter()
+            .map(|record| record.change),
+        );
+    }
+    sort_state_changes(&mut changes);
+    Ok(changes)
+}
+
+fn state_lifecycle_file_change_records_for_root(
+    paths: &Paths,
+    root: &RootConfig,
+    local_paths: bool,
+    include_meta: bool,
+    include_untracked: bool,
+) -> Result<Vec<StateFileChangeRecord>> {
+    let conn = crate::open_db(paths)?;
+    let untracked_paths = untracked_paths_for_root(&conn, &root.id)?;
+    let path_times = tracked_path_times_for_root(&conn, &root.id)?;
+    let mut live_files = scan_live_root_for_state_metadata(root)?;
+    live_files.retain(|path, record| {
+        state_record_path_is_file_relative(path) && record.kind != "directory"
+    });
+
+    let mut root_added_files = first_root_snapshot_file_map(paths, &conn, root)?;
+    root_added_files.retain(|path, record| {
+        state_record_path_is_file_relative(path)
+            && record.kind != "directory"
+            && !untracked_paths.contains(path)
+    });
+
+    let tombstones = tombstone_tracked_paths_for_root(&conn, root)?;
+    let mut managed_paths = tracked_paths_for_root(&conn, &root.id)?;
+    managed_paths.extend(root_added_files.keys().cloned());
+    managed_paths.extend(tombstones.iter().cloned());
+    for path in &untracked_paths {
+        managed_paths.remove(path);
+    }
+    let known_paths_for_untracked = managed_paths.clone();
+
+    let mut records = Vec::new();
+    for path in managed_paths {
+        let display_path = state_display_path(root, &path, local_paths);
+        match live_files.get(&path) {
+            Some(live) if live.kind != "directory" => {
+                if let Some(previous) = root_added_files.get(&path) {
+                    match state_lifecycle_initial_change_status(root, &path, previous, live)? {
+                        Some("M") => {
+                            records.push(StateFileChangeRecord {
+                                change: FileChange::from_records(
+                                    "M",
+                                    display_path,
+                                    Some(root),
+                                    &path,
+                                    Some(previous),
+                                    Some(live),
+                                )
+                                .with_state_order(1, modified_state_order_time(live)),
+                                previous: Some(previous.clone()),
+                                current: Some(live.clone()),
+                            });
+                        }
+                        Some("m") if include_meta => {
+                            records.push(StateFileChangeRecord {
+                                change: FileChange::from_records(
+                                    "m",
+                                    display_path,
+                                    Some(root),
+                                    &path,
+                                    Some(previous),
+                                    Some(live),
+                                )
+                                .with_state_order(1, modified_state_order_time(live)),
+                                previous: Some(previous.clone()),
+                                current: Some(live.clone()),
+                            });
+                        }
+                        _ => {
+                            let order_time = added_state_order_time(path_times.get(&path), live);
+                            records.push(StateFileChangeRecord {
+                                change: FileChange::from_record(
+                                    "A",
+                                    display_path,
+                                    Some(root),
+                                    &path,
+                                    Some(live),
+                                )
+                                .with_state_order(1, order_time),
+                                previous: None,
+                                current: Some(live.clone()),
+                            });
+                        }
+                    }
+                } else {
+                    let order_time = added_state_order_time(path_times.get(&path), live);
+                    records.push(StateFileChangeRecord {
+                        change: FileChange::from_record(
+                            "A",
+                            display_path,
+                            Some(root),
+                            &path,
+                            Some(live),
+                        )
+                        .with_state_order(1, order_time),
+                        previous: None,
+                        current: Some(live.clone()),
+                    });
+                }
+            }
+            None if root_added_files.contains_key(&path) || tombstones.contains(&path) => {
+                let previous = root_added_files
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or_else(|| tracked_tombstone_record(root, path.clone()));
+                records.push(StateFileChangeRecord {
+                    change: FileChange::from_record(
+                        "D",
+                        display_path,
+                        Some(root),
+                        &path,
+                        Some(&previous),
+                    )
+                    .with_state_order(
+                        1,
+                        deleted_state_order_time(path_times.get(&path), &previous),
+                    ),
+                    previous: Some(previous),
+                    current: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if include_untracked {
+        let mut untracked_changes = Vec::new();
+        append_state_untracked_changes(
+            root,
+            local_paths,
+            &known_paths_for_untracked,
+            &untracked_paths,
+            &mut untracked_changes,
+        )?;
+        records.extend(
+            untracked_changes
+                .into_iter()
+                .map(|change| StateFileChangeRecord {
+                    change,
+                    previous: None,
+                    current: None,
+                }),
+        );
+    }
+    sort_state_change_records(&mut records);
+    Ok(records)
+}
+
+fn first_root_snapshot_file_map(
+    paths: &Paths,
+    conn: &Connection,
+    root: &RootConfig,
+) -> Result<BTreeMap<String, FileRecord>> {
+    let root_ids = BTreeSet::from([root.id.clone()]);
+    let first = first_snapshots_for_roots(paths, conn, &root_ids)?;
+    let Some(snapshot_id) = first.get(&root.id) else {
+        return Ok(BTreeMap::new());
+    };
+    let snapshot = load_snapshot_header_by_id(paths, conn, snapshot_id)?;
+    root_file_map(paths, Some(&snapshot), &root.id)
+}
+
+fn state_change_rel_path<'a>(
+    display_path: &'a str,
+    root: &RootConfig,
+    local_paths: bool,
+) -> &'a str {
+    if local_paths {
+        display_path
+    } else {
+        display_path
+            .strip_prefix(&format!("{}/", root.id))
+            .unwrap_or(display_path)
+    }
+}
+
+fn scan_live_root_for_state_metadata(root: &RootConfig) -> Result<BTreeMap<String, FileRecord>> {
+    let mut records = BTreeMap::new();
+    scan_live_root_for_state_each(root, false, |path, record| {
+        records.insert(path, record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+fn append_state_untracked_changes(
+    root: &RootConfig,
+    local_paths: bool,
+    known_paths: &BTreeSet<String>,
+    explicit_untracked: &BTreeSet<String>,
+    changes: &mut Vec<FileChange>,
+) -> Result<()> {
+    let mut live = scan_live_root_for_state_metadata(root)?;
+    for path in explicit_untracked {
+        if !live.contains_key(path)
+            && let Some(record) = state_live_record_for_relative_path(root, path)?
+        {
+            live.insert(path.clone(), record);
+        }
+    }
+    let mut skipped_dirs = Vec::<String>::new();
+    for (path, record) in live {
+        if path_is_under_any(&path, &skipped_dirs) || known_paths.contains(&path) {
+            continue;
+        }
+        if record.kind == "directory" {
+            if known_paths
+                .iter()
+                .any(|known| known.starts_with(&format!("{path}/")))
+            {
+                continue;
+            }
+            let display_path = format!("{}/", state_display_path(root, &path, local_paths));
+            changes.push(
+                FileChange::from_record("?", display_path, Some(root), &path, Some(&record))
+                    .with_state_order(2, state_record_order_time(&record)),
+            );
+            skipped_dirs.push(path);
+            continue;
+        }
+        if explicit_untracked.contains(&path) || !known_paths.contains(&path) {
+            changes.push(
+                FileChange::from_record(
+                    "?",
+                    state_display_path(root, &path, local_paths),
+                    Some(root),
+                    &path,
+                    Some(&record),
+                )
+                .with_state_order(2, state_record_order_time(&record)),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn state_live_record_for_relative_path(
+    root: &RootConfig,
+    rel_s: &str,
+) -> Result<Option<FileRecord>> {
+    let rel = Path::new(rel_s);
+    if rel.is_absolute()
+        || rel.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Ok(None);
+    }
+    let path = root.path.join(rel);
+    let link_meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if link_meta.is_dir() {
+        return Ok(Some(FileRecord {
+            root_id: root.id.clone(),
+            path: rel_s.to_string(),
+            kind: "directory".into(),
+            size: 0,
+            mode: crate::fs_meta::file_mode(&link_meta),
+            modified: crate::util::modified_secs(&link_meta),
+            uid: crate::fs_meta::file_uid(&link_meta),
+            gid: crate::fs_meta::file_gid(&link_meta),
+            xattrs: crate::fs_meta::read_xattrs(&path),
+            payload: Payload::Directory,
+        }));
+    }
+    if link_meta.file_type().is_symlink() && !root.follow_symlinks {
+        return Ok(Some(FileRecord {
+            root_id: root.id.clone(),
+            path: rel_s.to_string(),
+            kind: "symlink".into(),
+            size: 0,
+            mode: crate::fs_meta::file_mode(&link_meta),
+            modified: crate::util::modified_secs(&link_meta),
+            uid: crate::fs_meta::file_uid(&link_meta),
+            gid: crate::fs_meta::file_gid(&link_meta),
+            xattrs: BTreeMap::new(),
+            payload: Payload::Symlink {
+                target: fs::read_link(&path)?.to_string_lossy().to_string(),
+            },
+        }));
+    }
+    if let Some(special_kind) = crate::fs_meta::special_file_kind(&link_meta) {
+        return Ok(Some(FileRecord {
+            root_id: root.id.clone(),
+            path: rel_s.to_string(),
+            kind: "special".into(),
+            size: 0,
+            mode: crate::fs_meta::file_mode(&link_meta),
+            modified: crate::util::modified_secs(&link_meta),
+            uid: crate::fs_meta::file_uid(&link_meta),
+            gid: crate::fs_meta::file_gid(&link_meta),
+            xattrs: crate::fs_meta::read_xattrs(&path),
+            payload: Payload::Special { special_kind },
+        }));
+    }
+    let meta = if link_meta.file_type().is_symlink() {
+        fs::metadata(&path)?
+    } else {
+        link_meta
+    };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(FileRecord {
+        root_id: root.id.clone(),
+        path: rel_s.to_string(),
+        kind: "file".into(),
+        size: meta.len(),
+        mode: crate::fs_meta::file_mode(&meta),
+        modified: crate::util::modified_secs(&meta),
+        uid: crate::fs_meta::file_uid(&meta),
+        gid: crate::fs_meta::file_gid(&meta),
+        xattrs: crate::fs_meta::read_xattrs(&path),
+        payload: Payload::NormalBlob {
+            oid: String::new(),
+            object_key: String::new(),
+        },
+    }))
+}
+
+fn path_is_under_any(path: &str, dirs: &[String]) -> bool {
+    dirs.iter().any(|dir| path.starts_with(&format!("{dir}/")))
 }
 
 fn tracked_tombstone_record(root: &RootConfig, path: String) -> FileRecord {
@@ -2836,63 +3635,26 @@ fn state_unified_diff_lines(old: &str, new: &str) -> Vec<String> {
     if old == new {
         return Vec::new();
     }
-    let old_lines = old.lines().collect::<Vec<_>>();
-    let new_lines = new.lines().collect::<Vec<_>>();
-    let ops = state_diff_ops(&old_lines, &new_lines);
+    const DIFF_CONTEXT_LINES: usize = 3;
+    let diff = TextDiff::from_lines(old, new);
     let mut out = Vec::new();
-    out.push("    @@".into());
-    for op in ops {
-        match op {
-            StateDiffOp::Context(line) => out.push(format!("     {line}")),
-            StateDiffOp::Delete(line) => out.push(format!("    -{line}")),
-            StateDiffOp::Add(line) => out.push(format!("    +{line}")),
+    for group in diff.grouped_ops(DIFF_CONTEXT_LINES) {
+        out.push("    @@".into());
+        for op in group {
+            for change in diff.iter_changes(&op) {
+                let sign = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+                out.push(format!(
+                    "    {sign}{}",
+                    change.value().trim_end_matches(['\r', '\n'])
+                ));
+            }
         }
     }
     out
-}
-
-enum StateDiffOp<'a> {
-    Context(&'a str),
-    Delete(&'a str),
-    Add(&'a str),
-}
-
-fn state_diff_ops<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<StateDiffOp<'a>> {
-    let mut table = vec![vec![0usize; new.len() + 1]; old.len() + 1];
-    for i in (0..old.len()).rev() {
-        for j in (0..new.len()).rev() {
-            table[i][j] = if old[i] == new[j] {
-                table[i + 1][j + 1] + 1
-            } else {
-                table[i + 1][j].max(table[i][j + 1])
-            };
-        }
-    }
-    let mut ops = Vec::new();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < old.len() && j < new.len() {
-        if old[i] == new[j] {
-            ops.push(StateDiffOp::Context(old[i]));
-            i += 1;
-            j += 1;
-        } else if table[i + 1][j] >= table[i][j + 1] {
-            ops.push(StateDiffOp::Delete(old[i]));
-            i += 1;
-        } else {
-            ops.push(StateDiffOp::Add(new[j]));
-            j += 1;
-        }
-    }
-    while i < old.len() {
-        ops.push(StateDiffOp::Delete(old[i]));
-        i += 1;
-    }
-    while j < new.len() {
-        ops.push(StateDiffOp::Add(new[j]));
-        j += 1;
-    }
-    ops
 }
 
 fn state_stream_payload_changed(
@@ -3072,6 +3834,25 @@ fn state_stream_record_fast_status(a: &FileRecord, b: &FileRecord) -> Option<&'s
     None
 }
 
+fn state_lifecycle_initial_change_status(
+    root: &RootConfig,
+    path: &str,
+    previous: &FileRecord,
+    live: &FileRecord,
+) -> Result<Option<&'static str>> {
+    let fast_status = state_stream_record_fast_status(previous, live);
+    if fast_status == Some("M") {
+        return Ok(Some("M"));
+    }
+    if previous.kind == "file"
+        && live.kind == "file"
+        && state_stream_payload_changed(root, path, previous)?
+    {
+        return Ok(Some("M"));
+    }
+    Ok(fast_status)
+}
+
 fn state_metadata_changed(a: &FileRecord, b: &FileRecord) -> bool {
     a.size != b.size
         || a.mode != b.mode
@@ -3173,40 +3954,6 @@ fn earliest_state_basis(paths: &Paths, conn: &Connection) -> Result<Option<State
             )
         })
         .transpose()
-}
-
-fn default_state_basis_set(
-    paths: &Paths,
-    conn: &Connection,
-    roots: &[RootConfig],
-) -> Result<StateBasisSet> {
-    let root_ids = roots
-        .iter()
-        .map(|root| root.id.clone())
-        .collect::<BTreeSet<_>>();
-    let first_snapshots = first_snapshots_for_roots(paths, conn, &root_ids)?;
-    let mut entries = Vec::new();
-    for root in roots {
-        let Some(snapshot) = first_snapshots.get(&root.id) else {
-            continue;
-        };
-        entries.push(StateRootBasisEntry {
-            root: root.clone(),
-            basis: state_basis_from_snapshot(
-                paths,
-                conn,
-                "root-added",
-                "initial-snapshot",
-                snapshot.clone(),
-                None,
-                None,
-            )?,
-        });
-    }
-    Ok(StateBasisSet {
-        explicit_reference: false,
-        entries,
-    })
 }
 
 fn resolve_state_basis_optional(
@@ -3975,7 +4722,16 @@ fn emit_status_output_auto(output: &str, height: usize) -> Result<()> {
 }
 
 fn should_page_status(output: &str, height: usize, force: bool) -> bool {
-    force || (io::stdout().is_terminal() && output.lines().count() > height)
+    should_page_status_with_tty(output, height, force, io::stdout().is_terminal())
+}
+
+fn should_page_status_with_tty(
+    output: &str,
+    height: usize,
+    force: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    force || (stdout_is_terminal && output.lines().count() > height)
 }
 
 fn write_to_pager(output: &str) -> Result<()> {
@@ -4616,7 +5372,10 @@ where
     let file_limit = if args.full { usize::MAX } else { 120 };
     let limit = args.limit.unwrap_or(usize::MAX);
     let batch_size = limit.max(20).saturating_mul(4).min(500);
-    let configured_roots = roots(conn)?
+    let configured_root_list = roots(conn)?;
+    let path_matcher =
+        PathspecMatcher::for_log(&args.pathspecs, &configured_root_list, args.root.as_deref())?;
+    let configured_roots = configured_root_list
         .into_iter()
         .map(|root| (root.id.clone(), root))
         .collect::<BTreeMap<_, _>>();
@@ -4639,6 +5398,10 @@ where
                 args.full,
                 &configured_roots,
             )?;
+            let changes = changes
+                .into_iter()
+                .filter(|change| path_matcher.allows_display_path(&change.path, None))
+                .collect::<Vec<_>>();
             if changes.is_empty() {
                 continue;
             }
@@ -5020,10 +5783,22 @@ fn truncate_for_terminal(line: &str, width: usize) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
             out.push(ch);
-            for next in chars.by_ref() {
-                out.push(next);
-                if ('@'..='~').contains(&next) {
-                    break;
+            if chars.peek().is_some_and(|next| *next == '[') {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+                for next in chars.by_ref() {
+                    out.push(next);
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            } else {
+                for next in chars.by_ref() {
+                    out.push(next);
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
                 }
             }
             continue;
@@ -5135,6 +5910,8 @@ struct FileChange {
     large: bool,
     volatile_mode: Option<String>,
     warning: Option<String>,
+    order_priority: u8,
+    order_time: Option<String>,
 }
 
 impl FileChange {
@@ -5145,6 +5922,8 @@ impl FileChange {
             large: false,
             volatile_mode: None,
             warning: None,
+            order_priority: 0,
+            order_time: None,
         }
     }
 
@@ -5155,6 +5934,8 @@ impl FileChange {
             large: false,
             volatile_mode: None,
             warning: Some(warning.into()),
+            order_priority: 0,
+            order_time: None,
         }
     }
 
@@ -5186,8 +5967,101 @@ impl FileChange {
             large,
             volatile_mode,
             warning: None,
+            order_priority: 0,
+            order_time: current.or(previous).and_then(state_record_order_time),
         }
     }
+
+    fn with_state_order(mut self, priority: u8, time: Option<String>) -> Self {
+        self.order_priority = priority;
+        self.order_time = time.or(self.order_time);
+        self
+    }
+}
+
+fn sort_state_changes(changes: &mut [FileChange]) {
+    changes.sort_by(compare_state_change_order);
+}
+
+fn sort_state_change_records(records: &mut [StateFileChangeRecord]) {
+    records.sort_by(|a, b| compare_state_change_order(&a.change, &b.change));
+}
+
+fn compare_state_change_order(a: &FileChange, b: &FileChange) -> std::cmp::Ordering {
+    b.order_priority
+        .cmp(&a.order_priority)
+        .then_with(|| b.order_time.cmp(&a.order_time))
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+fn state_record_order_time(record: &FileRecord) -> Option<String> {
+    record
+        .modified
+        .and_then(|secs| Utc.timestamp_opt(secs, 0).single())
+        .map(|time| time.to_rfc3339())
+}
+
+fn added_state_order_time(tracked: Option<&TrackedPathTimes>, live: &FileRecord) -> Option<String> {
+    merge_order_time(
+        tracked.and_then(|times| times.first_seen_at.clone()),
+        state_record_order_time(live),
+    )
+}
+
+fn modified_state_order_time(live: &FileRecord) -> Option<String> {
+    state_record_order_time(live)
+}
+
+fn deleted_state_order_time(
+    tracked: Option<&TrackedPathTimes>,
+    previous: &FileRecord,
+) -> Option<String> {
+    tracked
+        .and_then(|times| times.untracked_at.clone().or(times.last_seen_at.clone()))
+        .or_else(|| state_record_order_time(previous))
+}
+
+fn merge_order_time(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TrackedPathTimes {
+    first_seen_at: Option<String>,
+    last_seen_at: Option<String>,
+    untracked_at: Option<String>,
+}
+
+fn tracked_path_times_for_root(
+    conn: &Connection,
+    root_id: &str,
+) -> Result<BTreeMap<String, TrackedPathTimes>> {
+    let mut stmt = conn.prepare(
+        "select path, first_seen_at, last_seen_at, untracked_at
+         from tracked_paths
+         where root_id=?1",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            TrackedPathTimes {
+                first_seen_at: row.get::<_, Option<String>>(1)?,
+                last_seen_at: row.get::<_, Option<String>>(2)?,
+                untracked_at: row.get::<_, Option<String>>(3)?,
+            },
+        ))
+    })?;
+    let mut times = BTreeMap::new();
+    for row in rows {
+        let (path, path_times) = row?;
+        times.insert(path, path_times);
+    }
+    Ok(times)
 }
 
 fn record_is_large(record: &FileRecord) -> bool {
@@ -6138,4 +7012,31 @@ fn print_snapshot_diff(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_page_status_with_tty, truncate_for_terminal};
+
+    #[test]
+    fn status_pager_decision_respects_tty_height_and_force() {
+        let short = "one\ntwo\n";
+        let tall = "one\ntwo\nthree\n";
+
+        assert!(!should_page_status_with_tty(short, 2, false, true));
+        assert!(should_page_status_with_tty(tall, 2, false, true));
+        assert!(!should_page_status_with_tty(tall, 2, false, false));
+        assert!(should_page_status_with_tty(short, 100, true, false));
+    }
+
+    #[test]
+    fn terminal_truncation_keeps_ansi_escape_sequences_intact() {
+        let line = "\x1b[1;96msample\x1b[0m/path/to/file";
+        let truncated = truncate_for_terminal(line, 8);
+
+        assert!(truncated.starts_with("\x1b[1;96m"));
+        assert!(truncated.contains("\x1b[0m"));
+        assert!(truncated.ends_with("/p"));
+        assert!(!truncated.contains("path/to"));
+    }
 }

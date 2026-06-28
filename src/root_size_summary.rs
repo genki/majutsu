@@ -463,65 +463,6 @@ fn should_scan_legacy_roots(manifest: &SnapshotManifest) -> bool {
     manifest.root_trees.is_empty()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::resolve_paths;
-    use crate::majutsu_core::RootSnapshot;
-    use chrono::Utc;
-
-    #[test]
-    fn summary_sizes_prefer_remote_canonical_size_over_logical_chunk_size() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
-        let key = "objects/large/chunks/fixed/chunk-1".to_string();
-        let mut keys = BTreeSet::new();
-        keys.insert(key.clone());
-        let known_sizes = BTreeMap::from([(key, 1024_u64 * 1024)]);
-        let remote_sizes = SummaryRemoteSizes {
-            sizes: BTreeMap::from([(
-                "vagrant/large/chunks/fixed-8m/chunk-1.chunk.enc".to_string(),
-                123_u64,
-            )]),
-            is_s3_remote: true,
-            host_prefix: "vagrant".to_string(),
-        };
-
-        let resolved = resolve_summary_keys(&paths, &known_sizes, &keys, Some(&remote_sizes));
-
-        assert_eq!(resolved.bytes, 123);
-        assert_eq!(resolved.missing, 0);
-        assert!(
-            resolved
-                .found
-                .contains("vagrant/large/chunks/fixed-8m/chunk-1.chunk.enc")
-        );
-    }
-
-    #[test]
-    fn legacy_roots_are_scanned_only_when_tree_manifest_is_absent() {
-        let mut manifest = SnapshotManifest {
-            snapshot_id: "snap-test".into(),
-            parent: None,
-            op_id: "op-test".into(),
-            timestamp: Utc::now(),
-            roots: BTreeMap::new(),
-            root_trees: BTreeMap::new(),
-        };
-        assert!(should_scan_legacy_roots(&manifest));
-
-        manifest.root_trees.insert(
-            "sample".into(),
-            RootSnapshot {
-                tree_id: "tree-test".into(),
-                tree_key: "objects/trees/tree-test.json".into(),
-                file_count: 1,
-            },
-        );
-        assert!(!should_scan_legacy_roots(&manifest));
-    }
-}
-
 fn packed_blob_size_refs(paths: &Paths) -> Result<BTreeMap<String, PackedBlobSizeRef>> {
     let conn = crate::open_db(paths)?;
     let mut stmt = conn.prepare(
@@ -639,5 +580,64 @@ fn summary_remote_key_candidates(key: &str, remote_sizes: &SummaryRemoteSizes) -
         (true, None) => vec![host_remote_key(&remote_sizes.host_prefix, key)],
         (false, Some(alias)) => vec![key.to_string(), alias],
         (false, None) => vec![key.to_string()],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::resolve_paths;
+    use crate::majutsu_core::RootSnapshot;
+    use chrono::Utc;
+
+    #[test]
+    fn summary_sizes_prefer_remote_canonical_size_over_logical_chunk_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        let key = "objects/large/chunks/fixed/chunk-1".to_string();
+        let mut keys = BTreeSet::new();
+        keys.insert(key.clone());
+        let known_sizes = BTreeMap::from([(key, 1024_u64 * 1024)]);
+        let remote_sizes = SummaryRemoteSizes {
+            sizes: BTreeMap::from([(
+                "vagrant/large/chunks/fixed-8m/chunk-1.chunk.enc".to_string(),
+                123_u64,
+            )]),
+            is_s3_remote: true,
+            host_prefix: "vagrant".to_string(),
+        };
+
+        let resolved = resolve_summary_keys(&paths, &known_sizes, &keys, Some(&remote_sizes));
+
+        assert_eq!(resolved.bytes, 123);
+        assert_eq!(resolved.missing, 0);
+        assert!(
+            resolved
+                .found
+                .contains("vagrant/large/chunks/fixed-8m/chunk-1.chunk.enc")
+        );
+    }
+
+    #[test]
+    fn legacy_roots_are_scanned_only_when_tree_manifest_is_absent() {
+        let mut manifest = SnapshotManifest {
+            snapshot_id: "snap-test".into(),
+            parent: None,
+            op_id: "op-test".into(),
+            timestamp: Utc::now(),
+            roots: BTreeMap::new(),
+            root_trees: BTreeMap::new(),
+        };
+        assert!(should_scan_legacy_roots(&manifest));
+
+        manifest.root_trees.insert(
+            "sample".into(),
+            RootSnapshot {
+                tree_id: "tree-test".into(),
+                tree_key: "objects/trees/tree-test.json".into(),
+                file_count: 1,
+            },
+        );
+        assert!(!should_scan_legacy_roots(&manifest));
     }
 }

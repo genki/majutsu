@@ -26,30 +26,41 @@ mj note snap-12345678 -m 'migration前のcheckpoint'
 mj note op-12345678 --clear
 ```
 
-`mj state` を引数なしで実行すると、初回 snapshot から現在の live filesystem までの
-全変更を表示する。指定時点からの差分は `mj state <ref>` を使う。root を絞る場合は
+`mj state` を時刻・refなしで実行すると、無限の過去を指定したものとして扱い、
+root登録時点から追跡対象になった全pathのライフサイクル状態を表示する。存在中の
+追跡対象は `A`、削除済みの追跡対象は `D`、明示的に untrack されたpathは通常非表示
+になる。指定時点からの差分は `mj state <ref>` を使う。root を絞る場合は
 `-r/--root`、全root表示を明示する場合は `-g/--global` を使う。
+表示順は追跡操作時刻の新しい順とし、`-U/--untrack` で表示される `?` 行は最も新しい
+ものとして先頭に出す。
 
 ```sh
 mj state
 mj state 1d -r moon
-mj state 03:40 -r moon --diff
+mj state 03:40 -r moon -d
 mj state op-123456789abc -g
-mj state --deleted
+mj state -D
 mj state --status A,M
+mj state -r moon -U --status '?'
+mj state -r moon -- src README.md
 mj track path/to/file
 mj untrack path/to/file
 ```
 
 通常表示は `A/M/D` のファイル変更だけを出す。directory mtime、mode、owner、xattrs など
 metadata-only の変更は既定では隠し、必要な場合だけ `--meta` で小文字 `m` として表示する。
-`--diff` は text file の変更行を `@@` / `-` / `+` の色付き diff 形式で file row の直後に表示する。
+`-d/--diff` は text file の変更行を `@@` / `-` / `+` の色付き diff hunk形式で file row の直後に表示する。
 binary、special file、1 MiB 超のファイルは status row のみ表示し、diff body は省略する。
-実体が削除済みの管理対象だけを確認する場合は `--deleted` または `--status D` を使う。
+実体が削除済みの管理対象だけを確認する場合は `-D/--deleted` または `--status D` を使う。
 任意の状態で絞る場合は `--status A,M` や `-s A -s D` のように指定する。
+`mj state ... -- <dir or path>` は Git の pathspec に近い形で、指定したファイルや
+サブツリーに表示を絞る。root内で実行した場合や `-r/--root` 指定時は root相対path、
+`-g/--global` では `root/path` 形式で指定できる。root内で実行した場合や `-r/--root`
+指定時に限り、`mj state -U/--untrack` は未追跡の live file を `?` として表示する。
+未追跡ディレクトリは `? dir/` の1行にまとめ、内部は再帰展開しない。
 
 `rm` と `untrack` は別の操作である。root配下で管理対象になったファイルを `rm` した場合、
-そのpathは管理対象のまま削除状態として残り、`mj state --deleted` や `mj log` の対象になる。
+そのpathは管理対象のまま削除状態として残り、`mj state -D` や `mj log` の対象になる。
 一方で `mj untrack <path>` は、そのpathを明示的に管理対象から外す操作であり、以後の
 snapshot対象から除外され、retention / prune / gc / remote cleanup によって backend から
 やがて除去される。除外規則に当たるpathを明示的に保護したい場合は `mj track <path>` を使う。

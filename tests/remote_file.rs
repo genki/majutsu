@@ -6247,6 +6247,113 @@ fn log_defaults_to_managed_file_changes_not_sync_operations() {
 }
 
 #[test]
+fn log_filters_file_changes_by_pathspec() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(source.join("dir")).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("dir/beta.txt"), b"beta\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("baseline");
+        c
+    });
+
+    fs::write(source.join("alpha.txt"), b"alpha changed\n").unwrap();
+    fs::write(source.join("dir/beta.txt"), b"beta changed\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("changed both");
+        c
+    });
+
+    let root_relative = output({
+        let mut c = mj();
+        c.current_dir(&source)
+            .arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("-r")
+            .arg("sample")
+            .arg("--limit")
+            .arg("1")
+            .arg("--")
+            .arg("dir");
+        c
+    });
+    assert!(root_relative.contains("changed both"), "{root_relative}");
+    assert!(
+        root_relative.contains("M\tsample/dir/beta.txt"),
+        "{root_relative}"
+    );
+    assert!(!root_relative.contains("alpha.txt"), "{root_relative}");
+
+    let inferred_root_relative = output({
+        let mut c = mj();
+        c.current_dir(&source)
+            .arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("1")
+            .arg("--")
+            .arg("dir");
+        c
+    });
+    assert!(
+        inferred_root_relative.contains("M\tsample/dir/beta.txt"),
+        "{inferred_root_relative}"
+    );
+    assert!(
+        !inferred_root_relative.contains("alpha.txt"),
+        "{inferred_root_relative}"
+    );
+
+    let global_path = output({
+        let mut c = mj();
+        c.current_dir(tmp.path())
+            .arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("1")
+            .arg("--")
+            .arg("sample/dir");
+        c
+    });
+    assert!(
+        global_path.contains("M\tsample/dir/beta.txt"),
+        "{global_path}"
+    );
+    assert!(!global_path.contains("alpha.txt"), "{global_path}");
+}
+
+#[test]
 fn log_folds_large_change_sets_unless_full_is_requested() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -12898,6 +13005,64 @@ fn state_home_priority_prefers_cli_then_env_then_xdg_config() {
 }
 
 #[test]
+fn db_compact_cli_reports_checkpoint_and_vacuum_metrics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let compact = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("db").arg("compact");
+        c
+    });
+    assert!(
+        compact.contains(&format!("db {}", state.join("db/majutsu.sqlite").display())),
+        "{compact}"
+    );
+    assert!(compact.contains("checkpoint_busy "), "{compact}");
+    assert!(compact.contains("checkpoint_log_frames "), "{compact}");
+    assert!(compact.contains("checkpointed_frames "), "{compact}");
+    assert!(compact.contains("vacuum false"), "{compact}");
+    assert!(output_metric(&compact, "db_bytes_after") > 0, "{compact}");
+
+    let vacuum = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("db")
+            .arg("compact")
+            .arg("--vacuum");
+        c
+    });
+    assert!(vacuum.contains("vacuum true"), "{vacuum}");
+    assert!(vacuum.contains("wal_bytes_after "), "{vacuum}");
+    assert!(output_metric(&vacuum, "db_bytes_after") > 0, "{vacuum}");
+}
+
+#[test]
 fn operations_are_appended_to_local_oplog() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -14952,9 +15117,22 @@ fn snapshot_does_not_auto_track_new_large_file_after_initial_root_snapshot() {
             .arg("sample");
         c
     });
+    assert!(!state_out.contains("large.bin"), "{state_out}");
+    let untracked = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("-U")
+            .arg("--status")
+            .arg("?");
+        c
+    });
     assert!(
-        state_out.contains("A sample/large.bin") || state_out.contains("A large.bin"),
-        "{state_out}"
+        untracked.contains("? sample/large.bin") || untracked.contains("? large.bin"),
+        "{untracked}"
     );
 }
 
@@ -15013,16 +15191,34 @@ fn snapshot_does_not_auto_track_large_batches_of_new_files() {
         c
     });
     assert!(
-        state_out.contains("A sample/bulk-0.txt") || state_out.contains("A bulk-0.txt"),
+        !state_out.contains("bulk-0.txt")
+            && !state_out.contains("bulk-1.txt")
+            && !state_out.contains("bulk-2.txt"),
         "{state_out}"
     );
+    let untracked = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("-U")
+            .arg("--status")
+            .arg("?");
+        c
+    });
     assert!(
-        state_out.contains("A sample/bulk-1.txt") || state_out.contains("A bulk-1.txt"),
-        "{state_out}"
+        untracked.contains("? sample/bulk-0.txt") || untracked.contains("? bulk-0.txt"),
+        "{untracked}"
     );
     assert!(
-        state_out.contains("A sample/bulk-2.txt") || state_out.contains("A bulk-2.txt"),
-        "{state_out}"
+        untracked.contains("? sample/bulk-1.txt") || untracked.contains("? bulk-1.txt"),
+        "{untracked}"
+    );
+    assert!(
+        untracked.contains("? sample/bulk-2.txt") || untracked.contains("? bulk-2.txt"),
+        "{untracked}"
     );
 }
 
@@ -16922,7 +17118,7 @@ fn state_reports_live_added_modified_and_deleted_files_before_snapshot() {
 }
 
 #[test]
-fn state_default_uses_each_root_first_snapshot_as_basis() {
+fn state_default_uses_root_registration_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let alpha = tmp.path().join("alpha");
     let beta = tmp.path().join("beta");
@@ -16957,6 +17153,7 @@ fn state_default_uses_each_root_first_snapshot_as_basis() {
     });
 
     fs::write(alpha.join("note.txt"), b"alpha v2\n").unwrap();
+    fs::write(alpha.join("new.txt"), b"alpha new\n").unwrap();
     fs::write(beta.join("note.txt"), b"beta v1\n").unwrap();
     run({
         let mut c = mj();
@@ -16990,10 +17187,9 @@ fn state_default_uses_each_root_first_snapshot_as_basis() {
     lines.sort();
     assert_eq!(
         lines,
-        vec![" M alpha/note.txt", " M beta/note.txt"],
+        vec![" A alpha/new.txt", " M alpha/note.txt", " M beta/note.txt",],
         "{text}"
     );
-    assert!(!text.contains(" A beta/note.txt"), "{text}");
 
     let json = output({
         let mut c = mj();
@@ -17002,8 +17198,15 @@ fn state_default_uses_each_root_first_snapshot_as_basis() {
     });
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["basis"], serde_json::Value::Null, "{json}");
-    assert_eq!(value["basis_roots"].as_array().unwrap().len(), 2, "{json}");
-    assert_eq!(value["changes"]["total"], 2, "{json}");
+    assert!(
+        value["basis_roots"].is_null()
+            || value["basis_roots"]
+                .as_array()
+                .is_some_and(|roots| roots.is_empty()),
+        "{json}"
+    );
+    assert_eq!(value["changes"]["total"], 3, "{json}");
+    assert_eq!(value["changes"]["added"], 1, "{json}");
     assert_eq!(value["changes"]["modified"], 2, "{json}");
 }
 
@@ -17189,6 +17392,461 @@ fn state_hides_untracked_path_even_when_basis_snapshot_contains_it() {
         c
     });
     assert_eq!(deleted_after_untrack, "");
+}
+
+#[test]
+fn state_default_pathspec_and_untracked_files_follow_git_like_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(source.join("dir/nested")).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    fs::write(source.join("delete-me.txt"), b"delete\n").unwrap();
+    fs::write(source.join("dir/beta.txt"), b"beta\n").unwrap();
+    fs::write(source.join("dir/nested/gamma.txt"), b"gamma\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::remove_file(source.join("delete-me.txt")).unwrap();
+    let deleted_short = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("-D");
+        c
+    });
+    assert_eq!(deleted_short, " D sample/delete-me.txt\n");
+
+    let dir_only = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("--")
+            .arg("dir");
+        c
+    });
+    assert!(dir_only.contains(" A sample/dir/beta.txt"), "{dir_only}");
+    assert!(
+        dir_only.contains(" A sample/dir/nested/gamma.txt"),
+        "{dir_only}"
+    );
+    assert!(!dir_only.contains("alpha.txt"), "{dir_only}");
+    assert!(!dir_only.contains("delete-me.txt"), "{dir_only}");
+
+    let local_dir_only = output({
+        let mut c = mj();
+        c.current_dir(source.join("dir"))
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--")
+            .arg(".");
+        c
+    });
+    assert!(
+        local_dir_only.contains(" A dir/beta.txt"),
+        "{local_dir_only}"
+    );
+    assert!(!local_dir_only.contains("sample/"), "{local_dir_only}");
+    assert!(!local_dir_only.contains("alpha.txt"), "{local_dir_only}");
+    let local_json = output({
+        let mut c = mj();
+        c.current_dir(source.join("dir"))
+            .arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("--json")
+            .arg("--")
+            .arg(".");
+        c
+    });
+    let local_value: serde_json::Value = serde_json::from_str(&local_json).unwrap();
+    assert_eq!(local_value["changes"]["files"][0]["root"], "sample");
+    assert!(
+        local_value["changes"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["path"].as_str().unwrap().starts_with("dir/")),
+        "{local_json}"
+    );
+
+    fs::create_dir_all(source.join("loose-dir")).unwrap();
+    fs::write(source.join("loose-dir/child.txt"), b"loose\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("alpha.txt");
+        c
+    });
+    let untracked = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("-U")
+            .arg("--status")
+            .arg("?");
+        c
+    });
+    let mut untracked_lines = untracked.lines().collect::<Vec<_>>();
+    untracked_lines.sort();
+    assert_eq!(
+        untracked_lines,
+        vec![" ? sample/alpha.txt", " ? sample/loose-dir/"],
+        "{untracked}"
+    );
+    assert!(!untracked.contains("loose-dir/child.txt"), "{untracked}");
+    let ordered_with_untracked = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("-U");
+        c
+    });
+    assert!(
+        ordered_with_untracked
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with(" ? ")),
+        "{ordered_with_untracked}"
+    );
+
+    let outside_untracked = {
+        let output = {
+            let mut c = mj();
+            c.current_dir(tmp.path())
+                .arg("--home")
+                .arg(&state)
+                .arg("state")
+                .arg("-U");
+            c.output().expect("run command")
+        };
+        assert!(!output.status.success());
+        String::from_utf8_lossy(&output.stderr).to_string()
+    };
+    assert!(
+        outside_untracked.contains("requires --root or running inside a configured root"),
+        "{outside_untracked}"
+    );
+}
+
+#[test]
+fn state_orders_untracked_first_then_newest_tracked_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("older.txt"), b"older\n").unwrap();
+    fs::write(source.join("newer.txt"), b"newer\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.execute(
+            "update tracked_paths set first_seen_at='2029-01-01T00:00:00Z', last_seen_at='2029-01-01T00:00:00Z' where root_id='sample' and path='older.txt'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "update tracked_paths set first_seen_at='2030-01-01T00:00:00Z', last_seen_at='2030-01-01T00:00:00Z' where root_id='sample' and path='newer.txt'",
+            [],
+        )
+        .unwrap();
+    }
+    fs::write(source.join("loose.txt"), b"loose\n").unwrap();
+
+    let ordered = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample")
+            .arg("-U")
+            .arg("--status")
+            .arg("?,A");
+        c
+    });
+    let lines = ordered.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec![
+            " ? sample/loose.txt",
+            " A sample/newer.txt",
+            " A sample/older.txt",
+        ],
+        "{ordered}"
+    );
+}
+
+#[test]
+fn state_relative_reference_filters_added_paths_older_than_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        let old_snapshot_time = (Utc::now() - ChronoDuration::hours(2)).to_rfc3339();
+        conn.execute("update snapshots set created_at=?1", [&old_snapshot_time])
+            .unwrap();
+    }
+
+    fs::write(source.join("old-added.txt"), b"old\n").unwrap();
+    filetime::set_file_mtime(
+        source.join("old-added.txt"),
+        filetime::FileTime::from_unix_time(1, 0),
+    )
+    .unwrap();
+    fs::write(source.join("recent-added.txt"), b"recent\n").unwrap();
+
+    let state_output = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("1m")
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    assert!(
+        state_output.contains(" A sample/recent-added.txt"),
+        "{state_output}"
+    );
+    assert!(
+        !state_output.contains("old-added.txt"),
+        "old additions outside the relative window must not be shown\n{state_output}"
+    );
+}
+
+#[test]
+fn state_orders_recent_content_changes_before_snapshot_refreshed_adds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("aaa-stale.txt"), b"stale\n").unwrap();
+    fs::write(source.join("zzz-recent.txt"), b"recent v1\n").unwrap();
+    filetime::set_file_mtime(
+        source.join("aaa-stale.txt"),
+        filetime::FileTime::from_unix_time(1, 0),
+    )
+    .unwrap();
+    filetime::set_file_mtime(
+        source.join("zzz-recent.txt"),
+        filetime::FileTime::from_unix_time(1, 0),
+    )
+    .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::write(source.join("zzz-recent.txt"), b"recent v2\n").unwrap();
+    filetime::set_file_mtime(
+        source.join("zzz-recent.txt"),
+        filetime::FileTime::from_unix_time(1_800_000_000, 0),
+    )
+    .unwrap();
+    {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.execute(
+            "update tracked_paths
+             set first_seen_at='2020-01-01T00:00:00Z',
+                 last_seen_at='2030-01-01T00:00:00Z'
+             where root_id='sample'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let ordered = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg("-r")
+            .arg("sample");
+        c
+    });
+    let lines = ordered.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec![" M sample/zzz-recent.txt", " A sample/aaa-stale.txt"],
+        "{ordered}"
+    );
+}
+
+#[test]
+fn state_diff_short_option_prints_git_style_hunks_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    let original = (0..220)
+        .map(|i| format!("line-{i:03} original\n"))
+        .collect::<String>();
+    fs::write(source.join("long.txt"), original).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let baseline_op: String = {
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        conn.query_row(
+            "select op_id from snapshots order by created_at asc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let updated = (0..220)
+        .map(|i| {
+            if i == 120 {
+                "line-120 updated\n".to_string()
+            } else {
+                format!("line-{i:03} original\n")
+            }
+        })
+        .collect::<String>();
+    fs::write(source.join("long.txt"), updated).unwrap();
+
+    let diff = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("state")
+            .arg(&baseline_op)
+            .arg("-r")
+            .arg("sample")
+            .arg("-d");
+        c
+    });
+    assert!(diff.contains(" M sample/long.txt"), "{diff}");
+    assert!(diff.contains("    -line-120 original"), "{diff}");
+    assert!(diff.contains("    +line-120 updated"), "{diff}");
+    assert!(diff.contains("     line-117 original"), "{diff}");
+    assert!(diff.contains("     line-123 original"), "{diff}");
+    assert!(
+        !diff.contains("line-001 original"),
+        "diff should not print unrelated leading context\n{diff}"
+    );
+    assert!(
+        !diff.contains("line-200 original"),
+        "diff should not print unrelated trailing context\n{diff}"
+    );
 }
 
 #[test]
@@ -17443,7 +18101,16 @@ fn state_reference_reports_file_changes_since_operation() {
     });
     let mut default_state_lines = default_state_output.lines().collect::<Vec<_>>();
     default_state_lines.sort();
-    assert_eq!(default_state_lines, state_lines);
+    assert_eq!(
+        default_state_lines,
+        vec![
+            " A sample/added.txt",
+            " A sample/memo/new.md",
+            " D sample/deleted.txt",
+            " M other/other.txt",
+            " M sample/modified.txt",
+        ]
+    );
     let before_first_snapshot = output({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("state").arg("3650d");
@@ -18028,7 +18695,9 @@ fn state_inside_root_uses_local_paths_and_global_flag_restores_root_prefix() {
             .arg(&baseline_op);
         c
     });
-    assert_eq!(local_output, " A added.txt\n M modified.txt\n");
+    let mut local_lines = local_output.lines().collect::<Vec<_>>();
+    local_lines.sort();
+    assert_eq!(local_lines, vec![" A added.txt", " M modified.txt"]);
 
     let global_output = output({
         let mut c = mj();
@@ -18040,9 +18709,11 @@ fn state_inside_root_uses_local_paths_and_global_flag_restores_root_prefix() {
             .arg(&baseline_op);
         c
     });
+    let mut global_lines = global_output.lines().collect::<Vec<_>>();
+    global_lines.sort();
     assert_eq!(
-        global_output,
-        " A sample/added.txt\n M sample/modified.txt\n"
+        global_lines,
+        vec![" A sample/added.txt", " M sample/modified.txt"]
     );
 
     let outside_output = output({
@@ -18054,9 +18725,11 @@ fn state_inside_root_uses_local_paths_and_global_flag_restores_root_prefix() {
             .arg(&baseline_op);
         c
     });
+    let mut outside_lines = outside_output.lines().collect::<Vec<_>>();
+    outside_lines.sort();
     assert_eq!(
-        outside_output,
-        " A sample/added.txt\n M sample/modified.txt\n"
+        outside_lines,
+        vec![" A sample/added.txt", " M sample/modified.txt"]
     );
 }
 

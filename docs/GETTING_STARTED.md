@@ -108,7 +108,7 @@ Edit the root and compare it with a recent point in time:
 echo "next line" >> /tmp/mj-demo/root/README.md
 touch /tmp/mj-demo/root/new.txt
 
-mj --home /tmp/mj-demo/state state "$SNAPSHOT" -r demo --diff
+mj --home /tmp/mj-demo/state state "$SNAPSHOT" -r demo -d
 ```
 
 The output uses Git-style markers:
@@ -234,11 +234,10 @@ by `mj key export` when cloning into the empty recovered state.
 - Use `mj root add <id> <path> --no-default-excludes` only for roots where VCS
   internals, dependency directories, build outputs, and caches are part of the
   data you intentionally need to recover.
-- Review `mj state` after adding or copying files into a root. Unknown large
-  files and large batches of unknown files are shown as additions but are not
-  automatically tracked after the initial root scan; use `mj track <path>` when
-  they are truly recovery-critical.
-- Use `mj state 1d -r <root> --diff` for Git-style inspection of recent file
+- Review `mj state -U` after adding or copying files into a root. Unknown large
+  files and large batches of unknown files are shown as `?` untracked rows
+  until you opt in with `mj track <path>`.
+- Use `mj state 1d -r <root> -d` for Git-style inspection of recent file
   changes.
 - Use `mj branch create <name> --at <time> --switch --restore --force` to branch
   from an older host timeline point.

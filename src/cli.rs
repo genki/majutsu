@@ -1030,7 +1030,7 @@ pub(crate) struct HealthArgs {
 pub(crate) struct StateArgs {
     #[arg(
         value_name = "REF",
-        help = "Show managed file changes since a reference such as 1h, 03:40, op-..., or snap-...; omitted means since the first snapshot"
+        help = "Show managed file changes since a reference such as 1h, 03:40, op-..., or snap-...; omitted means from root registration time"
     )]
     pub(crate) reference: Option<String>,
     #[arg(
@@ -1055,22 +1055,32 @@ pub(crate) struct StateArgs {
     )]
     pub(crate) global: bool,
     #[arg(
+        short = 'd',
         long,
         default_value_t = false,
         help = "Show colored line diffs after changed file lines"
     )]
     pub(crate) diff: bool,
     #[arg(
+        short = 'D',
         long,
         default_value_t = false,
-        help = "Show only paths that are managed in the basis snapshot but missing from the live root"
+        help = "Show only managed paths that are missing from the live root"
     )]
     pub(crate) deleted: bool,
+    #[arg(
+        short = 'U',
+        long = "untrack",
+        visible_alias = "untracked",
+        default_value_t = false,
+        help = "Include untracked live files as '?' when running inside one root or with --root"
+    )]
+    pub(crate) untrack: bool,
     #[arg(
         short = 's',
         long = "status",
         value_name = "MARK",
-        help = "Filter by change status. May be repeated or comma-separated; valid marks are A, M, D, and m"
+        help = "Filter by change status. May be repeated or comma-separated; valid marks are A, M, D, m, and ?"
     )]
     pub(crate) status: Vec<String>,
     #[arg(
@@ -1079,6 +1089,12 @@ pub(crate) struct StateArgs {
         help = "Include metadata-only changes such as directory mtime, mode, owner, or xattrs"
     )]
     pub(crate) meta: bool,
+    #[arg(
+        last = true,
+        value_name = "PATH",
+        help = "Limit output to matching root-relative paths, or root/path when showing all roots"
+    )]
+    pub(crate) pathspecs: Vec<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -1403,7 +1419,7 @@ pub(crate) struct LogArgs {
         help = "Maximum number of operations to show; file detail lines do not count toward this limit"
     )]
     pub(crate) limit: Option<usize>,
-    #[arg(long)]
+    #[arg(short = 'r', long, help = "Limit change log to one configured root")]
     pub(crate) root: Option<String>,
     #[arg(
         long,
@@ -1417,6 +1433,12 @@ pub(crate) struct LogArgs {
         help = "Show every changed file instead of folding large change sets"
     )]
     pub(crate) full: bool,
+    #[arg(
+        last = true,
+        value_name = "PATH",
+        help = "Limit output to matching root-relative paths, or root/path when showing all roots"
+    )]
+    pub(crate) pathspecs: Vec<PathBuf>,
 }
 
 #[derive(Args)]

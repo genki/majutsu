@@ -1149,7 +1149,8 @@ fn state_reports_paths_refs_branches_and_json() {
             .any(|reference| reference["name"] == "current-branch"
                 && reference["value"] == "feature")
     );
-    assert_eq!(value["basis"]["kind"], "initial-snapshot");
+    assert!(value["basis"].is_null(), "{value:#}");
+    assert!(value["basis_roots"].is_null(), "{value:#}");
     assert_eq!(value["changes"]["total"], 1);
     assert_eq!(value["changes"]["modified"], 1);
 }

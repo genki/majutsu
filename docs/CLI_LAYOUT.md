@@ -97,17 +97,23 @@ mj note snap-12345678 --clear
 ## State inspection
 
 `mj state` is the Git `status -s`-like command for managed files. Without a
-reference it compares the first snapshot with the live filesystem. With a
-reference it compares that point in time with the live filesystem.
+reference it treats the reference as infinite past and shows every tracked path
+since root registration: live tracked paths are `A`, deleted tracked paths are
+`D`, and explicitly untracked paths are hidden. With a reference it compares
+that point in time with the live filesystem.
+Rows are sorted by newest tracked operation time first; `?` rows enabled by
+`-U/--untrack` are treated as newest and appear before tracked rows.
 
 ```sh
 mj state
 mj state 1d
 mj state 1d -r moon
-mj state 03:40 -r moon --diff
+mj state 03:40 -r moon -d
 mj state op-123456789abc -g
-mj state --deleted
+mj state -D
 mj state --status A,M
+mj state -r moon -U --status '?'
+mj state -r moon -- src
 mj track path/to/file
 mj untrack path/to/file
 ```
@@ -119,13 +125,17 @@ A  added file
 M  content or restore-significant change
 D  deleted file
 m  metadata-only change; shown only with --meta
+?  untracked live file; shown only with -U/--untrack
 ```
 
-`--diff` prints colored unified-diff-style text hunks after file rows.
+`-d/--diff` prints colored unified-diff-style text hunks after file rows.
 `--meta` includes metadata-only changes such as directory mtime, mode, owner,
 or xattrs.
-`--deleted` filters the output to `D` rows and is equivalent to `--status D`.
-`-s/--status` accepts repeated or comma-separated `A`, `M`, `D`, and `m`.
+`-D/--deleted` filters the output to `D` rows and is equivalent to
+`--status D`.
+`-s/--status` accepts repeated or comma-separated `A`, `M`, `D`, `m`, and `?`.
+`-- <path>...` limits `state` and `log` to matching root-relative files or
+subtrees.
 `mj track` explicitly protects a path even if root excludes would normally hide
 it. `mj untrack` is the explicit operation for removing a path from management;
 plain `rm` remains a tracked deletion.

@@ -87,10 +87,11 @@ regenerated.
 
 After the initial root scan, majutsu is conservative about unknown additions.
 Small authored files can still be picked up by the realtime path, but unknown
-large files and large batches of new files are left visible in `mj state` until
-the operator opts in with `mj track`. This avoids accidentally backing up build
-trees, archives, generated datasets, or mass-copy mistakes just because they
-briefly appeared under a managed root.
+large files and large batches of new files remain untracked until the operator
+opts in with `mj track`. Use `mj state -U` inside a root, or
+`mj state -r <root> -U`, to review those untracked files as `?` rows. This
+avoids accidentally backing up build trees, archives, generated datasets, or
+mass-copy mistakes just because they briefly appeared under a managed root.
 
 If a root really must capture everything, opt out explicitly:
 

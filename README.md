@@ -40,7 +40,7 @@ cargo install majutsu
 This installs the `mj` binary. To install a specific released version:
 
 ```sh
-cargo install majutsu --version 0.6.2 --locked
+cargo install majutsu --version 0.6.3 --locked
 ```
 
 Use repository-local builds only for development or verification of unreleased
@@ -66,8 +66,8 @@ minimal local flow is:
 mj init
 mj root add notes ~/notes
 mj snapshot --message 'first snapshot'
-mj state -r notes --diff
-mj state --deleted -r notes
+mj state -r notes -d
+mj state -D -r notes
 mj log
 mj restore plan --ago 2h --root notes --to /tmp/majutsu-restore
 ```
@@ -116,11 +116,14 @@ Inspect managed changes since a point in time:
 ```sh
 mj state
 mj state 1d
-mj state 03:40 -r notes --diff
+mj state 03:40 -r notes -d
 mj state op-123456789abc -g
-mj state --deleted
+mj state -D -r notes
 mj state --status A,M
+mj state -r notes -U --status '?'
+mj state -r notes -- docs
 mj log
+mj log --root notes -- docs
 mj note snap-12345678 -m 'before migration'
 mj track path/to/file
 mj untrack path/to/file
