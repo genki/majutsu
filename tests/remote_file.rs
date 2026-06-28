@@ -67,6 +67,16 @@ fn output_metric(output: &str, name: &str) -> usize {
         .unwrap_or_else(|| panic!("missing metric {name} in output:\n{output}"))
 }
 
+#[cfg(target_os = "linux")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote_path(path: &std::path::Path) -> String {
+    shell_quote(&path.to_string_lossy())
+}
+
 fn set_watch_backend(state: &std::path::Path, backend: &str) {
     let config_path = state.join("config.toml");
     let config = fs::read_to_string(&config_path).unwrap();
@@ -16828,6 +16838,96 @@ fn status_reports_configured_root_state() {
             .filter(|line| !line.starts_with("current "))
             .all(|line| line.len() <= 48),
         "{status}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn state_uses_viewer_when_tty_output_exceeds_terminal_height() {
+    let tmp = tempfile::tempdir().unwrap();
+    let probe = tmp.path().join("script-probe.out");
+    let script_supported = Command::new("script")
+        .arg("-qec")
+        .arg("true")
+        .arg(&probe)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .is_some_and(|status| status.success());
+    if !script_supported {
+        return;
+    }
+
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    for index in 0..20 {
+        fs::write(
+            source.join(format!("file-{index:02}.txt")),
+            format!("file {index}\n"),
+        )
+        .unwrap();
+    }
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("snapshot")
+            .arg("--message")
+            .arg("baseline");
+        c
+    });
+
+    let pty_output = tmp.path().join("state-pty.out");
+    let command = format!(
+        "env MAJUTSU_AUTO_DAEMON=0 LINES=5 COLUMNS=100 TERM=xterm-256color {} --home {} state",
+        shell_quote(env!("CARGO_BIN_EXE_mj")),
+        shell_quote_path(&state),
+    );
+    let mut child = Command::new("script")
+        .arg("-qec")
+        .arg(command)
+        .arg(&pty_output)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start script");
+    child.stdin.as_mut().unwrap().write_all(b"q").unwrap();
+    let status = child.wait().expect("wait script");
+    assert!(status.success());
+
+    let bytes = fs::read(&pty_output).unwrap();
+    assert!(
+        bytes
+            .windows(b"\x1b[?1049h".len())
+            .any(|window| window == b"\x1b[?1049h"),
+        "state output did not enter alternate-screen viewer:\n{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        bytes
+            .windows(b"mj state".len())
+            .any(|window| window == b"mj state"),
+        "state viewer status was not rendered:\n{}",
+        String::from_utf8_lossy(&bytes)
     );
 }
 

@@ -2671,6 +2671,7 @@ fn stream_state_lines_viewer(rx: mpsc::Receiver<LogProducerMessage>) -> Result<(
     let height = terminal_height();
     let mut lines = Vec::new();
     let mut overflowed = false;
+    let mut done = false;
     let max_wait = StdDuration::from_millis(150);
     let started = std::time::Instant::now();
     while lines.len() <= height {
@@ -2688,21 +2689,27 @@ fn stream_state_lines_viewer(rx: mpsc::Receiver<LogProducerMessage>) -> Result<(
                 }
             }
             Ok(LogProducerMessage::Done) => {
+                done = true;
                 break;
             }
             Ok(LogProducerMessage::Error(err)) => bail!("{err}"),
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                done = true;
                 break;
             }
         }
     }
 
-    if !overflowed {
+    if !state_prefetch_needs_viewer(done, overflowed) {
         return stream_state_lines_direct_with_initial(lines, rx);
     }
 
     run_log_viewer(lines, rx, "mj state")
+}
+
+fn state_prefetch_needs_viewer(done: bool, overflowed: bool) -> bool {
+    overflowed || !done
 }
 
 fn split_state_change_path(path: &str) -> (String, String) {
@@ -7016,7 +7023,7 @@ fn print_snapshot_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_page_status_with_tty, truncate_for_terminal};
+    use super::{should_page_status_with_tty, state_prefetch_needs_viewer, truncate_for_terminal};
 
     #[test]
     fn status_pager_decision_respects_tty_height_and_force() {
@@ -7038,5 +7045,12 @@ mod tests {
         assert!(truncated.contains("\x1b[0m"));
         assert!(truncated.ends_with("/p"));
         assert!(!truncated.contains("path/to"));
+    }
+
+    #[test]
+    fn state_prefetch_enters_viewer_for_overflow_or_pending_output() {
+        assert!(!state_prefetch_needs_viewer(true, false));
+        assert!(state_prefetch_needs_viewer(true, true));
+        assert!(state_prefetch_needs_viewer(false, false));
     }
 }
