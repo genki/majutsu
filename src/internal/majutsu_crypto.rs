@@ -138,6 +138,21 @@ pub fn decode_object(
     decode_legacy_envelope(bytes, master_key_path)
 }
 
+pub fn decode_object_with_master_key_hex(
+    bytes: &[u8],
+    master_key_hex: &str,
+    recipients_path: &Path,
+) -> Result<Vec<u8>> {
+    validate_key_hex(master_key_hex)?;
+    if bytes.starts_with(AGE_MAGIC) {
+        return age_decrypt_object(recipients_path, bytes);
+    }
+    if !bytes.starts_with(ENC_MAGIC) {
+        return Ok(bytes.to_vec());
+    }
+    decode_legacy_envelope_with_key_hex(bytes, master_key_hex)
+}
+
 pub fn random_key_hex() -> Result<String> {
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
@@ -157,6 +172,10 @@ pub fn read_master_key(master_key_path: &Path) -> Result<String> {
         validate_key_hex(&key)?;
         return Ok(key);
     }
+    read_master_key_file(master_key_path)
+}
+
+pub fn read_master_key_file(master_key_path: &Path) -> Result<String> {
     let key = fs::read_to_string(master_key_path)
         .with_context(|| format!("missing master key: {}", master_key_path.display()))?;
     validate_key_hex(key.trim())?;
@@ -261,8 +280,22 @@ pub fn read_age_keyring(recipients_path: &Path) -> Result<AgeKeyring> {
 pub fn write_age_keyring(recipients_path: &Path, keyring: &AgeKeyring) -> Result<()> {
     if let Some(parent) = recipients_path.parent() {
         fs::create_dir_all(parent)?;
+        restrict_key_parent_permissions(parent)?;
     }
-    fs::write(recipients_path, toml::to_string_pretty(keyring)?)?;
+    write_key_atomic(recipients_path, toml::to_string_pretty(keyring)?.as_bytes())?;
+    restrict_key_file_permissions(recipients_path)?;
+    Ok(())
+}
+
+pub fn restrict_age_keyring_permissions(recipients_path: &Path) -> Result<()> {
+    if let Some(parent) = recipients_path.parent()
+        && parent.exists()
+    {
+        restrict_key_parent_permissions(parent)?;
+    }
+    if recipients_path.exists() {
+        restrict_key_file_permissions(recipients_path)?;
+    }
     Ok(())
 }
 
@@ -275,6 +308,8 @@ pub fn ensure_age_keyring(recipients_path: &Path) -> Result<()> {
             .identities
             .push(identity.to_string().expose_secret().to_string());
         write_age_keyring(recipients_path, &keyring)?;
+    } else {
+        restrict_age_keyring_permissions(recipients_path)?;
     }
     Ok(())
 }
@@ -301,13 +336,17 @@ fn encode_legacy_envelope_with_key_hex(bytes: &[u8], key_hex: &str) -> Result<Ve
 }
 
 fn decode_legacy_envelope(bytes: &[u8], master_key_path: &Path) -> Result<Vec<u8>> {
+    let key_hex = read_master_key(master_key_path)?;
+    decode_legacy_envelope_with_key_hex(bytes, &key_hex)
+}
+
+fn decode_legacy_envelope_with_key_hex(bytes: &[u8], key_hex: &str) -> Result<Vec<u8>> {
     let start = ENC_MAGIC.len();
     if bytes.len() < start + 12 {
         bail!("encrypted object is truncated");
     }
     let nonce = &bytes[start..start + 12];
     let ciphertext = &bytes[start + 12..];
-    let key_hex = read_master_key(master_key_path)?;
     let key_bytes = hex::decode(key_hex.trim())?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
     cipher

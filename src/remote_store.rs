@@ -34,6 +34,8 @@ pub(crate) const DEFAULT_S3_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub(crate) const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 60;
 pub(crate) const DEFAULT_S3_TRANSIENT_RETRY_ATTEMPTS: usize = 4;
 pub(crate) const DEFAULT_S3_TRANSIENT_RETRY_BASE_MS: u64 = 250;
+const FILE_REMOTE_LOCK_RETRIES: usize = 200;
+const FILE_REMOTE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub(crate) fn adaptive_multipart_part_size(len: usize, endpoint: &str) -> usize {
     let requested = env::var("MAJUTSU_S3_MULTIPART_PART_SIZE")
@@ -339,15 +341,62 @@ fn file_remote_put_if_absent_atomic(
                 fs::remove_file(&tmp)?;
                 Ok(false)
             }
-            Err(err) => {
-                Err(err).with_context(|| format!("publish remote object {}", path.display()))
-            }
+            Err(err) => file_remote_put_if_absent_with_lock(path, &tmp, err),
         }
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+fn file_remote_put_if_absent_with_lock(
+    path: &Path,
+    tmp: &Path,
+    publish_error: std::io::Error,
+) -> Result<bool> {
+    let lock_path = file_remote_lock_path(path);
+    for _ in 0..FILE_REMOTE_LOCK_RETRIES {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(lock) => {
+                let result = (|| -> Result<bool> {
+                    if path.exists() {
+                        fs::remove_file(tmp)?;
+                        return Ok(false);
+                    }
+                    fs::rename(tmp, path)
+                        .with_context(|| format!("publish remote object {}", path.display()))?;
+                    crate::atomic_io::fsync_parent_dir(path)?;
+                    Ok(true)
+                })();
+                drop(lock);
+                let _ = fs::remove_file(&lock_path);
+                return result;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if path.exists() {
+                    fs::remove_file(tmp)?;
+                    return Ok(false);
+                }
+                thread::sleep(FILE_REMOTE_LOCK_RETRY_DELAY);
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("create remote object lock {}", lock_path.display()));
+            }
+        }
+    }
+    Err(publish_error).with_context(|| {
+        format!(
+            "publish remote object {} after waiting for fallback lock {}",
+            path.display(),
+            lock_path.display()
+        )
+    })
 }
 
 fn file_remote_tmp_path(path: &Path) -> PathBuf {
@@ -357,6 +406,15 @@ fn file_remote_tmp_path(path: &Path) -> PathBuf {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "object".to_string());
     parent.join(format!(".{file_name}.mjtmp-{}", uuid::Uuid::new_v4()))
+}
+
+fn file_remote_lock_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "object".to_string());
+    parent.join(format!(".{file_name}.mjlock"))
 }
 
 pub(crate) fn remote_config_diagnostics(config: &RemoteConfig) -> Result<Vec<(String, String)>> {
@@ -2082,6 +2140,38 @@ mod storage_characteristic_tests {
             adaptive_multipart_part_size(huge, "https://s3.amazonaws.com")
                 > MIN_MULTIPART_PART_SIZE
         );
+    }
+
+    #[test]
+    fn file_remote_fallback_lock_publishes_object_once() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dest = tmpdir.path().join("object.bin");
+        let tmp = tmpdir.path().join(".object.bin.mjtmp-test");
+        fs::write(&tmp, b"first").unwrap();
+
+        assert!(
+            file_remote_put_if_absent_with_lock(
+                &dest,
+                &tmp,
+                std::io::Error::new(std::io::ErrorKind::Unsupported, "hard link unsupported"),
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"first");
+        assert!(!tmp.exists());
+
+        let tmp = tmpdir.path().join(".object.bin.mjtmp-test-2");
+        fs::write(&tmp, b"second").unwrap();
+        assert!(
+            !file_remote_put_if_absent_with_lock(
+                &dest,
+                &tmp,
+                std::io::Error::new(std::io::ErrorKind::Unsupported, "hard link unsupported"),
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"first");
+        assert!(!tmp.exists());
     }
 
     #[test]

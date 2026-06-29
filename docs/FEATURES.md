@@ -58,7 +58,8 @@ including uncommitted files and selected non-repository directories.
 ## Watch and daemon
 
 - OS-native filesystem watch backend with debounce.
-- Linux defaults to inotify; `notify` is the cross-platform native watcher alias.
+- Linux defaults to fanotify and falls back to inotify when fanotify is
+  unavailable; `notify` is the cross-platform native watcher alias.
 - Polling watch fallback for environments where native events are unavailable.
 - Watch-created snapshots can auto-sync after each batch.
 - Daemon status and metrics expose root health, upload backlog, journal replay,

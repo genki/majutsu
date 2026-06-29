@@ -84,9 +84,11 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             .map(remote_host_prefix_from_summary)
             .unwrap_or_else(|| remote_host_label(&export.config.host.name));
         if let Some(recipients) = clone_remote_recipients(&remote, &host_prefix)? {
-            crate::atomic_io::write_atomic(
+            let keyring: crate::majutsu_crypto::AgeKeyring =
+                toml::from_str(std::str::from_utf8(&recipients)?)?;
+            crate::majutsu_crypto::write_age_keyring(
                 &staging_paths.home.join("keys/recipients.toml"),
-                &recipients,
+                &keyring,
             )?;
         }
         if export.config.security.encryption != "none" {

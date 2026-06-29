@@ -3972,7 +3972,12 @@ pub(crate) fn create_layout(paths: &Paths) -> Result<()> {
     restrict_state_permissions(paths)?;
     let recipients = paths.home.join("keys/recipients.toml");
     if !recipients.exists() {
-        fs::write(recipients, "recipients = []\n")?;
+        crate::majutsu_crypto::write_age_keyring(
+            &recipients,
+            &crate::majutsu_crypto::AgeKeyring::default(),
+        )?;
+    } else {
+        crate::majutsu_crypto::restrict_age_keyring_permissions(&recipients)?;
     }
     let log = paths.home.join("logs/majutsu.log");
     if !log.exists() {
@@ -4780,11 +4785,17 @@ pub(crate) fn decode_object(paths: &Paths, bytes: &[u8]) -> Result<Vec<u8>> {
                 key_rotation_pending_path(paths),
                 key_rotation_previous_path(paths),
             ] {
-                if fallback.exists()
-                    && let Ok(decoded) =
-                        crate::majutsu_crypto::decode_object(bytes, &fallback, &recipients)
-                {
-                    return Ok(decoded);
+                if fallback.exists() {
+                    let Ok(key_hex) = crate::majutsu_crypto::read_master_key_file(&fallback) else {
+                        continue;
+                    };
+                    if let Ok(decoded) = crate::majutsu_crypto::decode_object_with_master_key_hex(
+                        bytes,
+                        &key_hex,
+                        &recipients,
+                    ) {
+                        return Ok(decoded);
+                    }
                 }
             }
             Err(first)
@@ -5518,5 +5529,56 @@ tier = "Bulk"
         assert_eq!(before.len(), after.len());
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());
         assert!(!stable_metadata_matches(&before, &after));
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_object_fallback_key_files_do_not_reuse_env_master_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        create_layout(&paths).unwrap();
+        let object_key = "0000000000000000000000000000000000000000000000000000000000000000";
+        let env_key = "1111111111111111111111111111111111111111111111111111111111111111";
+        let fallback_key = "2222222222222222222222222222222222222222222222222222222222222222";
+        crate::majutsu_crypto::write_master_key(&paths.master_key, env_key).unwrap();
+        crate::majutsu_crypto::write_master_key(&key_rotation_pending_path(&paths), fallback_key)
+            .unwrap();
+        let encoded = crate::majutsu_crypto::encode_object_with_master_key_hex(
+            b"secret payload",
+            EncryptionMode::ChaCha20Poly1305,
+            fallback_key,
+            &recipients_path(&paths),
+        )
+        .unwrap();
+
+        let _guard = EnvVarGuard::set("MAJUTSU_MASTER_KEY", object_key);
+
+        assert_eq!(decode_object(&paths, &encoded).unwrap(), b"secret payload");
     }
 }

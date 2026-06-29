@@ -40,7 +40,7 @@ cargo install majutsu
 This installs the `mj` binary. To install a specific released version:
 
 ```sh
-cargo install majutsu --version 0.6.5 --locked
+cargo install majutsu --version 0.6.6 --locked
 ```
 
 Use repository-local builds only for development or verification of unreleased
@@ -164,9 +164,10 @@ root-owned host configuration under `/etc/majutsu/config.toml` and
 `/var/lib/majutsu`.
 
 Each state has a host id. Multiple hosts can share one S3/GCS bucket or prefix;
-host metadata is stored under host-scoped paths, while content-addressed payload
-objects can be reused when identical data appears across histories. Use separate
-prefixes for unrelated trust domains or projects.
+host metadata and payload objects are stored under host-scoped paths. Payload
+objects are not reused across host-id boundaries, so host size reports map
+directly to the remote prefix owned by that host. Use separate prefixes for
+unrelated trust domains or projects.
 
 For repository internals, see [crates.io release](docs/CRATES_IO_RELEASE.md)
 and [release checklist](docs/RELEASE_CHECKLIST.md). The public package is the

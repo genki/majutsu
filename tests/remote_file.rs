@@ -771,6 +771,14 @@ fn encrypted_init_restricts_state_and_master_key_permissions() {
             & 0o777,
         0o600
     );
+    assert_eq!(
+        fs::metadata(state.join("keys/recipients.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 fn root_list_has(root_list: &str, id: &str, status: &str) -> bool {
@@ -7864,10 +7872,10 @@ fn init_creates_spec_state_layout() {
     ] {
         assert!(state.join(path).is_dir(), "missing directory {path}");
     }
-    assert_eq!(
-        fs::read_to_string(state.join("keys/recipients.toml")).unwrap(),
-        "recipients = []\n"
-    );
+    let keyring: toml::Value =
+        toml::from_str(&fs::read_to_string(state.join("keys/recipients.toml")).unwrap()).unwrap();
+    assert_eq!(keyring["recipients"].as_array().unwrap().len(), 0);
+    assert_eq!(keyring["identities"].as_array().unwrap().len(), 0);
     let log = fs::read_to_string(state.join("logs/majutsu.log")).unwrap();
     assert!(log.contains("\"kind\":\"init\""));
     assert!(log.contains("\"status\":\"done\""));
