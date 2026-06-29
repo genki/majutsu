@@ -222,8 +222,10 @@ mj root list --json
 mj root list --no-truncate
 ```
 
-Use `--json` for scripts and dashboards. Use `--no-truncate` when you need the
-complete root paths in a narrow terminal or captured log.
+Use `--json` for scripts and dashboards. Text output prints complete root
+paths by default. When the table is wider than an interactive terminal, `mj`
+opens a pager with horizontal scrolling; `--no-truncate` remains as a
+compatibility alias and is normally unnecessary.
 
 Size roots and remote usage:
 

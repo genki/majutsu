@@ -4,6 +4,12 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=BUILD_NUMBER");
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    if let Ok(head) = fs::read_to_string(".git/HEAD")
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=.git/{reference}");
+    }
     println!("cargo:rerun-if-env-changed=MAJUTSU_DEV_BUILD");
     println!("cargo:rerun-if-env-changed=MAJUTSU_GIT_COMMIT");
     let build_number = fs::read_to_string("BUILD_NUMBER")

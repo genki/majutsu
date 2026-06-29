@@ -2708,8 +2708,8 @@ fn stream_state_lines_viewer(rx: mpsc::Receiver<LogProducerMessage>) -> Result<(
     run_log_viewer(lines, rx, "mj state")
 }
 
-fn state_prefetch_needs_viewer(done: bool, overflowed: bool) -> bool {
-    overflowed || !done
+fn state_prefetch_needs_viewer(_done: bool, overflowed: bool) -> bool {
+    overflowed
 }
 
 fn split_state_change_path(path: &str) -> (String, String) {
@@ -7048,9 +7048,9 @@ mod tests {
     }
 
     #[test]
-    fn state_prefetch_enters_viewer_for_overflow_or_pending_output() {
+    fn state_prefetch_enters_viewer_only_after_height_overflow() {
         assert!(!state_prefetch_needs_viewer(true, false));
         assert!(state_prefetch_needs_viewer(true, true));
-        assert!(state_prefetch_needs_viewer(false, false));
+        assert!(!state_prefetch_needs_viewer(false, false));
     }
 }

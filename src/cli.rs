@@ -802,9 +802,22 @@ pub(crate) struct RootListArgs {
     #[arg(
         long,
         default_value_t = false,
-        help = "Do not shorten columns to fit the terminal width"
+        help = "Compatibility no-op; root list no longer shortens paths"
     )]
     pub(crate) no_truncate: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "pager",
+        help = "Print directly without using a pager when output is wider than the terminal"
+    )]
+    pub(crate) no_pager: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Force pager output with horizontal scrolling"
+    )]
+    pub(crate) pager: bool,
 }
 
 #[derive(Args)]

@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -849,12 +850,8 @@ fn root_list_cmd(conn: &Connection, args: &RootListArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
+    let _ = args.no_truncate;
 
-    let width = if args.no_truncate {
-        usize::MAX
-    } else {
-        terminal_width()
-    };
     let mut output = String::new();
     output.push_str("Roots\n");
     output.push_str(&format!(
@@ -871,8 +868,59 @@ fn root_list_cmd(conn: &Connection, args: &RootListArgs) -> Result<()> {
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&mut output, width, &["ID", "STATUS", "NAME", "PATH"], &rows);
+    print_table(
+        &mut output,
+        usize::MAX,
+        &["ID", "STATUS", "NAME", "PATH"],
+        &rows,
+    );
+    emit_root_list_output(&output, terminal_width(), args)?;
+    Ok(())
+}
+
+fn emit_root_list_output(output: &str, width: usize, args: &RootListArgs) -> Result<()> {
+    if !args.no_pager
+        && should_page_wide_output(output, width, args.pager, io::stdout().is_terminal())
+        && write_to_horizontal_pager(output).is_ok()
+    {
+        return Ok(());
+    }
     print!("{output}");
+    Ok(())
+}
+
+fn should_page_wide_output(
+    output: &str,
+    width: usize,
+    force: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    force || (stdout_is_terminal && output.lines().any(|line| line.chars().count() > width))
+}
+
+fn write_to_horizontal_pager(output: &str) -> Result<()> {
+    let pager = env::var("MJ_PAGER")
+        .or_else(|_| env::var("PAGER"))
+        .unwrap_or_else(|_| "less -RS".into());
+    let mut parts = pager.split_whitespace();
+    let Some(program) = parts.next() else {
+        bail!("pager command is empty");
+    };
+    let mut child = Command::new(program)
+        .args(parts)
+        .env("LESS", env::var("LESS").unwrap_or_else(|_| "-RS".into()))
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("start pager: {pager}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(output.as_bytes())
+            .context("write root list to pager")?;
+    }
+    let status = child.wait().context("wait for pager")?;
+    if !status.success() {
+        bail!("pager exited with {status}");
+    }
     Ok(())
 }
 
@@ -3089,4 +3137,20 @@ fn format_count(value: usize) -> String {
         grouped.push(ch);
     }
     grouped.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_page_wide_output;
+
+    #[test]
+    fn root_list_pages_only_when_tty_output_exceeds_width_or_forced() {
+        let narrow = "ID  PATH\nr   /short\n";
+        let wide = "ID  PATH\nr   /very/long/path/that/exceeds/the/terminal/width\n";
+
+        assert!(!should_page_wide_output(narrow, 80, false, true));
+        assert!(should_page_wide_output(wide, 20, false, true));
+        assert!(!should_page_wide_output(wide, 20, false, false));
+        assert!(should_page_wide_output(narrow, 80, true, false));
+    }
 }
