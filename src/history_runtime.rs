@@ -2670,46 +2670,54 @@ fn stream_state_lines_direct_with_initial(
 fn stream_state_lines_viewer(rx: mpsc::Receiver<LogProducerMessage>) -> Result<()> {
     let height = terminal_height();
     let mut lines = Vec::new();
-    let mut overflowed = false;
-    let mut done = false;
-    let max_wait = StdDuration::from_millis(150);
-    let started = std::time::Instant::now();
-    while lines.len() <= height {
-        let elapsed = started.elapsed();
-        if elapsed >= max_wait {
-            break;
-        }
-        let timeout = max_wait - elapsed;
-        match rx.recv_timeout(timeout) {
-            Ok(LogProducerMessage::Line(line)) => {
-                lines.push(line);
-                if lines.len() > height {
-                    overflowed = true;
-                    break;
-                }
-            }
-            Ok(LogProducerMessage::Done) => {
-                done = true;
-                break;
-            }
-            Ok(LogProducerMessage::Error(err)) => bail!("{err}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                done = true;
-                break;
-            }
-        }
-    }
 
-    if !state_prefetch_needs_viewer(done, overflowed) {
+    if prefetch_state_lines_for_viewer(&rx, height, &mut lines)? == StateStreamMode::Direct {
         return stream_state_lines_direct_with_initial(lines, rx);
     }
 
     run_log_viewer(lines, rx, "mj state")
 }
 
-fn state_prefetch_needs_viewer(_done: bool, overflowed: bool) -> bool {
-    overflowed
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StateStreamMode {
+    Direct,
+    Viewer,
+}
+
+fn prefetch_state_lines_for_viewer(
+    rx: &mpsc::Receiver<LogProducerMessage>,
+    height: usize,
+    lines: &mut Vec<String>,
+) -> Result<StateStreamMode> {
+    loop {
+        if state_lines_need_viewer(lines.len(), height) {
+            return Ok(StateStreamMode::Viewer);
+        }
+        match rx.recv() {
+            Ok(LogProducerMessage::Line(line)) => {
+                lines.push(line);
+            }
+            Ok(LogProducerMessage::Done) => {
+                return Ok(if state_lines_need_viewer(lines.len(), height) {
+                    StateStreamMode::Viewer
+                } else {
+                    StateStreamMode::Direct
+                });
+            }
+            Ok(LogProducerMessage::Error(err)) => bail!("{err}"),
+            Err(_) => {
+                return Ok(if state_lines_need_viewer(lines.len(), height) {
+                    StateStreamMode::Viewer
+                } else {
+                    StateStreamMode::Direct
+                });
+            }
+        }
+    }
+}
+
+fn state_lines_need_viewer(line_count: usize, height: usize) -> bool {
+    line_count > height
 }
 
 fn split_state_change_path(path: &str) -> (String, String) {
@@ -7023,7 +7031,13 @@ fn print_snapshot_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_page_status_with_tty, state_prefetch_needs_viewer, truncate_for_terminal};
+    use super::{
+        LogProducerMessage, StateStreamMode, prefetch_state_lines_for_viewer,
+        should_page_status_with_tty, state_lines_need_viewer, truncate_for_terminal,
+    };
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn status_pager_decision_respects_tty_height_and_force() {
@@ -7049,8 +7063,39 @@ mod tests {
 
     #[test]
     fn state_prefetch_enters_viewer_only_after_height_overflow() {
-        assert!(!state_prefetch_needs_viewer(true, false));
-        assert!(state_prefetch_needs_viewer(true, true));
-        assert!(!state_prefetch_needs_viewer(false, false));
+        assert!(!state_lines_need_viewer(0, 5));
+        assert!(!state_lines_need_viewer(5, 5));
+        assert!(state_lines_need_viewer(6, 5));
+    }
+
+    #[test]
+    fn state_prefetch_waits_for_delayed_overflow() {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            tx.send(LogProducerMessage::Line("one".into())).unwrap();
+            thread::sleep(Duration::from_millis(220));
+            tx.send(LogProducerMessage::Line("two".into())).unwrap();
+            tx.send(LogProducerMessage::Done).unwrap();
+        });
+        let mut lines = Vec::new();
+        let mode = prefetch_state_lines_for_viewer(&rx, 1, &mut lines).unwrap();
+
+        assert_eq!(mode, StateStreamMode::Viewer);
+        assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn state_prefetch_prints_delayed_short_output_directly() {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            tx.send(LogProducerMessage::Line("one".into())).unwrap();
+            thread::sleep(Duration::from_millis(220));
+            tx.send(LogProducerMessage::Done).unwrap();
+        });
+        let mut lines = Vec::new();
+        let mode = prefetch_state_lines_for_viewer(&rx, 5, &mut lines).unwrap();
+
+        assert_eq!(mode, StateStreamMode::Direct);
+        assert_eq!(lines, vec!["one".to_string()]);
     }
 }
