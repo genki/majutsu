@@ -19835,6 +19835,60 @@ fn sync_live_diff_preserves_unsnapshotted_delete_without_watch_event() {
     assert!(!restore.join("sample/deleted.txt").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn restore_plan_reports_permission_denied_live_delete_scan_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept.txt"), b"kept\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::write(source.join("extra.txt"), b"extra\n").unwrap();
+    let blocked = source.join("blocked");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::write(blocked.join("hidden.txt"), b"hidden\n").unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = {
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("restore").arg("plan");
+        c.output().expect("run restore plan")
+    };
+
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !result.status.success(),
+        "restore plan unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("elevated privileges"), "{stderr}");
+    assert!(stderr.contains("sudo"), "{stderr}");
+}
+
 #[test]
 fn snapshot_compacts_covered_durable_journal_and_sync_prunes_remote_journal() {
     let tmp = tempfile::tempdir().unwrap();

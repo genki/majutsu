@@ -2750,7 +2750,12 @@ fn build_restore_deletes(
             continue;
         }
         for entry in WalkDir::new(&scan_base).follow_links(false) {
-            let entry = entry?;
+            let entry = entry.with_context(|| {
+                format!(
+                    "restore plan needs elevated privileges to scan live target {}; rerun with sudo or approve sudo elevation when prompted",
+                    scan_base.display()
+                )
+            })?;
             if entry.file_type().is_dir() {
                 continue;
             }

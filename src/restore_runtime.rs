@@ -8,10 +8,12 @@ use crate::majutsu_restore::{
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
@@ -76,7 +78,9 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
         .unwrap_or(RestoreCommand::Apply(top_args.args));
     match command {
         RestoreCommand::Plan(args) => {
-            let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            let Some(plan) = build_restore_plan_or_rerun_with_sudo(paths, &conn, &args)? else {
+                return Ok(());
+            };
             print_restore_plan(paths, &conn, &plan)?;
             if args.check_conflicts {
                 let conflicts = restore_conflicts(paths, &conn, &plan)?;
@@ -85,7 +89,9 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
         }
         RestoreCommand::Apply(args) => {
             let trace = RestoreTrace::new();
-            let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            let Some(plan) = build_restore_plan_or_rerun_with_sudo(paths, &conn, &args)? else {
+                return Ok(());
+            };
             trace.mark("build plan");
             apply_restore_plan(paths, &plan, args.force, args.check_conflicts)?;
             trace.mark("apply plan");
@@ -104,7 +110,9 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
             trace.mark("finish");
         }
         RestoreCommand::Prepare(args) => {
-            let plan = crate::build_restore_plan(paths, &conn, &args)?;
+            let Some(plan) = build_restore_plan_or_rerun_with_sudo(paths, &conn, &args)? else {
+                return Ok(());
+            };
             let stats = restore_object_stats(paths, &conn, &plan)?;
             let mut job = build_restore_job(paths, &plan, &args)?;
             request_archive_restore_for_job(paths, &mut job)?;
@@ -171,6 +179,107 @@ pub(crate) fn restore_cmd(paths: &Paths, top_args: RestoreTopArgs) -> Result<()>
         RestoreCommand::Hydrate(args) => crate::mount_runtime::hydrate_cmd(paths, args)?,
     }
     Ok(())
+}
+
+fn build_restore_plan_or_rerun_with_sudo(
+    paths: &Paths,
+    conn: &Connection,
+    args: &RestoreArgs,
+) -> Result<Option<RestorePlan>> {
+    match crate::build_restore_plan(paths, conn, args) {
+        Ok(plan) => Ok(Some(plan)),
+        Err(err) if restore_permission_denied_error(&err) => {
+            rerun_restore_with_sudo(paths, &err)?;
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn rerun_restore_with_sudo(paths: &Paths, err: &anyhow::Error) -> Result<()> {
+    if env::var_os("MAJUTSU_SUDO_ELEVATED").is_some() || running_as_root() {
+        return Err(anyhow!(
+            "{err:#}\nrestore requires privileges for one or more live target paths"
+        ));
+    }
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(anyhow!(
+            "{err:#}\nrestore requires elevated privileges; rerun from a terminal so mj can ask before sudo elevation"
+        ));
+    }
+
+    eprintln!("{err:#}");
+    eprint!(
+        "restore needs elevated privileges to inspect live target paths. Re-run with sudo now? [y/N] "
+    );
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+        bail!("restore aborted; elevated privileges were not approved");
+    }
+
+    let exe = env::current_exe().context("resolve current mj executable for sudo")?;
+    let mut command = Command::new("sudo");
+    command
+        .arg("-E")
+        .arg(exe)
+        .arg("--home")
+        .arg(&paths.home)
+        .args(sudo_rerun_args_without_home())
+        .env("MAJUTSU_SUDO_ELEVATED", "1");
+    let status = command.status().context("run sudo mj restore")?;
+    if !status.success() {
+        bail!("sudo restore command failed with status {status}");
+    }
+    Ok(())
+}
+
+fn sudo_rerun_args_without_home() -> Vec<OsString> {
+    let mut args = Vec::new();
+    let mut iter = env::args_os().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--home" {
+            let _ = iter.next();
+            continue;
+        }
+        if arg.to_string_lossy().starts_with("--home=") {
+            continue;
+        }
+        args.push(arg);
+    }
+    args
+}
+
+fn restore_permission_denied_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+        if cause
+            .downcast_ref::<walkdir::Error>()
+            .and_then(|walkdir| walkdir.io_error())
+            .is_some_and(|io| io.kind() == io::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+    }
+    let detail = format!("{err:#}");
+    detail.contains("Permission denied") || detail.contains("os error 13")
+}
+
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 struct RestoreTrace {
