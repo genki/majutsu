@@ -55,6 +55,35 @@ pub(crate) fn ensure_restore_parent_beneath(base: &Path, dest: &Path) -> Result<
     Ok(())
 }
 
+pub(crate) fn ensure_restore_existing_path_without_symlinks(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::RootDir | Component::Prefix(_)) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    bail!("restore path component is a symlink: {}", current.display());
+                }
+                if !meta.is_dir() {
+                    bail!(
+                        "restore path component is not a directory: {}",
+                        current.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("inspect restore directory {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_restore_target_not_symlink(dest: &Path) -> Result<()> {
     if fs::symlink_metadata(dest)
         .map(|meta| meta.file_type().is_symlink())

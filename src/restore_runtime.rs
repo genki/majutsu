@@ -25,7 +25,8 @@ use crate::config::{Paths, read_config};
 use crate::operation_log::record_op;
 use crate::remote_store::open_remote;
 use crate::restore_apply::{
-    apply_file_metadata, ensure_restore_parent_beneath, ensure_restore_target_not_symlink,
+    apply_file_metadata, ensure_restore_existing_path_without_symlinks,
+    ensure_restore_parent_beneath, ensure_restore_target_not_symlink,
     prepare_directory_restore_destination, prepare_file_restore_destination, restore_special_file,
     restore_special_matches, restore_symlink, validate_restore_relative_path,
 };
@@ -522,8 +523,14 @@ fn print_restore_plan_with_stats_mode(
     println!("snapshot {}", plan.snapshot.snapshot_id);
     if let Some(to) = &plan.to {
         println!("target {}", to.display());
+        println!("layout target/<root-id>/...");
     } else {
         println!("target original-roots");
+        println!("layout configured-root-paths");
+    }
+    for root_id in restore_plan_output_roots(plan) {
+        let base = restore_root_base(plan.to.as_ref(), &plan.root_paths, &root_id)?;
+        println!("root_target {root_id} {}", base.display());
     }
     println!(
         "restore {} files, {} bytes, {} large files",
@@ -554,6 +561,28 @@ fn print_restore_plan_with_stats_mode(
     );
     if matches!(stats_mode, RestoreStatsMode::LocalOnly) {
         println!("remote_stats skipped");
+    }
+    Ok(())
+}
+
+fn restore_plan_output_roots(plan: &RestorePlan) -> Vec<String> {
+    let mut roots = plan
+        .files
+        .iter()
+        .map(|record| record.root_id.clone())
+        .chain(plan.deletes.iter().map(|delete| delete.root_id.clone()))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+pub(crate) fn validate_restore_plan_destinations(plan: &RestorePlan) -> Result<()> {
+    let roots = restore_plan_output_roots(plan);
+    for root_id in roots {
+        let base = restore_root_base(plan.to.as_ref(), &plan.root_paths, &root_id)?;
+        ensure_restore_existing_path_without_symlinks(&base)
+            .with_context(|| format!("validate restore target for root {root_id}"))?;
     }
     Ok(())
 }

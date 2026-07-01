@@ -205,7 +205,7 @@ use remote_store::{
 use remote_store::{RemoteStore, open_remote};
 use restore_runtime::{
     RestoreDelete, RestorePlan, required_object_keys_for_plan, restore_cmd, restore_root_base,
-    write_restore_job,
+    validate_restore_plan_destinations, write_restore_job,
 };
 use root_runtime::root_cmd;
 use root_state::{
@@ -2509,13 +2509,16 @@ fn build_restore_plan(paths: &Paths, conn: &Connection, args: &RestoreArgs) -> R
     restore_trace_mark(trace_start, "build_plan filter files");
     let deletes = build_restore_deletes(args, &root_paths, &plan_roots, &files)?;
     restore_trace_mark(trace_start, "build_plan deletes");
-    Ok(RestorePlan {
+    let plan = RestorePlan {
         snapshot,
         to: args.to.clone(),
         root_paths,
         files,
         deletes,
-    })
+    };
+    validate_restore_plan_destinations(&plan)?;
+    restore_trace_mark(trace_start, "build_plan validate destinations");
+    Ok(plan)
 }
 
 fn restore_plan_root_ids(snapshot: &SnapshotManifest) -> Vec<String> {

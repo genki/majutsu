@@ -742,6 +742,62 @@ fn restore_rejects_symlink_escape() {
 
 #[cfg(unix)]
 #[test]
+fn restore_plan_rejects_symlinked_target_path_before_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let real_target = tmp.path().join("real-target");
+    let symlink_target = tmp.path().join("symlink-target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&real_target).unwrap();
+    fs::write(source.join("file.txt"), b"inside\n").unwrap();
+    symlink(&real_target, &symlink_target).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let failed = {
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--to")
+            .arg(&symlink_target);
+        c.output().unwrap()
+    };
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("validate restore target for root sample"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("restore path component is a symlink"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn encrypted_init_restricts_state_and_master_key_permissions() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
@@ -1884,6 +1940,19 @@ fn remote_recovery_preserves_paused_resumed_and_missing_roots() {
     });
     assert!(root_list_has(&root_list, "docs", "active"));
     assert!(root_list_has(&root_list, "photos", "missing"));
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health");
+        c
+    });
+    assert!(
+        health.contains("root set photos --path <new-path>"),
+        "{health}"
+    );
+    assert!(
+        health.contains("mj restore plan --root photos --to <dir>"),
+        "{health}"
+    );
 
     run({
         let mut c = mj();
@@ -8408,6 +8477,8 @@ fn restore_without_to_can_write_back_to_original_root() {
         c
     });
     assert!(plan.contains("target original-roots"));
+    assert!(plan.contains("layout configured-root-paths"));
+    assert!(plan.contains(&format!("root_target sample {}", source.display())));
     assert!(plan.contains("conflicts 1"));
     assert!(plan.contains("delete 1 files"));
     assert!(plan.contains("restore_files 0"));

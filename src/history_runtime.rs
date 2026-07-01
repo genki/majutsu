@@ -899,15 +899,11 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
     }
 
     for root in roots {
-        if root.status == "active" && !root.path.exists() {
+        if (root.status == "active" && !root.path.exists()) || root.status == "missing" {
             issues.push(HealthIssue {
                 severity: HealthSeverity::Critical,
                 code: "root-missing".into(),
-                message: format!(
-                    "active root {} is missing: {}",
-                    root.id,
-                    root.path.display()
-                ),
+                message: root_missing_recovery_message(root),
             });
         } else if root.status != "active" {
             issues.push(HealthIssue {
@@ -1111,6 +1107,16 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         roots: root_health,
         issues,
     })
+}
+
+fn root_missing_recovery_message(root: &RootConfig) -> String {
+    format!(
+        "root {} is missing: {}; recover by recreating the directory, running `mj root set {} --path <new-path>`, or restoring to a canonical target path with `mj restore plan --root {} --to <dir>`",
+        root.id,
+        root.path.display(),
+        root.id,
+        root.id
+    )
 }
 
 fn mark_stale_running_operations(conn: &Connection, older_than_secs: i64) -> Result<usize> {
