@@ -296,7 +296,7 @@ when the remote listing is not available.
 
 The long-term remote layout is host-scoped: a bucket may be shared, but durable
 payload, metadata, journal, and GC objects should live directly under a
-`<host-id>/` directory below the configured remote root and should not be
+`<host-prefix>/` directory below the configured remote root and should not be
 physically shared across host boundaries. If the bucket is also used for other
 purposes, pass a path in the S3 URL such as `s3://bucket/path-to-mj`; Majutsu
 then treats `path-to-mj/` as the remote root.

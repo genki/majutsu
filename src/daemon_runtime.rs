@@ -822,6 +822,7 @@ fn daemon_doctor(paths: &Paths) -> Result<()> {
             println!("action mj daemon start");
         }
     }
+    warn_stale_systemd_units(paths);
     if let Ok(tail) = daemon_log_tail(paths, 20)
         && !tail.is_empty()
     {
@@ -829,6 +830,49 @@ fn daemon_doctor(paths: &Paths) -> Result<()> {
         print!("{tail}");
     }
     Ok(())
+}
+
+fn warn_stale_systemd_units(paths: &Paths) {
+    for path in systemd_unit_candidates() {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !content.contains("majutsu") && !content.contains(&paths.home.display().to_string()) {
+            continue;
+        }
+        let mut reasons = Vec::new();
+        if content.contains("Type=forking")
+            || content.contains(" daemon start")
+            || content.contains("\"daemon\" \"start\"")
+            || content.contains("'daemon' 'start'")
+        {
+            reasons.push("legacy forking daemon style");
+        }
+        if !content.contains("MemoryMax=") {
+            reasons.push("missing MemoryMax");
+        }
+        if !content.contains("OOMPolicy=stop") {
+            reasons.push("missing OOMPolicy=stop");
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+        println!("systemd_unit_stale {}", path.display());
+        println!("reason {}", reasons.join(", "));
+        println!("action regenerate with `mj daemon service --provider systemd`");
+    }
+}
+
+fn systemd_unit_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates
+            .push(std::path::PathBuf::from(home).join(".config/systemd/user/majutsu.service"));
+    }
+    candidates.push(std::path::PathBuf::from(
+        "/etc/systemd/system/majutsu.service",
+    ));
+    candidates
 }
 
 fn daemon_log_path(paths: &Paths) -> std::path::PathBuf {

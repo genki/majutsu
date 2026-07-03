@@ -163,11 +163,12 @@ Majutsu stores state under CLI `--home`, `$MAJUTSU_HOME`, XDG config, or
 root-owned host configuration under `/etc/majutsu/config.toml` and
 `/var/lib/majutsu`.
 
-Each state has a host id. Multiple hosts can share one S3/GCS bucket or prefix;
-host metadata and payload objects are stored under host-scoped paths. Payload
-objects are not reused across host-id boundaries, so host size reports map
-directly to the remote prefix owned by that host. Use separate prefixes for
-unrelated trust domains or projects.
+Each state has a stable host id and a host name-derived remote prefix. Multiple
+hosts can share one S3/GCS bucket or prefix; host metadata and payload objects
+are stored under host-scoped paths. Payload objects are not reused across
+host-prefix boundaries, so host size reports map directly to the remote prefix
+owned by that host. Use separate prefixes for unrelated trust domains or
+projects.
 
 For repository internals, see [crates.io release](docs/CRATES_IO_RELEASE.md)
 and [release checklist](docs/RELEASE_CHECKLIST.md). The public package is the

@@ -837,6 +837,38 @@ fn encrypted_init_restricts_state_and_master_key_permissions() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn existing_encrypted_state_repairs_age_keyring_permissions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init").arg("--encrypt");
+        c
+    });
+
+    fs::set_permissions(
+        state.join("keys/recipients.toml"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("status").arg("--no-pager");
+        c
+    });
+
+    assert_eq!(
+        fs::metadata(state.join("keys/recipients.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
 fn root_list_has(root_list: &str, id: &str, status: &str) -> bool {
     root_list.lines().any(|line| {
         let mut columns = line.split_whitespace();
@@ -18322,6 +18354,58 @@ fn untrack_supports_path_files_summary_and_excluded_cleanup() {
 }
 
 #[test]
+fn fsck_accepts_path_track_operation_kinds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("manual.txt"), b"manual\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("manual.txt");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("track")
+            .arg("-r")
+            .arg("sample")
+            .arg("manual.txt");
+        c
+    });
+
+    let fsck = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck").arg("--quick");
+        c
+    });
+    assert!(fsck.contains("fsck ok"), "{fsck}");
+}
+
+#[test]
 fn state_reference_reports_file_changes_since_operation() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -21378,6 +21462,56 @@ fn daemon_doctor_and_restart_clean_stale_pid() {
         c.arg("--home").arg(&state).arg("daemon").arg("stop");
         c
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_doctor_warns_about_stale_systemd_unit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let home = tmp.path().join("home");
+    let unit_dir = home.join(".config/systemd/user");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&unit_dir).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    fs::write(
+        unit_dir.join("majutsu.service"),
+        format!(
+            "[Service]\nType=forking\nExecStart=mj --home {} daemon start\n",
+            state.display()
+        ),
+    )
+    .unwrap();
+
+    let doctor = output({
+        let mut c = mj();
+        c.env("HOME", &home)
+            .arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("doctor");
+        c
+    });
+    assert!(doctor.contains("systemd_unit_stale"), "{doctor}");
+    assert!(doctor.contains("legacy forking daemon style"), "{doctor}");
+    assert!(doctor.contains("missing MemoryMax"), "{doctor}");
+    assert!(doctor.contains("missing OOMPolicy=stop"), "{doctor}");
 }
 
 #[cfg(unix)]

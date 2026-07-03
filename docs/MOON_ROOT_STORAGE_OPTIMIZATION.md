@@ -41,7 +41,7 @@ MAJUTSU_SYNC_AUTO_PACK_COMPACT_MIN_RECLAIM_BYTES=33554432 mj sync
 MAJUTSU_SYNC_AUTO_PACK_COMPACT_MAX_UTILIZATION_PERCENT=70 mj sync
 ```
 
-sync 後は、current retention metadata から参照されない remote content object を削除する。対象には旧 loose blob object、canonical loose blob alias、pack、pack index、tree node、large object manifest / chunk を含める。S3/GCS 互換 remote では remote root 直下の `<host-id>/` が最上位境界であり、GC mark と tombstone も `<host-id>/gc/...` に保存する。削除判定はその host 境界内で完結し、別 host の payload object を共有前提で保護する設計にはしない。
+sync 後は、current retention metadata から参照されない remote content object を削除する。対象には旧 loose blob object、canonical loose blob alias、pack、pack index、tree node、large object manifest / chunk を含める。S3/GCS 互換 remote では remote root 直下の `<host-prefix>/` が最上位境界であり、GC mark と tombstone も `<host-prefix>/gc/...` に保存する。削除判定はその host 境界内で完結し、別 host の payload object を共有前提で保護する設計にはしない。
 
 ファイルを作業treeから削除しただけの場合、そのファイルは履歴上の復元対象として残る。一方で `mj root set --exclude ...` や include 変更によって majutsu の管理対象から外した場合は、保持中snapshotの該当root metadataからも対象外pathを忘却する。これにより、そのpayloadは通常の履歴retentionを待たずに metadata prune / remote cleanup の削除対象になれる。
 

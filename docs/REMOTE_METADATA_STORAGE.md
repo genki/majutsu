@@ -2,27 +2,27 @@
 
 Majutsu は snapshot payload を content-addressed object として保存する。S3/GCS 互換
 remote では、remote URL の path を Majutsu 用 remote root とし、その直下に
-`<host-id>/...` を配置する。host-id は remote 側の最上位境界であり、payload object や
-metadata はこの境界を越えて共有しない。
+`<host-prefix>/...` を配置する。host-prefix は host name から導出される remote 側の
+最上位境界であり、payload object や metadata はこの境界を越えて共有しない。
 
 現在の remote layout では、host ごとの metadata と payload は次のように保存する。
 
-- `<host-id>/metadata/export.json.zst`
-- `<host-id>/head.cbor.zst.enc`
-- `<host-id>/refs/...`
-- `<host-id>/snapshots/...`
-- `<host-id>/ops/...`
-- `<host-id>/objects/...`
-- `<host-id>/blobs/...`
-- `<host-id>/trees/...`
-- `<host-id>/packs/...`
-- `<host-id>/large/...`
-- `<host-id>/gc/...`
+- `<host-prefix>/metadata/export.json.zst`
+- `<host-prefix>/head.cbor.zst.enc`
+- `<host-prefix>/refs/...`
+- `<host-prefix>/snapshots/...`
+- `<host-prefix>/ops/...`
+- `<host-prefix>/objects/...`
+- `<host-prefix>/blobs/...`
+- `<host-prefix>/trees/...`
+- `<host-prefix>/packs/...`
+- `<host-prefix>/large/...`
+- `<host-prefix>/gc/...`
 
 履歴が長い場合、payload data が小さくても metadata が remote storage の大半を
 占める。compact remote metadata layout では、これらの file に `manifest_key` などの
 index field は残すが、S3 互換 remote では埋め込み `manifest_json` を省略する。
-full snapshot manifest は `<host-id>/objects/` 以下の content-addressed object を正とする。
+full snapshot manifest は `<host-prefix>/objects/` 以下の content-addressed object を正とする。
 
 ## 期待される効果
 

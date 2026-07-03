@@ -432,6 +432,8 @@ pub enum OperationKind {
     RootPermissionDenied,
     #[serde(alias = "RootRemoved")]
     RootRemoved,
+    PathTracked,
+    PathUntracked,
     OpRestore,
     #[serde(alias = "Restore")]
     Restore,
@@ -579,6 +581,8 @@ pub fn valid_operation_kind_label(kind: &str) -> bool {
             | "root-missing"
             | "root-unmounted"
             | "root-permission-denied"
+            | "path-tracked"
+            | "path-untracked"
             | "initial-scan"
             | "manual-snapshot"
             | "file-events-batch"
@@ -1533,6 +1537,8 @@ mod tests {
             "root-missing",
             "root-unmounted",
             "root-permission-denied",
+            "path-tracked",
+            "path-untracked",
             "initial-scan",
             "manual-snapshot",
             "file-events-batch",
@@ -1692,6 +1698,8 @@ mod tests {
 
         assert!(entry.validation_issues().is_empty());
         assert!(valid_operation_kind_label("root-permission-denied"));
+        assert!(valid_operation_kind_label("path-tracked"));
+        assert!(valid_operation_kind_label("path-untracked"));
         assert!(valid_operation_status_label("failed"));
         assert!(valid_remote_sync_state_label("queued"));
         assert!(valid_remote_sync_state_label("synced"));

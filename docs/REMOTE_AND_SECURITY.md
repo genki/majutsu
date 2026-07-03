@@ -82,28 +82,28 @@ it reports the missing-local count and asks for explicit repair/recovery work.
 ## Shared bucket design
 
 Majutsu can use one S3/GCS bucket for multiple environments. The S3 URL path is
-the Majutsu remote root. Directories directly below that remote root are host
-ids, and durable objects do not cross that boundary:
+the Majutsu remote root. Directories directly below that remote root are
+host-name-derived prefixes, and durable objects do not cross that boundary:
 
 ```text
-<host-id>/metadata/export.json.zst
-<host-id>/refs/current
-<host-id>/refs/last-synced
-<host-id>/snapshots/...
-<host-id>/ops/...
-<host-id>/objects/...
-<host-id>/blobs/...
-<host-id>/trees/...
-<host-id>/packs/...
-<host-id>/large/...
+<host-prefix>/metadata/export.json.zst
+<host-prefix>/refs/current
+<host-prefix>/refs/last-synced
+<host-prefix>/snapshots/...
+<host-prefix>/ops/...
+<host-prefix>/objects/...
+<host-prefix>/blobs/...
+<host-prefix>/trees/...
+<host-prefix>/packs/...
+<host-prefix>/large/...
 ```
 
 The bucket can still be shared. If the bucket is also used for other data, pass
 a path in the remote URL, for example `s3://bucket/path-to-mj`. Majutsu then
 treats `path-to-mj/` as the remote root and stores hosts as
-`path-to-mj/<host-id>/...`.
+`path-to-mj/<host-prefix>/...`.
 
-Hosts are selected by host id or a host name discovered from host metadata:
+Hosts are selected by stable host id or a host name discovered from host metadata:
 
 ```sh
 mj remote hosts
@@ -124,12 +124,12 @@ s3://bucket/majutsu/system
 Majutsu publishes host-scoped remote objects for trees, blobs, packs, indexes,
 large manifests/chunks, and host operation logs. For S3/GCS compatible remotes,
 the remote URL path is the Majutsu remote root and every durable object belongs
-under one direct child `<host-id>/...`. There is no `hosts/` wrapper, no global
-host registry, and no payload sharing across host-id boundaries.
+under one direct child `<host-prefix>/...`. There is no `hosts/` wrapper, no global
+host registry, and no payload sharing across host-prefix boundaries.
 
 `mj remote fsck` verifies each host metadata export, per-host refs,
 snapshot/operation exports, aggregate operation logs, and every referenced
-object under that host id. Old pre-migration prefixes are not fallback inputs;
+object under that host prefix. Old pre-migration prefixes are not fallback inputs;
 after a host has synced with the current layout, old prefixes can be removed
 from the remote.
 
@@ -142,7 +142,7 @@ mj --home /tmp/recovered-majutsu fsck
 mj --home /tmp/recovered-majutsu restore apply --to /tmp/restore
 ```
 
-When the remote root contains multiple host ids, clone requires `--host`. If a
+When the remote root contains multiple host prefixes, clone requires `--host`. If a
 host name matches multiple entries, use the host id shown by `mj remote hosts`.
 Duplicate host ids or metadata keys are treated as remote metadata corruption.
 

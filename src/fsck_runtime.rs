@@ -2739,7 +2739,7 @@ pub(crate) fn remote_fsck_with_options(
     }
     let index = read_remote_host_index(remote)?;
     if index.hosts.is_empty() {
-        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
+        bail!("remote metadata is missing: <host-prefix>/metadata/export.json.zst not found");
     }
     {
         for issue in index.duplicate_issues() {

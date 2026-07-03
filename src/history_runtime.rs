@@ -627,7 +627,7 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
                     &conn,
                     &remote_store,
                     args.sample,
-                    args.timeout_secs,
+                    args.timeout_secs.or(Some(15)),
                     !args.history,
                 )?),
                 Err(_) => None,
@@ -5121,7 +5121,7 @@ fn read_remote_head_status(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let root_acks = read_remote_root_acks(conn, remote_name, &config.host.id)?;
+    let root_acks = read_remote_root_acks(conn, remote_name, &host_prefix)?;
     let synced = current.is_some() && current.map(str::to_string) == remote_current;
     let detail = match (current, remote_current.as_deref()) {
         (Some(_), Some(_)) if synced => "synced".into(),
@@ -7039,8 +7039,10 @@ fn print_snapshot_diff(
 mod tests {
     use super::{
         LogProducerMessage, StateStreamMode, prefetch_state_lines_for_viewer,
-        should_page_status_with_tty, state_lines_need_viewer, truncate_for_terminal,
+        read_remote_root_acks, should_page_status_with_tty, state_lines_need_viewer,
+        truncate_for_terminal,
     };
+    use rusqlite::{Connection, params};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -7103,5 +7105,38 @@ mod tests {
 
         assert_eq!(mode, StateStreamMode::Direct);
         assert_eq!(lines, vec!["one".to_string()]);
+    }
+
+    #[test]
+    fn cached_remote_root_acks_are_read_from_host_prefix_refs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "create table remote_refs (remote text not null, name text not null, value text not null)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into remote_refs (remote, name, value) values (?1, ?2, ?3)",
+            params![
+                "remote",
+                "workstation/roots/sample/ack",
+                r#"{"snapshot_id":"snap-1","tree_id":"tree-1","tree_key":"objects/trees/tree-1","file_count":1,"synced_at":"2026-07-04T00:00:00Z"}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into remote_refs (remote, name, value) values (?1, ?2, ?3)",
+            params![
+                "remote",
+                "host-uuid/roots/sample/ack",
+                r#"{"snapshot_id":"snap-old","tree_id":"tree-old","tree_key":"objects/trees/tree-old","file_count":1,"synced_at":"2026-07-04T00:00:00Z"}"#
+            ],
+        )
+        .unwrap();
+
+        let by_prefix = read_remote_root_acks(&conn, "remote", "workstation").unwrap();
+        assert_eq!(by_prefix["sample"].tree_id, "tree-1");
+        let by_id = read_remote_root_acks(&conn, "remote", "host-uuid").unwrap();
+        assert_eq!(by_id["sample"].tree_id, "tree-old");
     }
 }

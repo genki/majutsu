@@ -113,7 +113,9 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 .find(|host| host.id == config.host.id)
                 .or_else(|| index.hosts.first())
             else {
-                bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
+                bail!(
+                    "remote metadata is missing: <host-prefix>/metadata/export.json.zst not found"
+                );
             };
             println!("metadata ok");
             println!("host_id {}", host.id);
@@ -291,7 +293,7 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     let mut checked_metadata = 0usize;
     let index = read_remote_host_index(remote)?;
     if index.hosts.is_empty() {
-        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
+        bail!("remote metadata is missing: <host-prefix>/metadata/export.json.zst not found");
     }
     for issue in index.duplicate_issues() {
         missing += 1;
@@ -740,7 +742,7 @@ fn scan_remote_object_availability(
     options: RemoteObjectScanOptions,
 ) -> Result<RemoteObjectScan> {
     if read_remote_host_index(remote)?.hosts.is_empty() {
-        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
+        bail!("remote metadata is missing: <host-prefix>/metadata/export.json.zst not found");
     }
     if let Some(sample) = options.sample {
         keys.truncate(sample);
@@ -975,7 +977,7 @@ fn remote_repair_canonical_aliases(
     verbose: bool,
 ) -> Result<RepairSummary> {
     if read_remote_host_index(remote)?.hosts.is_empty() {
-        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
+        bail!("remote metadata is missing: <host-prefix>/metadata/export.json.zst not found");
     }
 
     let mut skipped_local_missing = 0usize;
@@ -1125,7 +1127,7 @@ fn scan_remote_object_availability_for_repair(
     options: RemoteObjectScanOptions,
 ) -> Result<RemoteObjectScan> {
     if read_remote_host_index(remote)?.hosts.is_empty() {
-        bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found");
+        bail!("remote metadata is missing: <host-prefix>/metadata/export.json.zst not found");
     }
     let total = keys.len();
     let start = Instant::now();

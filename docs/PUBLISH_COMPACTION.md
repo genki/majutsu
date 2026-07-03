@@ -13,7 +13,7 @@ GCS request latency に支配されていた。
 S3/GCS 互換 backend では、最新 head 情報を次の単一 object として publish する。
 
 ```text
-<host-id>/head.cbor.zst.enc
+<host-prefix>/head.cbor.zst.enc
 ```
 
 この object には current snapshot、last-synced、host metadata key、GC mark key、
@@ -42,9 +42,9 @@ MAJUTSU_SYNC_REMOTE_REF_OBJECTS=1 mj sync
 
 ## host metadata discovery
 
-S3/GCS 互換 backend では remote root 直下の `<host-id>/metadata/export.json.zst`
+S3/GCS 互換 backend では remote root 直下の `<host-prefix>/metadata/export.json.zst`
 を列挙して host を discovery する。`hosts/index.json` や global metadata object は
-作成しない。最新 current、last-synced、root ack は `<host-id>/head.cbor.zst.enc` を正とする。
+作成しない。最新 current、last-synced、root ack は `<host-prefix>/head.cbor.zst.enc` を正とする。
 
 2026-06-16 の GCS S3互換 endpoint 実測では、1ファイル追記後の小変更 sync は次の結果だった。
 

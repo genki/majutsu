@@ -4022,6 +4022,17 @@ fn ensure_ready(paths: &Paths) -> Result<()> {
             paths.home.display()
         );
     }
+    repair_existing_state_security(paths)?;
+    Ok(())
+}
+
+fn repair_existing_state_security(paths: &Paths) -> Result<()> {
+    restrict_state_permissions(paths)?;
+    if let Ok(config) = read_config(paths)
+        && config.security.encryption == "age"
+    {
+        crate::majutsu_crypto::restrict_age_keyring_permissions(&recipients_path(paths))?;
+    }
     Ok(())
 }
 

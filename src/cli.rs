@@ -1027,7 +1027,7 @@ pub(crate) struct HealthArgs {
         long,
         value_name = "SECONDS",
         requires = "deep",
-        help = "Stop --deep object availability checks after this many seconds"
+        help = "Stop --deep object availability checks after this many seconds; defaults to 15 seconds"
     )]
     pub(crate) timeout_secs: Option<u64>,
     #[arg(

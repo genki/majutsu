@@ -951,7 +951,7 @@ fn enqueue_and_drain_sync(
         persist_remote_root_acks(
             conn,
             &remote.describe(),
-            &config.host.id,
+            &host_label,
             &build_remote_root_acks(paths, &remote_export)?,
         )?;
     }
@@ -1831,7 +1831,7 @@ fn sync_status_snapshot(
     if let Some(value) = remote_last_synced.as_deref() {
         set_remote_ref_value(conn, &remote.describe(), &canonical_last_synced, value)?;
     }
-    persist_remote_root_acks(conn, &remote.describe(), &config.host.id, &remote_root_acks)?;
+    persist_remote_root_acks(conn, &remote.describe(), &host_label, &remote_root_acks)?;
     let mut export = export_metadata(paths, conn, &read_config(paths)?)?;
     if options.current_only
         && let Some(current) = local_current.as_deref()

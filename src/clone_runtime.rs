@@ -328,7 +328,7 @@ fn clone_metadata_selection(
             host: Some(host.clone()),
             host_index: true,
         }),
-        [] => bail!("remote metadata is missing: <host-id>/metadata/export.json.zst not found"),
+        [] => bail!("remote metadata is missing: <host-prefix>/metadata/export.json.zst not found"),
         _ => bail!("remote contains multiple hosts; rerun clone with --host"),
     }
 }
