@@ -212,6 +212,8 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             };
             let backend = daemon_service_backend(&config.watch.backend, scope)?;
             let interval_secs = daemon_service_interval(config.watch.interval, backend, scope);
+            let max_rss_mib = default_watch_max_rss_mib();
+            let memory_max_mib = daemon_service_memory_max_mib(max_rss_mib, backend, scope);
             let service = render_daemon_service(DaemonServiceConfig {
                 provider: &provider,
                 style: &style,
@@ -226,7 +228,8 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 buffer_max_ms: config.watch.buffer_max,
                 buffer_max_events: config.watch.buffer_max_events,
                 periodic_rescan_secs: config.watch.periodic_rescan,
-                max_rss_mib: default_watch_max_rss_mib(),
+                max_rss_mib,
+                memory_max_mib,
             })
             .map_err(anyhow::Error::msg)?;
             print!("{service}");
@@ -295,6 +298,17 @@ fn daemon_service_interval(
         return configured_interval.max(900);
     }
     configured_interval
+}
+
+fn daemon_service_memory_max_mib(
+    max_rss_mib: u64,
+    backend: &str,
+    scope: DaemonServiceScope,
+) -> u64 {
+    if cfg!(target_os = "linux") && matches!(scope, DaemonServiceScope::User) && backend == "poll" {
+        return max_rss_mib.saturating_mul(2).max(4096);
+    }
+    max_rss_mib
 }
 
 fn daemon_service_backend(

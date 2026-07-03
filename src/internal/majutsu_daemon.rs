@@ -28,6 +28,7 @@ pub struct DaemonServiceConfig<'a> {
     pub buffer_max_events: usize,
     pub periodic_rescan_secs: u64,
     pub max_rss_mib: u64,
+    pub memory_max_mib: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,10 +150,10 @@ fn render_systemd_service(config: &DaemonServiceConfig<'_>) -> String {
         DaemonServiceScope::User => "",
         DaemonServiceScope::System => "User=root\nUMask=0077\n",
     };
-    let memory_limit = if config.max_rss_mib == 0 {
+    let memory_limit = if config.memory_max_mib == 0 {
         String::new()
     } else {
-        format!("MemoryMax={}M\nOOMPolicy=stop\n", config.max_rss_mib)
+        format!("MemoryMax={}M\nOOMPolicy=stop\n", config.memory_max_mib)
     };
     format!(
         "[Unit]\n\
@@ -314,6 +315,7 @@ mod tests {
             buffer_max_events: 1000,
             periodic_rescan_secs: 3600,
             max_rss_mib: 2048,
+            memory_max_mib: 2048,
         })
         .unwrap();
 
@@ -348,6 +350,7 @@ mod tests {
             buffer_max_events: 1000,
             periodic_rescan_secs: 3600,
             max_rss_mib: 2048,
+            memory_max_mib: 2048,
         })
         .unwrap();
 
@@ -374,6 +377,7 @@ mod tests {
             buffer_max_events: 1000,
             periodic_rescan_secs: 3600,
             max_rss_mib: 2048,
+            memory_max_mib: 2048,
         })
         .unwrap();
 
@@ -406,6 +410,7 @@ mod tests {
             buffer_max_events: 20,
             periodic_rescan_secs: 0,
             max_rss_mib: 2048,
+            memory_max_mib: 2048,
         })
         .unwrap();
 
@@ -433,6 +438,7 @@ mod tests {
                 buffer_max_events: 1000,
                 periodic_rescan_secs: 3600,
                 max_rss_mib: 2048,
+                memory_max_mib: 2048,
             })
             .is_err()
         );

@@ -21275,7 +21275,7 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(systemd.contains("EnvironmentFile="));
     assert!(systemd.contains("/daemon.env"));
     assert!(systemd.contains("/s3.env"));
-    assert!(systemd.contains("MemoryMax=2048M"));
+    assert!(systemd.contains("MemoryMax=4096M"));
     assert!(systemd.contains("OOMPolicy=stop"));
     assert!(systemd.contains("Restart=on-failure"));
     assert!(systemd.contains("WantedBy=default.target"));
