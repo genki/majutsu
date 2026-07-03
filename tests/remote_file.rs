@@ -21010,7 +21010,7 @@ fn linux_inotify_backend_records_native_events() {
         c
     });
     assert!(
-        health.contains("issue critical watch-attribution-unavailable"),
+        health.contains("issue warning watch-attribution-unavailable"),
         "{health}"
     );
 }
@@ -21269,6 +21269,8 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     assert!(systemd.contains(state.to_str().unwrap()));
     assert!(systemd.contains("watch"));
     assert!(systemd.contains("--backend"));
+    assert!(systemd.contains("--backend poll"));
+    assert!(systemd.contains("--interval-secs 900"));
     assert!(systemd.contains("--mode"));
     assert!(systemd.contains("EnvironmentFile="));
     assert!(systemd.contains("/daemon.env"));
@@ -21290,6 +21292,7 @@ fn daemon_service_renders_systemd_and_launchd_configs() {
     });
     assert!(systemd_system.contains("User=root"));
     assert!(systemd_system.contains("UMask=0077"));
+    assert!(systemd_system.contains("--backend fanotify"));
     assert!(systemd_system.contains("WantedBy=multi-user.target"));
 
     let launchd = output({

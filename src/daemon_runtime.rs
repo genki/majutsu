@@ -211,6 +211,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 other => bail!("unsupported daemon service scope: {other}"),
             };
             let backend = daemon_service_backend(&config.watch.backend, scope)?;
+            let interval_secs = daemon_service_interval(config.watch.interval, backend, scope);
             let service = render_daemon_service(DaemonServiceConfig {
                 provider: &provider,
                 style: &style,
@@ -219,7 +220,7 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 home: &paths.home,
                 backend,
                 mode: &config.watch.mode,
-                interval_secs: config.watch.interval,
+                interval_secs,
                 debounce_ms: config.watch.debounce,
                 settle_ms: config.watch.settle,
                 buffer_max_ms: config.watch.buffer_max,
@@ -285,12 +286,26 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
     Ok(())
 }
 
+fn daemon_service_interval(
+    configured_interval: u64,
+    backend: &str,
+    scope: DaemonServiceScope,
+) -> u64 {
+    if cfg!(target_os = "linux") && matches!(scope, DaemonServiceScope::User) && backend == "poll" {
+        return configured_interval.max(900);
+    }
+    configured_interval
+}
+
 fn daemon_service_backend(
     configured_backend: &str,
     scope: DaemonServiceScope,
 ) -> Result<&'static str> {
     if cfg!(target_os = "linux") && matches!(scope, DaemonServiceScope::System) {
         return Ok("fanotify");
+    }
+    if cfg!(target_os = "linux") && matches!(scope, DaemonServiceScope::User) {
+        return Ok("poll");
     }
     normalize_watch_backend(configured_backend)
 }

@@ -795,7 +795,7 @@ struct HealthInputs<'a> {
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
     durable_journal_pending: usize,
-    watch_attribution_issue: Option<String>,
+    watch_attribution_issue: Option<(HealthSeverity, String)>,
     current_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     remote_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     deep_remote: Option<&'a SyncDeepHealthSummary>,
@@ -932,10 +932,10 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         });
     }
     if active_roots > 0
-        && let Some(message) = watch_attribution_issue
+        && let Some((severity, message)) = watch_attribution_issue
     {
         issues.push(HealthIssue {
-            severity: HealthSeverity::Critical,
+            severity,
             code: "watch-attribution-unavailable".into(),
             message,
         });
@@ -4101,7 +4101,9 @@ fn pending_journal_event_count(records: &[crate::majutsu_db::EventJournalRecord]
         .count()
 }
 
-fn watch_attribution_issue(records: &[crate::majutsu_db::EventJournalRecord]) -> Option<String> {
+fn watch_attribution_issue(
+    records: &[crate::majutsu_db::EventJournalRecord],
+) -> Option<(HealthSeverity, String)> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -4110,17 +4112,23 @@ fn watch_attribution_issue(records: &[crate::majutsu_db::EventJournalRecord]) ->
         .filter(|event| matches!(event.kind.as_str(), "watch-start" | "watch-backend-error"))
         .max_by_key(|event| event.observed_at)?;
     if latest_watch_event.kind == "watch-backend-error" {
-        return Some(format!(
-            "fanotify watch failed: {}; run a root-owned fanotify daemon to record the mutating process pid",
-            latest_watch_event.detail
+        return Some((
+            HealthSeverity::Critical,
+            format!(
+                "fanotify watch failed: {}; run a root-owned fanotify daemon to record the mutating process pid",
+                latest_watch_event.detail
+            ),
         ));
     }
     if latest_watch_event.detail.contains("backend=fanotify") {
         None
     } else {
-        Some(format!(
-            "watch is not using fanotify: {}; run a root-owned fanotify daemon to record the mutating process pid",
-            latest_watch_event.detail
+        Some((
+            HealthSeverity::Warning,
+            format!(
+                "watch is not using fanotify: {}; process attribution is unavailable for this daemon",
+                latest_watch_event.detail
+            ),
         ))
     }
 }
