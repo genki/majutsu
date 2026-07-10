@@ -3,6 +3,7 @@ use chrono::Utc;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
+use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::mem;
@@ -1031,20 +1032,15 @@ fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
         std::env::var("MAJUTSU_WATCH_PRUNE_KEEP_MONTHLY").unwrap_or_else(|_| "0".into());
     let exe = child_process_exe()?;
     let status = std::process::Command::new(&exe)
-        .arg("--home")
-        .arg(&paths.home)
-        .arg("prune")
-        .arg("--dry-run=false")
-        .arg("--keep-daily")
-        .arg(&keep_daily)
-        .arg("--keep-monthly")
-        .arg(&keep_monthly)
+        .args(auto_prune_args(paths, &keep_daily, &keep_monthly))
         .status()?;
     if status.success() {
         record_event(
             paths,
             "watch-prune",
-            &format!("auto prune completed keep_daily={keep_daily} keep_monthly={keep_monthly}"),
+            &format!(
+                "auto prune completed keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=true"
+            ),
         )?;
     } else {
         record_event(
@@ -1054,6 +1050,20 @@ fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn auto_prune_args(paths: &Paths, keep_daily: &str, keep_monthly: &str) -> Vec<OsString> {
+    vec![
+        "--home".into(),
+        paths.home.as_os_str().to_owned(),
+        "prune".into(),
+        "--dry-run=false".into(),
+        "--keep-daily".into(),
+        keep_daily.into(),
+        "--keep-monthly".into(),
+        keep_monthly.into(),
+        "--drop-missing-remote-history".into(),
+    ]
 }
 
 fn fallback_watch_origin(label: &str, confidence: Option<&str>) -> Option<OperationOriginOverride> {
@@ -1671,6 +1681,24 @@ mod tests {
         .unwrap();
 
         assert!(pending_journal_summary(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn auto_prune_always_drops_unrecoverable_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let args = auto_prune_args(&paths, "7", "3");
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--drop-missing-remote-history")
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--keep-daily", "7"]));
+        assert!(args.windows(2).any(|pair| pair == ["--keep-monthly", "3"]));
     }
 
     fn test_event(path: &str) -> Event {

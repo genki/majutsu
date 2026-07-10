@@ -6,7 +6,9 @@ use rusqlite::{Connection, params};
 use std::collections::BTreeSet;
 use std::fs;
 
-use crate::cache_runtime::{remote_payload_index_contains, remote_payload_key_index};
+use crate::cache_runtime::{
+    remote_payload_index_contains, remote_payload_key_index, remote_payload_key_index_for_host,
+};
 use crate::cli::PruneArgs;
 use crate::config::{Paths, read_config};
 use crate::object_paths::{all_local_object_keys, local_object_keys_with_progress};
@@ -198,7 +200,14 @@ fn missing_remote_history_snapshots(
         return Ok(Vec::new());
     };
     let remote = open_remote(remote_config)?;
-    let remote_keys = remote_payload_key_index(&remote)?;
+    let remote_keys = if matches!(remote, crate::remote_store::RemoteStore::S3(_)) {
+        remote_payload_key_index_for_host(
+            &remote,
+            &crate::majutsu_store::remote_host_label(&config.host.name),
+        )?
+    } else {
+        remote_payload_key_index(&remote)?
+    };
     let export = export_metadata(paths, conn, &config)?;
     let mut missing = Vec::new();
     for snapshot in &export.snapshots {

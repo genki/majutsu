@@ -1436,6 +1436,12 @@ fn sync_status_quick_and_wait_target_advancement() {
     assert_success(sampled, "sync status deep sample");
     assert!(sampled_stdout.contains("remote_objects_checked 1"));
     assert!(sampled_stdout.contains("missing_remote_objects_limited true"));
+    assert!(sampled_stdout.contains("remote_object_check_source head"));
+
+    let listed_sample = run_mj(&home, ["sync", "status", "--deep", "--sample", "100"]);
+    let listed_sample_stdout = String::from_utf8_lossy(&listed_sample.stdout).to_string();
+    assert_success(listed_sample, "sync status deep list-backed sample");
+    assert!(listed_sample_stdout.contains("remote_object_check_source list"));
 
     fs::write(root.join("file.txt"), b"v2\n").unwrap();
     assert_success(

@@ -1741,7 +1741,7 @@ impl SyncStatusDeepOptions {
     }
 
     fn prefer_head_checks(&self) -> bool {
-        self.sample.is_some() || self.deadline.is_some()
+        self.sample.is_some_and(|sample| sample <= 16)
     }
 
     fn maybe_progress(&self, checked: usize, total: usize, source: &str) {
