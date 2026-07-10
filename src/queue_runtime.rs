@@ -136,6 +136,10 @@ pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQu
     if !paths.upload_queue.exists() {
         return Ok(Vec::new());
     }
+    crate::atomic_io::cleanup_stale_atomic_temps(
+        &paths.upload_queue,
+        StdDuration::from_secs(60 * 60),
+    )?;
     let mut items = Vec::new();
     for entry in fs::read_dir(&paths.upload_queue)? {
         let entry = entry?;
@@ -656,6 +660,10 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
     if !paths.event_queue.exists() {
         return Ok(Vec::new());
     }
+    crate::atomic_io::cleanup_stale_atomic_temps(
+        &paths.event_queue,
+        StdDuration::from_secs(60 * 60),
+    )?;
     let mut records: Vec<EventJournalRecord> = Vec::new();
     for entry in fs::read_dir(&paths.event_queue)? {
         let entry = entry?;

@@ -1644,9 +1644,16 @@ pub(crate) struct SyncStatusArgs {
     #[arg(
         long,
         default_value_t = false,
-        help = "Check every referenced remote object instead of only refs and queues"
+        help = "Check referenced remote objects for the current protection state instead of only refs and queues"
     )]
     pub(crate) deep: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "deep",
+        help = "With --deep, check all retained history snapshots instead of only the current protection state"
+    )]
+    pub(crate) history: bool,
     #[arg(
         long,
         value_name = "N",
@@ -1767,6 +1774,12 @@ pub(crate) enum RemoteCommand {
             help = "Only repair missing canonical S3 object aliases from local objects"
         )]
         canonical_aliases_only: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Repair all retained history snapshots instead of only the current protection state"
+        )]
+        history: bool,
         #[arg(
             long,
             default_value_t = 16,

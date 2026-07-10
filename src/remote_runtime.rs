@@ -15,7 +15,9 @@ use crate::majutsu_core::{
     payload_blob_ref, payload_large_ref,
 };
 use crate::majutsu_store::canonical_remote_alias;
-use crate::object_paths::{canonical_alias_for_legacy_key, local_object_keys};
+use crate::object_paths::{
+    canonical_alias_for_legacy_key, local_object_keys, local_object_keys_for_snapshot,
+};
 use crate::operation_log::record_op;
 use crate::remote_store::{RemoteStore, open_remote_with_upload_policy, remote_config_diagnostics};
 use crate::snapshot_state::current_snapshot;
@@ -175,6 +177,7 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
         RemoteCommand::Repair {
             dry_run,
             canonical_aliases_only,
+            history,
             parallelism,
             sample,
             timeout_secs,
@@ -189,6 +192,7 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 },
                 dry_run,
                 canonical_aliases_only,
+                !history,
             )?;
             let conn = open_db(paths)?;
             let current = current_snapshot(&conn)?;
@@ -284,6 +288,7 @@ pub(crate) fn repair_missing_referenced_objects(
         },
         false,
         false,
+        true,
     )
 }
 
@@ -698,7 +703,7 @@ fn remote_fsck_objects(
     remote: &RemoteStore,
     options: RemoteObjectScanOptions,
 ) -> Result<()> {
-    let keys = referenced_local_object_keys(paths)?;
+    let keys = referenced_local_object_keys(paths, false)?;
     let scan = scan_remote_object_availability(paths, remote, keys, options)?;
     for key in &scan.missing {
         eprintln!("missing remote object {key}");
@@ -728,10 +733,13 @@ fn remote_fsck_objects(
     Ok(())
 }
 
-fn referenced_local_object_keys(paths: &Paths) -> Result<Vec<String>> {
+fn referenced_local_object_keys(paths: &Paths, current_only: bool) -> Result<Vec<String>> {
     let config = read_config(paths)?;
     let conn = open_db(paths)?;
     let export = export_metadata(paths, &conn, &config)?;
+    if current_only && let Some(current) = export.refs.get("current") {
+        return local_object_keys_for_snapshot(paths, &export, current);
+    }
     local_object_keys(paths, &export)
 }
 
@@ -852,11 +860,12 @@ fn remote_repair(
     options: RemoteObjectScanOptions,
     dry_run: bool,
     canonical_aliases_only: bool,
+    current_only: bool,
 ) -> Result<()> {
     let summary = if canonical_aliases_only {
         remote_repair_canonical_aliases(paths, remote, dry_run, true)?
     } else {
-        remote_repair_summary(paths, remote, options, dry_run, true)?
+        remote_repair_summary(paths, remote, options, dry_run, true, current_only)?
     };
     if summary.missing_local > 0 {
         bail!(
@@ -882,8 +891,9 @@ fn remote_repair_summary(
     options: RemoteObjectScanOptions,
     dry_run: bool,
     verbose: bool,
+    current_only: bool,
 ) -> Result<RepairSummary> {
-    let mut keys = referenced_local_object_keys(paths)?;
+    let mut keys = referenced_local_object_keys(paths, current_only)?;
     if let Some(sample) = options.sample {
         keys.truncate(sample);
     }
@@ -954,6 +964,10 @@ fn remote_repair_summary(
     }
     if verbose {
         println!("remote repair complete");
+        println!(
+            "object_scope {}",
+            if current_only { "current" } else { "history" }
+        );
         println!("checked_objects {}", scan.checked);
         println!("total_objects {}", scan.total);
         println!("missing_objects {}", scan.missing.len());
@@ -981,7 +995,7 @@ fn remote_repair_canonical_aliases(
     }
 
     let mut skipped_local_missing = 0usize;
-    let alias_candidates = referenced_local_object_keys(paths)?
+    let alias_candidates = referenced_local_object_keys(paths, false)?
         .into_iter()
         .filter_map(|key| canonical_alias_for_legacy_key(&key).map(|alias| (key, alias)))
         .filter(|(key, _)| {

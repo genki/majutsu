@@ -1,4 +1,5 @@
 use crate::majutsu_core::{LargeManifest, LiveMetadataReferences, payload_large_ref};
+use crate::majutsu_pack::PackIndex;
 use crate::majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -56,6 +57,7 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
         println!("removed_large_metadata {}", removed.large_objects);
         println!("removed_chunk_metadata {}", removed.chunks);
         println!("removed_pack_metadata {}", removed.packs);
+        println!("rewritten_pack_indexes {}", removed.pack_indexes);
         println!(
             "removed_snapshot_payload_indexes {}",
             removed.snapshot_payload_indexes
@@ -93,6 +95,7 @@ pub(crate) struct PrunedMetadata {
     pub(crate) large_objects: usize,
     pub(crate) chunks: usize,
     pub(crate) packs: usize,
+    pub(crate) pack_indexes: usize,
     pub(crate) snapshot_payload_indexes: usize,
     pub(crate) snapshot_payload_rows: usize,
     pub(crate) large_pins: usize,
@@ -134,8 +137,7 @@ fn build_prune_plan(paths: &Paths, conn: &Connection, args: &PruneArgs) -> Resul
     plan.delete = still_delete;
     let mut missing_remote_history = Vec::new();
     if args.drop_missing_remote_history {
-        let missing =
-            missing_remote_history_snapshots(paths, conn, &protected, current.as_deref())?;
+        let missing = missing_remote_history_snapshots(paths, conn, current.as_deref())?;
         for (snapshot_id, missing_count) in missing {
             if plan.keep.binary_search(&snapshot_id).is_ok() {
                 plan.keep.retain(|id| id != &snapshot_id);
@@ -189,7 +191,6 @@ fn protected_ref_snapshots(
 fn missing_remote_history_snapshots(
     paths: &Paths,
     conn: &Connection,
-    protected: &BTreeSet<String>,
     current: Option<&str>,
 ) -> Result<Vec<(String, usize)>> {
     let config = read_config(paths)?;
@@ -201,7 +202,7 @@ fn missing_remote_history_snapshots(
     let export = export_metadata(paths, conn, &config)?;
     let mut missing = Vec::new();
     for snapshot in &export.snapshots {
-        if current == Some(snapshot.id.as_str()) || protected.contains(&snapshot.id) {
+        if current == Some(snapshot.id.as_str()) {
             continue;
         }
         let keys =
@@ -288,6 +289,7 @@ pub(crate) fn prune_unreferenced_metadata(
         delete_rows_not_in(conn, "chunks", "oid", &live.chunks)?
     };
     let packs = delete_packs_without_blobs(conn)?;
+    let pack_indexes = prune_stale_pack_indexes(paths, conn)?;
     let (snapshot_payload_indexes, snapshot_payload_rows) =
         delete_snapshot_payload_indexes_without_snapshots(conn)?;
     Ok(PrunedMetadata {
@@ -295,6 +297,7 @@ pub(crate) fn prune_unreferenced_metadata(
         large_objects,
         chunks,
         packs,
+        pack_indexes,
         snapshot_payload_indexes,
         snapshot_payload_rows,
         large_pins,
@@ -390,6 +393,49 @@ fn delete_packs_without_blobs(conn: &Connection) -> Result<usize> {
         }
     }
     Ok(removed)
+}
+
+fn prune_stale_pack_indexes(paths: &Paths, conn: &Connection) -> Result<usize> {
+    let mut stmt = conn
+        .prepare("select pack_id, pack_key, index_key, object_count from packs order by pack_id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, usize>(3)?,
+        ))
+    })?;
+    let packs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut rewritten = 0usize;
+    for (pack_id, pack_key, index_key, object_count) in packs {
+        let mut blob_stmt =
+            conn.prepare("select oid from blobs where pack_id=?1 order by pack_offset, oid")?;
+        let rows = blob_stmt.query_map(params![&pack_id], |row| row.get::<_, String>(0))?;
+        let live_oids = rows.collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        if live_oids.is_empty() {
+            continue;
+        }
+        let mut index: PackIndex = serde_json::from_slice(&read_object(paths, &index_key)?)?;
+        let before = index.entries.len();
+        index.pack_id = pack_id.clone();
+        index.pack_key = pack_key.clone();
+        index.entries.retain(|entry| live_oids.contains(&entry.oid));
+        if index.entries.len() == before && object_count == index.entries.len() {
+            continue;
+        }
+        let index_path = paths.home.join(&index_key);
+        if let Some(parent) = index_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(index_path, serde_json::to_vec_pretty(&index)?)?;
+        conn.execute(
+            "update packs set object_count=?2 where pack_id=?1",
+            params![pack_id, index.entries.len()],
+        )?;
+        rewritten += 1;
+    }
+    Ok(rewritten)
 }
 
 fn delete_rows_not_in(

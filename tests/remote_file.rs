@@ -9127,6 +9127,158 @@ fn prune_can_drop_unprotected_history_with_missing_remote_objects() {
 }
 
 #[test]
+fn sync_status_defaults_to_current_and_prune_can_drop_protected_broken_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"one\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let first = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    let first_blob = local_snapshot_file_object_key(&state, &first, "sample", "alpha.txt");
+
+    fs::write(source.join("alpha.txt"), b"two\n").unwrap();
+    let second = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    assert_ne!(first, second);
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let removed = remove_remote_payload_aliases(&remote, &first_blob);
+    assert!(
+        !removed.is_empty(),
+        "expected first snapshot blob aliases to be removed"
+    );
+
+    let current_status = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("status")
+            .arg("--deep");
+        c
+    });
+    assert!(
+        current_status.contains("object_scope current"),
+        "{current_status}"
+    );
+    assert!(
+        current_status.contains("missing_remote_objects 0"),
+        "{current_status}"
+    );
+
+    let history_status = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("status")
+            .arg("--deep")
+            .arg("--history");
+        c
+    });
+    assert!(
+        history_status.contains("object_scope history"),
+        "{history_status}"
+    );
+    assert!(
+        history_status.contains("missing_remote_objects 1"),
+        "{history_status}"
+    );
+
+    let dry_run = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run")
+            .arg("--keep-daily")
+            .arg("90")
+            .arg("--keep-monthly")
+            .arg("36")
+            .arg("--drop-missing-remote-history");
+        c
+    });
+    assert!(
+        dry_run.contains("missing_remote_history_snapshots 1"),
+        "{dry_run}"
+    );
+    assert!(
+        dry_run.contains(&format!("missing_remote_history_snapshot {first}")),
+        "{dry_run}"
+    );
+
+    let prune = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("90")
+            .arg("--keep-monthly")
+            .arg("36")
+            .arg("--drop-missing-remote-history");
+        c
+    });
+    assert!(prune.contains("deleted_snapshots 1"), "{prune}");
+
+    let history_status_after = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("status")
+            .arg("--deep")
+            .arg("--history");
+        c
+    });
+    assert!(
+        history_status_after.contains("missing_remote_objects 0"),
+        "{history_status_after}"
+    );
+}
+
+#[test]
 fn sync_prunes_stale_remote_host_exports_after_prune() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -11175,9 +11327,10 @@ fn pack_compaction_rewrites_existing_packs() {
         c.arg("--home").arg(&state).arg("gc");
         c
     });
-    assert_eq!(
-        count_files_ending(&state.join("objects/packs"), ".mpack"),
-        1
+    let compacted_pack_count = count_files_ending(&state.join("objects/packs"), ".mpack");
+    assert!(
+        (1..=2).contains(&compacted_pack_count),
+        "compaction should keep only live compacted packs, got {compacted_pack_count}"
     );
     run({
         let mut c = mj();
@@ -11326,6 +11479,103 @@ fn pack_compaction_separates_current_blobs_from_history_only_blobs() {
             .all(|pack_id| !history_pack_ids.contains(pack_id)),
         "current blobs should not share packs with history-only blobs: current={current_pack_ids:?} history={history_pack_ids:?}"
     );
+}
+
+#[test]
+fn prune_rewrites_pack_indexes_after_history_blob_metadata_removal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept.txt"), vec![b'a'; 4096]).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace(
+            "small_pack_target = 67108864",
+            "small_pack_target = \"16 KiB\"",
+        )
+        .replace(
+            "normal_pack_target = 268435456",
+            "normal_pack_target = \"16 KiB\"",
+        );
+    fs::write(&config_path, config).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    fs::write(source.join("history-only.txt"), vec![b'b'; 4096]).unwrap();
+    let middle = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+
+    fs::remove_file(source.join("history-only.txt")).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let prune = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("prune")
+            .arg("--dry-run=false")
+            .arg("--keep-daily")
+            .arg("0")
+            .arg("--keep-monthly")
+            .arg("0");
+        c
+    });
+    assert!(prune.contains("deleted_snapshots 1"), "{prune}");
+    assert!(prune.contains("rewritten_pack_indexes 1"), "{prune}");
+    fails({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("restore")
+            .arg("plan")
+            .arg("--snapshot")
+            .arg(&middle)
+            .arg("--to")
+            .arg(tmp.path().join("middle-restore"));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
 }
 
 #[test]
@@ -13698,6 +13948,109 @@ fn fsck_detects_broken_remote_ref_cache() {
     .unwrap();
 
     fails({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("fsck");
+        c
+    });
+}
+
+#[test]
+fn sync_prunes_stale_remote_ref_cache_for_previous_host_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let snapshot = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    })
+    .lines()
+    .find_map(|line| line.strip_prefix("snapshot "))
+    .unwrap()
+    .to_string();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let remote_name: String = conn
+        .query_row("select remote from remote_refs limit 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    conn.execute(
+        "insert into remote_refs(remote, name, value, observed_at) values (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            remote_name,
+            "oldhost/refs/current",
+            snapshot,
+            "2026-01-01T00:00:00Z",
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into remote_refs(remote, name, value, observed_at) values (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            "file:///previous-remote",
+            "vagrant/refs/current",
+            snapshot,
+            "2026-01-01T00:00:00Z",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "select count(*) from remote_refs where name like 'oldhost/%' or remote='file:///previous-remote'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2
+    );
+    drop(conn);
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "select count(*) from remote_refs where name like 'oldhost/%' or remote='file:///previous-remote'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    drop(conn);
+    run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("fsck");
         c

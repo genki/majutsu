@@ -2,6 +2,7 @@ use crate::majutsu_store::{canonical_remote_alias, host_remote_key, remote_host_
 use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeSet;
 use std::fs;
+use std::thread;
 
 use crate::cli::{CacheCommand, CachePruneArgs};
 use crate::config::{MetadataExport, Paths, read_config};
@@ -303,14 +304,47 @@ fn filter_remote_available_by_head(
     candidates: Vec<CachePruneCandidate>,
 ) -> Result<CachePrunePlan> {
     let mut plan = CachePrunePlan::default();
-    for candidate in candidates {
-        if remote_object_available_for_paths(paths, remote, &candidate.key)? {
-            plan.candidates.push(candidate);
-        } else {
-            plan.remote_missing += 1;
+    for batch in candidates.chunks(cache_remote_parallelism()) {
+        let availability = thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|candidate| {
+                    scope.spawn(move || {
+                        remote_object_available_for_paths(paths, remote, &candidate.key)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow!("cache remote probe worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (candidate, available) in batch.iter().zip(availability) {
+            if available {
+                plan.candidates.push(CachePruneCandidate {
+                    key: candidate.key.clone(),
+                    bytes: candidate.bytes,
+                    metadata: candidate.metadata,
+                });
+            } else {
+                plan.remote_missing += 1;
+            }
         }
     }
     Ok(plan)
+}
+
+fn cache_remote_parallelism() -> usize {
+    std::env::var("MAJUTSU_CACHE_REMOTE_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+        .min(64)
 }
 
 fn filter_remote_available_from_index(
@@ -347,8 +381,7 @@ fn remote_payload_key_index_with_host(
     remote: &RemoteStore,
     host_id: Option<&str>,
 ) -> Result<BTreeSet<String>> {
-    let mut keys = BTreeSet::new();
-    for prefix in [
+    let prefixes = [
         "objects/blobs/",
         "blobs/loose/",
         "objects/packs/",
@@ -361,13 +394,34 @@ fn remote_payload_key_index_with_host(
         "large/manifests/",
         "objects/trees/",
         "trees/",
-    ] {
-        let remote_prefix = host_id
-            .map(|host_id| host_remote_key(host_id, prefix))
-            .unwrap_or_else(|| prefix.to_string());
-        for key in remote.list(&remote_prefix)? {
-            if let Some(host_id) = host_id {
-                let Some(stripped) = key.strip_prefix(&format!("{host_id}/")) else {
+    ];
+    let listed = thread::scope(|scope| {
+        let handles = prefixes
+            .iter()
+            .map(|prefix| {
+                scope.spawn(move || {
+                    let remote_prefix = host_id
+                        .map(|host_id| host_remote_key(host_id, prefix))
+                        .unwrap_or_else(|| prefix.to_string());
+                    remote.list(&remote_prefix)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("remote payload index worker panicked"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let host_prefix = host_id.map(|host_id| format!("{host_id}/"));
+    let mut keys = BTreeSet::new();
+    for listed_keys in listed {
+        for key in listed_keys {
+            if let Some(host_prefix) = host_prefix.as_deref() {
+                let Some(stripped) = key.strip_prefix(host_prefix) else {
                     continue;
                 };
                 keys.insert(stripped.to_string());

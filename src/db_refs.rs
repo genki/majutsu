@@ -46,12 +46,27 @@ pub(crate) fn set_remote_ref_value(
     Ok(())
 }
 
+pub(crate) fn prune_remote_refs_for_host(
+    conn: &Connection,
+    remote: &str,
+    host_id: &str,
+) -> Result<usize> {
+    let prefix = format!("{host_id}/");
+    let removed = conn.execute(
+        "delete from remote_refs
+         where remote != ?1 or substr(name, 1, ?2) != ?3",
+        params![remote, prefix.len() as i64, prefix],
+    )?;
+    Ok(removed)
+}
+
 pub(crate) fn persist_export_remote_refs(
     conn: &Connection,
     remote: &str,
     host_id: &str,
     refs: &BTreeMap<String, String>,
 ) -> Result<()> {
+    prune_remote_refs_for_host(conn, remote, host_id)?;
     if let Some(current) = refs.get("current") {
         set_remote_ref_value(conn, remote, &host_current_ref_key(host_id), current)?;
     }

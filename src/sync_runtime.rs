@@ -29,7 +29,8 @@ use crate::cache_runtime::{
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, read_config};
 use crate::db_refs::{
-    persist_export_remote_refs, ref_value, restore_ref_value, set_ref_value, set_remote_ref_value,
+    persist_export_remote_refs, prune_remote_refs_for_host, ref_value, restore_ref_value,
+    set_ref_value, set_remote_ref_value,
 };
 use crate::object_paths::{
     canonical_alias_for_legacy_key, local_object_keys, prefer_s3_canonical_remote_only,
@@ -164,6 +165,7 @@ fn persist_remote_root_acks(
     host_id: &str,
     root_acks: &BTreeMap<String, RemoteRootAck>,
 ) -> Result<()> {
+    prune_remote_refs_for_host(conn, remote, host_id)?;
     for (root_id, ack) in root_acks {
         set_remote_ref_value(
             conn,
@@ -230,6 +232,8 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
         config.large.multipart,
         config.large.max_parallel_uploads,
     )?;
+    let host_label = remote_host_label(&config.host.name);
+    prune_remote_refs_for_host(&conn, &remote.describe(), &host_label)?;
     if let Some(SyncCommand::Status(status_args)) = args.command {
         if status_args.deep {
             return sync_status(paths, &conn, &remote, &status_args);
@@ -1727,7 +1731,7 @@ impl SyncStatusDeepOptions {
                 .map(|timeout| Instant::now() + Duration::from_secs(timeout)),
             progress: args.progress,
             started: Instant::now(),
-            current_only: false,
+            current_only: !args.history,
         }
     }
 
@@ -1752,6 +1756,7 @@ impl SyncStatusDeepOptions {
 
 struct SyncStatusSnapshot {
     remote: String,
+    object_scope: &'static str,
     local_current: String,
     remote_current: String,
     remote_last_synced: String,
@@ -1896,6 +1901,11 @@ fn sync_status_snapshot(
     let upload_stats = upload_queue_stats(paths)?;
     Ok(SyncStatusSnapshot {
         remote: remote.describe(),
+        object_scope: if options.current_only {
+            "current"
+        } else {
+            "history"
+        },
         local_current: local_current.unwrap_or_else(|| "(none)".into()),
         remote_current: remote_current.unwrap_or_else(|| "(none)".into()),
         remote_last_synced: remote_last_synced.unwrap_or_else(|| "(none)".into()),
@@ -1919,6 +1929,7 @@ fn sync_status_snapshot(
 
 fn print_sync_status(status: &SyncStatusSnapshot) {
     println!("remote {}", status.remote);
+    println!("object_scope {}", status.object_scope);
     println!("local_current {}", status.local_current);
     println!("remote_current {}", status.remote_current);
     println!("remote_last_synced {}", status.remote_last_synced);
