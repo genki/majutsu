@@ -207,6 +207,13 @@ prune される。
 MAJUTSU_SNAPSHOT_ALLOW_NOOP=1 mj snapshot
 ```
 
+watch daemon は root の除外・volatile・explicit untrack 規則に一致する filesystem event を
+snapshot の起点にしない。Linux の fanotify では event fd から変更対象の pathname を取得して
+判定し、pathname を取得できない場合は保全漏れを避けるため発火する。また、イベントを受けて
+snapshot を実行した結果 current snapshot が変化しなかった場合、後続の remote sync/prune は
+省略される。これにより、除外ファイルの更新や変更が元に戻った短時間の編集で不要な GCS/S3
+通信が発生しない。
+
 ## local fsck
 
 通常運用の保護状態確認では full fsck ではなく `mj health` を使う。
@@ -301,6 +308,21 @@ mj fsck --deep --since "24h ago" --progress
 
 remote backend が S3 / GCS S3互換の場合、HTTP request は既定で connect timeout 10秒、
 request timeout 300秒を使う。provider 側の一時遅延を切り分けたい場合は次で調整できる。
+
+S3互換APIの通信エラーと `408`、`429`、`5xx` の一時HTTPエラーには、全リクエスト共通で
+試行回数上限付きの指数バックオフを適用する。対象には通常の `GET` / `HEAD` / `LIST` /
+`PUT` / `DELETE` に加え、multipart upload、lifecycle設定、アーカイブ復元を含む。
+既定値は4試行、初回待機250msで、環境変数で調整できる。
+
+```sh
+MAJUTSU_S3_TRANSIENT_RETRY_ATTEMPTS=6 \
+MAJUTSU_S3_TRANSIENT_RETRY_BASE_MS=500 \
+mj sync
+```
+
+リトライ上限を超えた場合はエラーとして扱い、daemonのupload queueに登録された保全対象は
+永続queue側の再試行へ引き継がれる。`LIST` が一時的に503を返しても、pruneやfsckが即時に
+失敗しないよう、ページ単位で同じリトライ処理を行う。
 
 ```sh
 MAJUTSU_S3_CONNECT_TIMEOUT_SECS=10 mj fsck --since "24h ago" --progress
@@ -602,6 +624,11 @@ mj op diff <op-id> --root moon
 
 `mj op log` は操作単位の履歴、`mj op diff` はその操作の before / after snapshot から
 導出した file-level diff を表示する。
+
+before / after snapshotのmetadataがprune済みの場合でも、snapshot作成時に保存した軽量な
+operation change summaryから変更パスを表示する。summaryは1 operation・1 rootあたりの上限を
+持ち、巨大な一括変更では省略通知を表示する。summaryはremote metadataにも含まれるため、
+remoteからcloneしたstateでも利用できる。
 
 `mj op log` と `mj op show` は、変更発生源の推定情報と、操作を記録した
 session / process の手掛かりを分けて表示する。通常の `mj log` / `mj op log`

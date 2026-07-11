@@ -14,6 +14,7 @@ pub const REFS_TABLE: &str = "refs";
 pub const PACKS_TABLE: &str = "packs";
 pub const LARGE_PINS_TABLE: &str = "large_pins";
 pub const REMOTE_REFS_TABLE: &str = "remote_refs";
+pub const OPERATION_CHANGES_TABLE: &str = "operation_changes";
 pub const SNAPSHOT_PAYLOAD_INDEX_TABLE: &str = "snapshot_payload_index";
 pub const SNAPSHOT_PAYLOADS_TABLE: &str = "snapshot_payloads";
 pub const LARGE_OBJECT_CHUNKS_TABLE: &str = "large_object_chunks";
@@ -51,6 +52,13 @@ create table if not exists operations(
   message text,
   error text,
   remote_sync_state text
+);
+create table if not exists operation_changes(
+  op_id text not null,
+  root_id text not null,
+  path text not null,
+  status text not null,
+  primary key(op_id, root_id, path)
 );
 create table if not exists refs(name text primary key, value text not null);
 create table if not exists blobs(oid text primary key, size integer not null, object_key text not null);
@@ -702,6 +710,7 @@ mod tests {
             ROOTS_TABLE,
             SNAPSHOTS_TABLE,
             OPERATIONS_TABLE,
+            OPERATION_CHANGES_TABLE,
             BLOBS_TABLE,
             PACKS_TABLE,
             LARGE_OBJECTS_TABLE,

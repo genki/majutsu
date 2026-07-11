@@ -6770,6 +6770,8 @@ fn remote_check_uses_s3_range_get_probe() {
         listener.set_nonblocking(true).unwrap();
         let started = std::time::Instant::now();
         let mut seen = Vec::new();
+        let mut list_failed_once = false;
+        let mut range_get_failed_once = false;
         loop {
             let Ok((mut stream, _)) = listener.accept() else {
                 if started.elapsed() > Duration::from_secs(5) {
@@ -6800,6 +6802,11 @@ fn remote_check_uses_s3_range_get_probe() {
                 .unwrap_or_default();
             seen.push((first.clone(), range.clone()));
             if first.starts_with("GET ") && first.contains("list-type=2") {
+                if !list_failed_once {
+                    list_failed_once = true;
+                    write_mock_http_response(&mut stream, "503 Service Unavailable", b"").unwrap();
+                    continue;
+                }
                 let body = concat!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                     "<ListBucketResult>",
@@ -6807,12 +6814,16 @@ fn remote_check_uses_s3_range_get_probe() {
                     "</ListBucketResult>"
                 );
                 write_mock_http_response(&mut stream, "200 OK", body.as_bytes()).unwrap();
-            } else if first.starts_with("HEAD ") {
-                write_mock_http_response(&mut stream, "200 OK", b"").unwrap();
             } else if first.starts_with("GET ")
                 && first.contains("/range-bucket/majutsu/v1/vagrant/metadata/export.json.zst")
             {
                 if range == "bytes=0-0" {
+                    if !range_get_failed_once {
+                        range_get_failed_once = true;
+                        write_mock_http_response(&mut stream, "503 Service Unavailable", b"")
+                            .unwrap();
+                        continue;
+                    }
                     write_mock_http_response(
                         &mut stream,
                         "206 Partial Content",
@@ -6880,9 +6891,25 @@ signature_version = "s3v4"
 
     let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     server.join().unwrap();
+    assert!(
+        seen.iter()
+            .filter(|(line, _)| line.starts_with("GET ") && line.contains("list-type=2"))
+            .count()
+            >= 2,
+        "S3 LIST was not retried after a transient 503: {seen:?}"
+    );
     assert!(seen.iter().any(|(line, range)| line.starts_with("GET ")
         && line.contains("/range-bucket/majutsu/v1/vagrant/metadata/export.json.zst")
         && range == "bytes=0-0"));
+    assert!(
+        seen.iter()
+            .filter(|(line, range)| line.starts_with("GET ")
+                && line.contains("/range-bucket/majutsu/v1/vagrant/metadata/export.json.zst")
+                && range == "bytes=0-0")
+            .count()
+            >= 2,
+        "S3 range GET was not retried after a transient 503: {seen:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -8278,7 +8305,7 @@ fn log_root_filter_applies_limit_after_filtering() {
 }
 
 #[test]
-fn log_root_filter_skips_operations_with_pruned_snapshot_metadata() {
+fn log_root_filter_uses_operation_change_summary_after_snapshot_prune() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let state = tmp.path().join("state");
@@ -8343,6 +8370,7 @@ fn log_root_filter_skips_operations_with_pruned_snapshot_metadata() {
         c
     });
     assert!(!log.contains("Query returned no rows"), "{log}");
+    assert!(log.contains("sample/alpha.txt"), "{log}");
 }
 
 #[test]
@@ -8409,8 +8437,8 @@ fn log_reports_pruned_snapshot_metadata_without_root_filter() {
         c
     });
     assert!(log.contains("manual-snapshot"), "{log}");
-    assert!(log.contains("snapshot metadata unavailable"), "{log}");
-    assert!(log.contains("[metadata-unavailable]"), "{log}");
+    assert!(log.contains("sample/alpha.txt"), "{log}");
+    assert!(!log.contains("[metadata-unavailable]"), "{log}");
 }
 
 #[test]
@@ -21168,6 +21196,77 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         assert!(log.contains("sample/alpha.txt"), "{log}");
         assert!(log.contains("watch:notify"), "{log}");
     }
+}
+
+#[test]
+fn watch_skips_followup_sync_when_event_snapshot_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let baseline = db_ref(&state, "current").unwrap();
+    let original_mtime = filetime::FileTime::from_last_modification_time(
+        &fs::metadata(source.join("alpha.txt")).unwrap(),
+    );
+    let mut child = mj()
+        .arg("--home")
+        .arg(&state)
+        .arg("watch")
+        .arg("--once")
+        .arg("--backend")
+        .arg("notify")
+        .arg("--debounce-ms")
+        .arg("150")
+        .arg("--settle-ms")
+        .arg("50")
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    fs::write(source.join("alpha.txt"), b"temporary\n").unwrap();
+    thread::sleep(Duration::from_millis(10));
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    filetime::set_file_mtime(source.join("alpha.txt"), original_mtime).unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    assert_eq!(
+        db_ref(&state, "current").as_deref(),
+        Some(baseline.as_str())
+    );
+
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("snapshot-noop"), "{events}");
+    assert!(events.contains("watch-sync-skipped"), "{events}");
 }
 
 #[test]

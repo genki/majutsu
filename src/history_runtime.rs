@@ -6101,6 +6101,10 @@ fn operation_file_changes(
         return Ok(Vec::new());
     };
     let Some(after) = load_snapshot_header_by_id_optional(paths, conn, after_id)? else {
+        let summary = operation_summary_changes(conn, &op.id, root)?;
+        if !summary.is_empty() {
+            return Ok(summary);
+        }
         return Ok(snapshot_metadata_unavailable_changes(
             root, after_id, "after",
         ));
@@ -6109,6 +6113,10 @@ fn operation_file_changes(
         match load_snapshot_header_by_id_optional(paths, conn, before_id)? {
             Some(snapshot) => Some(snapshot),
             None => {
+                let summary = operation_summary_changes(conn, &op.id, root)?;
+                if !summary.is_empty() {
+                    return Ok(summary);
+                }
                 return Ok(snapshot_metadata_unavailable_changes(
                     root, before_id, "before",
                 ));
@@ -6118,6 +6126,46 @@ fn operation_file_changes(
         None
     };
     snapshot_file_changes(paths, before.as_ref(), &after, root, full, configured_roots)
+}
+
+fn operation_summary_changes(
+    conn: &Connection,
+    op_id: &str,
+    root: Option<&str>,
+) -> Result<Vec<FileChange>> {
+    let mut stmt = conn.prepare(
+        "select root_id, path, status
+         from operation_changes
+         where op_id=?1
+           and (?2 is null or root_id=?2)
+         order by root_id, path",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![op_id, root], |row| {
+        let root_id: String = row.get(0)?;
+        let path: String = row.get(1)?;
+        let status: String = row.get(2)?;
+        Ok((root_id, path, status))
+    })?;
+    let mut changes = Vec::new();
+    for row in rows {
+        let (root_id, path, status) = row?;
+        let status = match status.as_str() {
+            "A" => "A",
+            "D" => "D",
+            _ => "M",
+        };
+        let display_path = format!("{root_id}/{path}");
+        if path.starts_with("** (") {
+            changes.push(FileChange::warning(
+                status,
+                display_path,
+                "operation change summary was truncated",
+            ));
+        } else {
+            changes.push(FileChange::plain(status, display_path));
+        }
+    }
+    Ok(changes)
 }
 
 fn snapshot_metadata_unavailable_changes(

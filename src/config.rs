@@ -197,6 +197,14 @@ pub(crate) struct TieringRule {
     pub(crate) storage: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct OperationChangeExport {
+    pub(crate) op_id: String,
+    pub(crate) root_id: String,
+    pub(crate) path: String,
+    pub(crate) status: String,
+}
+
 pub(crate) const METADATA_EXPORT_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,6 +215,8 @@ pub(crate) struct MetadataExport {
     pub(crate) roots: Vec<RootConfig>,
     pub(crate) snapshots: Vec<SnapshotExport>,
     pub(crate) operations: Vec<OperationExport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) operation_changes: Vec<OperationChangeExport>,
     pub(crate) refs: BTreeMap<String, String>,
     pub(crate) blobs: Vec<BlobExport>,
     pub(crate) large_objects: Vec<LargeObjectExport>,

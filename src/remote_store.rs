@@ -7,7 +7,7 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use reqwest::blocking::{Body, Client};
+use reqwest::blocking::{Body, Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use reqwest::redirect::Policy as RedirectPolicy;
 use sha1::Sha1;
@@ -114,6 +114,31 @@ fn s3_status_is_transient(status: reqwest::StatusCode) -> bool {
 
 fn sleep_before_s3_retry(attempt: usize) {
     thread::sleep(s3_retry_delay(attempt));
+}
+
+fn send_s3_with_retry<F>(mut send: F) -> Result<Response>
+where
+    F: FnMut() -> Result<Response>,
+{
+    let attempts = s3_retry_attempts();
+    for attempt in 0..attempts {
+        match send() {
+            Ok(response) => {
+                if attempt + 1 < attempts && s3_status_is_transient(response.status()) {
+                    drop(response);
+                    sleep_before_s3_retry(attempt);
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(err) if attempt + 1 < attempts => {
+                sleep_before_s3_retry(attempt);
+                drop(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("S3 retry loop always returns")
 }
 
 pub(crate) fn s3_http_client() -> Result<Client> {
@@ -907,7 +932,7 @@ impl S3Remote {
                     .put(url.clone())
                     .header(HOST, self.host_header()?)
                     .header("x-amz-date", auth.amz_date)
-                    .header("x-amz-content-sha256", payload_hash)
+                    .header("x-amz-content-sha256", payload_hash.clone())
                     .header(AUTHORIZATION, auth.authorization)
                     .header(CONTENT_TYPE, "application/octet-stream");
                 for (name, value) in extra_headers {
@@ -977,7 +1002,7 @@ impl S3Remote {
                     .put(url.clone())
                     .header(HOST, self.host_header()?)
                     .header("x-amz-date", auth.amz_date)
-                    .header("x-amz-content-sha256", payload_hash)
+                    .header("x-amz-content-sha256", payload_hash.clone())
                     .header(AUTHORIZATION, auth.authorization)
                     .header(CONTENT_TYPE, "application/octet-stream");
                 for (name, value) in extra_headers {
@@ -1046,17 +1071,19 @@ impl S3Remote {
         }
         let query = "lifecycle=".to_string();
         let payload_hash = sha256_hex(policy_xml.as_bytes());
-        let auth = self.auth_v4("PUT", "", &query, &payload_hash, &[])?;
-        let response = self
-            .client
-            .put(self.bucket_url_query(&query))
-            .header(HOST, self.host_header()?)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization)
-            .header(CONTENT_TYPE, "application/xml")
-            .body(policy_xml.to_string())
-            .send()?;
+        let response = send_s3_with_retry(|| {
+            let auth = self.auth_v4("PUT", "", &query, &payload_hash, &[])?;
+            Ok(self
+                .client
+                .put(self.bucket_url_query(&query))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash.clone())
+                .header(AUTHORIZATION, auth.authorization)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(policy_xml.to_string())
+                .send()?)
+        })?;
         record_s3_put(policy_xml.len() as u64);
         if !response.status().is_success() {
             bail!(
@@ -1233,18 +1260,20 @@ impl S3Remote {
         let query = "uploads=".to_string();
         let payload_hash = sha256_hex(b"");
         let extra_headers = self.multipart_initiate_headers(key)?;
-        let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &extra_headers)?;
-        let mut request = self
-            .client
-            .post(self.object_url_query(remote_key, &query))
-            .header(HOST, self.host_header()?)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization);
-        for (name, value) in extra_headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        let response = request.body(Vec::new()).send()?;
+        let response = send_s3_with_retry(|| {
+            let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &extra_headers)?;
+            let mut request = self
+                .client
+                .post(self.object_url_query(remote_key, &query))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash.clone())
+                .header(AUTHORIZATION, auth.authorization);
+            for (name, value) in &extra_headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            Ok(request.body(Vec::new()).send()?)
+        })?;
         record_s3_post(0, 0);
         if !response.status().is_success() {
             bail!(
@@ -1270,16 +1299,18 @@ impl S3Remote {
             ("uploadId", upload_id.to_string()),
         ]);
         let payload_hash = sha256_hex(bytes);
-        let auth = self.auth_v4("PUT", remote_key, &query, &payload_hash, &[])?;
-        let response = self
-            .client
-            .put(self.object_url_query(remote_key, &query))
-            .header(HOST, self.host_header()?)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization)
-            .body(bytes.to_vec())
-            .send()?;
+        let response = send_s3_with_retry(|| {
+            let auth = self.auth_v4("PUT", remote_key, &query, &payload_hash, &[])?;
+            Ok(self
+                .client
+                .put(self.object_url_query(remote_key, &query))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash.clone())
+                .header(AUTHORIZATION, auth.authorization)
+                .body(bytes.to_vec())
+                .send()?)
+        })?;
         record_s3_put(bytes.len() as u64);
         if !response.status().is_success() {
             bail!(
@@ -1309,16 +1340,18 @@ impl S3Remote {
         ]);
         let bytes_len = bytes.len() as u64;
         let payload_hash = sha256_hex(&bytes);
-        let auth = self.auth_v4("PUT", remote_key, &query, &payload_hash, &[])?;
-        let response = self
-            .client
-            .put(self.object_url_query(remote_key, &query))
-            .header(HOST, self.host_header()?)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization)
-            .body(bytes)
-            .send()?;
+        let response = send_s3_with_retry(|| {
+            let auth = self.auth_v4("PUT", remote_key, &query, &payload_hash, &[])?;
+            Ok(self
+                .client
+                .put(self.object_url_query(remote_key, &query))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash.clone())
+                .header(AUTHORIZATION, auth.authorization)
+                .body(bytes.clone())
+                .send()?)
+        })?;
         record_s3_put(bytes_len);
         if !response.status().is_success() {
             bail!(
@@ -1354,17 +1387,19 @@ impl S3Remote {
         body.push_str("</CompleteMultipartUpload>");
         let body_len = body.len() as u64;
         let payload_hash = sha256_hex(body.as_bytes());
-        let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &[])?;
-        let response = self
-            .client
-            .post(self.object_url_query(remote_key, &query))
-            .header(HOST, self.host_header()?)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization)
-            .header(CONTENT_TYPE, "application/xml")
-            .body(body)
-            .send()?;
+        let response = send_s3_with_retry(|| {
+            let auth = self.auth_v4("POST", remote_key, &query, &payload_hash, &[])?;
+            Ok(self
+                .client
+                .post(self.object_url_query(remote_key, &query))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash.clone())
+                .header(AUTHORIZATION, auth.authorization)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(body.clone())
+                .send()?)
+        })?;
         record_s3_post(body_len, 0);
         if !response.status().is_success() {
             bail!(
@@ -1379,16 +1414,18 @@ impl S3Remote {
     fn abort_multipart(&self, remote_key: &str, upload_id: &str) -> Result<()> {
         let query = canonical_query(&[("uploadId", upload_id.to_string())]);
         let payload_hash = sha256_hex(b"");
-        let auth = self.auth_v4("DELETE", remote_key, &query, &payload_hash, &[])?;
-        let response = self
-            .client
-            .delete(self.object_url_query(remote_key, &query))
-            .header(HOST, self.host_header()?)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization)
-            .body(Vec::new())
-            .send()?;
+        let response = send_s3_with_retry(|| {
+            let auth = self.auth_v4("DELETE", remote_key, &query, &payload_hash, &[])?;
+            Ok(self
+                .client
+                .delete(self.object_url_query(remote_key, &query))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash.clone())
+                .header(AUTHORIZATION, auth.authorization)
+                .body(Vec::new())
+                .send()?)
+        })?;
         record_s3_delete();
         if response.status().is_success() {
             Ok(())
@@ -1403,32 +1440,36 @@ impl S3Remote {
         let body = s3_archive_restore_request_xml(days, tier)?;
         let body_len = body.len() as u64;
         if self.uses_sigv2() {
-            let date = http_date();
-            let path = format!("/{}/{}?restore", self.bucket, remote_key);
-            let auth = self.auth_v2("POST", "", "application/xml", &date, &path)?;
-            let response = self
-                .client
-                .post(self.object_url_query(&remote_key, &query))
-                .header(DATE, date)
-                .header(CONTENT_TYPE, "application/xml")
-                .header(AUTHORIZATION, auth)
-                .body(body)
-                .send()?;
+            let response = send_s3_with_retry(|| {
+                let date = http_date();
+                let path = format!("/{}/{}?restore", self.bucket, remote_key);
+                let auth = self.auth_v2("POST", "", "application/xml", &date, &path)?;
+                Ok(self
+                    .client
+                    .post(self.object_url_query(&remote_key, &query))
+                    .header(DATE, date)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .header(AUTHORIZATION, auth)
+                    .body(body.clone())
+                    .send()?)
+            })?;
             record_s3_post(body_len, 0);
             return archive_restore_status(key, response.status().as_u16());
         }
         let payload_hash = sha256_hex(body.as_bytes());
-        let auth = self.auth_v4("POST", &remote_key, &query, &payload_hash, &[])?;
-        let response = self
-            .client
-            .post(self.object_url_query(&remote_key, &query))
-            .header(HOST, self.host_header()?)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(AUTHORIZATION, auth.authorization)
-            .header(CONTENT_TYPE, "application/xml")
-            .body(body)
-            .send()?;
+        let response = send_s3_with_retry(|| {
+            let auth = self.auth_v4("POST", &remote_key, &query, &payload_hash, &[])?;
+            Ok(self
+                .client
+                .post(self.object_url_query(&remote_key, &query))
+                .header(HOST, self.host_header()?)
+                .header("x-amz-date", auth.amz_date)
+                .header("x-amz-content-sha256", payload_hash.clone())
+                .header(AUTHORIZATION, auth.authorization)
+                .header(CONTENT_TYPE, "application/xml")
+                .body(body.clone())
+                .send()?)
+        })?;
         record_s3_post(body_len, 0);
         archive_restore_status(key, response.status().as_u16())
     }
@@ -1462,7 +1503,7 @@ impl S3Remote {
                     .delete(url.clone())
                     .header(HOST, self.host_header()?)
                     .header("x-amz-date", auth.amz_date)
-                    .header("x-amz-content-sha256", payload_hash)
+                    .header("x-amz-content-sha256", payload_hash.clone())
                     .header(AUTHORIZATION, auth.authorization)
                     .send()
             };
@@ -1503,38 +1544,40 @@ impl S3Remote {
 
     fn get_with_range_optional(&self, key: &str, range: Option<String>) -> Result<Option<Vec<u8>>> {
         let remote_key = self.remote_key(key);
-        let response = if self.uses_sigv2() {
-            let date = http_date();
-            let path = format!("/{}/{}", self.bucket, remote_key);
-            let auth = self.auth_v2("GET", "", "", &date, &path)?;
-            let mut request = self
-                .client
-                .get(self.object_url(&remote_key))
-                .header(DATE, date)
-                .header(AUTHORIZATION, auth);
-            if let Some(range) = &range {
-                request = request.header(RANGE, range);
+        let response = send_s3_with_retry(|| {
+            if self.uses_sigv2() {
+                let date = http_date();
+                let path = format!("/{}/{}", self.bucket, remote_key);
+                let auth = self.auth_v2("GET", "", "", &date, &path)?;
+                let mut request = self
+                    .client
+                    .get(self.object_url(&remote_key))
+                    .header(DATE, date)
+                    .header(AUTHORIZATION, auth);
+                if let Some(range) = &range {
+                    request = request.header(RANGE, range);
+                }
+                Ok(request.send()?)
+            } else {
+                let payload_hash = sha256_hex(b"");
+                let mut extra = Vec::new();
+                if let Some(range) = &range {
+                    extra.push(("range".to_string(), range.clone()));
+                }
+                let auth = self.auth_v4("GET", &remote_key, "", &payload_hash, &extra)?;
+                let mut request = self
+                    .client
+                    .get(self.object_url(&remote_key))
+                    .header(HOST, self.host_header()?)
+                    .header("x-amz-date", auth.amz_date)
+                    .header("x-amz-content-sha256", payload_hash.clone())
+                    .header(AUTHORIZATION, auth.authorization);
+                if let Some(range) = &range {
+                    request = request.header(RANGE, range);
+                }
+                Ok(request.send()?)
             }
-            request.send()?
-        } else {
-            let payload_hash = sha256_hex(b"");
-            let mut extra = Vec::new();
-            if let Some(range) = &range {
-                extra.push(("range".to_string(), range.clone()));
-            }
-            let auth = self.auth_v4("GET", &remote_key, "", &payload_hash, &extra)?;
-            let mut request = self
-                .client
-                .get(self.object_url(&remote_key))
-                .header(HOST, self.host_header()?)
-                .header("x-amz-date", auth.amz_date)
-                .header("x-amz-content-sha256", payload_hash)
-                .header(AUTHORIZATION, auth.authorization);
-            if let Some(range) = &range {
-                request = request.header(RANGE, range);
-            }
-            request.send()?
-        };
+        })?;
         if !response.status().is_success() && response.status().as_u16() == 404 {
             record_s3_get(0);
             return Ok(None);
@@ -1550,26 +1593,30 @@ impl S3Remote {
 
     fn exists(&self, key: &str) -> Result<bool> {
         let remote_key = self.remote_key(key);
-        let response = if self.uses_sigv2() {
-            let date = http_date();
-            let path = format!("/{}/{}", self.bucket, remote_key);
-            let auth = self.auth_v2("HEAD", "", "", &date, &path)?;
-            self.client
-                .head(self.object_url(&remote_key))
-                .header(DATE, date)
-                .header(AUTHORIZATION, auth)
-                .send()?
-        } else {
-            let payload_hash = sha256_hex(b"");
-            let auth = self.auth_v4("HEAD", &remote_key, "", &payload_hash, &[])?;
-            self.client
-                .head(self.object_url(&remote_key))
-                .header(HOST, self.host_header()?)
-                .header("x-amz-date", auth.amz_date)
-                .header("x-amz-content-sha256", payload_hash)
-                .header(AUTHORIZATION, auth.authorization)
-                .send()?
-        };
+        let response = send_s3_with_retry(|| {
+            if self.uses_sigv2() {
+                let date = http_date();
+                let path = format!("/{}/{}", self.bucket, remote_key);
+                let auth = self.auth_v2("HEAD", "", "", &date, &path)?;
+                Ok(self
+                    .client
+                    .head(self.object_url(&remote_key))
+                    .header(DATE, date)
+                    .header(AUTHORIZATION, auth)
+                    .send()?)
+            } else {
+                let payload_hash = sha256_hex(b"");
+                let auth = self.auth_v4("HEAD", &remote_key, "", &payload_hash, &[])?;
+                Ok(self
+                    .client
+                    .head(self.object_url(&remote_key))
+                    .header(HOST, self.host_header()?)
+                    .header("x-amz-date", auth.amz_date)
+                    .header("x-amz-content-sha256", payload_hash.clone())
+                    .header(AUTHORIZATION, auth.authorization)
+                    .send()?)
+            }
+        })?;
         record_s3_head();
         if response.status().is_success() {
             Ok(true)
@@ -1628,26 +1675,30 @@ impl S3Remote {
     }
 
     fn list_objects_page(&self, query: &str) -> Result<String> {
-        let response = if self.uses_sigv2() {
-            let date = http_date();
-            let resource = format!("/{}/", self.bucket);
-            let auth = self.auth_v2("GET", "", "", &date, &resource)?;
-            self.client
-                .get(self.bucket_url_query(query))
-                .header(DATE, date)
-                .header(AUTHORIZATION, auth)
-                .send()?
-        } else {
-            let payload_hash = sha256_hex(b"");
-            let auth = self.auth_v4("GET", "", query, &payload_hash, &[])?;
-            self.client
-                .get(self.bucket_url_query(query))
-                .header(HOST, self.host_header()?)
-                .header("x-amz-date", auth.amz_date)
-                .header("x-amz-content-sha256", payload_hash)
-                .header(AUTHORIZATION, auth.authorization)
-                .send()?
-        };
+        let response = send_s3_with_retry(|| {
+            if self.uses_sigv2() {
+                let date = http_date();
+                let resource = format!("/{}/", self.bucket);
+                let auth = self.auth_v2("GET", "", "", &date, &resource)?;
+                Ok(self
+                    .client
+                    .get(self.bucket_url_query(query))
+                    .header(DATE, date)
+                    .header(AUTHORIZATION, auth)
+                    .send()?)
+            } else {
+                let payload_hash = sha256_hex(b"");
+                let auth = self.auth_v4("GET", "", query, &payload_hash, &[])?;
+                Ok(self
+                    .client
+                    .get(self.bucket_url_query(query))
+                    .header(HOST, self.host_header()?)
+                    .header("x-amz-date", auth.amz_date)
+                    .header("x-amz-content-sha256", payload_hash.clone())
+                    .header(AUTHORIZATION, auth.authorization)
+                    .send()?)
+            }
+        })?;
         if !response.status().is_success() {
             record_s3_list(0);
             bail!("s3 list failed: HTTP {}", response.status());
@@ -2172,6 +2223,42 @@ mod storage_characteristic_tests {
         );
         assert_eq!(fs::read(&dest).unwrap(), b"first");
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn s3_head_retries_transient_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let remote = S3Remote {
+            bucket: "retry-bucket".to_string(),
+            prefix: "majutsu/v1".to_string(),
+            endpoint: format!("http://{address}"),
+            region: "us-test-1".to_string(),
+            signature_version: "s3v4".to_string(),
+            access_key: "dummy".to_string(),
+            secret_key: "dummy".to_string(),
+            storage_class: None,
+            object_tags: Vec::new(),
+            multipart_enabled: true,
+            max_parallel_uploads: 1,
+            client: s3_http_client().unwrap(),
+        };
+
+        assert!(remote.exists("objects/sample").unwrap());
+        server.join().unwrap();
     }
 
     #[test]

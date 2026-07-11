@@ -35,6 +35,7 @@ use crate::snapshot_rules::{
     build_ignore, explicitly_untracked, is_ignored, root_dir_allows_descend,
     volatile_allows_watch_snapshot,
 };
+use crate::snapshot_state::current_snapshot;
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
 use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
 
@@ -215,6 +216,9 @@ fn watch_fanotify(
             }
             continue;
         };
+        if !fanotify_event_relevant_for_roots(&active_roots, &event) {
+            continue;
+        }
         record_fanotify_event(paths, &event)?;
         let origin = event.origin();
         if args.mode == "strict" {
@@ -235,7 +239,7 @@ fn watch_fanotify(
             max_latency: Duration::from_millis(args.buffer_max_ms.max(1)),
             max_events: args.buffer_max_events.max(1),
         };
-        let outcome = fanotify.drain_buffer(buffer, origin)?;
+        let outcome = fanotify.drain_buffer(buffer, origin, &active_roots)?;
         record_event(
             paths,
             "watch-buffer-flush",
@@ -472,6 +476,9 @@ impl FanotifyFd {
             if metadata.event_len == 0 {
                 break;
             }
+            let event_path = (metadata.fd >= 0)
+                .then(|| fanotify_path_from_fd(metadata.fd))
+                .flatten();
             if metadata.fd >= 0 {
                 unsafe {
                     libc::close(metadata.fd);
@@ -482,6 +489,7 @@ impl FanotifyFd {
                 observed = Some(FanotifyObservedEvent {
                     pid: metadata.pid as u32,
                     mask: metadata.mask,
+                    path: event_path,
                 });
             }
         }
@@ -492,6 +500,7 @@ impl FanotifyFd {
         &self,
         config: FanotifyBufferConfig,
         mut origin: Option<OperationOriginOverride>,
+        active_roots: &[RootConfig],
     ) -> Result<FanotifyBufferOutcome> {
         let started = Instant::now();
         let mut last_event = started;
@@ -548,6 +557,9 @@ impl FanotifyFd {
                 continue;
             }
             if let Some(event) = self.read_one()? {
+                if !fanotify_event_relevant_for_roots(active_roots, &event) {
+                    continue;
+                }
                 origin = event.origin();
                 events += 1;
                 last_event = Instant::now();
@@ -569,6 +581,7 @@ impl Drop for FanotifyFd {
 struct FanotifyObservedEvent {
     pid: u32,
     mask: u64,
+    path: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -604,10 +617,32 @@ fn record_fanotify_event(paths: &Paths, event: &FanotifyObservedEvent) -> Result
         paths,
         "fs-event",
         &format!(
-            "fanotify mask=0x{:x} origin_pid={} origin_confidence=fanotify",
-            event.mask, event.pid
+            "fanotify mask=0x{:x} origin_pid={} origin_confidence=fanotify path={}",
+            event.mask,
+            event.pid,
+            event
+                .path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(unknown)".into())
         ),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn fanotify_path_from_fd(fd: RawFd) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn fanotify_event_relevant_for_roots(
+    active_roots: &[RootConfig],
+    event: &FanotifyObservedEvent,
+) -> bool {
+    event
+        .path
+        .as_deref()
+        .is_none_or(|path| event_path_for_roots(active_roots, path).is_some())
 }
 
 fn watch_notify_loop<W: Watcher>(
@@ -909,8 +944,14 @@ fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
 
 fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     sync_current_external(paths)?;
+    let before_snapshot = local_current_snapshot(paths)?;
     if std::env::var("MAJUTSU_WATCH_INLINE_SNAPSHOT").as_deref() == Ok("1") {
         snapshot(paths, args)?;
+        let after_snapshot = local_current_snapshot(paths)?;
+        if before_snapshot == after_snapshot {
+            record_watch_sync_skipped(paths, after_snapshot.as_deref())?;
+            return Ok(());
+        }
         match sync_current_if_remote(paths) {
             Ok(AutoSyncResult::Synced) => {
                 record_event(paths, "watch-sync", "synced current snapshot to remote")?;
@@ -963,22 +1004,102 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             command.env("MAJUTSU_ORIGIN_CONFIDENCE", confidence);
         }
     }
-    let output = command.output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("snapshot already running with pid") {
-            record_event(paths, "watch-snapshot-deferred", stderr.trim())?;
-            return Ok(());
-        }
-        bail!(
-            "watch snapshot child process failed with status {}",
-            output.status
-        );
+    if matches!(
+        run_snapshot_child_with_retry(paths, &mut command)?,
+        SnapshotChildOutcome::Deferred
+    ) {
+        return Ok(());
     }
     record_event(paths, "watch-snapshot-child", &message)?;
 
+    let after_snapshot = local_current_snapshot(paths)?;
+    if before_snapshot == after_snapshot {
+        record_watch_sync_skipped(paths, after_snapshot.as_deref())?;
+        return Ok(());
+    }
     sync_current_external(paths)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotChildOutcome {
+    Succeeded,
+    Deferred,
+}
+
+const SNAPSHOT_DB_RETRY_DELAYS_MS: &[u64] = &[100, 250, 500, 1_000, 2_000, 4_000];
+
+fn run_snapshot_child_with_retry(
+    paths: &Paths,
+    command: &mut std::process::Command,
+) -> Result<SnapshotChildOutcome> {
+    for (attempt, delay_ms) in SNAPSHOT_DB_RETRY_DELAYS_MS
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        let output = command.output()?;
+        if output.status.success() {
+            return Ok(SnapshotChildOutcome::Succeeded);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim().replace('\n', " ");
+        if detail.contains("snapshot already running with pid") {
+            record_event(paths, "watch-snapshot-deferred", &detail)?;
+            return Ok(SnapshotChildOutcome::Deferred);
+        }
+        if !is_database_busy_error(&detail) {
+            bail!(
+                "watch snapshot child process failed with status {}: {}",
+                output.status,
+                detail
+            );
+        }
+        let Some(delay_ms) = delay_ms else {
+            record_event(
+                paths,
+                "watch-snapshot-deferred",
+                &format!(
+                    "reason=database-busy attempts={} error={detail}",
+                    attempt + 1
+                ),
+            )?;
+            return Ok(SnapshotChildOutcome::Deferred);
+        };
+        record_event(
+            paths,
+            "watch-snapshot-retry",
+            &format!(
+                "reason=database-busy attempt={} delay_ms={} error={detail}",
+                attempt + 1,
+                delay_ms
+            ),
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    unreachable!("snapshot retry loop must return after the final attempt")
+}
+
+fn is_database_busy_error(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("database is locked")
+        || detail.contains("database is busy")
+        || detail.contains("database busy")
+}
+
+fn local_current_snapshot(paths: &Paths) -> Result<Option<String>> {
+    let conn = open_db(paths)?;
+    current_snapshot(&conn)
+}
+
+fn record_watch_sync_skipped(paths: &Paths, current: Option<&str>) -> Result<()> {
+    record_event(
+        paths,
+        "watch-sync-skipped",
+        &format!("snapshot unchanged current={}", current.unwrap_or("(none)")),
+    )
 }
 
 fn sync_current_external(paths: &Paths) -> Result<()> {
@@ -1520,6 +1641,70 @@ mod tests {
             &[root],
             &test_event_abs(root_path.join("data/app.sqlite"))
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fanotify_uses_event_path_to_skip_excluded_files() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let excluded = root_path.join("runtime.log");
+        std::fs::write(&excluded, b"ignored").unwrap();
+        let file = std::fs::File::open(&excluded).unwrap();
+        let event = FanotifyObservedEvent {
+            pid: 1,
+            mask: FAN_CLOSE_WRITE_MASK,
+            path: fanotify_path_from_fd(file.as_raw_fd()),
+        };
+        let root = test_root(root_path.clone(), vec!["*.log".into()]);
+
+        assert!(!fanotify_event_relevant_for_roots(&[root], &event));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fanotify_unknown_path_is_fail_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let root = test_root(root_path, vec!["*.log".into()]);
+        let event = FanotifyObservedEvent {
+            pid: 1,
+            mask: FAN_CLOSE_WRITE_MASK,
+            path: None,
+        };
+
+        assert!(fanotify_event_relevant_for_roots(&[root], &event));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_child_retries_database_lock_before_succeeding() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let attempts = temp.path().join("attempts");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"count=$(cat "$1" 2>/dev/null || echo 0); count=$((count + 1)); printf '%s' "$count" > "$1"; if [ "$count" -lt 3 ]; then echo 'database is locked' >&2; exit 1; fi"#,
+            )
+            .arg("mj-test")
+            .arg(&attempts);
+
+        let outcome = run_snapshot_child_with_retry(&paths, &mut command).unwrap();
+
+        assert_eq!(outcome, SnapshotChildOutcome::Succeeded);
+        assert_eq!(fs::read_to_string(attempts).unwrap(), "3");
+        let events = fs::read_dir(paths.event_queue)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(events.contains("watch-snapshot-retry"), "{events}");
     }
 
     #[test]

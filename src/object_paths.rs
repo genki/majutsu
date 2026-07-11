@@ -377,6 +377,7 @@ mod tests {
             roots: Vec::new(),
             snapshots: Vec::new(),
             operations: Vec::new(),
+            operation_changes: Vec::new(),
             refs: BTreeMap::new(),
             blobs: Vec::new(),
             large_objects: Vec::new(),

@@ -170,12 +170,13 @@ use cli::{Command, InitArgs, RestoreArgs, SnapshotArgs, VersionArgs, parse_cli};
 use clone_runtime::clone_cmd;
 use config::{
     Config, ConfigRoot, HostConfig, LargeCompressionConfig, LargeConfig, METADATA_EXPORT_VERSION,
-    MetadataExport, PackConfig, Paths, RemoteConfig, RestoreConfig, RootConfig, RootDegraded,
-    SecurityConfig, TieringConfig, WatchConfig, default_chunk_size, default_large_binary_min_size,
-    default_large_chunked_chunk_size, default_large_chunked_min_size, default_large_chunking,
-    default_large_max_parallel_uploads, default_large_min_size, default_security_hash,
-    default_security_key_id, encryption_enabled, encryption_mode, read_config, resolve_paths,
-    resolve_paths_with_scope, validate_restore_archive_config, write_config,
+    MetadataExport, OperationChangeExport, PackConfig, Paths, RemoteConfig, RestoreConfig,
+    RootConfig, RootDegraded, SecurityConfig, TieringConfig, WatchConfig, default_chunk_size,
+    default_large_binary_min_size, default_large_chunked_chunk_size,
+    default_large_chunked_min_size, default_large_chunking, default_large_max_parallel_uploads,
+    default_large_min_size, default_security_hash, default_security_key_id, encryption_enabled,
+    encryption_mode, read_config, resolve_paths, resolve_paths_with_scope,
+    validate_restore_archive_config, write_config,
 };
 use daemon_runtime::{apply_env_files, daemon_cmd};
 use fs_meta::{file_gid, file_mode, file_uid, is_mount_point, read_xattrs, special_file_kind};
@@ -506,6 +507,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let mut skipped_auto_track_batch = 0usize;
     let mut pending_blob_inserts = Vec::new();
     let mut pending_tracked_paths = Vec::new();
+    let mut pending_operation_changes = Vec::new();
     for root in roots(&conn)? {
         if root.status != "active" {
             eprintln!("root {}, skipped: status={}", root.id, root.status);
@@ -592,6 +594,11 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             .as_ref()
             .map(|manifest| snapshot_root_file_paths(paths, manifest, &root.id))
             .transpose()?;
+        let parent_root_records = parent_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.root_trees.get(&root.id))
+            .map(|root_tree| load_root_tree_entries(paths, root_tree))
+            .transpose()?;
         let known_paths = root_known_paths(&conn, &root.id, parent_root_files.as_ref())?;
         let initial_root_scan = parent_root_files.is_none() && known_paths.is_empty();
         let scan_result =
@@ -654,6 +661,13 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             }
         };
         let records = scanned.records;
+        append_operation_changes(
+            &mut pending_operation_changes,
+            &op_id,
+            &root.id,
+            parent_root_records.as_ref(),
+            &records,
+        );
         pending_blob_inserts.extend(scanned.blobs);
         pending_tracked_paths.extend(scanned.tracked_paths);
         skipped_auto_track_large += scanned.skipped_auto_track_large;
@@ -757,6 +771,12 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     }
     for (root_id, path) in &pending_tracked_paths {
         mark_path_tracked(&tx, root_id, path)?;
+    }
+    for change in &pending_operation_changes {
+        tx.execute(
+            "insert or ignore into operation_changes(op_id, root_id, path, status) values (?1, ?2, ?3, ?4)",
+            params![change.op_id, change.root_id, change.path, change.status],
+        )?;
     }
     tx.execute(
         "insert into snapshots(id, parent_id, op_id, created_at, manifest_key, manifest_json)
@@ -863,6 +883,73 @@ fn snapshot_operation_kind(message: Option<&str>, parent: Option<&str>) -> &'sta
     } else {
         "manual-snapshot"
     }
+}
+
+const MAX_OPERATION_CHANGE_SUMMARY_ENTRIES: usize = 1024;
+
+fn append_operation_changes(
+    changes: &mut Vec<OperationChangeExport>,
+    op_id: &str,
+    root_id: &str,
+    previous: Option<&BTreeMap<String, FileRecord>>,
+    current: &[FileRecord],
+) {
+    let current = current
+        .iter()
+        .filter(|record| record.kind != "directory" && operation_change_path_is_file(&record.path))
+        .map(|record| (record.path.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let previous = previous
+        .into_iter()
+        .flat_map(|records| records.iter())
+        .filter(|(_, record)| {
+            record.kind != "directory" && operation_change_path_is_file(&record.path)
+        })
+        .map(|(path, record)| (path.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let paths = previous
+        .keys()
+        .chain(current.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut root_changes = Vec::new();
+    for path in paths {
+        let status = match (previous.get(&path), current.get(&path)) {
+            (None, Some(_)) => Some("A"),
+            (Some(_), None) => Some("D"),
+            (Some(before), Some(after)) if *before != *after => Some("M"),
+            _ => None,
+        };
+        if let Some(status) = status {
+            root_changes.push((path, status));
+        }
+    }
+    let truncated = root_changes.len() > MAX_OPERATION_CHANGE_SUMMARY_ENTRIES;
+    root_changes.truncate(MAX_OPERATION_CHANGE_SUMMARY_ENTRIES);
+    changes.extend(
+        root_changes
+            .into_iter()
+            .map(|(path, status)| OperationChangeExport {
+                op_id: op_id.to_string(),
+                root_id: root_id.to_string(),
+                path,
+                status: status.to_string(),
+            }),
+    );
+    if truncated {
+        changes.push(OperationChangeExport {
+            op_id: op_id.to_string(),
+            root_id: root_id.to_string(),
+            path:
+                "** (operation change summary truncated; use current state or an unpruned snapshot)"
+                    .into(),
+            status: "M".into(),
+        });
+    }
+}
+
+fn operation_change_path_is_file(path: &str) -> bool {
+    !path.is_empty() && path != "."
 }
 
 fn record_snapshot_failure(
@@ -4098,6 +4185,7 @@ pub(crate) fn export_metadata(
     }
 
     let operations = query_operations(conn)?;
+    let operation_changes = query_operation_changes(conn)?;
 
     let mut refs = BTreeMap::new();
     let mut stmt = conn.prepare("select name, value from refs order by name")?;
@@ -4142,6 +4230,7 @@ pub(crate) fn export_metadata(
         roots,
         snapshots,
         operations,
+        operation_changes,
         refs,
         blobs: query_blobs(conn)?,
         large_objects: query_large_objects(conn)?,
@@ -4212,6 +4301,12 @@ fn import_metadata(conn: &mut Connection, export: &MetadataExport) -> Result<()>
             ],
         )?;
     }
+    for change in &export.operation_changes {
+        tx.execute(
+            "insert or replace into operation_changes(op_id, root_id, path, status) values (?1, ?2, ?3, ?4)",
+            params![change.op_id, change.root_id, change.path, change.status],
+        )?;
+    }
     for (name, value) in &export.refs {
         tx.execute(
             "insert or replace into refs(name, value) values (?1, ?2)",
@@ -4251,6 +4346,23 @@ fn import_metadata(conn: &mut Connection, export: &MetadataExport) -> Result<()>
     rewrite_local_oplog(&tx)?;
     tx.commit()?;
     Ok(())
+}
+
+fn query_operation_changes(conn: &Connection) -> Result<Vec<OperationChangeExport>> {
+    let mut stmt = conn.prepare(
+        "select op_id, root_id, path, status
+         from operation_changes
+         order by op_id, root_id, path",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(OperationChangeExport {
+            op_id: row.get(0)?,
+            root_id: row.get(1)?,
+            path: row.get(2)?,
+            status: row.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub(crate) fn query_blobs(conn: &Connection) -> Result<Vec<BlobExport>> {
