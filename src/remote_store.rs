@@ -12,6 +12,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use reqwest::redirect::Policy as RedirectPolicy;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -834,6 +835,13 @@ impl RemoteStore {
         match self {
             RemoteStore::File(remote) => list_file_remote(&remote.root, prefix),
             RemoteStore::S3(remote) => remote.list(prefix),
+        }
+    }
+
+    pub(crate) fn list_common_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        match self {
+            RemoteStore::File(remote) => list_file_remote_common_prefixes(&remote.root, prefix),
+            RemoteStore::S3(remote) => remote.list_common_prefixes(prefix),
         }
     }
 
@@ -1674,6 +1682,56 @@ impl S3Remote {
         Ok(objects)
     }
 
+    fn list_common_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        let remote_prefix = self.remote_key(prefix);
+        let remote_prefix = if remote_prefix.is_empty() || remote_prefix.ends_with('/') {
+            remote_prefix
+        } else {
+            format!("{remote_prefix}/")
+        };
+        let mut prefixes = BTreeSet::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut query = canonical_query(&[
+                ("delimiter", "/".to_string()),
+                ("list-type", "2".to_string()),
+                ("prefix", remote_prefix.clone()),
+            ]);
+            if let Some(token) = continuation_token.as_deref() {
+                query = canonical_query(&[
+                    ("continuation-token", token.to_string()),
+                    ("delimiter", "/".to_string()),
+                    ("list-type", "2".to_string()),
+                    ("prefix", remote_prefix.clone()),
+                ]);
+            }
+            let xml = self.list_objects_page(&query)?;
+            let page = parse_s3_list_objects_v2(&xml)?;
+            for common_prefix in page.common_prefixes {
+                if let Some(local) = self.local_key(&common_prefix) {
+                    prefixes.insert(local);
+                }
+            }
+            // 一部のS3互換実装はdelimiterを無視して一致objectを返すため、
+            // その応答から直下prefixを導出して追加LISTを発生させない。
+            for object in page.objects {
+                if let Some(local) = self.local_key(&object.key)
+                    && let Some((first, _)) = local.split_once('/')
+                {
+                    prefixes.insert(format!("{first}/"));
+                }
+            }
+            if !page.is_truncated {
+                break;
+            }
+            continuation_token = page.next_continuation_token;
+            if continuation_token.is_none() {
+                bail!("s3 list response was truncated but did not include NextContinuationToken");
+            }
+        }
+        Ok(prefixes.into_iter().collect())
+    }
+
     fn list_objects_page(&self, query: &str) -> Result<String> {
         let response = send_s3_with_retry(|| {
             if self.uses_sigv2() {
@@ -1906,6 +1964,27 @@ fn list_file_remote_with_sizes(root: &Path, prefix: &str) -> Result<Vec<RemoteOb
     Ok(objects)
 }
 
+fn list_file_remote_common_prefixes(root: &Path, prefix: &str) -> Result<Vec<String>> {
+    let prefix = prefix.trim_end_matches('/');
+    let base = if prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        file_remote_path(root, prefix)?
+    };
+    if !base.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut prefixes = BTreeSet::new();
+    for entry in fs::read_dir(base)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let relative = path_to_slash(entry.path().strip_prefix(root)?);
+            prefixes.insert(format!("{relative}/"));
+        }
+    }
+    Ok(prefixes.into_iter().collect())
+}
+
 fn path_to_slash(path: &Path) -> String {
     path.components()
         .map(|c| c.as_os_str().to_string_lossy())
@@ -1986,6 +2065,7 @@ fn canonical_query(params: &[(&str, String)]) -> String {
 
 struct S3ListPage {
     objects: Vec<RemoteObjectStat>,
+    common_prefixes: Vec<String>,
     is_truncated: bool,
     next_continuation_token: Option<String>,
 }
@@ -1996,8 +2076,11 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
     let mut current = String::new();
     let mut in_contents = false;
     let mut objects = Vec::new();
+    let mut common_prefixes = Vec::new();
     let mut object_key: Option<String> = None;
     let mut object_size: Option<u64> = None;
+    let mut in_common_prefixes = false;
+    let mut common_prefix: Option<String> = None;
     let mut is_truncated = false;
     let mut next_continuation_token = None;
     loop {
@@ -2008,6 +2091,9 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
                     in_contents = true;
                     object_key = None;
                     object_size = None;
+                } else if current == "CommonPrefixes" {
+                    in_common_prefixes = true;
+                    common_prefix = None;
                 }
             }
             Ok(Event::End(event)) => {
@@ -2019,6 +2105,11 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
                         });
                     }
                     in_contents = false;
+                } else if event.name().as_ref() == b"CommonPrefixes" {
+                    if let Some(prefix) = common_prefix.take() {
+                        common_prefixes.push(prefix);
+                    }
+                    in_common_prefixes = false;
                 }
                 current.clear();
             }
@@ -2027,6 +2118,7 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
                 match current.as_str() {
                     "Key" if in_contents => object_key = Some(value),
                     "Size" if in_contents => object_size = Some(value.parse()?),
+                    "Prefix" if in_common_prefixes => common_prefix = Some(value),
                     "IsTruncated" => is_truncated = value == "true" || value == "1",
                     "NextContinuationToken" => next_continuation_token = Some(value),
                     _ => {}
@@ -2039,6 +2131,7 @@ fn parse_s3_list_objects_v2(body: &str) -> Result<S3ListPage> {
     }
     Ok(S3ListPage {
         objects,
+        common_prefixes,
         is_truncated,
         next_continuation_token,
     })
@@ -2175,6 +2268,25 @@ fn xml_escape(input: &str) -> String {
 #[cfg(test)]
 mod storage_characteristic_tests {
     use super::*;
+
+    #[test]
+    fn parses_s3_common_prefixes_without_treating_them_as_objects() {
+        let page = parse_s3_list_objects_v2(
+            r#"
+                <ListBucketResult>
+                  <CommonPrefixes><Prefix>vagrant/</Prefix></CommonPrefixes>
+                  <CommonPrefixes><Prefix>mba22/</Prefix></CommonPrefixes>
+                  <Contents><Key>vagrant/head.cbor.zst.enc</Key><Size>12</Size></Contents>
+                  <IsTruncated>false</IsTruncated>
+                </ListBucketResult>
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(page.common_prefixes, vec!["vagrant/", "mba22/"]);
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key, "vagrant/head.cbor.zst.enc");
+    }
 
     #[test]
     fn adaptive_part_size_prefers_smaller_local_parts_and_obeys_part_limit() {

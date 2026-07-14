@@ -1,6 +1,6 @@
 use crate::majutsu_daemon::{DaemonServiceConfig, DaemonServiceScope, render_daemon_service};
 use crate::majutsu_restore::RestoreQueueItem;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::env;
@@ -18,7 +18,10 @@ use crate::cli::DaemonCommand;
 use crate::config::{Paths, read_config, validate_watch_mode};
 #[cfg(not(windows))]
 use crate::platform_runtime::configure_background_command;
-use crate::process_runtime::{pid_alive, read_pid};
+use crate::process_runtime::{
+    ProcessLock, acquire_process_lock, pid_alive, process_identity, process_identity_matches,
+    read_pid, read_process_identity, write_process_identity,
+};
 use crate::queue_runtime::{event_journal_records, upload_queue_stats};
 use crate::root_state::roots;
 use crate::snapshot_state::current_snapshot;
@@ -35,6 +38,8 @@ const DAEMON_ATTRIBUTION_ENV_KEYS: &[&str] = &[
     "CURSOR_SESSION_ID",
     "TERM_SESSION_ID",
 ];
+
+const DAEMON_IDENTITY_FILE: &str = "daemon.identity";
 
 pub(crate) fn child_process_exe() -> Result<PathBuf> {
     if let Some(path) = env::var_os("MAJUTSU_CHILD_EXE").map(PathBuf::from)
@@ -231,9 +236,19 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
             print!("{service}");
         }
         DaemonCommand::Stop => {
-            let pid = read_pid(&paths.daemon_pid)?
-                .or(discover_running_watch_daemon(paths)?)
-                .ok_or_else(|| anyhow!("daemon pid file not found"))?;
+            let pid_file_pid = read_pid(&paths.daemon_pid)?;
+            let pid = match pid_file_pid {
+                Some(pid) if daemon_process_matches(paths, pid)? => Some(pid),
+                _ => discover_running_watch_daemon(paths)?,
+            };
+            let Some(pid) = pid else {
+                if pid_file_pid.is_some() {
+                    cleanup_daemon_runtime(paths);
+                    println!("cleaned stale daemon runtime");
+                    return Ok(());
+                }
+                bail!("daemon pid file not found");
+            };
             stop_daemon_process(pid)?;
             if let Some(extra_pid) = discover_running_watch_daemon(paths)?
                 && extra_pid != pid
@@ -264,23 +279,34 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                 }
             }
         }
-        DaemonCommand::Metrics => {
-            if let Some(pid) = read_pid(&paths.daemon_pid)? {
-                if pid_alive(pid) {
-                    if let Ok(reply) = daemon_ipc_request(paths, "metrics") {
-                        println!("{reply}");
-                    } else {
-                        println!("majutsu_daemon_up 1");
-                        println!("majutsu_daemon_ipc_up 0");
-                    }
+        DaemonCommand::Metrics => match daemon_health(paths)? {
+            DaemonHealth {
+                state: DaemonHealthState::Running,
+                ..
+            } => {
+                if let Ok(reply) = daemon_ipc_request(paths, "metrics") {
+                    println!("{reply}");
                 } else {
-                    println!("majutsu_daemon_up 0");
-                    println!("majutsu_daemon_stale_pid {}", pid);
+                    println!("majutsu_daemon_up 1");
+                    println!("majutsu_daemon_ipc_up 0");
                 }
-            } else {
+            }
+            DaemonHealth {
+                state: DaemonHealthState::Stale,
+                pid: Some(pid),
+                ..
+            } => {
+                println!("majutsu_daemon_up 0");
+                println!("majutsu_daemon_stale_pid {pid}");
+            }
+            DaemonHealth {
+                state: DaemonHealthState::Stopped,
+                ..
+            }
+            | DaemonHealth { pid: None, .. } => {
                 println!("majutsu_daemon_up 0");
             }
-        }
+        },
     }
     Ok(())
 }
@@ -423,25 +449,25 @@ pub(crate) fn daemon_health(paths: &Paths) -> Result<DaemonHealth> {
             ipc_available: false,
         });
     };
-    if !pid_alive(pid) {
-        if let Some(live_pid) = discover_running_watch_daemon(paths)? {
-            let _ = fs::write(&paths.daemon_pid, live_pid.to_string());
-            return Ok(DaemonHealth {
-                state: DaemonHealthState::Running,
-                pid: Some(live_pid),
-                ipc_available: daemon_ipc_request(paths, "status").is_ok(),
-            });
-        }
+    if daemon_process_matches(paths, pid)? {
         return Ok(DaemonHealth {
-            state: DaemonHealthState::Stale,
+            state: DaemonHealthState::Running,
             pid: Some(pid),
-            ipc_available: false,
+            ipc_available: daemon_ipc_request(paths, "status").is_ok(),
+        });
+    }
+    if let Some(live_pid) = discover_running_watch_daemon(paths)? {
+        adopt_daemon_pid(paths, live_pid)?;
+        return Ok(DaemonHealth {
+            state: DaemonHealthState::Running,
+            pid: Some(live_pid),
+            ipc_available: daemon_ipc_request(paths, "status").is_ok(),
         });
     }
     Ok(DaemonHealth {
-        state: DaemonHealthState::Running,
+        state: DaemonHealthState::Stale,
         pid: Some(pid),
-        ipc_available: daemon_ipc_request(paths, "status").is_ok(),
+        ipc_available: false,
     })
 }
 
@@ -453,14 +479,6 @@ fn discover_running_watch_daemon(paths: &Paths) -> Result<Option<u32>> {
     if !output.status.success() {
         return Ok(None);
     }
-    let home = paths.home.to_string_lossy();
-    let exe_name = env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| "mj".into());
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let trimmed = line.trim_start();
         let Some((pid_s, command)) = trimmed.split_once(char::is_whitespace) else {
@@ -472,12 +490,7 @@ fn discover_running_watch_daemon(paths: &Paths) -> Result<Option<u32>> {
         if !pid_alive(pid) {
             continue;
         }
-        if command.contains(&exe_name)
-            && command.contains("--home")
-            && command.contains(home.as_ref())
-            && command.contains(" watch ")
-            && command.contains("--foreground")
-        {
+        if watch_command_matches(paths, command) {
             return Ok(Some(pid));
         }
     }
@@ -487,6 +500,102 @@ fn discover_running_watch_daemon(paths: &Paths) -> Result<Option<u32>> {
 #[cfg(not(unix))]
 fn discover_running_watch_daemon(_paths: &Paths) -> Result<Option<u32>> {
     Ok(None)
+}
+
+fn daemon_identity_path(paths: &Paths) -> PathBuf {
+    paths.runtime.join(DAEMON_IDENTITY_FILE)
+}
+
+fn adopt_daemon_pid(paths: &Paths, pid: u32) -> Result<()> {
+    fs::write(&paths.daemon_pid, pid.to_string())?;
+    write_process_identity(&daemon_identity_path(paths), &process_identity(pid))?;
+    Ok(())
+}
+
+fn daemon_process_matches(paths: &Paths, pid: u32) -> Result<bool> {
+    if !pid_alive(pid) {
+        return Ok(false);
+    }
+
+    let identity_path = daemon_identity_path(paths);
+    if let Some(expected) = read_process_identity(&identity_path)? {
+        if !process_identity_matches(&expected, &process_identity(pid)) {
+            return Ok(false);
+        }
+        // Unixではcommand lineも確認し、壊れたidentityや過度に広い記録だけで
+        // 無関係なプロセスを信頼しない。
+        #[cfg(unix)]
+        if let Some(command) = process_command_line(pid) {
+            return Ok(watch_command_matches(paths, &command));
+        }
+        return Ok(true);
+    }
+
+    // 旧版はPIDだけを保存していた。Unixではcommand lineで再利用PIDを区別し、
+    // Windowsでは強い検証に新identityが必要なので、ここでは実行ファイル一致
+    // のみを受け入れる。
+    #[cfg(unix)]
+    {
+        Ok(process_command_line(pid)
+            .as_deref()
+            .is_some_and(|command| watch_command_matches(paths, command)))
+    }
+    #[cfg(windows)]
+    {
+        let current = process_identity(std::process::id());
+        let actual = process_identity(pid);
+        return Ok(current.executable.is_some() && current.executable == actual.executable);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (paths, pid);
+        Ok(false)
+    }
+}
+
+#[cfg(unix)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = ProcessCommand::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(unix)]
+fn watch_command_matches(paths: &Paths, command: &str) -> bool {
+    let exe_name = env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "mj".into());
+    let padded = format!(" {command} ");
+    command.contains(&exe_name)
+        && command.contains("--home")
+        && command.contains(&paths.home.to_string_lossy().to_string())
+        && padded.contains(" watch ")
+}
+
+pub(crate) fn acquire_daemon_lock(paths: &Paths) -> Result<ProcessLock> {
+    if paths.daemon_lock.exists() {
+        let owner = fs::read_to_string(&paths.daemon_lock)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let stale = match owner {
+            Some(pid) => !daemon_process_matches(paths, pid)?,
+            None => true,
+        };
+        if stale {
+            let _ = fs::remove_file(&paths.daemon_lock);
+        }
+    }
+    acquire_process_lock(&paths.daemon_lock, "daemon")
 }
 
 pub(crate) fn ensure_daemon_running(paths: &Paths) -> Result<Option<u32>> {
@@ -560,11 +669,11 @@ pub(crate) struct WatchDaemonLaunchConfig {
 
 pub(crate) fn start_watch_daemon(paths: &Paths, config: WatchDaemonLaunchConfig) -> Result<u32> {
     if let Some(pid) = read_pid(&paths.daemon_pid)? {
-        if pid_alive(pid) {
+        if daemon_process_matches(paths, pid)? {
             bail!("daemon already running with pid {pid}");
         }
         if let Some(live_pid) = discover_running_watch_daemon(paths)? {
-            fs::write(&paths.daemon_pid, live_pid.to_string())?;
+            adopt_daemon_pid(paths, live_pid)?;
             return Ok(live_pid);
         }
         cleanup_daemon_runtime(paths);
@@ -636,8 +745,9 @@ fn wait_for_daemon_registered_pid(paths: &Paths, fallback_pid: u32) -> Result<u3
     let attempts = 50;
     for _ in 0..attempts {
         if let Some(pid) = read_pid(&paths.daemon_pid)?
-            && pid_alive(pid)
+            && daemon_process_matches(paths, pid)?
         {
+            let _ = write_process_identity(&daemon_identity_path(paths), &process_identity(pid));
             return Ok(pid);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -645,7 +755,7 @@ fn wait_for_daemon_registered_pid(paths: &Paths, fallback_pid: u32) -> Result<u3
     if fallback_pid == 0 {
         bail!("daemon did not register a live pid before startup timeout");
     }
-    fs::write(&paths.daemon_pid, fallback_pid.to_string())?;
+    adopt_daemon_pid(paths, fallback_pid)?;
     Ok(fallback_pid)
 }
 
@@ -997,7 +1107,10 @@ fn stop_daemon_process(pid: u32) -> Result<()> {
 
 fn cleanup_daemon_runtime(paths: &Paths) {
     let _ = fs::remove_file(&paths.daemon_pid);
+    let _ = fs::remove_file(daemon_identity_path(paths));
+    let _ = fs::remove_file(&paths.daemon_lock);
     let _ = fs::remove_file(paths.runtime.join("daemon.sock"));
+    let _ = fs::remove_file(paths.runtime.join("watch-backend"));
 }
 
 pub(crate) struct ForegroundDaemonRuntime {
@@ -1007,7 +1120,9 @@ pub(crate) struct ForegroundDaemonRuntime {
 impl ForegroundDaemonRuntime {
     pub(crate) fn register(paths: &Paths) -> Result<Self> {
         fs::create_dir_all(&paths.runtime)?;
-        fs::write(&paths.daemon_pid, std::process::id().to_string())?;
+        let pid = std::process::id();
+        fs::write(&paths.daemon_pid, pid.to_string())?;
+        write_process_identity(&daemon_identity_path(paths), &process_identity(pid))?;
         Ok(Self {
             paths: paths.clone(),
         })
@@ -1384,7 +1499,9 @@ pub(crate) fn daemon_ipc_request(paths: &Paths, command: &str) -> Result<String>
 
 #[cfg(test)]
 mod tests {
-    use super::parse_daemon_env_file;
+    use super::{parse_daemon_env_file, watch_command_matches};
+    use crate::config::resolve_paths;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_daemon_env_files() {
@@ -1406,6 +1523,29 @@ BAD-NAME=ignored
             "http://127.0.0.1:9000"
         );
         assert!(!envs.contains_key("BAD-NAME"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_command_matching_requires_the_configured_home() {
+        let home = PathBuf::from("/tmp/majutsu-test-home");
+        let paths = resolve_paths(Some(home.clone())).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let valid = format!(
+            "{} --home {} watch --foreground true --backend fanotify",
+            exe.display(),
+            home.display()
+        );
+        let other_home = format!(
+            "{} --home /tmp/another-home watch --foreground true --backend fanotify",
+            exe.display()
+        );
+        assert!(watch_command_matches(&paths, &valid));
+        assert!(!watch_command_matches(&paths, &other_home));
+        assert!(!watch_command_matches(
+            &paths,
+            &format!("{} --home {} daemon status", exe.display(), home.display())
+        ));
     }
 }
 

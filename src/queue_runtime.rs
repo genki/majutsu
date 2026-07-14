@@ -142,7 +142,11 @@ pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQu
     )?;
     let mut items = Vec::new();
     for entry in fs::read_dir(&paths.upload_queue)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
@@ -666,10 +670,17 @@ pub(crate) fn event_journal_records(paths: &Paths) -> Result<Vec<EventJournalRec
     )?;
     let mut records: Vec<EventJournalRecord> = Vec::new();
     for entry in fs::read_dir(&paths.event_queue)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry.path().extension().and_then(OsStr::to_str) == Some("json")
-        {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let is_file = match entry.file_type() {
+            Ok(file_type) => file_type.is_file(),
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if is_file && entry.path().extension().and_then(OsStr::to_str) == Some("json") {
             let bytes = match fs::read(entry.path()) {
                 Ok(bytes) => bytes,
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,

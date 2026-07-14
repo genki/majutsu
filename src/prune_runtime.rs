@@ -5,22 +5,26 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::cache_runtime::{
     remote_payload_index_contains, remote_payload_key_index, remote_payload_key_index_for_host,
 };
-use crate::cli::PruneArgs;
-use crate::config::{Paths, read_config};
+use crate::cli::{GcArgs, PruneArgs};
+use crate::config::{Paths, maintenance_lock_path, read_config};
 use crate::object_paths::{all_local_object_keys, local_object_keys_with_progress};
 use crate::operation_log::record_op;
+use crate::process_runtime::acquire_process_lock;
+use crate::queue_runtime::{event_journal_records, upload_queue_items};
 use crate::remote_store::RemoteStore;
 use crate::root_state::roots;
 use crate::snapshot_state::{current_snapshot, first_snapshots_for_roots};
-use crate::util::parse_db_time;
+use crate::util::{parse_db_time, path_to_slash, validate_local_object_key};
 use crate::{ensure_ready, export_metadata, open_db, open_remote, read_object};
 
 pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     ensure_ready(paths)?;
+    let _maintenance_lock = acquire_process_lock(&maintenance_lock_path(paths), "maintenance")?;
     let conn = open_db(paths)?;
     let plan = build_prune_plan(paths, &conn, &args)?;
     let total = plan.keep.len() + plan.delete.len();
@@ -69,8 +73,17 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
             removed.snapshot_payload_rows
         );
         println!("removed_large_pins {}", removed.large_pins);
-        if args.remote_cleanup && read_config(paths)?.remote.is_some() {
+        let remote_cleanup = args.remote_cleanup && read_config(paths)?.remote.is_some();
+        if remote_cleanup {
             println!("remote_cleanup true");
+        } else {
+            println!("remote_cleanup false");
+        }
+        // syncもmaintenance lockを取得するため、remote cleanupはDB変更と
+        // lockの解放後に実行する。connを保持したまま別プロセスを起動しない。
+        drop(conn);
+        drop(_maintenance_lock);
+        if remote_cleanup {
             crate::sync_runtime::sync_cmd(
                 paths,
                 crate::cli::SyncArgs {
@@ -79,8 +92,6 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
                     command: None,
                 },
             )?;
-        } else {
-            println!("remote_cleanup false");
         }
     }
     Ok(())
@@ -469,8 +480,10 @@ fn delete_rows_not_in(
     Ok(removed)
 }
 
-pub(crate) fn gc_cmd(paths: &Paths) -> Result<()> {
+pub(crate) fn gc_cmd(paths: &Paths, args: GcArgs) -> Result<()> {
     ensure_ready(paths)?;
+    let _maintenance_lock =
+        acquire_process_lock(&paths.home.join("locks/maintenance.lock"), "maintenance")?;
     let conn = open_db(paths)?;
     let config = read_config(paths)?;
     eprintln!("gc progress phase=metadata-export");
@@ -482,19 +495,47 @@ pub(crate) fn gc_cmd(paths: &Paths) -> Result<()> {
     let referenced = local_object_keys_with_progress(paths, &export, "referenced-objects")?
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let queued = queued_local_object_keys(paths)?;
+    let queued_count = queued.len();
+    let mut referenced = referenced;
+    referenced.extend(queued);
     eprintln!(
-        "gc progress phase=local-object-scan referenced={}",
+        "gc progress phase=local-object-scan referenced={} queued_protected={queued_count}",
         referenced.len()
     );
+    let all_objects = all_local_object_keys(paths)?;
     let mut removed = 0usize;
-    for key in all_local_object_keys(paths)? {
-        if !referenced.contains(&key) {
-            fs::remove_file(paths.home.join(&key))?;
+    let mut unreferenced_objects = 0usize;
+    let mut unreferenced_bytes = 0u64;
+    for key in &all_objects {
+        if !referenced.contains(key) {
+            unreferenced_objects += 1;
+            unreferenced_bytes = unreferenced_bytes.saturating_add(
+                fs::metadata(paths.home.join(key))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+            );
+            if args.dry_run {
+                continue;
+            }
+            fs::remove_file(paths.home.join(key))?;
             removed += 1;
             if removed.is_multiple_of(500) {
                 eprintln!("gc progress phase=remove-unreferenced removed={removed}");
             }
         }
+    }
+    if args.dry_run {
+        println!("dry_run true");
+        println!("local_object_files {}", all_objects.len());
+        println!("referenced_objects {}", referenced.len());
+        println!("queued_protected_objects {queued_count}");
+        println!("unreferenced_objects {unreferenced_objects}");
+        println!("unreferenced_bytes {unreferenced_bytes}");
+        println!("removed_unreferenced_objects 0");
+        println!("compacted_snapshot_manifests 0");
+        println!("compacted_snapshot_manifest_objects 0");
+        return Ok(());
     }
     eprintln!("gc progress phase=compact-snapshot-manifests");
     let (compacted_manifests, compacted_manifest_objects) =
@@ -512,6 +553,45 @@ pub(crate) fn gc_cmd(paths: &Paths) -> Result<()> {
     println!("compacted_snapshot_manifests {compacted_manifests}");
     println!("compacted_snapshot_manifest_objects {compacted_manifest_objects}");
     Ok(())
+}
+
+fn queued_local_object_keys(paths: &Paths) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for (_, item) in upload_queue_items(paths)? {
+        let Some(source) = item.source.as_deref() else {
+            continue;
+        };
+        let source = normalize_queue_source_path(paths, source);
+        let Ok(relative) = source.strip_prefix(&paths.home) else {
+            continue;
+        };
+        let key = path_to_slash(relative);
+        if validate_local_object_key(&key).is_ok() {
+            keys.insert(key);
+        }
+    }
+    for event in event_journal_records(paths)? {
+        for key in [
+            event.durable_payload_key.as_deref(),
+            event.durable_large_manifest_key.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if validate_local_object_key(key).is_ok() {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn normalize_queue_source_path(paths: &Paths, source: &str) -> PathBuf {
+    if source.starts_with('/') {
+        Path::new("/").join(source.trim_start_matches('/'))
+    } else {
+        paths.home.join(source)
+    }
 }
 
 fn compact_snapshot_manifest_metadata(paths: &Paths, conn: &Connection) -> Result<(usize, usize)> {

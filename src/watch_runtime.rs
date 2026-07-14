@@ -19,14 +19,13 @@ use walkdir::WalkDir;
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{
-    ForegroundDaemonRuntime, WatchDaemonLaunchConfig, child_process_exe, ensure_daemon_ipc,
-    start_daemon_ipc, start_watch_daemon,
+    ForegroundDaemonRuntime, WatchDaemonLaunchConfig, acquire_daemon_lock, child_process_exe,
+    ensure_daemon_ipc, start_daemon_ipc, start_watch_daemon,
 };
 use crate::history_runtime::refresh_runtime_health;
 use crate::operation_log::OperationOriginOverride;
 #[cfg(target_os = "linux")]
 use crate::operation_log::origin_override_from_pid;
-use crate::process_runtime::acquire_process_lock;
 use crate::queue_runtime::{
     event_journal_records, record_event, record_file_event, upload_queue_stats,
 };
@@ -51,6 +50,11 @@ pub fn default_daemon_backend() -> &'static str {
 
 pub fn default_watch_backend() -> String {
     default_daemon_backend().into()
+}
+
+fn write_active_watch_backend(paths: &Paths, backend: &str) -> Result<()> {
+    fs::create_dir_all(&paths.runtime)?;
+    crate::atomic_io::write_atomic(&paths.runtime.join("watch-backend"), backend.as_bytes())
 }
 
 pub(crate) fn default_watch_max_rss_mib() -> u64 {
@@ -83,7 +87,7 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
         println!("started daemon pid {pid}");
         return Ok(());
     }
-    let _lock = acquire_process_lock(&paths.daemon_lock, "daemon")?;
+    let _lock = acquire_daemon_lock(paths)?;
     let _runtime = ForegroundDaemonRuntime::register(paths)?;
     start_daemon_ipc(paths)?;
     match backend {
@@ -164,6 +168,7 @@ fn watch_fanotify(
     if watched == 0 {
         bail!("no active roots could be watched by fanotify");
     }
+    write_active_watch_backend(paths, "fanotify")?;
     record_event(
         paths,
         "watch-start",
@@ -180,8 +185,9 @@ fn watch_fanotify(
     )?;
     record_health(paths);
     enforce_watch_memory_guard(paths, args.max_rss_mib)?;
-    if replay_pending_journal_events(paths)? {
-        sync_current_external(paths)?;
+    let replayed_journal = replay_pending_journal_events(paths)?;
+    sync_current_external(paths, true)?;
+    if replayed_journal {
         record_health(paths);
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
@@ -292,6 +298,7 @@ fn resolve_watch_args(args: WatchArgs, config: &WatchConfig) -> Result<ResolvedW
 }
 
 fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
+    write_active_watch_backend(paths, "poll")?;
     record_event(
         paths,
         "watch-start",
@@ -329,6 +336,31 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
     if active_roots.is_empty() {
         bail!("no active roots are available to watch");
     }
+    let (tx, rx) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    if backend_label == "inotify" {
+        let watcher = notify::INotifyWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            NotifyConfig::default(),
+        )?;
+        write_active_watch_backend(paths, backend_label)?;
+        record_watch_start(paths, &args, backend_label)?;
+        return watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx);
+    }
+    let watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        NotifyConfig::default(),
+    )?;
+    write_active_watch_backend(paths, backend_label)?;
+    record_watch_start(paths, &args, backend_label)?;
+    watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx)
+}
+
+fn record_watch_start(paths: &Paths, args: &ResolvedWatchArgs, backend_label: &str) -> Result<()> {
     record_event(
         paths,
         "watch-start",
@@ -343,25 +375,7 @@ fn watch_notify(paths: &Paths, args: ResolvedWatchArgs, backend_label: &str) -> 
             args.periodic_rescan_secs,
             args.max_rss_mib
         ),
-    )?;
-    let (tx, rx) = mpsc::channel();
-    #[cfg(target_os = "linux")]
-    if backend_label == "inotify" {
-        let watcher = notify::INotifyWatcher::new(
-            move |res| {
-                let _ = tx.send(res);
-            },
-            NotifyConfig::default(),
-        )?;
-        return watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx);
-    }
-    let watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx.send(res);
-        },
-        NotifyConfig::default(),
-    )?;
-    watch_notify_loop(paths, args, backend_label, active_roots, watcher, rx)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -691,8 +705,9 @@ fn watch_notify_loop<W: Watcher>(
     }
     record_health(paths);
     enforce_watch_memory_guard(paths, args.max_rss_mib)?;
-    if replay_pending_journal_events(paths)? {
-        sync_current_external(paths)?;
+    let replayed_journal = replay_pending_journal_events(paths)?;
+    sync_current_external(paths, true)?;
+    if replayed_journal {
         record_health(paths);
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
@@ -943,7 +958,7 @@ fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
 }
 
 fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
-    sync_current_external(paths)?;
+    sync_current_external(paths, false)?;
     let before_snapshot = local_current_snapshot(paths)?;
     if std::env::var("MAJUTSU_WATCH_INLINE_SNAPSHOT").as_deref() == Ok("1") {
         snapshot(paths, args)?;
@@ -1017,7 +1032,7 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         record_watch_sync_skipped(paths, after_snapshot.as_deref())?;
         return Ok(());
     }
-    sync_current_external(paths)?;
+    sync_current_external(paths, true)?;
     Ok(())
 }
 
@@ -1046,7 +1061,9 @@ fn run_snapshot_child_with_retry(
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim().replace('\n', " ");
-        if detail.contains("snapshot already running with pid") {
+        if detail.contains("snapshot already running with pid")
+            || detail.contains("maintenance already running with pid")
+        {
             record_event(paths, "watch-snapshot-deferred", &detail)?;
             return Ok(SnapshotChildOutcome::Deferred);
         }
@@ -1102,7 +1119,7 @@ fn record_watch_sync_skipped(paths: &Paths, current: Option<&str>) -> Result<()>
     )
 }
 
-fn sync_current_external(paths: &Paths) -> Result<()> {
+fn sync_current_external(paths: &Paths, prune_after: bool) -> Result<()> {
     if read_config(paths)?.remote.is_none() {
         return Ok(());
     }
@@ -1133,7 +1150,9 @@ fn sync_current_external(paths: &Paths) -> Result<()> {
         .status()?;
     if status.success() {
         record_event(paths, "watch-sync", "external sync completed")?;
-        auto_prune_after_sync(paths)?;
+        if prune_after {
+            auto_prune_after_sync(paths)?;
+        }
     } else {
         record_event(
             paths,
@@ -1497,7 +1516,7 @@ fn enforce_watch_memory_guard(paths: &Paths, max_rss_mib: u64) -> Result<()> {
     if max_rss_mib == 0 {
         return Ok(());
     }
-    let rss_kib = self_proc_status_kib("VmRSS").unwrap_or(0);
+    let rss_kib = self_process_rss_kib().unwrap_or(0);
     if rss_kib == 0 {
         return Ok(());
     }
@@ -1513,13 +1532,31 @@ fn enforce_watch_memory_guard(paths: &Paths, max_rss_mib: u64) -> Result<()> {
     bail!("watch daemon RSS exceeded limit: {rss_kib} KiB > {limit_kib} KiB");
 }
 
-fn self_proc_status_kib(field: &str) -> Option<u64> {
+#[cfg(target_os = "linux")]
+fn self_process_rss_kib() -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     status.lines().find_map(|line| {
-        let rest = line.strip_prefix(field)?.trim_start();
+        let rest = line.strip_prefix("VmRSS")?.trim_start();
         let rest = rest.strip_prefix(':')?.trim_start();
         rest.split_whitespace().next()?.parse().ok()
     })
+}
+
+#[cfg(target_os = "macos")]
+fn self_process_rss_kib() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // macOSのru_maxrssはbyte単位。現在値が取れない場合も上限超過を安全側で検出する。
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let bytes = unsafe { usage.assume_init() }.ru_maxrss;
+    u64::try_from(bytes).ok().map(|value| value / 1024)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn self_process_rss_kib() -> Option<u64> {
+    None
 }
 
 fn record_watch_error(
@@ -1707,6 +1744,28 @@ mod tests {
         assert!(events.contains("watch-snapshot-retry"), "{events}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_child_defers_when_maintenance_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'maintenance already running with pid 42' >&2; exit 1")
+            .arg("mj-test");
+
+        let outcome = run_snapshot_child_with_retry(&paths, &mut command).unwrap();
+
+        assert_eq!(outcome, SnapshotChildOutcome::Deferred);
+        let events = fs::read_dir(paths.event_queue)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(events.contains("watch-snapshot-deferred"), "{events}");
+    }
+
     #[test]
     fn volatile_exclude_subtrees_are_not_watched() {
         let temp = tempfile::tempdir().unwrap();
@@ -1866,6 +1925,19 @@ mod tests {
         .unwrap();
 
         assert!(pending_journal_summary(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn active_watch_backend_state_survives_event_journal_compaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+
+        write_active_watch_backend(&paths, "fanotify").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(paths.runtime.join("watch-backend")).unwrap(),
+            "fanotify"
+        );
     }
 
     #[test]

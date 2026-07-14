@@ -82,13 +82,31 @@ pub(crate) fn cleanup_stale_atomic_temps(dir: &Path, min_age: Duration) -> Resul
         return Ok(0);
     }
     let mut removed = 0usize;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() || !is_atomic_temp_name(&entry.file_name()) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let is_file = match entry.file_type() {
+            Ok(file_type) => file_type.is_file(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if !is_file || !is_atomic_temp_name(&entry.file_name()) {
             continue;
         }
-        let old_enough = entry
-            .metadata()?
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let old_enough = metadata
             .modified()
             .ok()
             .and_then(|modified| modified.elapsed().ok())

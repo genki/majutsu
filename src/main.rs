@@ -175,7 +175,7 @@ use config::{
     default_large_binary_min_size, default_large_chunked_chunk_size,
     default_large_chunked_min_size, default_large_chunking, default_large_max_parallel_uploads,
     default_large_min_size, default_security_hash, default_security_key_id, encryption_enabled,
-    encryption_mode, read_config, resolve_paths, resolve_paths_with_scope,
+    encryption_mode, maintenance_lock_path, read_config, resolve_paths, resolve_paths_with_scope,
     validate_restore_archive_config, write_config,
 };
 use daemon_runtime::{apply_env_files, daemon_cmd};
@@ -290,7 +290,7 @@ fn real_main() -> Result<()> {
         Command::Key { command } => key_cmd(&paths, command),
         Command::Pack(args) => pack_cmd(&paths, args),
         Command::Prune(args) => prune_cmd(&paths, args),
-        Command::Gc => gc_cmd(&paths),
+        Command::Gc(args) => gc_cmd(&paths, args),
         Command::Fsck(args) => fsck(&paths, args),
         Command::Db { command } => db_cmd(&paths, command),
     }
@@ -485,6 +485,7 @@ fn file_size(path: &Path) -> u64 {
 fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     ensure_ready(paths)?;
     let _lock = acquire_process_lock(&paths.snapshot_lock, "snapshot")?;
+    let _maintenance_lock = acquire_process_lock(&maintenance_lock_path(paths), "maintenance")?;
     record_event(
         paths,
         "snapshot-start",

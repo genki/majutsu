@@ -1,6 +1,6 @@
 [package]
 name = "majutsu"
-version = "0.6.12"
+version = "0.6.13"
 edition = "2024"
 description = "Host-level multi-root snapshot history agent"
 license = "MIT"
@@ -22,6 +22,7 @@ include = [
     "/docs/OPERATIONS.md",
     "/docs/PLATFORM_SUPPORT.md",
     "/docs/RELEASE_CHECKLIST.md",
+    "/docs/REMOTE_BUILD.md",
     "/docs/REMOTE_AND_SECURITY.md",
     "/docs/RESTORE_TUTORIAL.md",
     "/docs/WINDOWS_EXTENDED_ATTRIBUTES.md",
@@ -69,7 +70,7 @@ libc = "0.2"
 notify = "8"
 quick-xml = "0.37"
 rand = "0.8"
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"

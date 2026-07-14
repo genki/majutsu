@@ -159,6 +159,75 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// プロセスの生存中は変化しない起動トークンを返す。
+///
+/// トークンの形式は意図的に非公開とする。Linuxでは`/proc/<pid>/stat`の
+/// 起動tick、他のUnixでは`ps`の起動時刻、Windowsではプロセス生成時刻の
+/// FILETIMEを使い、PIDの再利用を検出する。
+pub(crate) fn process_start_token(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+        // commの後の最初の値がfield 3 (state)であり、starttimeはfield 22なので、
+        // このsuffixではindex 19にあたる。
+        fields.nth(19).map(str::to_owned)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!value.is_empty()).then_some(value)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return None;
+        }
+        let value = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        return Some(value.to_string());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 pub(crate) fn terminate_process(pid: u32, timeout: Duration) -> Result<()> {
     if !pid_alive(pid) {
         return Ok(());

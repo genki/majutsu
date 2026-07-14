@@ -38,6 +38,10 @@ pub(crate) struct Paths {
     pub(crate) master_key: PathBuf,
 }
 
+pub(crate) fn maintenance_lock_path(paths: &Paths) -> PathBuf {
+    paths.home.join("locks/maintenance.lock")
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Config {
     pub(crate) host: HostConfig,

@@ -59,9 +59,15 @@ fn canonical_remote_alias(key: &str) -> Option<String> {
 }
 
 fn mj_bin() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_mj")
+    option_env!("CARGO_BIN_EXE_mj")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/mj"))
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_mj").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+                .join("debug/mj")
+        })
 }
 
 fn run_mj<I, S>(home: &Path, args: I) -> Output

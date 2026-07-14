@@ -1,5 +1,9 @@
 # release checklist
 
+コンパイル成果物をローカルに蓄積させない場合は、
+[`REMOTE_BUILD.md`](REMOTE_BUILD.md)のremote builderを利用する。cross build後も
+対象OS上でのtestは省略しない。
+
 1. ローカル completion check を実行する。
 
    ```sh

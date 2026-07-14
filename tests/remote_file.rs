@@ -6888,6 +6888,7 @@ signature_version = "s3v4"
     assert!(check.contains("secret_key_source env:AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"));
     assert!(check.contains("metadata ok"));
     assert!(check.contains("range_get 1"));
+    assert!(check.contains("objects_exact false"), "{check}");
 
     let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     server.join().unwrap();
@@ -6897,6 +6898,11 @@ signature_version = "s3v4"
             .count()
             >= 2,
         "S3 LIST was not retried after a transient 503: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|(line, _)| line.starts_with("GET ") && line.contains("prefix=majutsu%2Fv1%2F")),
+        "host prefix LIST must be scoped below the configured remote prefix: {seen:?}"
     );
     assert!(seen.iter().any(|(line, range)| line.starts_with("GET ")
         && line.contains("/range-bucket/majutsu/v1/vagrant/metadata/export.json.zst")
@@ -8139,6 +8145,52 @@ fn snapshot_lock_blocks_concurrent_snapshot_and_recovers_stale_lock() {
         c
     });
     assert!(!state.join("locks/snapshot.lock").exists());
+}
+
+#[test]
+fn maintenance_lock_blocks_concurrent_mutations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    fs::write(
+        state.join("locks/maintenance.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    for (command, dry_run) in [
+        ("prune", true),
+        ("gc", true),
+        ("sync", false),
+        ("snapshot", false),
+    ] {
+        let mut child = mj();
+        child.arg("--home").arg(&state).arg(command);
+        if dry_run {
+            child.arg("--dry-run");
+        }
+        let failed = child.output().unwrap();
+        assert!(
+            !failed.status.success(),
+            "{command} should honor maintenance lock"
+        );
+        let detail = format!(
+            "{}{}",
+            String::from_utf8_lossy(&failed.stdout),
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert!(detail.contains("maintenance already running"), "{detail}");
+    }
 }
 
 #[test]
@@ -13462,6 +13514,80 @@ fn db_compact_cli_reports_checkpoint_and_vacuum_metrics() {
 }
 
 #[test]
+fn gc_dry_run_reports_unreferenced_objects_without_deleting_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let stale = state.join("objects/blobs/ff/stale-object");
+    fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    fs::write(&stale, b"stale").unwrap();
+    let queued = state.join("objects/blobs/aa/queued-object");
+    fs::create_dir_all(queued.parent().unwrap()).unwrap();
+    fs::write(&queued, b"queued").unwrap();
+    let queue_item = state.join("queue/uploads/queued.json");
+    fs::create_dir_all(queue_item.parent().unwrap()).unwrap();
+    fs::write(
+        &queue_item,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "id": "queued",
+            "key": "vagrant/objects/blobs/aa/queued-object",
+            "source": queued.display().to_string(),
+            "inline": null,
+            "created_at": "2026-07-14T00:00:00Z",
+            "attempts": 0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let dry_run = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc").arg("--dry-run");
+        c
+    });
+    assert!(dry_run.contains("dry_run true"), "{dry_run}");
+    assert!(dry_run.contains("unreferenced_objects 1"), "{dry_run}");
+    assert!(dry_run.contains("unreferenced_bytes 5"), "{dry_run}");
+    assert!(dry_run.contains("queued_protected_objects 1"), "{dry_run}");
+    assert!(stale.exists());
+    assert!(queued.exists());
+
+    let gc = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("gc");
+        c
+    });
+    assert!(gc.contains("removed_unreferenced_objects 1"), "{gc}");
+    assert!(!stale.exists());
+    assert!(queued.exists());
+    assert!(queue_item.exists());
+}
+
+#[test]
 fn operations_are_appended_to_local_oplog() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -17532,7 +17658,7 @@ fn state_does_not_use_viewer_when_tty_output_fits_terminal_height() {
 
     let pty_output = tmp.path().join("state-short-pty.out");
     let command = format!(
-        "env MAJUTSU_AUTO_DAEMON=0 LINES=24 COLUMNS=100 TERM=xterm-256color {} --home {} state",
+        "env MAJUTSU_AUTO_DAEMON=0 NO_COLOR=1 LINES=24 COLUMNS=100 TERM=xterm-256color {} --home {} state",
         shell_quote(env!("CARGO_BIN_EXE_mj")),
         shell_quote_path(&state),
     );
@@ -21270,6 +21396,65 @@ fn watch_skips_followup_sync_when_event_snapshot_is_noop() {
 }
 
 #[test]
+fn watch_does_not_auto_prune_twice_for_one_noop_rescan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("watch")
+            .arg("--once")
+            .arg("--backend")
+            .arg("notify")
+            .arg("--periodic-rescan-secs")
+            .arg("1");
+        c
+    });
+
+    let events = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(events.matches("watch-prune").count(), 1, "{events}");
+}
+
+#[test]
 fn watch_uses_configured_timing_defaults() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -21701,6 +21886,85 @@ fn notify_watch_replay_syncs_current_snapshot_when_remote_is_configured() {
 }
 
 #[test]
+fn notify_watch_startup_syncs_local_current_without_pending_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("--wait")
+            .arg("--timeout-secs")
+            .arg("60");
+        c
+    });
+
+    fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("watch")
+            .arg("--once")
+            .arg("--backend")
+            .arg("notify")
+            .arg("--periodic-rescan-secs")
+            .arg("1");
+        c
+    });
+
+    assert_eq!(
+        db_remote_ref_value(
+            &state,
+            &format!(
+                "{}/refs/current",
+                first_remote_host_dir(&remote)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+            )
+        ),
+        db_ref(&state, "current")
+    );
+}
+
+#[test]
 fn daemon_service_renders_systemd_and_launchd_configs() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
@@ -21911,6 +22175,61 @@ fn daemon_doctor_and_restart_clean_stale_pid() {
     assert!(status.contains("running pid") || status.contains("ipc ok"));
     run({
         let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("daemon").arg("stop");
+        c
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_start_does_not_trust_an_alive_unrelated_pid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    fs::create_dir_all(state.join("runtime")).unwrap();
+    // このテストプロセスは生存しているが、対象homeのwatch daemonではない。
+    fs::write(
+        state.join("runtime/daemon.pid"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(state.join("locks")).unwrap();
+    fs::write(
+        state.join("locks/daemon.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    let started = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("daemon")
+            .arg("start")
+            .arg("--backend")
+            .arg("notify");
+        c
+    });
+    assert!(started.contains("started daemon pid"), "{started}");
+    run({
+        let mut c = mj();
         c.arg("--home").arg(&state).arg("daemon").arg("stop");
         c
     });
@@ -22524,7 +22843,7 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
     }
     fs::write(source.join("alpha.txt"), b"daemon captured\n").unwrap();
     let mut captured = false;
-    for _ in 0..100 {
+    for _ in 0..400 {
         if db_ref(&state, "current").is_some() {
             captured = true;
             break;
@@ -22690,7 +23009,7 @@ fn daemon_watch_snapshot_survives_sync_retry_and_remote_recovery() {
     }
     fs::write(source.join("alpha.txt"), b"daemon retry captured\n").unwrap();
     let mut captured = false;
-    for _ in 0..100 {
+    for _ in 0..400 {
         if db_ref(&state, "current").is_some() {
             captured = true;
             break;
@@ -22856,7 +23175,7 @@ fn daemon_watch_large_snapshot_sync_clone_restore_preserves_chunks() {
     payload.extend(vec![5u8; 4096]);
     fs::write(source.join("payload.bin"), &payload).unwrap();
     let mut captured = false;
-    for _ in 0..100 {
+    for _ in 0..400 {
         if db_ref(&state, "current").is_some() {
             captured = true;
             break;

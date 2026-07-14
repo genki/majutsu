@@ -104,9 +104,9 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
             println!("hosts 0");
         }
         RemoteCommand::Check => {
-            let keys = remote.list("")?;
             println!("remote {}", remote.describe());
-            println!("objects {}", keys.len());
+            println!("objects not-scanned");
+            println!("objects_exact false");
             let index = read_remote_host_index(&remote)?;
             println!("hosts {}", index.hosts.len());
             let Some(host) = index
@@ -924,10 +924,8 @@ fn remote_repair_summary(
             if verbose {
                 println!("repaired {key} -> {remote_key}");
             }
-        } else {
-            if verbose {
-                println!("already_present {key} -> {remote_key}");
-            }
+        } else if verbose {
+            println!("already_present {key} -> {remote_key}");
         }
     }
     if verbose && scan.timed_out {
@@ -1506,32 +1504,24 @@ fn read_large_manifest_for_explain(paths: &Paths, key: &str) -> Result<LargeMani
 
 pub(crate) fn read_remote_host_index(remote: &RemoteStore) -> Result<RemoteHostIndex> {
     let mut index = RemoteHostIndex::empty(Utc::now());
-    let keys = remote.list("")?;
-    let mut host_ids = BTreeSet::new();
-    for key in keys {
-        let Some((host_id, rest)) = key.split_once('/') else {
+    let host_prefixes = remote.list_common_prefixes("")?;
+    for host_prefix in host_prefixes {
+        let host_id = host_prefix.trim_end_matches('/');
+        if host_id.is_empty() {
             continue;
-        };
-        if rest == "metadata/export.json.zst" || rest == "metadata/export.json" {
-            host_ids.insert(host_id.to_string());
         }
-    }
-    for host_id in host_ids {
         let compressed_key = format!("{host_id}/metadata/export.json.zst");
         let plain_key = format!("{host_id}/metadata/export.json");
-        let Some((metadata_key, bytes)) = remote
-            .get_optional(&compressed_key)?
-            .map(|bytes| (compressed_key.clone(), bytes))
-            .or_else(|| {
-                remote
-                    .get_optional(&plain_key)
-                    .ok()
-                    .flatten()
-                    .map(|bytes| (plain_key.clone(), bytes))
-            })
-        else {
-            continue;
+        let (metadata_key, bytes) = match remote.get_optional(&compressed_key)? {
+            Some(bytes) => (compressed_key, bytes),
+            None => match remote.get_optional(&plain_key)? {
+                Some(bytes) => (plain_key, bytes),
+                None => continue,
+            },
         };
+        if metadata_key.is_empty() {
+            continue;
+        }
         let metadata_bytes = decode_remote_metadata_bytes(&metadata_key, &bytes)?;
         let export: MetadataExport = serde_json::from_slice(&metadata_bytes)
             .with_context(|| format!("parse remote host metadata {metadata_key}"))?;

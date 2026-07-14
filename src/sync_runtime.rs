@@ -27,7 +27,7 @@ use crate::cache_runtime::{
     remote_payload_key_index, remote_payload_key_index_for_host,
 };
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
-use crate::config::{Config, MetadataExport, Paths, read_config};
+use crate::config::{Config, MetadataExport, Paths, maintenance_lock_path, read_config};
 use crate::db_refs::{
     persist_export_remote_refs, prune_remote_refs_for_host, ref_value, restore_ref_value,
     set_ref_value, set_remote_ref_value,
@@ -317,6 +317,8 @@ fn sync_configured_remote(
     let trace = SyncTrace::new();
     let _lock = acquire_process_lock(&paths.sync_lock, "sync")?;
     trace.mark("lock");
+    let _maintenance_lock = acquire_process_lock(&maintenance_lock_path(paths), "maintenance")?;
+    trace.mark("maintenance lock");
     auto_pack_before_sync(paths, conn)?;
     trace.mark("auto pack");
     let current = current_snapshot(conn)?;

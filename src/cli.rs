@@ -731,7 +731,7 @@ pub(crate) enum Command {
     #[command(about = "Prune old history according to retention settings")]
     Prune(PruneArgs),
     #[command(about = "Remove unreferenced local loose objects")]
-    Gc,
+    Gc(GcArgs),
     #[command(about = "Check local metadata, objects, queues, and refs")]
     Fsck(FsckArgs),
     #[command(about = "Inspect or compact the local filesystem event journal")]
@@ -750,6 +750,16 @@ pub(crate) enum Command {
 pub(crate) struct VersionArgs {
     #[arg(long, default_value_t = false, help = "Print machine-readable JSON")]
     pub(crate) json: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct GcArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Report unreferenced local objects without deleting them"
+    )]
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Args)]

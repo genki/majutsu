@@ -98,6 +98,12 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let event_count = event_records.len();
     let pending_event_count = pending_journal_event_count(&event_records);
     let watch_attribution_issue = watch_attribution_issue(&event_records);
+    let effective_watch_backend = effective_watch_backend(
+        paths,
+        config.watch.backend.as_str(),
+        &event_records,
+        daemon.state == DaemonHealthState::Running,
+    );
     let remote_journal_stats = remote_event_journal_stats(paths)?;
 
     let health = build_health_report(HealthInputs {
@@ -233,6 +239,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
             ],
             ["security", "hash", config.security.hash.as_str()],
             ["watch", "backend", config.watch.backend.as_str()],
+            ["watch", "backend-effective", &effective_watch_backend],
             ["watch", "mode", config.watch.mode.as_str()],
             [
                 "watch",
@@ -291,136 +298,128 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     writeln!(output, "{}", ui.heading("Roots")).expect("write status output");
     if roots.is_empty() {
         writeln!(output, "  (none)").expect("write status output");
+    } else if width < 64 {
+        let root_rows = roots
+            .iter()
+            .map(|root| {
+                let state = if root.status == "active" && !root.path.exists() {
+                    "missing".to_string()
+                } else {
+                    root.status.clone()
+                };
+                let current_root = current_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.root_trees.get(&root.id));
+                [
+                    root.id.clone(),
+                    state,
+                    current_root
+                        .map(|root_tree| root_tree.file_count.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    current_root
+                        .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
+                        .unwrap_or_else(|| "-".into()),
+                    root.path.display().to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let root_row_refs = root_rows
+            .iter()
+            .map(|row| {
+                [
+                    row[0].as_str(),
+                    row[1].as_str(),
+                    row[2].as_str(),
+                    row[3].as_str(),
+                    row[4].as_str(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(
+            &mut output,
+            width,
+            &["ID", "STATUS", "FILES", "TREE", "PATH"],
+            &root_row_refs,
+        );
     } else {
-        if width < 64 {
-            let root_rows = roots
-                .iter()
-                .map(|root| {
-                    let state = if root.status == "active" && !root.path.exists() {
-                        "missing".to_string()
-                    } else {
-                        root.status.clone()
-                    };
-                    let current_root = current_manifest
+        let root_rows = roots
+            .iter()
+            .map(|root| {
+                let state = if root.status == "active" && !root.path.exists() {
+                    "missing".to_string()
+                } else {
+                    root.status.clone()
+                };
+                let current_root = current_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.root_trees.get(&root.id));
+                Ok([
+                    root.id.clone(),
+                    state,
+                    root.degraded
                         .as_ref()
-                        .and_then(|manifest| manifest.root_trees.get(&root.id));
-                    [
-                        root.id.clone(),
-                        state,
-                        current_root
-                            .map(|root_tree| root_tree.file_count.to_string())
-                            .unwrap_or_else(|| "-".into()),
-                        current_root
-                            .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
-                            .unwrap_or_else(|| "-".into()),
-                        root.path.display().to_string(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            let root_row_refs = root_rows
-                .iter()
-                .map(|row| {
-                    [
-                        row[0].as_str(),
-                        row[1].as_str(),
-                        row[2].as_str(),
-                        row[3].as_str(),
-                        row[4].as_str(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            print_table(
-                &mut output,
-                width,
-                &["ID", "STATUS", "FILES", "TREE", "PATH"],
-                &root_row_refs,
-            );
-        } else {
-            let root_rows = roots
-                .iter()
-                .map(|root| {
-                    let state = if root.status == "active" && !root.path.exists() {
-                        "missing".to_string()
-                    } else {
-                        root.status.clone()
-                    };
-                    let current_root = current_manifest
-                        .as_ref()
-                        .and_then(|manifest| manifest.root_trees.get(&root.id));
-                    Ok([
-                        root.id.clone(),
-                        state,
-                        root.degraded
-                            .as_ref()
-                            .map(|degraded| {
-                                format!(
-                                    "{} {}",
-                                    degraded.kind,
-                                    compact_timestamp(&degraded.at.to_rfc3339())
-                                )
-                            })
-                            .unwrap_or_else(|| "-".into()),
-                        current_root
-                            .map(|root_tree| root_tree.file_count.to_string())
-                            .unwrap_or_else(|| "-".into()),
-                        current_root
-                            .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
-                            .unwrap_or_else(|| "-".into()),
-                        current
-                            .as_deref()
-                            .zip(current_root)
-                            .map(|(current_id, root_tree)| {
-                                root_last_change(
-                                    paths,
-                                    &conn,
-                                    current_id,
-                                    &root.id,
-                                    &root_tree.tree_id,
-                                )
+                        .map(|degraded| {
+                            format!(
+                                "{} {}",
+                                degraded.kind,
+                                compact_timestamp(&degraded.at.to_rfc3339())
+                            )
+                        })
+                        .unwrap_or_else(|| "-".into()),
+                    current_root
+                        .map(|root_tree| root_tree.file_count.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    current_root
+                        .map(|root_tree| shorten_middle(&root_tree.tree_id, 18))
+                        .unwrap_or_else(|| "-".into()),
+                    current
+                        .as_deref()
+                        .zip(current_root)
+                        .map(|(current_id, root_tree)| {
+                            root_last_change(paths, &conn, current_id, &root.id, &root_tree.tree_id)
                                 .map(|change| change.changed_at)
-                            })
-                            .transpose()?
-                            .map(|changed_at| compact_timestamp(&changed_at))
-                            .unwrap_or_else(|| "-".into()),
-                        current_root
-                            .map(|root_tree| {
-                                root_remote_sync_label(
-                                    remote_head.root_acks.get(&root.id),
-                                    remote_manifest.as_ref(),
-                                    &root.id,
-                                    &root_tree.tree_id,
-                                    remote_head.remote_last_synced.as_deref(),
-                                )
-                            })
-                            .unwrap_or_else(|| "-".into()),
-                        root.path.display().to_string(),
-                    ])
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let root_row_refs = root_rows
-                .iter()
-                .map(|row| {
-                    [
-                        row[0].as_str(),
-                        row[1].as_str(),
-                        row[2].as_str(),
-                        row[3].as_str(),
-                        row[4].as_str(),
-                        row[5].as_str(),
-                        row[6].as_str(),
-                        row[7].as_str(),
-                    ]
-                })
-                .collect::<Vec<_>>();
-            print_table(
-                &mut output,
-                width,
-                &[
-                    "ID", "STATUS", "ISSUE", "FILES", "TREE", "CHANGED", "REMOTE", "PATH",
-                ],
-                &root_row_refs,
-            );
-        }
+                        })
+                        .transpose()?
+                        .map(|changed_at| compact_timestamp(&changed_at))
+                        .unwrap_or_else(|| "-".into()),
+                    current_root
+                        .map(|root_tree| {
+                            root_remote_sync_label(
+                                remote_head.root_acks.get(&root.id),
+                                remote_manifest.as_ref(),
+                                &root.id,
+                                &root_tree.tree_id,
+                                remote_head.remote_last_synced.as_deref(),
+                            )
+                        })
+                        .unwrap_or_else(|| "-".into()),
+                    root.path.display().to_string(),
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let root_row_refs = root_rows
+            .iter()
+            .map(|row| {
+                [
+                    row[0].as_str(),
+                    row[1].as_str(),
+                    row[2].as_str(),
+                    row[3].as_str(),
+                    row[4].as_str(),
+                    row[5].as_str(),
+                    row[6].as_str(),
+                    row[7].as_str(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(
+            &mut output,
+            width,
+            &[
+                "ID", "STATUS", "ISSUE", "FILES", "TREE", "CHANGED", "REMOTE", "PATH",
+            ],
+            &root_row_refs,
+        );
     }
     writeln!(output).expect("write status output");
 
@@ -4125,6 +4124,37 @@ fn watch_attribution_issue(records: &[crate::majutsu_db::EventJournalRecord]) ->
     }
 }
 
+fn effective_watch_backend(
+    paths: &Paths,
+    configured: &str,
+    records: &[crate::majutsu_db::EventJournalRecord],
+    daemon_running: bool,
+) -> String {
+    if daemon_running && let Ok(backend) = fs::read_to_string(paths.runtime.join("watch-backend")) {
+        let backend = backend.trim();
+        if matches!(backend, "fanotify" | "inotify" | "notify" | "poll") {
+            return backend.to_string();
+        }
+    }
+    let Some(latest_watch_event) = records
+        .iter()
+        .filter(|event| matches!(event.kind.as_str(), "watch-start" | "watch-backend-error"))
+        .max_by_key(|event| event.observed_at)
+    else {
+        return configured.to_string();
+    };
+    let backend = latest_watch_event
+        .detail
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("backend="))
+        .unwrap_or(configured);
+    if latest_watch_event.kind == "watch-backend-error" {
+        format!("{backend} (error)")
+    } else {
+        backend.to_string()
+    }
+}
+
 #[derive(Serialize)]
 struct StateBranch {
     name: String,
@@ -7086,10 +7116,12 @@ fn print_snapshot_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        LogProducerMessage, StateStreamMode, prefetch_state_lines_for_viewer,
-        read_remote_root_acks, should_page_status_with_tty, state_lines_need_viewer,
-        truncate_for_terminal,
+        LogProducerMessage, StateStreamMode, effective_watch_backend,
+        prefetch_state_lines_for_viewer, read_remote_root_acks, should_page_status_with_tty,
+        state_lines_need_viewer, truncate_for_terminal,
     };
+    use crate::majutsu_db::EventJournalRecord;
+    use chrono::{TimeZone, Utc};
     use rusqlite::{Connection, params};
     use std::sync::mpsc;
     use std::thread;
@@ -7104,6 +7136,40 @@ mod tests {
         assert!(should_page_status_with_tty(tall, 2, false, true));
         assert!(!should_page_status_with_tty(tall, 2, false, false));
         assert!(should_page_status_with_tty(short, 100, true, false));
+    }
+
+    #[test]
+    fn status_reports_effective_watch_backend_from_latest_event() {
+        let event = EventJournalRecord::new(
+            "event-1".into(),
+            "watch-start".into(),
+            Utc.timestamp_opt(1, 0).single().unwrap(),
+            "backend=fanotify mode=watch".into(),
+        );
+
+        let paths =
+            crate::config::resolve_paths(Some(tempfile::tempdir().unwrap().path().into())).unwrap();
+        assert_eq!(
+            effective_watch_backend(&paths, "inotify", &[event], false),
+            "fanotify"
+        );
+    }
+
+    #[test]
+    fn status_prefers_live_watch_backend_after_event_compaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::config::resolve_paths(Some(temp.path().into())).unwrap();
+        std::fs::create_dir_all(&paths.runtime).unwrap();
+        std::fs::write(paths.runtime.join("watch-backend"), "fanotify\n").unwrap();
+
+        assert_eq!(
+            effective_watch_backend(&paths, "inotify", &[], true),
+            "fanotify"
+        );
+        assert_eq!(
+            effective_watch_backend(&paths, "inotify", &[], false),
+            "inotify"
+        );
     }
 
     #[test]

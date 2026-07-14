@@ -6,7 +6,9 @@ target_dir="${CARGO_TARGET_DIR:-target}"
 dist_dir="${MAJUTSU_DIST_DIR:-${target_dir}/dist}"
 mkdir -p "$dist_dir"
 
-if [[ "$mode" == "dev" ]]; then
+if [[ -n "${MAJUTSU_PREBUILT_BIN:-}" ]]; then
+  bin="$MAJUTSU_PREBUILT_BIN"
+elif [[ "$mode" == "dev" ]]; then
   MAJUTSU_DEV_BUILD=1 cargo build --locked
   bin="$target_dir/debug/mj"
 elif [[ "$mode" == "smoke" ]]; then
@@ -24,7 +26,7 @@ fi
 
 version="$($bin --version | awk '{print $2}')"
 package_version="${version/+/-}"
-platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+platform="${MAJUTSU_PACKAGE_PLATFORM:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}"
 stage="${dist_dir}/majutsu-${package_version}-${platform}"
 rm -rf "$stage"
 mkdir -p "$stage"
