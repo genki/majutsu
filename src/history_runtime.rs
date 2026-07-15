@@ -67,7 +67,13 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let conn = crate::open_db(paths)?;
     let config = read_config(paths)?;
     let roots = roots(&conn)?;
-    let auto_daemon_result = ensure_daemon_running(paths);
+    // status は診断コマンドなので、明示指定がない限り daemon を起動しない。
+    // 起動は root add や system service に任せ、停止状態を隠さない。
+    let auto_daemon_result = if args.start_daemon {
+        ensure_daemon_running(paths)
+    } else {
+        Ok(None)
+    };
     let auto_daemon_started = matches!(auto_daemon_result, Ok(Some(_)));
     let auto_daemon_error = auto_daemon_result.err().map(|err| format!("{err:#}"));
     let remote = read_remote_status(&config)?;

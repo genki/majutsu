@@ -1969,7 +1969,7 @@ fn print_sync_status(status: &SyncStatusSnapshot) {
     }
 }
 
-fn metadata_export_json_for_remote(
+pub(crate) fn metadata_export_json_for_remote(
     remote: &RemoteStore,
     export: &MetadataExport,
 ) -> Result<Vec<u8>> {
@@ -2042,7 +2042,10 @@ fn compact_manifest_json_fields(value: &mut serde_json::Value) {
     }
 }
 
-fn encode_canonical_remote_export<T: Serialize>(paths: &Paths, value: &T) -> Result<Vec<u8>> {
+pub(crate) fn encode_canonical_remote_export<T: Serialize>(
+    paths: &Paths,
+    value: &T,
+) -> Result<Vec<u8>> {
     let cbor = serde_cbor::to_vec(value)?;
     let compressed = zstd::stream::encode_all(cbor.as_slice(), 3)?;
     encode_object(paths, &compressed)

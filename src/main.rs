@@ -2337,7 +2337,7 @@ fn restore_prefetch_parallelism() -> usize {
         .unwrap_or(32)
 }
 
-fn canonical_remote_object_to_local_bytes(
+pub(crate) fn canonical_remote_object_to_local_bytes(
     paths: &Paths,
     key: &str,
     bytes: &[u8],

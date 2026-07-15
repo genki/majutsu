@@ -993,6 +993,12 @@ pub(crate) struct StatusArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Start the watch daemon before displaying status; status is read-only by default"
+    )]
+    pub(crate) start_daemon: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         conflicts_with = "pager",
         help = "Print directly without using a pager even when output is taller than the terminal"
     )]
@@ -1819,6 +1825,23 @@ pub(crate) enum RemoteCommand {
     Capabilities,
     #[command(about = "List hosts published in the shared remote backend")]
     Hosts,
+    #[command(
+        name = "migrate-legacy",
+        about = "Copy one pre-v0.6 host layout into the current host-prefix layout"
+    )]
+    MigrateLegacy {
+        #[arg(
+            long,
+            help = "Legacy host id or host name; required when the legacy remote has multiple hosts"
+        )]
+        host: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Show the migration plan without writing destination objects"
+        )]
+        dry_run: bool,
+    },
     #[command(about = "Inspect one remote host timeline")]
     Host {
         #[arg(help = "Remote host id or unambiguous host name")]

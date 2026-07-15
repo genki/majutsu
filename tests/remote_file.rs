@@ -869,6 +869,98 @@ fn existing_encrypted_state_repairs_age_keyring_permissions() {
     );
 }
 
+#[test]
+fn remote_migrate_legacy_host_layout_copies_metadata_to_named_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    let metadata = read_remote_metadata(&remote);
+    let host_id = metadata["config"]["host"]["id"].as_str().unwrap();
+    let host_name = metadata["config"]["host"]["name"].as_str().unwrap();
+    let old_host = first_remote_host_dir(&remote);
+    let old_prefix = remote.join("hosts").join(host_id);
+    fs::create_dir_all(&old_prefix).unwrap();
+    for entry in walkdir::WalkDir::new(&old_host)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let relative = entry.path().strip_prefix(&old_host).unwrap();
+        let destination = old_prefix.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::rename(entry.path(), destination).unwrap();
+    }
+    fs::remove_dir_all(&old_host).unwrap();
+    assert!(
+        remote
+            .join("hosts")
+            .join(host_id)
+            .join("metadata/export.json")
+            .exists()
+    );
+
+    let migrated = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("remote")
+            .arg("migrate-legacy")
+            .arg("--host")
+            .arg(host_name);
+        c
+    });
+    assert!(migrated.contains("target_prefix"), "{migrated}");
+    assert!(remote.join(host_name).join("metadata/export.json").exists());
+    assert!(
+        remote
+            .join("hosts")
+            .join(host_id)
+            .join("metadata/export.json")
+            .exists()
+    );
+
+    let hosts = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("remote").arg("hosts");
+        c
+    });
+    assert!(hosts.contains(host_name), "{hosts}");
+}
+
 fn root_list_has(root_list: &str, id: &str, status: &str) -> bool {
     root_list.lines().any(|line| {
         let mut columns = line.split_whitespace();
@@ -20839,7 +20931,10 @@ fn status_restarts_stale_daemon_for_active_roots() {
     fs::write(state.join("runtime/daemon.pid"), b"99999999").unwrap();
     let status = output({
         let mut c = mj_auto();
-        c.arg("--home").arg(&state).arg("status");
+        c.arg("--home")
+            .arg(&state)
+            .arg("status")
+            .arg("--start-daemon");
         c
     });
     assert!(status.contains("Daemon"), "{status}");
@@ -20850,6 +20945,112 @@ fn status_restarts_stale_daemon_for_active_roots() {
         c.arg("--home").arg(&state).arg("daemon").arg("stop");
         c
     });
+}
+
+#[test]
+fn status_is_read_only_and_does_not_start_daemon_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+
+    let status = output({
+        let mut c = mj_auto();
+        c.arg("--home").arg(&state).arg("status");
+        c
+    });
+    assert!(status.contains("Daemon"), "{status}");
+    assert!(!status.contains("auto-start failed"), "{status}");
+    assert!(!state.join("runtime/daemon.pid").exists(), "{status}");
+}
+
+#[test]
+fn read_only_diagnostics_do_not_start_daemon_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    for (name, args) in [
+        ("fsck", vec!["fsck", "--quick"]),
+        ("sync-status", vec!["sync", "status"]),
+        ("remote-check", vec!["remote", "check"]),
+        (
+            "remote-repair-dry-run",
+            vec!["remote", "repair", "--dry-run", "--sample", "1"],
+        ),
+    ] {
+        let mut command = mj_auto();
+        command
+            .env_remove("MAJUTSU_AUTO_DAEMON")
+            .arg("--home")
+            .arg(&state)
+            .args(args);
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{name} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            !state.join("runtime/daemon.pid").exists(),
+            "{name} created a daemon pid file"
+        );
+        assert!(
+            !state.join("runtime/daemon.sock").exists(),
+            "{name} created a daemon socket"
+        );
+    }
 }
 
 #[test]

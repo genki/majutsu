@@ -301,6 +301,22 @@ physically shared across host boundaries. If the bucket is also used for other
 purposes, pass a path in the S3 URL such as `s3://bucket/path-to-mj`; Majutsu
 then treats `path-to-mj/` as the remote root.
 
+host-prefix 導入前の旧 hosts/<uuid>/... または metadata/export.json* レイアウトは
+自動フォールバックしません。既存 remote を段階的に移行する場合は、対象 host
+を明示して新しい名前付き prefix へコピーします。旧データは検証が終わるまで
+残ります。
+
+```sh
+mj remote migrate-legacy --host vagrant --dry-run
+mj remote migrate-legacy --host vagrant
+mj remote check
+```
+
+複数 host の旧 metadata がある場合は --host が必須です。移行コマンドは
+metadata、timeline/ref、参照される content object を新 prefix にコピーする
+だけで、旧 prefix や旧 global object は削除しません。mj remote check と
+clone/restore の検証後に、旧データを backend の運用手順で削除してください。
+
 Pause and resume roots:
 
 ```sh

@@ -240,6 +240,9 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                 );
             }
         }
+        RemoteCommand::MigrateLegacy { host, dry_run } => {
+            migrate_legacy_remote(paths, &remote, host.as_deref(), dry_run)?;
+        }
         RemoteCommand::Host {
             id,
             snapshots,
@@ -1571,6 +1574,555 @@ fn print_remote_host_operations(export: &MetadataExport) {
     }
 }
 
+#[derive(Debug)]
+struct LegacyRemoteHost {
+    id: String,
+    name: String,
+    metadata_key: String,
+    source_prefix: Option<String>,
+    export: MetadataExport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyMigrationItem {
+    source: String,
+    logical_key: Option<String>,
+}
+
+fn migrate_legacy_remote(
+    paths: &Paths,
+    remote: &RemoteStore,
+    selector: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let candidates = discover_legacy_remote_hosts(remote)?;
+    let host = select_legacy_remote_host(candidates, selector)?;
+    let target_prefix = remote_host_label(&host.name);
+    let metadata_json = crate::sync_runtime::metadata_export_json_for_remote(remote, &host.export)?;
+    let metadata_destination =
+        legacy_metadata_destination(matches!(remote, RemoteStore::S3(_)), &target_prefix);
+    let metadata_bytes = if matches!(remote, RemoteStore::S3(_)) {
+        zstd::stream::encode_all(metadata_json.as_slice(), 3)?
+    } else {
+        metadata_json
+    };
+
+    let mut items = BTreeMap::<String, LegacyMigrationItem>::new();
+    add_legacy_migration_item(
+        &mut items,
+        host.metadata_key.clone(),
+        metadata_destination.clone(),
+        None,
+    )?;
+
+    // 旧 host prefix にある timeline/ref/config は、同じ相対パスで新 prefix へ移す。
+    if let Some(source_prefix) = &host.source_prefix {
+        for source in remote.list(source_prefix)? {
+            if source == host.metadata_key {
+                continue;
+            }
+            let Some(relative) = source.strip_prefix(source_prefix) else {
+                continue;
+            };
+            if relative.is_empty()
+                || relative == "metadata/export.json"
+                || relative == "metadata/export.json.zst"
+            {
+                continue;
+            }
+            let destination = host_remote_key(&target_prefix, relative);
+            add_legacy_migration_item(&mut items, source, destination, None)?;
+        }
+    }
+
+    let content_keys = legacy_remote_content_keys(paths, remote, &host)?;
+    for key in content_keys {
+        let (source, destination_relative) = resolve_legacy_content_source(remote, &host, &key)?;
+        let destination = if matches!(remote, RemoteStore::S3(_)) {
+            host_remote_key(&target_prefix, &destination_relative)
+        } else {
+            destination_relative
+        };
+        add_legacy_migration_item(&mut items, source, destination, Some(key))?;
+    }
+
+    let snapshot_manifest_keys = host
+        .export
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.manifest_key.as_str())
+        .collect::<BTreeSet<_>>();
+    println!("remote {}", remote.describe());
+    println!("legacy_host_id {}", host.id);
+    println!("legacy_host_name {}", host.name);
+    println!("legacy_metadata {}", host.metadata_key);
+    println!("target_prefix {target_prefix}");
+    println!("migration_items {}", items.len());
+    println!("dry_run {dry_run}");
+
+    let mut copied = 0usize;
+    let mut existing = 0usize;
+    for (destination, item) in items {
+        let source = item.source;
+        let mut bytes = if source == host.metadata_key {
+            metadata_bytes.clone()
+        } else {
+            remote
+                .get_optional(&source)?
+                .ok_or_else(|| anyhow!("legacy migration source is missing: {source}"))?
+        };
+        if matches!(remote, RemoteStore::S3(_))
+            && let Some(logical_key) = item.logical_key.as_deref()
+            && (snapshot_manifest_keys.contains(logical_key)
+                || legacy_structured_alias(logical_key))
+        {
+            bytes = encode_legacy_canonical_content(
+                paths,
+                logical_key,
+                &source,
+                &bytes,
+                snapshot_manifest_keys.contains(logical_key),
+            )?;
+        }
+        if dry_run {
+            println!("migration_item {source} -> {destination}");
+            continue;
+        }
+        if destination == source {
+            existing += 1;
+            continue;
+        }
+        if remote.exists(&destination)? {
+            let current = remote.get(&destination)?;
+            if current != bytes {
+                bail!(
+                    "legacy migration destination differs from source: {destination}; remove it or use a separate remote prefix"
+                );
+            }
+            existing += 1;
+            continue;
+        }
+        remote.put(&destination, &bytes)?;
+        copied += 1;
+        println!("migrated {source} -> {destination}");
+    }
+    if !dry_run {
+        println!("copied {copied}");
+        println!("already_present {existing}");
+        println!(
+            "next: run mj remote check, then remove the old {} prefix and old global objects after verification",
+            host.source_prefix.as_deref().unwrap_or("metadata")
+        );
+    }
+    Ok(())
+}
+
+fn discover_legacy_remote_hosts(remote: &RemoteStore) -> Result<Vec<LegacyRemoteHost>> {
+    let mut hosts = Vec::new();
+    for key in remote.list("hosts/")? {
+        if !key.ends_with("/metadata/export.json") && !key.ends_with("/metadata/export.json.zst") {
+            continue;
+        }
+        let bytes = remote
+            .get(&key)
+            .with_context(|| format!("read legacy host metadata {key}"))?;
+        let decoded = decode_remote_metadata_bytes(&key, &bytes)?;
+        let export: MetadataExport = serde_json::from_slice(&decoded)
+            .with_context(|| format!("parse legacy host metadata {key}"))?;
+        let prefix = key
+            .strip_suffix("metadata/export.json.zst")
+            .or_else(|| key.strip_suffix("metadata/export.json"))
+            .map(str::to_string);
+        hosts.push(LegacyRemoteHost {
+            id: export.config.host.id.clone(),
+            name: export.config.host.name.clone(),
+            metadata_key: key,
+            source_prefix: prefix,
+            export,
+        });
+    }
+    for key in ["metadata/export.json.zst", "metadata/export.json"] {
+        let Some(bytes) = remote.get_optional(key)? else {
+            continue;
+        };
+        let decoded = decode_remote_metadata_bytes(key, &bytes)?;
+        let export: MetadataExport = serde_json::from_slice(&decoded)
+            .with_context(|| format!("parse legacy metadata {key}"))?;
+        hosts.push(LegacyRemoteHost {
+            id: export.config.host.id.clone(),
+            name: export.config.host.name.clone(),
+            metadata_key: key.to_string(),
+            source_prefix: None,
+            export,
+        });
+        break;
+    }
+    hosts.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then_with(|| a.metadata_key.cmp(&b.metadata_key))
+    });
+    hosts.dedup_by(|a, b| a.metadata_key == b.metadata_key);
+    Ok(hosts)
+}
+
+fn legacy_metadata_destination(s3: bool, host_prefix: &str) -> String {
+    let key = host_metadata_key(host_prefix);
+    if s3 { format!("{key}.zst") } else { key }
+}
+
+fn select_legacy_remote_host(
+    hosts: Vec<LegacyRemoteHost>,
+    selector: Option<&str>,
+) -> Result<LegacyRemoteHost> {
+    if hosts.is_empty() {
+        bail!("legacy remote metadata was not found under metadata/ or hosts/");
+    }
+    if let Some(selector) = selector {
+        let matches = hosts
+            .into_iter()
+            .filter(|host| host.id == selector || host.name == selector)
+            .collect::<Vec<_>>();
+        return match matches.len() {
+            1 => Ok(matches.into_iter().next().expect("one matching host")),
+            0 => bail!("legacy remote host not found: {selector}"),
+            _ => bail!("legacy remote host selector is ambiguous: {selector}"),
+        };
+    }
+    match hosts.len() {
+        1 => Ok(hosts.into_iter().next().expect("one legacy host")),
+        _ => bail!("legacy remote contains multiple hosts; rerun with --host <id-or-name>"),
+    }
+}
+
+fn add_legacy_migration_item(
+    items: &mut BTreeMap<String, LegacyMigrationItem>,
+    source: String,
+    destination: String,
+    logical_key: Option<String>,
+) -> Result<()> {
+    let item = LegacyMigrationItem {
+        source: source.clone(),
+        logical_key,
+    };
+    if let Some(previous) = items.insert(destination.clone(), item.clone())
+        && (previous.source != source || previous.logical_key != item.logical_key)
+    {
+        bail!(
+            "legacy migration has conflicting sources for destination {destination}: {} and {source}",
+            previous.source
+        );
+    }
+    Ok(())
+}
+
+fn legacy_remote_content_keys(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host: &LegacyRemoteHost,
+) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    let packed_oids = host
+        .export
+        .blobs
+        .iter()
+        .filter(|blob| blob.pack_id.is_some())
+        .map(|blob| blob.oid.as_str())
+        .collect::<BTreeSet<_>>();
+    for blob in &host.export.blobs {
+        if blob.pack_id.is_none() {
+            keys.insert(blob.object_key.clone());
+        }
+    }
+    for pack in &host.export.packs {
+        keys.insert(pack.pack_key.clone());
+        keys.insert(pack.index_key.clone());
+    }
+    for large in &host.export.large_objects {
+        keys.insert(large.manifest_key.clone());
+    }
+    for chunk in &host.export.chunks {
+        keys.insert(chunk.object_key.clone());
+    }
+    for snapshot in &host.export.snapshots {
+        keys.insert(snapshot.manifest_key.clone());
+        let manifest = if snapshot.manifest_json.trim().is_empty() {
+            let (source, bytes) = read_legacy_object(remote, host, &snapshot.manifest_key)?;
+            serde_json::from_slice::<SnapshotManifest>(&decode_legacy_object_bytes(
+                paths,
+                &snapshot.manifest_key,
+                &source,
+                &bytes,
+            )?)?
+        } else {
+            serde_json::from_str::<SnapshotManifest>(&snapshot.manifest_json)?
+        };
+        let mut visited = BTreeSet::new();
+        for root_tree in manifest.root_trees.values() {
+            collect_legacy_tree_keys(
+                paths,
+                remote,
+                host,
+                &root_tree.tree_key,
+                &packed_oids,
+                &mut keys,
+                &mut visited,
+            )?;
+        }
+        for records in manifest.roots.values() {
+            for record in records {
+                collect_legacy_payload_key(
+                    paths,
+                    remote,
+                    host,
+                    &record.payload,
+                    &packed_oids,
+                    &mut keys,
+                    &mut visited,
+                )?;
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn collect_legacy_tree_keys(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host: &LegacyRemoteHost,
+    key: &str,
+    packed_oids: &BTreeSet<&str>,
+    keys: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) -> Result<()> {
+    if !visited.insert(key.to_string()) {
+        return Ok(());
+    }
+    keys.insert(key.to_string());
+    let (source, bytes) = read_legacy_object(remote, host, key)?;
+    let decoded = decode_legacy_object_bytes(paths, key, &source, &bytes)?;
+    let tree: TreeManifest = serde_json::from_slice(&decoded)
+        .with_context(|| format!("parse legacy tree manifest {key}"))?;
+    for record in tree.entries.values() {
+        collect_legacy_payload_key(
+            paths,
+            remote,
+            host,
+            &record.payload,
+            packed_oids,
+            keys,
+            visited,
+        )?;
+    }
+    if let Some(root) = &tree.root_node {
+        collect_legacy_tree_node_keys(
+            paths,
+            remote,
+            host,
+            &root.node_key,
+            packed_oids,
+            keys,
+            visited,
+        )?;
+    }
+    for node in tree.subtree_nodes.values() {
+        collect_legacy_tree_node_keys(
+            paths,
+            remote,
+            host,
+            &node.node_key,
+            packed_oids,
+            keys,
+            visited,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_legacy_tree_node_keys(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host: &LegacyRemoteHost,
+    key: &str,
+    packed_oids: &BTreeSet<&str>,
+    keys: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) -> Result<()> {
+    if !visited.insert(key.to_string()) {
+        return Ok(());
+    }
+    keys.insert(key.to_string());
+    let (source, bytes) = read_legacy_object(remote, host, key)?;
+    let decoded = decode_legacy_object_bytes(paths, key, &source, &bytes)?;
+    let node: TreeNodeManifest = serde_json::from_slice(&decoded)
+        .with_context(|| format!("parse legacy tree node {key}"))?;
+    for record in node.entries.values() {
+        collect_legacy_payload_key(
+            paths,
+            remote,
+            host,
+            &record.payload,
+            packed_oids,
+            keys,
+            visited,
+        )?;
+    }
+    for child in node.child_nodes.values() {
+        collect_legacy_tree_node_keys(
+            paths,
+            remote,
+            host,
+            &child.node_key,
+            packed_oids,
+            keys,
+            visited,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_legacy_payload_key(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host: &LegacyRemoteHost,
+    payload: &crate::majutsu_core::Payload,
+    packed_oids: &BTreeSet<&str>,
+    keys: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) -> Result<()> {
+    if let Some((oid, key)) = payload_blob_ref(payload)
+        && !packed_oids.contains(oid)
+    {
+        keys.insert(key.to_string());
+    }
+    if let Some((_, key, _)) = payload_large_ref(payload) {
+        keys.insert(key.to_string());
+        if visited.insert(key.to_string()) {
+            let (source, bytes) = read_legacy_object(remote, host, key)?;
+            let decoded = decode_legacy_object_bytes(paths, key, &source, &bytes)?;
+            let manifest: LargeManifest = serde_json::from_slice(&decoded)
+                .with_context(|| format!("parse legacy large manifest {key}"))?;
+            for chunk in manifest.chunks {
+                keys.insert(chunk.object_key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_legacy_object(
+    remote: &RemoteStore,
+    host: &LegacyRemoteHost,
+    key: &str,
+) -> Result<(String, Vec<u8>)> {
+    let alias = canonical_remote_alias(key);
+    let mut candidates = Vec::new();
+    if let Some(prefix) = &host.source_prefix
+        && !key.starts_with(prefix)
+    {
+        candidates.push(format!("{prefix}{key}"));
+    }
+    candidates.push(key.to_string());
+    if let Some(alias) = alias {
+        if let Some(prefix) = &host.source_prefix {
+            candidates.push(format!("{prefix}{alias}"));
+        }
+        candidates.push(alias);
+    }
+    candidates.dedup();
+    for candidate in candidates {
+        if let Some(bytes) = remote.get_optional(&candidate)? {
+            return Ok((candidate, bytes));
+        }
+    }
+    bail!("legacy remote object is missing: {key}")
+}
+
+fn decode_legacy_object_bytes(
+    paths: &Paths,
+    key: &str,
+    source: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let canonical_source = canonical_remote_alias(key)
+        .is_some_and(|alias| source == alias || source.ends_with(&format!("/{alias}")));
+    if canonical_source {
+        let local = crate::canonical_remote_object_to_local_bytes(paths, key, bytes)?;
+        return crate::decode_object(paths, &local);
+    }
+    crate::decode_object(paths, bytes)
+}
+
+fn resolve_legacy_content_source(
+    remote: &RemoteStore,
+    host: &LegacyRemoteHost,
+    key: &str,
+) -> Result<(String, String)> {
+    let source = read_legacy_object(remote, host, key)?.0;
+    let relative = if let Some(prefix) = &host.source_prefix {
+        source
+            .strip_prefix(prefix)
+            .unwrap_or(source.as_str())
+            .to_string()
+    } else {
+        source.clone()
+    };
+    let destination = if matches!(remote, RemoteStore::S3(_)) {
+        canonical_remote_alias(key).unwrap_or_else(|| key.to_string())
+    } else if relative == key || canonical_remote_alias(key).as_deref() == Some(relative.as_str()) {
+        relative
+    } else {
+        key.to_string()
+    };
+    Ok((source, destination))
+}
+
+fn encode_legacy_canonical_content(
+    paths: &Paths,
+    key: &str,
+    source: &str,
+    bytes: &[u8],
+    snapshot_manifest: bool,
+) -> Result<Vec<u8>> {
+    let alias = canonical_remote_alias(key)
+        .ok_or_else(|| anyhow!("legacy content key has no canonical alias: {key}"))?;
+    if source == alias || source.ends_with(&format!("/{alias}")) {
+        return Ok(bytes.to_vec());
+    }
+    let decoded = crate::decode_object(paths, bytes)?;
+    if snapshot_manifest {
+        let manifest: SnapshotManifest = serde_json::from_slice(&decoded)
+            .with_context(|| format!("decode legacy snapshot manifest {key}"))?;
+        return crate::encode_compact_snapshot_manifest_for_remote(paths, &manifest);
+    }
+    if key.starts_with("objects/trees/nodes/") {
+        let manifest: TreeNodeManifest = serde_json::from_slice(&decoded)
+            .with_context(|| format!("decode legacy tree node {key}"))?;
+        return crate::sync_runtime::encode_canonical_remote_export(paths, &manifest);
+    }
+    if key.starts_with("objects/trees/") {
+        let manifest: TreeManifest = serde_json::from_slice(&decoded)
+            .with_context(|| format!("decode legacy tree manifest {key}"))?;
+        return crate::sync_runtime::encode_canonical_remote_export(paths, &manifest);
+    }
+    if key.starts_with("objects/indexes/pack/") {
+        let index: crate::majutsu_pack::PackIndex = serde_json::from_slice(&decoded)
+            .with_context(|| format!("decode legacy pack index {key}"))?;
+        return crate::sync_runtime::encode_canonical_remote_export(paths, &index);
+    }
+    if key.starts_with("objects/large/manifests/") {
+        let manifest: LargeManifest = serde_json::from_slice(&decoded)
+            .with_context(|| format!("decode legacy large manifest {key}"))?;
+        return crate::sync_runtime::encode_canonical_remote_export(paths, &manifest);
+    }
+    crate::encode_object(paths, &decoded)
+}
+
+fn legacy_structured_alias(key: &str) -> bool {
+    key.starts_with("objects/blobs/")
+        || key.starts_with("objects/trees/")
+        || key.starts_with("objects/indexes/pack/")
+        || key.starts_with("objects/large/manifests/")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1587,5 +2139,13 @@ mod tests {
         let key = "objects/blobs/aa/bb";
         let remote_key = repair_remote_key(false, "mba22", key);
         assert_eq!(remote_key, key);
+    }
+
+    #[test]
+    fn legacy_metadata_destination_uses_s3_compressed_suffix() {
+        let file_key = legacy_metadata_destination(false, "vagrant");
+        let s3_key = legacy_metadata_destination(true, "vagrant");
+        assert_eq!(file_key, "vagrant/metadata/export.json");
+        assert_eq!(s3_key, "vagrant/metadata/export.json.zst");
     }
 }

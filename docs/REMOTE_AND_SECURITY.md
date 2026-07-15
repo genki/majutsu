@@ -129,9 +129,20 @@ host registry, and no payload sharing across host-prefix boundaries.
 
 `mj remote fsck` verifies each host metadata export, per-host refs,
 snapshot/operation exports, aggregate operation logs, and every referenced
-object under that host prefix. Old pre-migration prefixes are not fallback inputs;
-after a host has synced with the current layout, old prefixes can be removed
-from the remote.
+object under that host prefix. 旧レイアウトは自動フォールバックしません。
+host-prefix 導入前の remote を移行する場合は、明示的な移行コマンドを使います。
+
+```sh
+mj remote migrate-legacy --host workstation-a --dry-run
+mj remote migrate-legacy --host workstation-a
+mj remote check
+```
+
+このコマンドは旧 host metadata、host timeline/ref object、参照される content
+object を現行の名前付き prefix へコピーします。コピー元は削除しません。
+`mj remote check` と clone/restore を検証してから、backend の運用手順で旧
+`hosts/<uuid>/` prefix と旧 global object を削除してください。自動フォールバック
+はないため、未移行の旧 remote を暗黙に読み込むことはありません。
 
 To rebuild an empty state directory from remote:
 

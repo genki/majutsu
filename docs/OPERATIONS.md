@@ -15,6 +15,11 @@ mj daemon metrics
 `mj status` は運用上の要点確認に使う。`mj state` は Git の `status -s` に近い
 管理対象ファイル差分の確認に使う。
 
+診断コマンドは意図した停止状態を変更しない。`mj status`、`mj fsck --quick`、
+`mj sync status`、`mj remote check`、dry-run の remote repair は既定で watch daemon
+を起動しない。status と同時に明示的に起動する必要がある場合だけ
+`mj status --start-daemon` を指定する。
+
 既存の operation / snapshot に運用上の説明を後から付けたい場合は `mj note` を使う。
 引数なしの表示ではなく、`mj note REF` で現在の note を表示し、`-m`、`--stdin`、
 `--clear` で更新する。`snap-...` は、その snapshot を作成した operation に解決されるため、
