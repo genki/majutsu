@@ -896,7 +896,19 @@ fn remote_fsck_default_is_quick_and_deep_is_available() {
         "canonical alias repair should restore missing alias"
     );
     let quick = run_mj(&home, ["remote", "fsck"]);
+    let quick_stderr = String::from_utf8_lossy(&quick.stderr).to_string();
     assert_success(quick, "remote fsck quick");
+    assert!(
+        quick_stderr.contains("remote fsck progress phase=start"),
+        "quick remote fsck must report progress on stderr\n{quick_stderr}"
+    );
+    let timeout = run_mj(&home, ["remote", "fsck", "--timeout-secs", "0"]);
+    let timeout_stderr = String::from_utf8_lossy(&timeout.stderr).to_string();
+    assert_failure(timeout, "remote fsck quick timeout");
+    assert!(
+        timeout_stderr.contains("remote fsck quick timed out"),
+        "quick remote fsck timeout must be explicit\n{timeout_stderr}"
+    );
     assert_success(
         run_mj(
             &home,

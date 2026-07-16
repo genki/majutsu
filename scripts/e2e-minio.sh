@@ -151,7 +151,12 @@ if printf '%s\n' "$listing_keys" | grep -Eq '(^|/)e2e/(hosts/|metadata/export\.j
 fi
 
 "$mj_bin" --home "$home" remote check
-"$mj_bin" --home "$home" remote fsck
+fsck_output="$("$mj_bin" --home "$home" remote fsck 2>&1)"
+printf '%s\n' "$fsck_output"
+if ! printf '%s\n' "$fsck_output" | grep -q 'tombstones=skipped_compact_head'; then
+  echo "MinIO E2E: compact head による tombstone 監査省略が確認できません" >&2
+  exit 5
+fi
 "$mj_bin" --home "$home" remote hosts
 "$mj_bin" --home "$home" remote host minio-e2e --snapshots --operations
 "$mj_bin" --home "$recovered" clone --remote s3://majutsu/e2e

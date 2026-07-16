@@ -35,6 +35,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+const DEFAULT_REMOTE_FSCK_QUICK_TIMEOUT_SECS: u64 = 60;
+
 #[derive(Debug, serde::Deserialize)]
 struct RemoteHeadExport {
     version: u32,
@@ -156,7 +158,13 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                     },
                 )?;
             } else {
-                remote_fsck_quick(paths, &remote)?;
+                remote_fsck_quick(
+                    paths,
+                    &remote,
+                    timeout_secs.map(Duration::from_secs).unwrap_or_else(|| {
+                        Duration::from_secs(DEFAULT_REMOTE_FSCK_QUICK_TIMEOUT_SECS)
+                    }),
+                )?;
             }
             let conn = open_db(paths)?;
             let current = current_snapshot(&conn)?;
@@ -295,20 +303,43 @@ pub(crate) fn repair_missing_referenced_objects(
     )
 }
 
-fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
-    let start = std::time::Instant::now();
+fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
     let mut missing = 0usize;
     let mut checked_metadata = 0usize;
+    let mut context = QuickFsckContext {
+        start,
+        timeout,
+        checked_metadata,
+    };
+    eprintln!(
+        "remote fsck progress phase=start timeout_secs={}",
+        timeout.as_secs()
+    );
+    context.ensure("host-index")?;
+    eprintln!("remote fsck progress phase=host-index");
     let index = read_remote_host_index(remote)?;
     if index.hosts.is_empty() {
         bail!("remote metadata is missing: <host-prefix>/metadata/export.json.zst not found");
     }
+    eprintln!(
+        "remote fsck progress phase=host-index-done hosts={} elapsed_secs={}",
+        index.hosts.len(),
+        start.elapsed().as_secs()
+    );
     for issue in index.duplicate_issues() {
         missing += 1;
         eprintln!("remote host metadata issue: {issue:?}");
     }
-    for host in &index.hosts {
-        checked_metadata += 1;
+    for (host_index, host) in index.hosts.iter().enumerate() {
+        context.checked_metadata = checked_metadata;
+        context.ensure("host")?;
+        eprintln!(
+            "remote fsck progress phase=host index={}/{} host={}",
+            host_index + 1,
+            index.hosts.len(),
+            host.name
+        );
         let host_prefix = remote_host_prefix(host);
         let expected_metadata_key = host_metadata_key(&host_prefix);
         let expected_compressed_metadata_key = compressed_metadata_key(&expected_metadata_key);
@@ -324,6 +355,7 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
         let Some(bytes) = remote.get_optional(&host.metadata_key)? else {
             missing += 1;
             eprintln!("missing host metadata {} {}", host.id, host.metadata_key);
+            checked_metadata += 1;
             continue;
         };
         let metadata_bytes = match decode_remote_metadata_bytes(&host.metadata_key, &bytes) {
@@ -331,6 +363,7 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
             Err(err) => {
                 missing += 1;
                 eprintln!("invalid host metadata {}: {err}", host.metadata_key);
+                checked_metadata += 1;
                 continue;
             }
         };
@@ -339,14 +372,30 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
             Err(err) => {
                 missing += 1;
                 eprintln!("invalid host metadata {}: {err}", host.metadata_key);
+                checked_metadata += 1;
                 continue;
             }
         };
-        validate_quick_host_metadata(paths, remote, host, &export, &mut missing)?;
+        validate_quick_host_metadata(paths, remote, host, &export, context, &mut missing)?;
+        checked_metadata += 1;
+        eprintln!(
+            "remote fsck progress phase=host-done index={}/{} host={} elapsed_secs={}",
+            host_index + 1,
+            index.hosts.len(),
+            host.name,
+            start.elapsed().as_secs()
+        );
     }
+    context.checked_metadata = checked_metadata;
+    context.ensure("done")?;
     if missing > 0 {
         bail!("remote fsck quick found {missing} issue(s)");
     }
+    eprintln!(
+        "remote fsck progress phase=done hosts={} elapsed_secs={}",
+        checked_metadata,
+        start.elapsed().as_secs()
+    );
     println!("remote fsck quick ok");
     println!("mode metadata");
     println!("checked_metadata {checked_metadata}");
@@ -354,6 +403,27 @@ fn remote_fsck_quick(paths: &Paths, remote: &RemoteStore) -> Result<()> {
     println!("hint use `mj remote fsck --objects` to verify every referenced object");
     println!("hint use `mj remote fsck --deep` for payload decode/hash verification");
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct QuickFsckContext {
+    start: Instant,
+    timeout: Duration,
+    checked_metadata: usize,
+}
+
+impl QuickFsckContext {
+    fn ensure(self, phase: &str) -> Result<()> {
+        if self.start.elapsed() < self.timeout {
+            return Ok(());
+        }
+        bail!(
+            "remote fsck quick timed out after {} second(s) phase={} checked_metadata={}",
+            self.timeout.as_secs(),
+            phase,
+            self.checked_metadata
+        )
+    }
 }
 
 fn compressed_metadata_key(key: &str) -> String {
@@ -376,8 +446,10 @@ fn validate_quick_host_metadata(
     remote: &RemoteStore,
     host: &RemoteHostSummary,
     export: &MetadataExport,
+    context: QuickFsckContext,
     missing: &mut usize,
 ) -> Result<()> {
+    context.ensure("host-metadata")?;
     if export.config.host.id != host.id {
         *missing += 1;
         eprintln!(
@@ -401,6 +473,7 @@ fn validate_quick_host_metadata(
         );
     }
     let head = read_remote_head(paths, remote, &host_prefix)?;
+    context.ensure("head")?;
     let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
     let current = export.refs.get("current");
     if host.current_snapshot.as_ref() != current && !compact_head_authoritative {
@@ -515,6 +588,7 @@ fn validate_quick_host_metadata(
         &host.id,
         current,
         head.as_ref(),
+        context,
         missing,
     )
 }
@@ -625,9 +699,11 @@ fn validate_quick_gc_records(
     expected_mark_host_id: &str,
     current: Option<&String>,
     head: Option<&RemoteHeadExport>,
+    context: QuickFsckContext,
     missing: &mut usize,
 ) -> Result<()> {
     let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
+    context.ensure("gc-mark")?;
     let mark_key = remote_gc_mark_key(host_id);
     let Some(bytes) = remote.get_optional(&mark_key)? else {
         if !compact_head_authoritative {
@@ -663,7 +739,16 @@ fn validate_quick_gc_records(
         *missing += 1;
         eprintln!("remote gc mark contains duplicate object keys {mark_key}");
     }
+    if compact_head_authoritative {
+        eprintln!(
+            "remote fsck progress phase=gc host={} tombstones=skipped_compact_head",
+            host_id
+        );
+        return Ok(());
+    }
+    context.ensure("gc-tombstones")?;
     for key in remote.list(&remote_gc_tombstone_prefix(host_id))? {
+        context.ensure("gc-tombstones")?;
         if !key.ends_with(".json") {
             continue;
         }

@@ -1761,7 +1761,7 @@ pub(crate) enum RemoteCommand {
         #[arg(
             long,
             value_name = "SECONDS",
-            help = "Stop --objects probes or --deep payload verification after this many seconds"
+            help = "Stop remote fsck after this many seconds; applies to quick metadata, --objects, and --deep checks"
         )]
         timeout_secs: Option<u64>,
         #[arg(
