@@ -661,7 +661,8 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
                 return Err(err);
             }
         };
-        let records = scanned.records;
+        let mut records = scanned.records;
+        stabilize_directory_modified_times(&mut records, parent_root_records.as_ref());
         append_operation_changes(
             &mut pending_operation_changes,
             &op_id,
@@ -927,6 +928,15 @@ fn append_operation_changes(
     }
     let truncated = root_changes.len() > MAX_OPERATION_CHANGE_SUMMARY_ENTRIES;
     root_changes.truncate(MAX_OPERATION_CHANGE_SUMMARY_ENTRIES);
+    if root_changes.is_empty() {
+        changes.push(OperationChangeExport {
+            op_id: op_id.to_string(),
+            root_id: root_id.to_string(),
+            path: String::new(),
+            status: "N".into(),
+        });
+        return;
+    }
     changes.extend(
         root_changes
             .into_iter()
@@ -3191,7 +3201,8 @@ fn scan_root(
     let mut blobs = Vec::new();
     let mut skipped_auto_track_large = 0usize;
     let mut skipped_auto_track_batch = 0usize;
-    let packed_blob_keys = packed_blob_object_keys(conn)?;
+    let remote_payloads_are_durable = current_is_remote_synced(conn)?;
+    let reusable_blob_keys = reusable_blob_object_keys(conn, remote_payloads_are_durable)?;
     let walker = WalkDir::new(&root.path)
         .follow_links(root.follow_symlinks)
         .sort_by_file_name()
@@ -3288,9 +3299,23 @@ fn scan_root(
         }
         let payload = if large {
             let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
-                store_large_file(paths, entry.path(), &rel, &large_config, binary)?
+                store_large_file_with_remote_reuse(
+                    paths,
+                    entry.path(),
+                    &rel,
+                    &large_config,
+                    binary,
+                    remote_payloads_are_durable,
+                )?
             } else {
-                store_large_file_in_root(paths, &root.path, &rel, &large_config, binary)?
+                store_large_file_in_root_with_remote_reuse(
+                    paths,
+                    &root.path,
+                    &rel,
+                    &large_config,
+                    binary,
+                    remote_payloads_are_durable,
+                )?
             };
             Payload::LargeObject {
                 oid,
@@ -3308,9 +3333,23 @@ fn scan_root(
             let mut chunked_config = large_config.clone();
             chunked_config.chunk_size = large_config.chunked_chunk_size;
             let (oid, manifest_key, chunk_count) = if root.follow_symlinks {
-                store_large_file(paths, entry.path(), &rel, &chunked_config, binary)?
+                store_large_file_with_remote_reuse(
+                    paths,
+                    entry.path(),
+                    &rel,
+                    &chunked_config,
+                    binary,
+                    remote_payloads_are_durable,
+                )?
             } else {
-                store_large_file_in_root(paths, &root.path, &rel, &chunked_config, binary)?
+                store_large_file_in_root_with_remote_reuse(
+                    paths,
+                    &root.path,
+                    &rel,
+                    &chunked_config,
+                    binary,
+                    remote_payloads_are_durable,
+                )?
             };
             Payload::ChunkedBlob {
                 oid,
@@ -3324,7 +3363,7 @@ fn scan_root(
                 stable_read_in_root(&root.path, &rel, root.snapshot_mode.as_str())?
             };
             let oid = blake3_hex(&bytes);
-            let object_key = if let Some(object_key) = packed_blob_keys.get(oid.as_str()) {
+            let object_key = if let Some(object_key) = reusable_blob_keys.get(oid.as_str()) {
                 object_key.clone()
             } else {
                 store_bytes(paths, &paths.objects, &oid, &bytes)?
@@ -3367,9 +3406,29 @@ fn scan_root(
     })
 }
 
-fn packed_blob_object_keys(conn: &Connection) -> Result<BTreeMap<String, String>> {
-    let mut stmt = conn.prepare("select oid, object_key from blobs where pack_id is not null")?;
-    let rows = stmt.query_map([], |row| {
+fn current_is_remote_synced(conn: &Connection) -> Result<bool> {
+    let Some(current) = current_snapshot(conn)? else {
+        return Ok(false);
+    };
+    Ok(conn.query_row(
+        "select exists(
+             select 1 from remote_refs
+             where name like '%/refs/current' and value=?1
+         )",
+        [current],
+        |row| row.get(0),
+    )?)
+}
+
+fn reusable_blob_object_keys(
+    conn: &Connection,
+    remote_current_is_synced: bool,
+) -> Result<BTreeMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "select oid, object_key from blobs
+         where pack_id is not null or ?1",
+    )?;
+    let rows = stmt.query_map([remote_current_is_synced], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     let mut keys = BTreeMap::new();
@@ -3378,6 +3437,39 @@ fn packed_blob_object_keys(conn: &Connection) -> Result<BTreeMap<String, String>
         keys.insert(oid, object_key);
     }
     Ok(keys)
+}
+
+fn stabilize_directory_modified_times(
+    records: &mut [FileRecord],
+    previous: Option<&BTreeMap<String, FileRecord>>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    for record in records
+        .iter_mut()
+        .filter(|record| record.kind == "directory")
+    {
+        let Some(before) = previous.get(&record.path) else {
+            continue;
+        };
+        if directory_record_matches_except_modified(before, record) {
+            record.modified = before.modified;
+        }
+    }
+}
+
+fn directory_record_matches_except_modified(before: &FileRecord, after: &FileRecord) -> bool {
+    before.root_id == after.root_id
+        && before.path == after.path
+        && before.kind == "directory"
+        && after.kind == "directory"
+        && before.size == after.size
+        && before.mode == after.mode
+        && before.uid == after.uid
+        && before.gid == after.gid
+        && before.xattrs == after.xattrs
+        && before.payload == after.payload
 }
 
 fn is_permission_denied_error(err: &anyhow::Error) -> bool {
@@ -3605,11 +3697,29 @@ pub(crate) fn store_large_file(
     config: &LargeConfig,
     binary: bool,
 ) -> Result<(String, String, usize)> {
+    store_large_file_with_remote_reuse(paths, path, rel, config, binary, false)
+}
+
+fn store_large_file_with_remote_reuse(
+    paths: &Paths,
+    path: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+    reuse_remote_chunks: bool,
+) -> Result<(String, String, usize)> {
     if config.default_chunking == "fixed" {
-        return store_large_file_fixed_streaming(paths, path, rel, config, binary);
+        return store_large_file_fixed_streaming(
+            paths,
+            path,
+            rel,
+            config,
+            binary,
+            reuse_remote_chunks,
+        );
     }
     let bytes = stable_read(path, "strict")?;
-    store_large_bytes_buffered(paths, rel, config, binary, &bytes)
+    store_large_bytes_buffered(paths, rel, config, binary, &bytes, reuse_remote_chunks)
 }
 
 pub(crate) fn store_large_file_in_root(
@@ -3619,11 +3729,29 @@ pub(crate) fn store_large_file_in_root(
     config: &LargeConfig,
     binary: bool,
 ) -> Result<(String, String, usize)> {
+    store_large_file_in_root_with_remote_reuse(paths, root, rel, config, binary, false)
+}
+
+fn store_large_file_in_root_with_remote_reuse(
+    paths: &Paths,
+    root: &Path,
+    rel: &Path,
+    config: &LargeConfig,
+    binary: bool,
+    reuse_remote_chunks: bool,
+) -> Result<(String, String, usize)> {
     if config.default_chunking == "fixed" {
-        return store_large_file_fixed_streaming_in_root(paths, root, rel, config, binary);
+        return store_large_file_fixed_streaming_in_root(
+            paths,
+            root,
+            rel,
+            config,
+            binary,
+            reuse_remote_chunks,
+        );
     }
     let bytes = stable_read_in_root(root, rel, "strict")?;
-    store_large_bytes_buffered(paths, rel, config, binary, &bytes)
+    store_large_bytes_buffered(paths, rel, config, binary, &bytes, reuse_remote_chunks)
 }
 
 fn store_large_bytes_buffered(
@@ -3632,6 +3760,7 @@ fn store_large_bytes_buffered(
     config: &LargeConfig,
     binary: bool,
     bytes: &[u8],
+    reuse_remote_chunks: bool,
 ) -> Result<(String, String, usize)> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(bytes);
@@ -3652,7 +3781,14 @@ fn store_large_bytes_buffered(
         let chunk = &bytes[start..end];
         let chunk_oid = blake3_hex(chunk);
         let stored = compress_large_chunk(config, rel, chunk)?;
-        let object_key = store_large_chunk_bytes(paths, &conn, config, &chunk_oid, &stored.bytes)?;
+        let object_key = store_large_chunk_bytes(
+            paths,
+            &conn,
+            config,
+            &chunk_oid,
+            &stored.bytes,
+            reuse_remote_chunks,
+        )?;
         chunks.push(LargeChunk {
             index,
             offset: start as u64,
@@ -3694,11 +3830,19 @@ fn store_large_file_fixed_streaming(
     rel: &Path,
     config: &LargeConfig,
     binary: bool,
+    reuse_remote_chunks: bool,
 ) -> Result<(String, String, usize)> {
     let attempts = 8;
     let mut last_error = None;
     for _ in 0..attempts {
-        match store_large_file_fixed_streaming_once(paths, path, rel, config, binary) {
+        match store_large_file_fixed_streaming_once(
+            paths,
+            path,
+            rel,
+            config,
+            binary,
+            reuse_remote_chunks,
+        ) {
             Ok(result) => return Ok(result),
             Err(err) if is_file_changed_error(&err) => {
                 last_error = Some(err);
@@ -3715,11 +3859,19 @@ fn store_large_file_fixed_streaming_in_root(
     rel: &Path,
     config: &LargeConfig,
     binary: bool,
+    reuse_remote_chunks: bool,
 ) -> Result<(String, String, usize)> {
     let attempts = 8;
     let mut last_error = None;
     for _ in 0..attempts {
-        match store_large_file_fixed_streaming_in_root_once(paths, root, rel, config, binary) {
+        match store_large_file_fixed_streaming_in_root_once(
+            paths,
+            root,
+            rel,
+            config,
+            binary,
+            reuse_remote_chunks,
+        ) {
             Ok(result) => return Ok(result),
             Err(err) if is_file_changed_error(&err) => {
                 last_error = Some(err);
@@ -3737,6 +3889,7 @@ fn store_large_file_fixed_streaming_once(
     rel: &Path,
     config: &LargeConfig,
     binary: bool,
+    reuse_remote_chunks: bool,
 ) -> Result<(String, String, usize)> {
     let before = fs::metadata(path)?;
     let mut file = File::open(path)?;
@@ -3755,7 +3908,14 @@ fn store_large_file_fixed_streaming_once(
         hasher.update(chunk);
         let chunk_oid = blake3_hex(chunk);
         let stored = compress_large_chunk(config, rel, chunk)?;
-        let object_key = store_large_chunk_bytes(paths, &conn, config, &chunk_oid, &stored.bytes)?;
+        let object_key = store_large_chunk_bytes(
+            paths,
+            &conn,
+            config,
+            &chunk_oid,
+            &stored.bytes,
+            reuse_remote_chunks,
+        )?;
         chunks.push(LargeChunk {
             index,
             offset,
@@ -3811,28 +3971,42 @@ fn store_large_file_fixed_streaming_in_root_once(
     rel: &Path,
     config: &LargeConfig,
     binary: bool,
+    reuse_remote_chunks: bool,
 ) -> Result<(String, String, usize)> {
     let (file, before) = stable_open_file_in_root(root, rel)?;
     store_large_file_fixed_streaming_from_file(
         paths,
-        file,
-        before,
-        &root.join(rel),
+        FixedStreamingSource {
+            file,
+            before,
+            display_path: root.join(rel),
+        },
         rel,
         config,
         binary,
+        reuse_remote_chunks,
     )
+}
+
+struct FixedStreamingSource {
+    file: File,
+    before: fs::Metadata,
+    display_path: PathBuf,
 }
 
 fn store_large_file_fixed_streaming_from_file(
     paths: &Paths,
-    mut file: File,
-    before: fs::Metadata,
-    display_path: &Path,
+    source: FixedStreamingSource,
     rel: &Path,
     config: &LargeConfig,
     binary: bool,
+    reuse_remote_chunks: bool,
 ) -> Result<(String, String, usize)> {
+    let FixedStreamingSource {
+        mut file,
+        before,
+        display_path,
+    } = source;
     let conn = open_db(paths)?;
     let mut hasher = blake3::Hasher::new();
     let mut chunks = Vec::new();
@@ -3848,7 +4022,14 @@ fn store_large_file_fixed_streaming_from_file(
         hasher.update(chunk);
         let chunk_oid = blake3_hex(chunk);
         let stored = compress_large_chunk(config, rel, chunk)?;
-        let object_key = store_large_chunk_bytes(paths, &conn, config, &chunk_oid, &stored.bytes)?;
+        let object_key = store_large_chunk_bytes(
+            paths,
+            &conn,
+            config,
+            &chunk_oid,
+            &stored.bytes,
+            reuse_remote_chunks,
+        )?;
         chunks.push(LargeChunk {
             index,
             offset,
@@ -3904,8 +4085,11 @@ fn store_large_chunk_bytes(
     config: &LargeConfig,
     chunk_oid: &str,
     bytes: &[u8],
+    reuse_remote_chunks: bool,
 ) -> Result<String> {
-    if let Some(object_key) = existing_chunk_object_key(paths, conn, chunk_oid)? {
+    if let Some(object_key) =
+        existing_chunk_object_key(paths, conn, chunk_oid, reuse_remote_chunks)?
+    {
         return Ok(object_key);
     }
     store_bytes(
@@ -3920,6 +4104,7 @@ fn existing_chunk_object_key(
     paths: &Paths,
     conn: &Connection,
     oid: &str,
+    reuse_remote_chunks: bool,
 ) -> Result<Option<String>> {
     let mut stmt = conn.prepare("select object_key from chunks where oid=?1")?;
     let mut rows = stmt.query(params![oid])?;
@@ -3927,7 +4112,7 @@ fn existing_chunk_object_key(
         return Ok(None);
     };
     let object_key: String = row.get(0)?;
-    if paths.home.join(&object_key).exists() {
+    if reuse_remote_chunks || paths.home.join(&object_key).exists() {
         Ok(Some(object_key))
     } else {
         Ok(None)
@@ -5556,6 +5741,224 @@ tier = "Bulk"
             !paths.home.join(&object_key).exists(),
             "snapshot should keep using the packed blob instead of recreating a loose object"
         );
+    }
+
+    #[test]
+    fn snapshot_ignores_directory_mtime_noise_without_losing_directory_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        init(
+            &paths,
+            InitArgs {
+                remote: None,
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let root = tmp.path().join("root");
+        let directory = root.join("docs");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("kept.txt"), b"kept\n").unwrap();
+        root_cmd(
+            &paths,
+            RootCommand::Add(test_root_add_args("sample", root.clone())),
+        )
+        .unwrap();
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("initial".into()),
+                origin: None,
+            },
+        )
+        .unwrap();
+        let conn = open_db(&paths).unwrap();
+        let before = current_snapshot(&conn).unwrap().unwrap();
+        let before_manifest = load_snapshot_by_id(&paths, &conn, &before).unwrap();
+        let before_entries =
+            load_root_tree_entries(&paths, before_manifest.root_trees.get("sample").unwrap())
+                .unwrap();
+        let before_directory = before_entries.get("docs").unwrap().clone();
+        drop(conn);
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(directory.join("transient.tmp"), b"temporary\n").unwrap();
+        fs::remove_file(directory.join("transient.tmp")).unwrap();
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("directory-mtime-only".into()),
+                origin: None,
+            },
+        )
+        .unwrap();
+
+        let conn = open_db(&paths).unwrap();
+        assert_eq!(
+            current_snapshot(&conn).unwrap().as_deref(),
+            Some(before.as_str())
+        );
+        let current_manifest = load_snapshot_by_id(&paths, &conn, &before).unwrap();
+        let current_entries =
+            load_root_tree_entries(&paths, current_manifest.root_trees.get("sample").unwrap())
+                .unwrap();
+        assert_eq!(current_entries.get("docs"), Some(&before_directory));
+    }
+
+    #[test]
+    fn synced_loose_blob_is_reused_without_recreating_local_payload_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        init(
+            &paths,
+            InitArgs {
+                remote: Some(format!("file://{}", tmp.path().join("remote").display())),
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let payload = b"remote durable payload\n";
+        fs::write(root.join("payload.txt"), payload).unwrap();
+        root_cmd(
+            &paths,
+            RootCommand::Add(test_root_add_args("sample", root.clone())),
+        )
+        .unwrap();
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("initial".into()),
+                origin: None,
+            },
+        )
+        .unwrap();
+
+        let conn = open_db(&paths).unwrap();
+        let current = current_snapshot(&conn).unwrap().unwrap();
+        let oid = blake3_hex(payload);
+        let object_key: String = conn
+            .query_row("select object_key from blobs where oid=?1", [oid], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "insert into remote_refs(remote, name, value, observed_at)
+             values ('file://test', 'test-host/refs/current', ?1, ?2)",
+            params![current, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+        fs::remove_file(paths.home.join(&object_key)).unwrap();
+
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("reuse-remote".into()),
+                origin: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.home.join(&object_key).exists(),
+            "synced payload should remain remote-only during an unchanged scan"
+        );
+    }
+
+    #[test]
+    fn synced_large_chunks_are_reused_without_recreating_local_payload_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        init(
+            &paths,
+            InitArgs {
+                remote: Some(format!("file://{}", tmp.path().join("remote").display())),
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("payload.txt"), vec![b'x'; 8192]).unwrap();
+        let mut root_args = test_root_add_args("sample", root.clone());
+        root_args.large_chunked_min_size = Some(1024);
+        root_args.large_chunked_chunk_size = Some(1024);
+        root_cmd(&paths, RootCommand::Add(root_args)).unwrap();
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("initial".into()),
+                origin: None,
+            },
+        )
+        .unwrap();
+
+        let conn = open_db(&paths).unwrap();
+        let current = current_snapshot(&conn).unwrap().unwrap();
+        let chunk_keys = {
+            let mut stmt = conn.prepare("select object_key from chunks").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(!chunk_keys.is_empty());
+        conn.execute(
+            "insert into remote_refs(remote, name, value, observed_at)
+             values ('file://test', 'test-host/refs/current', ?1, ?2)",
+            params![current, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+        for key in &chunk_keys {
+            fs::remove_file(paths.home.join(key)).unwrap();
+        }
+
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("reuse-remote-large".into()),
+                origin: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            chunk_keys.iter().all(|key| !paths.home.join(key).exists()),
+            "synced chunks should remain remote-only during an unchanged scan"
+        );
+    }
+
+    fn test_root_add_args(id: &str, path: PathBuf) -> RootAddArgs {
+        RootAddArgs {
+            id: id.into(),
+            path,
+            name: None,
+            exclude: Vec::new(),
+            presets: Vec::new(),
+            no_default_excludes: false,
+            include: Vec::new(),
+            follow_symlinks: false,
+            require_mount: false,
+            snapshot_mode: "default".into(),
+            pre_snapshot: None,
+            post_snapshot: None,
+            snapshot_source: None,
+            application_plugin: None,
+            large_min_size: None,
+            large_binary_min_size: None,
+            large_chunked_min_size: None,
+            large_chunked_chunk_size: None,
+            large_chunk_size: None,
+            large_chunking: None,
+            large_always: Vec::new(),
+            large_never: Vec::new(),
+            volatile: Vec::new(),
+            volatile_mode: "checkpoint".into(),
+        }
     }
 
     #[cfg(target_os = "linux")]

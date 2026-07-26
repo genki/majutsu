@@ -8585,6 +8585,79 @@ fn log_reports_pruned_snapshot_metadata_without_root_filter() {
     assert!(!log.contains("[metadata-unavailable]"), "{log}");
 }
 
+#[cfg(unix)]
+#[test]
+fn log_does_not_warn_when_pruned_snapshot_had_only_directory_metadata_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let directory = source.join("docs");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let (op_id, before_snapshot): (String, String) = conn
+        .query_row(
+            "select id, before_snapshot
+             from operations
+             where kind='manual-snapshot' and before_snapshot is not null
+             order by rowid desc limit 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let marker_count: usize = conn
+        .query_row(
+            "select count(*) from operation_changes where op_id=?1 and status='N'",
+            [&op_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker_count, 1);
+    conn.execute("delete from snapshots where id=?1", [&before_snapshot])
+        .unwrap();
+    drop(conn);
+
+    let log = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("log")
+            .arg("--limit")
+            .arg("20")
+            .arg("--full");
+        c
+    });
+    assert!(!log.contains("[metadata-unavailable]"), "{log}");
+}
+
 #[test]
 fn prune_dry_run_and_gc_are_safe_entry_points() {
     let tmp = tempfile::tempdir().unwrap();
@@ -9098,7 +9171,12 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
         c
     });
     assert!(prune.contains("deleted_snapshots 1"));
+    assert!(
+        prune.contains("removed_unreferenced_objects "),
+        "prune should collect local objects made unreachable by deleted snapshots:\n{prune}"
+    );
     assert_eq!(db_operation_count(&state, "prune"), 1);
+    assert_eq!(db_operation_count(&state, "gc"), 1);
     run({
         let mut c = mj();
         c.arg("--home")
@@ -9123,12 +9201,6 @@ fn prune_can_delete_unkept_snapshots_and_gc_their_objects() {
             .arg(&restore);
         c
     });
-    run({
-        let mut c = mj();
-        c.arg("--home").arg(&state).arg("gc");
-        c
-    });
-    assert_eq!(db_operation_count(&state, "gc"), 1);
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("fsck");
@@ -19821,6 +19893,77 @@ fn sync_publishes_event_journal_as_durable_remote_journal() {
     assert!(
         status.contains("1 durable, 0 pending remote ack"),
         "{status}"
+    );
+}
+
+#[test]
+fn snapshot_keeps_unsynced_event_and_next_sync_durably_publishes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("note.txt"), b"before\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+
+    let event_dir = state.join("queue/events");
+    fs::create_dir_all(&event_dir).unwrap();
+    let event_path = event_dir.join("event-before-snapshot.json");
+    fs::write(
+        &event_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "event_id": "event-before-snapshot",
+            "kind": "fs-event",
+            "observed_at": Utc::now().to_rfc3339(),
+            "detail": "sample changed",
+            "root_id": "sample",
+            "path": "note.txt",
+            "event_kind": "modify",
+            "raw_backend": "test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    assert!(
+        event_path.exists(),
+        "unsynced event must survive snapshot compaction"
+    );
+
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    assert!(sync.contains("durable_journal_enqueued 1"), "{sync}");
+    assert!(sync.contains("durable_journal_acknowledged 1"), "{sync}");
+    assert!(
+        !event_path.exists(),
+        "remotely acknowledged event should be compacted after sync"
     );
 }
 

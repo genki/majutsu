@@ -2992,10 +2992,19 @@ fn short_snapshot_id(id: &str) -> &str {
 }
 
 fn terminal_width() -> usize {
-    env::var("COLUMNS")
+    let columns = env::var("COLUMNS")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    let detected = crossterm::terminal::size()
+        .ok()
+        .map(|(width, _)| usize::from(width));
+    terminal_width_from(columns, detected)
+}
+
+fn terminal_width_from(columns: Option<usize>, detected: Option<usize>) -> usize {
+    columns
         .filter(|width| *width >= 40)
+        .or_else(|| detected.filter(|width| *width >= 40))
         .unwrap_or(100)
 }
 
@@ -3141,7 +3150,7 @@ fn format_count(value: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::should_page_wide_output;
+    use super::{should_page_wide_output, terminal_width_from};
 
     #[test]
     fn root_list_pages_only_when_tty_output_exceeds_width_or_forced() {
@@ -3152,5 +3161,13 @@ mod tests {
         assert!(should_page_wide_output(wide, 20, false, true));
         assert!(!should_page_wide_output(wide, 20, false, false));
         assert!(should_page_wide_output(narrow, 80, true, false));
+    }
+
+    #[test]
+    fn root_list_terminal_width_prefers_columns_then_detected_terminal() {
+        assert_eq!(terminal_width_from(Some(160), Some(200)), 160);
+        assert_eq!(terminal_width_from(None, Some(200)), 200);
+        assert_eq!(terminal_width_from(Some(20), Some(200)), 200);
+        assert_eq!(terminal_width_from(None, None), 100);
     }
 }

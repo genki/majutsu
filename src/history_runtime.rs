@@ -123,6 +123,7 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         auto_daemon_error,
         upload_stats: &upload_stats,
         pending_event_count,
+        durable_journal_count: remote_journal_stats.durable,
         durable_journal_pending: remote_journal_stats.pending,
         watch_attribution_issue,
         current_manifest: current_manifest.as_ref(),
@@ -654,6 +655,7 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
         auto_daemon_error: None,
         upload_stats: &upload_stats,
         pending_event_count,
+        durable_journal_count: remote_journal_stats.durable,
         durable_journal_pending: remote_journal_stats.pending,
         watch_attribution_issue,
         current_manifest: current_manifest.as_ref(),
@@ -799,6 +801,7 @@ struct HealthInputs<'a> {
     auto_daemon_error: Option<String>,
     upload_stats: &'a crate::queue_runtime::UploadQueueStats,
     pending_event_count: usize,
+    durable_journal_count: usize,
     durable_journal_pending: usize,
     watch_attribution_issue: Option<String>,
     current_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
@@ -819,6 +822,7 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         auto_daemon_error,
         upload_stats,
         pending_event_count,
+        durable_journal_count,
         durable_journal_pending,
         watch_attribution_issue,
         current_manifest,
@@ -970,12 +974,28 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         });
     }
 
+    let sync_lock_pid = process_lock_owner(&paths.sync_lock)?;
+    let durable_catch_up = sync_lock_pid.is_some()
+        && durable_journal_count > 0
+        && durable_journal_pending == 0
+        && !upload_stats.has_backpressure();
     if current.is_some() && remote.configured && remote.open_error.is_none() && !remote_head.synced
     {
         issues.push(HealthIssue {
-            severity: HealthSeverity::Critical,
+            severity: if durable_catch_up {
+                HealthSeverity::Warning
+            } else {
+                HealthSeverity::Critical
+            },
             code: "remote-head-lagging".into(),
-            message: format!("remote head is {}", remote_head.label()),
+            message: if durable_catch_up {
+                format!(
+                    "remote head is {}; current changes are durable and snapshot publish is catching up",
+                    remote_head.label()
+                )
+            } else {
+                format!("remote head is {}", remote_head.label())
+            },
         });
     }
 
@@ -1035,7 +1055,6 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         }
     }
 
-    let sync_lock_pid = process_lock_owner(&paths.sync_lock)?;
     let sync_lock_is_only_waiter =
         remote_head.synced && upload_stats.total == 0 && durable_journal_pending == 0;
     if let Some(pid) = sync_lock_pid
@@ -6138,7 +6157,7 @@ fn operation_file_changes(
     };
     let Some(after) = load_snapshot_header_by_id_optional(paths, conn, after_id)? else {
         let summary = operation_summary_changes(conn, &op.id, root)?;
-        if !summary.is_empty() {
+        if !summary.is_empty() || operation_summary_marks_no_file_changes(conn, &op.id, root)? {
             return Ok(summary);
         }
         return Ok(snapshot_metadata_unavailable_changes(
@@ -6150,7 +6169,9 @@ fn operation_file_changes(
             Some(snapshot) => Some(snapshot),
             None => {
                 let summary = operation_summary_changes(conn, &op.id, root)?;
-                if !summary.is_empty() {
+                if !summary.is_empty()
+                    || operation_summary_marks_no_file_changes(conn, &op.id, root)?
+                {
                     return Ok(summary);
                 }
                 return Ok(snapshot_metadata_unavailable_changes(
@@ -6185,6 +6206,9 @@ fn operation_summary_changes(
     let mut changes = Vec::new();
     for row in rows {
         let (root_id, path, status) = row?;
+        if status == "N" {
+            continue;
+        }
         let status = match status.as_str() {
             "A" => "A",
             "D" => "D",
@@ -6202,6 +6226,23 @@ fn operation_summary_changes(
         }
     }
     Ok(changes)
+}
+
+fn operation_summary_marks_no_file_changes(
+    conn: &Connection,
+    op_id: &str,
+    root: Option<&str>,
+) -> Result<bool> {
+    conn.query_row(
+        "select exists(
+             select 1 from operation_changes
+             where op_id=?1 and status='N'
+               and (?2 is null or root_id=?2)
+         )",
+        rusqlite::params![op_id, root],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn snapshot_metadata_unavailable_changes(

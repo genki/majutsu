@@ -45,6 +45,7 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     if args.dry_run {
         println!("dry_run true");
     } else {
+        let deleted_snapshots = plan.delete.len();
         let before = current_snapshot(&conn)?;
         for snapshot in &plan.delete {
             conn.execute("delete from snapshots where id=?1", params![snapshot])?;
@@ -80,9 +81,13 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
             println!("remote_cleanup false");
         }
         // syncもmaintenance lockを取得するため、remote cleanupはDB変更と
-        // lockの解放後に実行する。connを保持したまま別プロセスを起動しない。
+        // lockの解放後に実行する。local GCも同じlockを取得するため、
+        // connを保持したまま呼び出さない。
         drop(conn);
         drop(_maintenance_lock);
+        if deleted_snapshots > 0 {
+            gc_cmd(paths, GcArgs { dry_run: false })?;
+        }
         if remote_cleanup {
             crate::sync_runtime::sync_cmd(
                 paths,

@@ -330,15 +330,7 @@ fn sync_configured_remote(
     let enqueued_live_diff =
         enqueue_live_diff_event_journals(paths, current_manifest.as_ref(), &configured_roots)?;
     trace.mark("enqueue live diff journal");
-    let export = export_metadata(paths, conn, config)?;
-    trace.mark("export metadata");
-    let sync_cache = read_remote_sync_cache(paths, remote)?;
-    trace.mark("read sync cache");
-    let remote_export = metadata_export_for_remote(paths, remote, export)?;
-    trace.mark("prepare remote metadata");
-    let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
     let host_label = remote_host_label(&config.host.name);
-    trace.mark("state fingerprint");
     let enqueued_remote_journal = enqueue_remote_event_journal_uploads(
         paths,
         config,
@@ -347,6 +339,22 @@ fn sync_configured_remote(
         current_manifest.as_ref(),
     )?;
     trace.mark("enqueue remote journal");
+
+    // 変更内容を通常の snapshot publish より先に遠隔へ耐久化する。
+    let journal_upload_drain =
+        drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    let acknowledged_remote_journal =
+        acknowledge_remote_event_journal_uploads(paths, remote, &host_label)?;
+    trace.mark("durable journal fast lane");
+
+    let export = export_metadata(paths, conn, config)?;
+    trace.mark("export metadata");
+    let sync_cache = read_remote_sync_cache(paths, remote)?;
+    trace.mark("read sync cache");
+    let remote_export = metadata_export_for_remote(paths, remote, export)?;
+    trace.mark("prepare remote metadata");
+    let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
+    trace.mark("state fingerprint");
     let upload_stats = upload_queue_stats(paths)?;
     trace.mark("upload queue stats");
     let should_prune_remote =
@@ -368,10 +376,19 @@ fn sync_configured_remote(
             Default::default()
         };
         trace.mark("local prune");
-        println!("synced 0 objects to {}", remote.describe());
+        println!(
+            "synced {} objects to {}",
+            journal_upload_drain.uploaded,
+            remote.describe()
+        );
+        println!("synced_bytes {}", journal_upload_drain.uploaded_bytes);
+        println!("skipped_uploads {}", journal_upload_drain.skipped);
         println!("live_diff_journal_enqueued {}", enqueued_live_diff);
-        println!("durable_journal_enqueued 0");
-        println!("durable_journal_acknowledged 0");
+        println!("durable_journal_enqueued {}", enqueued_remote_journal);
+        println!(
+            "durable_journal_acknowledged {}",
+            acknowledged_remote_journal
+        );
         println!("pruned_remote_exports 0");
         println!("pruned_remote_objects 0");
         println!("pruned_remote_journals 0");
@@ -420,8 +437,12 @@ fn sync_configured_remote(
         config,
         remote,
         &trace,
-        enqueued_live_diff,
-        enqueued_remote_journal,
+        SyncJournalFastLane {
+            enqueued_live_diff,
+            enqueued_remote_journal,
+            acknowledged_remote_journal,
+            upload_drain: journal_upload_drain,
+        },
     );
     match result {
         Ok(()) => {
@@ -660,15 +681,27 @@ fn auto_pack_before_sync(paths: &Paths, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+struct SyncJournalFastLane {
+    enqueued_live_diff: usize,
+    enqueued_remote_journal: usize,
+    acknowledged_remote_journal: usize,
+    upload_drain: crate::queue_runtime::UploadDrainStats,
+}
+
 fn enqueue_and_drain_sync(
     paths: &Paths,
     conn: &Connection,
     config: &Config,
     remote: &RemoteStore,
     trace: &SyncTrace,
-    enqueued_live_diff: usize,
-    enqueued_remote_journal: usize,
+    journal: SyncJournalFastLane,
 ) -> Result<()> {
+    let SyncJournalFastLane {
+        enqueued_live_diff,
+        enqueued_remote_journal,
+        acknowledged_remote_journal,
+        upload_drain: journal_upload_drain,
+    } = journal;
     let local_prune_cutoff = local_prune_cutoff_time();
     let content_export = export_metadata(paths, conn, config)?;
     trace.mark("content export");
@@ -868,6 +901,9 @@ fn enqueue_and_drain_sync(
     enqueue_gc_mark_if_needed(paths, remote, &host_label, config, &content_export)?;
     trace.mark("gc mark");
     let mut upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
+    upload_drain.uploaded += journal_upload_drain.uploaded;
+    upload_drain.uploaded_bytes += journal_upload_drain.uploaded_bytes;
+    upload_drain.skipped += journal_upload_drain.skipped;
     trace.mark("drain content queue");
 
     let mut root_size_summary_cache = None::<RootSizeSummary>;
@@ -895,8 +931,8 @@ fn enqueue_and_drain_sync(
     upload_drain.uploaded += summary_upload_drain.uploaded;
     upload_drain.uploaded_bytes += summary_upload_drain.uploaded_bytes;
     upload_drain.skipped += summary_upload_drain.skipped;
-    let acknowledged_remote_journal =
-        acknowledge_remote_event_journal_uploads(paths, remote, &host_label)?;
+    let acknowledged_remote_journal = acknowledged_remote_journal
+        + acknowledge_remote_event_journal_uploads(paths, remote, &host_label)?;
     let compacted_event_journal = crate::queue_runtime::compact_event_journal_force(paths)?;
     if let Some(summary) = &root_size_summary_cache
         && let Err(err) = write_cached_root_size_summary(paths, summary)

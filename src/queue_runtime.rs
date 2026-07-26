@@ -958,16 +958,13 @@ pub(crate) fn enqueue_remote_event_journal_uploads(
     config: &Config,
     host_id: &str,
     roots: &[RootConfig],
-    current: Option<&SnapshotManifest>,
+    _current: Option<&SnapshotManifest>,
 ) -> Result<usize> {
     let mut enqueued = 0usize;
     for mut record in event_journal_records(paths)?
         .into_iter()
         .filter(EventJournalRecord::is_remote_journal_pending)
     {
-        if current.is_some_and(|snapshot| record.observed_at <= snapshot.timestamp) {
-            continue;
-        }
         let key = remote_event_journal_key(host_id, &record.event_id);
         record.remote_journal_key = Some(key.clone());
         enrich_remote_event_journal_payload(paths, config, host_id, roots, &mut record)?;
@@ -1158,7 +1155,8 @@ pub(crate) fn acknowledge_remote_event_journal_uploads(
             .remote_journal_key
             .clone()
             .unwrap_or_else(|| remote_event_journal_key(host_id, &record.event_id));
-        if remote.exists(&key)? {
+        if remote.exists(&key)? && remote_event_payload_is_durable(paths, remote, host_id, &record)?
+        {
             record.remote_journal_key = Some(key);
             record.remote_journal_synced_at = Some(Utc::now());
             write_event_record(paths, record)?;
@@ -1166,6 +1164,43 @@ pub(crate) fn acknowledge_remote_event_journal_uploads(
         }
     }
     Ok(acknowledged)
+}
+
+fn remote_event_payload_is_durable(
+    paths: &Paths,
+    remote: &RemoteStore,
+    host_id: &str,
+    record: &EventJournalRecord,
+) -> Result<bool> {
+    if let Some(payload_key) = record.durable_payload_key.as_deref() {
+        return remote.exists(&durable_payload_remote_key(remote, host_id, payload_key));
+    }
+    let Some(manifest_key) = record.durable_large_manifest_key.as_deref() else {
+        return Ok(true);
+    };
+    if !remote.exists(&durable_payload_remote_key(remote, host_id, manifest_key))? {
+        return Ok(false);
+    }
+    let manifest: LargeManifest =
+        serde_json::from_slice(&crate::read_object(paths, manifest_key)?)?;
+    for chunk in manifest.chunks {
+        if !remote.exists(&durable_payload_remote_key(
+            remote,
+            host_id,
+            &chunk.object_key,
+        ))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn durable_payload_remote_key(remote: &RemoteStore, host_id: &str, key: &str) -> String {
+    if matches!(remote, RemoteStore::S3(_)) {
+        host_remote_key(host_id, key)
+    } else {
+        key.to_string()
+    }
 }
 
 pub(crate) fn remote_event_journal_stats(paths: &Paths) -> Result<RemoteEventJournalStats> {
@@ -1439,11 +1474,12 @@ fn event_removable_after_snapshot(
     if event.observed_at >= last_snapshot_finish {
         return false;
     }
-    if compact_event_journal_trust_snapshot_finish() {
-        return true;
-    }
+    // snapshot がローカルで完了しても、遠隔耐久化前のイベントは削除しない。
     if event.remote_journal_synced_at.is_none() {
         return false;
+    }
+    if compact_event_journal_trust_snapshot_finish() {
+        return true;
     }
     let Some(current) = current else {
         return false;
