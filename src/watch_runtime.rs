@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::ffi::OsString;
@@ -26,6 +27,10 @@ use crate::history_runtime::refresh_runtime_health;
 use crate::operation_log::OperationOriginOverride;
 #[cfg(target_os = "linux")]
 use crate::operation_log::origin_override_from_pid;
+use crate::platform_runtime::configure_background_command;
+use crate::process_runtime::{
+    ProcessIdentity, acquire_process_lock, pid_alive, process_identity, process_identity_matches,
+};
 use crate::queue_runtime::{
     event_journal_records, record_event, record_file_event, upload_queue_stats,
 };
@@ -186,7 +191,7 @@ fn watch_fanotify(
     record_health(paths);
     enforce_watch_memory_guard(paths, args.max_rss_mib)?;
     let replayed_journal = replay_pending_journal_events(paths)?;
-    sync_current_external(paths, true)?;
+    sync_current_external(paths, true, &[])?;
     if replayed_journal {
         record_health(paths);
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
@@ -212,6 +217,7 @@ fn watch_fanotify(
                 paths,
                 SnapshotArgs {
                     message: Some("watch periodic rescan".into()),
+                    changed_roots: Vec::new(),
                     origin: fallback_watch_origin("watch:fanotify", Some("fanotify")),
                 },
             )?;
@@ -225,13 +231,15 @@ fn watch_fanotify(
         if !fanotify_event_relevant_for_roots(&active_roots, &event) {
             continue;
         }
-        record_fanotify_event(paths, &event)?;
+        let changed_roots = fanotify_event_changed_roots(&active_roots, &event);
+        record_fanotify_event(paths, &active_roots, &event)?;
         let origin = event.origin();
         if args.mode == "strict" {
             snapshot_and_maybe_sync(
                 paths,
                 SnapshotArgs {
                     message: Some("watch strict event snapshot".into()),
+                    changed_roots: changed_roots_vec(changed_roots),
                     origin,
                 },
             )?;
@@ -245,7 +253,7 @@ fn watch_fanotify(
             max_latency: Duration::from_millis(args.buffer_max_ms.max(1)),
             max_events: args.buffer_max_events.max(1),
         };
-        let outcome = fanotify.drain_buffer(buffer, origin, &active_roots)?;
+        let outcome = fanotify.drain_buffer(paths, buffer, origin, &active_roots, changed_roots)?;
         record_event(
             paths,
             "watch-buffer-flush",
@@ -266,6 +274,7 @@ fn watch_fanotify(
             paths,
             SnapshotArgs {
                 message: Some("watch event snapshot".into()),
+                changed_roots: changed_roots_vec(outcome.changed_roots),
                 origin: outcome.origin,
             },
         )?;
@@ -313,6 +322,7 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
             paths,
             SnapshotArgs {
                 message: Some("watch snapshot".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )?;
@@ -512,9 +522,11 @@ impl FanotifyFd {
 
     fn drain_buffer(
         &self,
+        paths: &Paths,
         config: FanotifyBufferConfig,
         mut origin: Option<OperationOriginOverride>,
         active_roots: &[RootConfig],
+        mut changed_roots: Option<BTreeSet<String>>,
     ) -> Result<FanotifyBufferOutcome> {
         let started = Instant::now();
         let mut last_event = started;
@@ -526,6 +538,7 @@ impl FanotifyFd {
                     events,
                     elapsed_ms: started.elapsed().as_millis(),
                     origin,
+                    changed_roots,
                 });
             }
             let elapsed = started.elapsed();
@@ -535,6 +548,7 @@ impl FanotifyFd {
                     events,
                     elapsed_ms: elapsed.as_millis(),
                     origin,
+                    changed_roots,
                 });
             }
             let quiet_remaining = config
@@ -547,6 +561,7 @@ impl FanotifyFd {
                     events,
                     elapsed_ms: started.elapsed().as_millis(),
                     origin,
+                    changed_roots,
                 });
             }
             let timeout = quiet_remaining
@@ -574,6 +589,11 @@ impl FanotifyFd {
                 if !fanotify_event_relevant_for_roots(active_roots, &event) {
                     continue;
                 }
+                record_fanotify_event(paths, active_roots, &event)?;
+                merge_changed_roots(
+                    &mut changed_roots,
+                    fanotify_event_changed_roots(active_roots, &event),
+                );
                 origin = event.origin();
                 events += 1;
                 last_event = Instant::now();
@@ -623,24 +643,38 @@ struct FanotifyBufferOutcome {
     events: usize,
     elapsed_ms: u128,
     origin: Option<OperationOriginOverride>,
+    changed_roots: Option<BTreeSet<String>>,
 }
 
 #[cfg(target_os = "linux")]
-fn record_fanotify_event(paths: &Paths, event: &FanotifyObservedEvent) -> Result<()> {
-    record_event(
-        paths,
-        "fs-event",
-        &format!(
-            "fanotify mask=0x{:x} origin_pid={} origin_confidence=fanotify path={}",
-            event.mask,
-            event.pid,
-            event
-                .path
-                .as_deref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "(unknown)".into())
-        ),
-    )
+fn record_fanotify_event(
+    paths: &Paths,
+    active_roots: &[RootConfig],
+    event: &FanotifyObservedEvent,
+) -> Result<()> {
+    let detail = format!(
+        "fanotify mask=0x{:x} origin_pid={} origin_confidence=fanotify path={}",
+        event.mask,
+        event.pid,
+        event
+            .path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(unknown)".into())
+    );
+    if let Some(path) = event.path.as_deref()
+        && let Some((root_id, relative_path)) = event_path_for_roots(active_roots, path)
+    {
+        return record_file_event(
+            paths,
+            &root_id,
+            &relative_path,
+            "modify",
+            "fanotify",
+            &detail,
+        );
+    }
+    record_event(paths, "fs-event", &detail)
 }
 
 #[cfg(target_os = "linux")]
@@ -657,6 +691,15 @@ fn fanotify_event_relevant_for_roots(
         .path
         .as_deref()
         .is_none_or(|path| event_path_for_roots(active_roots, path).is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn fanotify_event_changed_roots(
+    active_roots: &[RootConfig],
+    event: &FanotifyObservedEvent,
+) -> Option<BTreeSet<String>> {
+    let path = event.path.as_deref()?;
+    changed_roots_for_paths(active_roots, std::iter::once(path))
 }
 
 fn watch_notify_loop<W: Watcher>(
@@ -706,7 +749,7 @@ fn watch_notify_loop<W: Watcher>(
     record_health(paths);
     enforce_watch_memory_guard(paths, args.max_rss_mib)?;
     let replayed_journal = replay_pending_journal_events(paths)?;
-    sync_current_external(paths, true)?;
+    sync_current_external(paths, true, &[])?;
     if replayed_journal {
         record_health(paths);
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
@@ -734,6 +777,7 @@ fn watch_notify_loop<W: Watcher>(
                     paths,
                     SnapshotArgs {
                         message: Some("watch periodic rescan".into()),
+                        changed_roots: Vec::new(),
                         origin: fallback_watch_origin(
                             &format!("watch:{backend_label}"),
                             Some(backend_label),
@@ -758,12 +802,14 @@ fn watch_notify_loop<W: Watcher>(
         if !snapshot_relevant_event(&event) || !event_relevant_for_roots(&watched_roots, &event) {
             continue;
         }
+        let changed_roots = notify_event_changed_roots(&watched_roots, &event);
         record_notify_event(paths, backend_label, &watched_roots, &event)?;
         if args.mode == "strict" {
             snapshot_and_maybe_sync(
                 paths,
                 SnapshotArgs {
                     message: Some("watch strict event snapshot".into()),
+                    changed_roots: changed_roots_vec(changed_roots),
                     origin: fallback_watch_origin(
                         &format!("watch:{backend_label}"),
                         Some(backend_label),
@@ -782,7 +828,14 @@ fn watch_notify_loop<W: Watcher>(
             max_events: args.buffer_max_events.max(1),
             max_rss_mib: args.max_rss_mib,
         };
-        let outcome = drain_watch_event_buffer(paths, &rx, buffer, backend_label, &watched_roots)?;
+        let outcome = drain_watch_event_buffer(
+            paths,
+            &rx,
+            buffer,
+            backend_label,
+            &watched_roots,
+            changed_roots,
+        )?;
         record_event(
             paths,
             "watch-buffer-flush",
@@ -795,6 +848,7 @@ fn watch_notify_loop<W: Watcher>(
             paths,
             SnapshotArgs {
                 message: Some("watch event snapshot".into()),
+                changed_roots: changed_roots_vec(outcome.changed_roots),
                 origin: fallback_watch_origin(
                     &format!("watch:{backend_label}"),
                     Some(backend_label),
@@ -958,7 +1012,8 @@ fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
 }
 
 fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
-    sync_current_external(paths, false)?;
+    let changed_roots = args.changed_roots.clone();
+    sync_current_external(paths, false, &changed_roots)?;
     let before_snapshot = local_current_snapshot(paths)?;
     if std::env::var("MAJUTSU_WATCH_INLINE_SNAPSHOT").as_deref() == Ok("1") {
         snapshot(paths, args)?;
@@ -1002,6 +1057,9 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         .arg("snapshot")
         .arg("--message")
         .arg(&message);
+    for root_id in &changed_roots {
+        command.arg("--changed-root").arg(root_id);
+    }
     if let Some(origin) = &origin {
         if let Some(label) = &origin.label {
             command.env("MAJUTSU_ORIGIN_LABEL", label);
@@ -1032,7 +1090,7 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         record_watch_sync_skipped(paths, after_snapshot.as_deref())?;
         return Ok(());
     }
-    sync_current_external(paths, true)?;
+    sync_current_external(paths, true, &changed_roots)?;
     Ok(())
 }
 
@@ -1119,7 +1177,7 @@ fn record_watch_sync_skipped(paths: &Paths, current: Option<&str>) -> Result<()>
     )
 }
 
-fn sync_current_external(paths: &Paths, prune_after: bool) -> Result<()> {
+fn sync_current_external(paths: &Paths, prune_after: bool, changed_roots: &[String]) -> Result<()> {
     if read_config(paths)?.remote.is_none() {
         return Ok(());
     }
@@ -1140,14 +1198,18 @@ fn sync_current_external(paths: &Paths, prune_after: bool) -> Result<()> {
         return Ok(());
     }
     let exe = child_process_exe()?;
-    let status = std::process::Command::new(&exe)
+    let mut command = std::process::Command::new(&exe);
+    command
         .arg("--home")
         .arg(&paths.home)
         .arg("sync")
         .arg("--wait")
         .arg("--timeout-secs")
-        .arg("300")
-        .status()?;
+        .arg("300");
+    for root_id in changed_roots {
+        command.arg("--changed-root").arg(root_id);
+    }
+    let status = command.status()?;
     if status.success() {
         record_event(paths, "watch-sync", "external sync completed")?;
         if prune_after {
@@ -1167,29 +1229,232 @@ fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
     if std::env::var("MAJUTSU_WATCH_AUTO_PRUNE").as_deref() == Ok("0") {
         return Ok(());
     }
+    let prune_interval = watch_prune_interval();
+    if let Some(interval) = prune_interval
+        && !watch_prune_due(paths, interval)?
+    {
+        record_event(
+            paths,
+            "watch-prune-deferred",
+            &format!("interval_secs={} reason=rate-limit", interval.as_secs()),
+        )?;
+        return Ok(());
+    }
     let keep_daily = std::env::var("MAJUTSU_WATCH_PRUNE_KEEP_DAILY").unwrap_or_else(|_| "0".into());
     let keep_monthly =
         std::env::var("MAJUTSU_WATCH_PRUNE_KEEP_MONTHLY").unwrap_or_else(|_| "0".into());
     let exe = child_process_exe()?;
-    let status = std::process::Command::new(&exe)
-        .args(auto_prune_args(paths, &keep_daily, &keep_monthly))
-        .status()?;
-    if status.success() {
-        record_event(
-            paths,
-            "watch-prune",
-            &format!(
-                "auto prune completed keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=true"
-            ),
-        )?;
-    } else {
-        record_event(
-            paths,
-            "watch-prune-error",
-            &format!("auto prune exited with status {status}"),
-        )?;
+    let prune_args = auto_prune_args(paths, &keep_daily, &keep_monthly);
+
+    // テストや明示的な互換運用では従来どおり完了を待てるようにする。
+    // 通常のdaemonでは保守処理をwatchの同期hot pathから切り離す。
+    if std::env::var("MAJUTSU_WATCH_PRUNE_ASYNC").as_deref() == Ok("0") {
+        let status = std::process::Command::new(&exe).args(prune_args).status()?;
+        if status.success() {
+            record_watch_prune_completed(paths, &keep_daily, &keep_monthly, prune_interval)?;
+        } else {
+            record_event(
+                paths,
+                "watch-prune-error",
+                &format!("auto prune exited with status {status}"),
+            )?;
+        }
+        return Ok(());
+    }
+
+    let _schedule_lock = match acquire_process_lock(
+        &paths.home.join("locks/watch-prune-schedule.lock"),
+        "watch prune scheduling",
+    ) {
+        Ok(lock) => lock,
+        Err(error) if error.to_string().contains("already running") => {
+            record_event(paths, "watch-prune-deferred", "reason=schedule-lock-busy")?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if watch_prune_job_running(paths)? {
+        record_event(paths, "watch-prune-deferred", "reason=job-running")?;
+        return Ok(());
+    }
+
+    let mut command = std::process::Command::new(&exe);
+    command.args(prune_args);
+    configure_background_command(&mut command);
+    let mut child = command.spawn().context("spawn asynchronous watch prune")?;
+    let job_path = watch_prune_job_path(paths);
+    let job = WatchPruneJob {
+        version: 1,
+        identity: process_identity(child.id()),
+        started_at_unix_secs: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    if let Err(error) = write_watch_prune_job(paths, &job) {
+        let _ = child.kill();
+        return Err(error);
+    }
+
+    let worker_paths = paths.clone();
+    let worker_job_path = job_path.clone();
+    let worker_keep_daily = keep_daily.clone();
+    let worker_keep_monthly = keep_monthly.clone();
+    let worker_prune_interval = prune_interval;
+    std::thread::spawn(move || {
+        let result = child.wait();
+        let _ = fs::remove_file(&worker_job_path);
+        match result {
+            Ok(status) if status.success() => {
+                let _ = record_watch_prune_completed(
+                    &worker_paths,
+                    &worker_keep_daily,
+                    &worker_keep_monthly,
+                    worker_prune_interval,
+                );
+            }
+            Ok(status) => {
+                let _ = record_event(
+                    &worker_paths,
+                    "watch-prune-error",
+                    &format!("auto prune exited with status {status}"),
+                );
+            }
+            Err(error) => {
+                let _ = record_event(
+                    &worker_paths,
+                    "watch-prune-error",
+                    &format!("wait for auto prune failed: {error}"),
+                );
+            }
+        }
+    });
+    record_event(
+        paths,
+        "watch-prune-started",
+        &format!(
+            "auto prune started keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=true interval_secs={}",
+            prune_interval.map_or(0, |interval| interval.as_secs())
+        ),
+    )?;
+    Ok(())
+}
+
+fn record_watch_prune_completed(
+    paths: &Paths,
+    keep_daily: &str,
+    keep_monthly: &str,
+    prune_interval: Option<Duration>,
+) -> Result<()> {
+    record_event(
+        paths,
+        "watch-prune",
+        &format!(
+            "auto prune completed keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=true interval_secs={}",
+            prune_interval.map_or(0, |interval| interval.as_secs())
+        ),
+    )?;
+    if prune_interval.is_some() {
+        write_watch_prune_state(paths)?;
     }
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WatchPruneState {
+    version: u32,
+    pruned_at_unix_secs: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WatchPruneJob {
+    version: u32,
+    identity: ProcessIdentity,
+    started_at_unix_secs: u64,
+}
+
+fn watch_prune_interval() -> Option<Duration> {
+    std::env::var("MAJUTSU_WATCH_PRUNE_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
+fn watch_prune_state_path(paths: &Paths) -> PathBuf {
+    paths.home.join("cache/watch-prune-state.json")
+}
+
+fn watch_prune_job_path(paths: &Paths) -> PathBuf {
+    paths.runtime.join("watch-prune-job.json")
+}
+
+fn watch_prune_job_running(paths: &Paths) -> Result<bool> {
+    let path = watch_prune_job_path(paths);
+    let Some(job) = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WatchPruneJob>(&bytes).ok())
+    else {
+        // 旧形式、破損、または完了後に残ったmarkerは次の起動で回収する。
+        let _ = fs::remove_file(path);
+        return Ok(false);
+    };
+    if job.version != 1 {
+        let _ = fs::remove_file(path);
+        return Ok(false);
+    }
+    let actual = process_identity(job.identity.pid);
+    let matches = process_identity_matches(&job.identity, &actual)
+        || (job.identity.start_token.is_none()
+            && job.identity.executable.is_none()
+            && pid_alive(job.identity.pid));
+    if matches {
+        return Ok(true);
+    }
+    let _ = fs::remove_file(path);
+    Ok(false)
+}
+
+fn write_watch_prune_job(paths: &Paths, job: &WatchPruneJob) -> Result<()> {
+    if let Some(parent) = watch_prune_job_path(paths).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_io::write_atomic(&watch_prune_job_path(paths), &serde_json::to_vec(job)?)
+}
+
+fn watch_prune_due(paths: &Paths, interval: Duration) -> Result<bool> {
+    let path = watch_prune_state_path(paths);
+    if !path.exists() {
+        return Ok(true);
+    }
+    let state: WatchPruneState = match fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(state) => state,
+        None => return Ok(true),
+    };
+    if state.version != 1 {
+        return Ok(true);
+    }
+    let now = SystemTime::now();
+    let last_pruned = SystemTime::UNIX_EPOCH + Duration::from_secs(state.pruned_at_unix_secs);
+    Ok(now.duration_since(last_pruned).unwrap_or(Duration::MAX) >= interval)
+}
+
+fn write_watch_prune_state(paths: &Paths) -> Result<()> {
+    let path = watch_prune_state_path(paths);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let state = WatchPruneState {
+        version: 1,
+        pruned_at_unix_secs: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    crate::atomic_io::write_atomic(&path, &serde_json::to_vec(&state)?)
 }
 
 fn auto_prune_args(paths: &Paths, keep_daily: &str, keep_monthly: &str) -> Vec<OsString> {
@@ -1314,6 +1579,59 @@ fn event_relevant_for_roots(active_roots: &[RootConfig], event: &notify::Event) 
         .any(|path| event_path_for_roots(active_roots, path).is_some())
 }
 
+fn notify_event_changed_roots(
+    active_roots: &[RootConfig],
+    event: &notify::Event,
+) -> Option<BTreeSet<String>> {
+    changed_roots_for_paths(active_roots, event.paths.iter().map(PathBuf::as_path))
+}
+
+fn changed_roots_for_paths<'a>(
+    active_roots: &[RootConfig],
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Option<BTreeSet<String>> {
+    if active_roots.is_empty() {
+        return None;
+    }
+    let mut changed = BTreeSet::new();
+    for path in paths {
+        let matching_roots = event_root_ids_for_path(active_roots, path);
+        if matching_roots.is_empty() {
+            // pathをrootへ確実に対応付けられない場合は安全側で全rootを走査する。
+            return None;
+        }
+        changed.extend(matching_roots);
+    }
+    (!changed.is_empty()).then_some(changed)
+}
+
+fn event_root_ids_for_path(active_roots: &[RootConfig], path: &Path) -> BTreeSet<String> {
+    active_roots
+        .iter()
+        .filter_map(|root| {
+            let relative = path.strip_prefix(&root.path).ok()?;
+            if !relative.as_os_str().is_empty()
+                && root_ignores_relative_path(root, relative, path.is_dir())
+            {
+                return None;
+            }
+            Some(root.id.clone())
+        })
+        .collect()
+}
+
+fn merge_changed_roots(changed: &mut Option<BTreeSet<String>>, next: Option<BTreeSet<String>>) {
+    let (Some(changed), Some(next)) = (changed.as_mut(), next) else {
+        *changed = None;
+        return;
+    };
+    changed.extend(next);
+}
+
+fn changed_roots_vec(changed: Option<BTreeSet<String>>) -> Vec<String> {
+    changed.map_or_else(Vec::new, |roots| roots.into_iter().collect())
+}
+
 fn event_path_for_roots(active_roots: &[RootConfig], path: &Path) -> Option<(String, String)> {
     active_roots
         .iter()
@@ -1375,6 +1693,7 @@ struct WatchEventBufferOutcome {
     reason: &'static str,
     events: usize,
     elapsed_ms: u128,
+    changed_roots: Option<BTreeSet<String>>,
 }
 
 fn drain_watch_event_buffer(
@@ -1383,6 +1702,7 @@ fn drain_watch_event_buffer(
     config: WatchEventBufferConfig,
     backend_label: &str,
     active_roots: &[RootConfig],
+    mut changed_roots: Option<BTreeSet<String>>,
 ) -> Result<WatchEventBufferOutcome> {
     let started = Instant::now();
     let mut last_event = started;
@@ -1397,18 +1717,18 @@ fn drain_watch_event_buffer(
     loop {
         enforce_watch_memory_guard(paths, config.max_rss_mib)?;
         if events >= config.max_events {
-            return settle_before_flush(&context, started, events, "max-events");
+            return settle_before_flush(&context, started, events, "max-events", changed_roots);
         }
         let elapsed = started.elapsed();
         if elapsed >= config.max_latency {
-            return settle_before_flush(&context, started, events, "max-latency");
+            return settle_before_flush(&context, started, events, "max-latency", changed_roots);
         }
         let quiet_remaining = config
             .quiet
             .checked_sub(last_event.elapsed())
             .unwrap_or(Duration::ZERO);
         if quiet_remaining.is_zero() {
-            return settle_before_flush(&context, started, events, "quiet");
+            return settle_before_flush(&context, started, events, "quiet", changed_roots);
         }
         let max_remaining = config.max_latency.saturating_sub(elapsed);
         let timeout = quiet_remaining
@@ -1421,6 +1741,10 @@ fn drain_watch_event_buffer(
                     continue;
                 }
                 record_notify_event(paths, backend_label, active_roots, &next)?;
+                merge_changed_roots(
+                    &mut changed_roots,
+                    notify_event_changed_roots(active_roots, &next),
+                );
                 events += 1;
                 last_event = Instant::now();
             }
@@ -1434,7 +1758,7 @@ fn drain_watch_event_buffer(
                 } else {
                     "quiet"
                 };
-                return settle_before_flush(&context, started, events, reason);
+                return settle_before_flush(&context, started, events, reason, changed_roots);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
         }
@@ -1454,6 +1778,7 @@ fn settle_before_flush(
     started: Instant,
     mut events: usize,
     reason: &'static str,
+    mut changed_roots: Option<BTreeSet<String>>,
 ) -> Result<WatchEventBufferOutcome> {
     let paths = context.paths;
     let rx = context.rx;
@@ -1469,10 +1794,15 @@ fn settle_before_flush(
         loop {
             enforce_watch_memory_guard(paths, config.max_rss_mib)?;
             if events >= config.max_events {
-                return Ok(buffer_outcome(started, events, "max-events"));
+                return Ok(buffer_outcome(started, events, "max-events", changed_roots));
             }
             if started.elapsed() >= config.max_latency {
-                return Ok(buffer_outcome(started, events, "max-latency"));
+                return Ok(buffer_outcome(
+                    started,
+                    events,
+                    "max-latency",
+                    changed_roots,
+                ));
             }
             let timeout = config
                 .settle
@@ -1486,6 +1816,10 @@ fn settle_before_flush(
                         continue;
                     }
                     record_notify_event(paths, backend_label, active_roots, &next)?;
+                    merge_changed_roots(
+                        &mut changed_roots,
+                        notify_event_changed_roots(active_roots, &next),
+                    );
                     events += 1;
                 }
                 Ok(Err(err)) => {
@@ -1497,18 +1831,20 @@ fn settle_before_flush(
             }
         }
     }
-    Ok(buffer_outcome(started, events, reason))
+    Ok(buffer_outcome(started, events, reason, changed_roots))
 }
 
 fn buffer_outcome(
     started: Instant,
     events: usize,
     reason: &'static str,
+    changed_roots: Option<BTreeSet<String>>,
 ) -> WatchEventBufferOutcome {
     WatchEventBufferOutcome {
         reason,
         events,
         elapsed_ms: started.elapsed().as_millis(),
+        changed_roots,
     }
 }
 
@@ -1657,6 +1993,43 @@ mod tests {
             &[root],
             &test_event_abs(root_path.join("src/main.rs"))
         ));
+    }
+
+    #[test]
+    fn notify_events_identify_only_the_changed_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a_path = temp.path().join("a");
+        let root_b_path = temp.path().join("b");
+        std::fs::create_dir_all(&root_a_path).unwrap();
+        std::fs::create_dir_all(&root_b_path).unwrap();
+        let root_a = test_root(root_a_path.clone(), Vec::new());
+        let mut root_b = test_root(root_b_path.clone(), Vec::new());
+        root_b.id = "root-b".into();
+        let event = test_event_abs(root_b_path.join("note.txt"));
+
+        let changed = notify_event_changed_roots(&[root_a, root_b], &event).unwrap();
+
+        assert_eq!(changed, BTreeSet::from(["root-b".to_string()]));
+    }
+
+    #[test]
+    fn notify_events_update_every_overlapping_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        let child_path = parent_path.join("child");
+        std::fs::create_dir_all(&child_path).unwrap();
+        let mut parent = test_root(parent_path, Vec::new());
+        parent.id = "parent".into();
+        let mut child = test_root(child_path.clone(), Vec::new());
+        child.id = "child".into();
+        let event = test_event_abs(child_path.join("note.txt"));
+
+        let changed = notify_event_changed_roots(&[parent, child], &event).unwrap();
+
+        assert_eq!(
+            changed,
+            BTreeSet::from(["child".to_string(), "parent".to_string()])
+        );
     }
 
     #[test]
@@ -1811,6 +2184,7 @@ mod tests {
             },
             "test",
             &[],
+            None,
         )
         .unwrap();
         release_tx.send(()).unwrap();
@@ -1843,6 +2217,7 @@ mod tests {
             },
             "test",
             &[],
+            None,
         )
         .unwrap();
 
@@ -1879,6 +2254,7 @@ mod tests {
             },
             "test",
             &[],
+            None,
         )
         .unwrap();
 
@@ -1956,6 +2332,44 @@ mod tests {
         );
         assert!(args.windows(2).any(|pair| pair == ["--keep-daily", "7"]));
         assert!(args.windows(2).any(|pair| pair == ["--keep-monthly", "3"]));
+    }
+
+    #[test]
+    fn watch_prune_state_defers_until_interval_has_elapsed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let state_path = watch_prune_state_path(&paths);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        write_watch_prune_state(&paths).unwrap();
+
+        assert!(!watch_prune_due(&paths, Duration::from_secs(3600)).unwrap());
+        assert!(watch_prune_due(&paths, Duration::from_secs(0)).unwrap());
+    }
+
+    #[test]
+    fn watch_prune_job_marker_distinguishes_running_and_stale_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let running = WatchPruneJob {
+            version: 1,
+            identity: process_identity(std::process::id()),
+            started_at_unix_secs: 0,
+        };
+        write_watch_prune_job(&paths, &running).unwrap();
+        assert!(watch_prune_job_running(&paths).unwrap());
+
+        let stale = WatchPruneJob {
+            version: 1,
+            identity: ProcessIdentity {
+                pid: u32::MAX,
+                start_token: Some("stale".into()),
+                executable: Some("stale".into()),
+            },
+            started_at_unix_secs: 0,
+        };
+        write_watch_prune_job(&paths, &stale).unwrap();
+        assert!(!watch_prune_job_running(&paths).unwrap());
+        assert!(!watch_prune_job_path(&paths).exists());
     }
 
     fn test_event(path: &str) -> Event {

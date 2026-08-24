@@ -464,7 +464,10 @@ snapshots.
 The daemon default is `keep-daily 0` / `keep-monthly 0`, so remote storage
 converges toward the current restore set. Set `MAJUTSU_WATCH_PRUNE_KEEP_DAILY`,
 `MAJUTSU_WATCH_PRUNE_KEEP_MONTHLY`, or `MAJUTSU_WATCH_AUTO_PRUNE=0` when the
-backend should keep longer snapshot history.
+backend should keep longer snapshot history. To avoid running maintenance after
+every event-driven sync, set `MAJUTSU_WATCH_PRUNE_INTERVAL_SECS` to a positive
+number; the last successful watch prune is recorded under
+`$MAJUTSU_HOME/cache/watch-prune-state.json`.
 
 Use `--drop-missing-remote-history` when `mj health --deep --history` reports
 missing remote objects for old history, while current health remains protected.

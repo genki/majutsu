@@ -1436,6 +1436,8 @@ pub(crate) struct RootSetArgs {
 pub(crate) struct SnapshotArgs {
     #[arg(long)]
     pub(crate) message: Option<String>,
+    #[arg(long = "changed-root", value_name = "ROOT", hide = true)]
+    pub(crate) changed_roots: Vec<String>,
     #[arg(skip)]
     pub(crate) origin: Option<crate::operation_log::OperationOriginOverride>,
 }
@@ -1705,6 +1707,8 @@ pub(crate) struct SyncArgs {
         help = "Maximum time to wait with --wait"
     )]
     pub(crate) timeout_secs: u64,
+    #[arg(long = "changed-root", value_name = "ROOT", hide = true)]
+    pub(crate) changed_roots: Vec<String>,
     #[command(subcommand)]
     pub(crate) command: Option<SyncCommand>,
 }

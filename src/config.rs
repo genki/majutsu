@@ -11,7 +11,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use crate::watch_runtime::{default_watch_backend, normalize_watch_backend};
 
@@ -42,7 +44,7 @@ pub(crate) fn maintenance_lock_path(paths: &Paths) -> PathBuf {
     paths.home.join("locks/maintenance.lock")
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Config {
     pub(crate) host: HostConfig,
     pub(crate) remote: Option<RemoteConfig>,
@@ -61,7 +63,7 @@ pub(crate) struct Config {
     pub(crate) restore: RestoreConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct HostConfig {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -612,9 +614,68 @@ pub(crate) fn policy_config(tiering: &TieringConfig) -> crate::majutsu_policy::P
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFileSignature {
+    exists: bool,
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct CachedConfig {
+    signature: ConfigFileSignature,
+    config: Config,
+}
+
+static CONFIG_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, CachedConfig>>> = OnceLock::new();
+
+fn config_cache() -> &'static Mutex<BTreeMap<PathBuf, CachedConfig>> {
+    CONFIG_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn config_file_signature(path: &Path) -> Result<ConfigFileSignature> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(ConfigFileSignature {
+            exists: true,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFileSignature {
+            exists: false,
+            length: 0,
+            modified: None,
+        }),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn invalidate_config_cache(path: &Path) {
+    if let Ok(mut cache) = config_cache().lock() {
+        cache.remove(path);
+    }
+}
+
 pub(crate) fn read_config(paths: &Paths) -> Result<Config> {
+    let signature = config_file_signature(&paths.config)?;
+    if let Ok(cache) = config_cache().lock()
+        && let Some(cached) = cache.get(&paths.config)
+        && cached.signature == signature
+    {
+        return Ok(cached.config.clone());
+    }
+
     let config: Config = toml::from_str(&fs::read_to_string(&paths.config)?)?;
     validate_config(&config)?;
+    let signature = config_file_signature(&paths.config)?;
+    if let Ok(mut cache) = config_cache().lock() {
+        cache.insert(
+            paths.config.clone(),
+            CachedConfig {
+                signature,
+                config: config.clone(),
+            },
+        );
+    }
     Ok(config)
 }
 
@@ -631,6 +692,7 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
 
 pub(crate) fn write_config(paths: &Paths, config: &Config) -> Result<()> {
     crate::atomic_io::write_atomic(&paths.config, toml::to_string_pretty(config)?.as_bytes())?;
+    invalidate_config_cache(&paths.config);
     Ok(())
 }
 

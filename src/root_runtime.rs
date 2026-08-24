@@ -4,7 +4,7 @@ use crate::majutsu_core::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -295,6 +295,15 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
         }
         bail!("no paths supplied");
     }
+    let transaction = if args.dry_run {
+        None
+    } else {
+        Some(Transaction::new_unchecked(
+            &conn,
+            TransactionBehavior::Immediate,
+        )?)
+    };
+    let db = transaction.as_deref().unwrap_or(&conn);
     let mut changed = BTreeMap::<String, RootConfig>::new();
     let mut summary = UntrackSummary {
         requested: input_paths.len(),
@@ -318,7 +327,7 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
         if track {
             remove_pattern(&mut root.explicit_untrack, &rel);
             push_pattern(&mut root.explicit_track, rel.clone());
-            mark_path_explicitly_tracked(&conn, &root.id, &rel)?;
+            mark_path_explicitly_tracked(db, &root.id, &rel)?;
             println!("tracked {}:{}", root.id, rel);
         } else {
             if args.dry_run {
@@ -332,7 +341,7 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
             if !args.excluded {
                 push_pattern(&mut root.explicit_untrack, rel.clone());
             }
-            mark_path_untracked(&conn, &root.id, &rel)?;
+            mark_path_untracked(db, &root.id, &rel)?;
             untracked_by_root
                 .entry(root.id.clone())
                 .or_default()
@@ -366,7 +375,7 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
             let forgotten = match with_sqlite_storage_context(
                 paths,
                 "forget unmanaged root history",
-                || forget_unmanaged_root_history(paths, &conn, root),
+                || forget_unmanaged_root_history(paths, db, root),
             ) {
                 Ok(stats) => stats,
                 Err(err) if args.continue_on_history_error => {
@@ -384,7 +393,7 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
             if forgotten.records > 0 {
                 let removed =
                     with_sqlite_storage_context(paths, "prune unreferenced metadata", || {
-                        crate::prune_runtime::prune_unreferenced_metadata(paths, &conn)
+                        crate::prune_runtime::prune_unreferenced_metadata(paths, db)
                     })?;
                 if !args.quiet && !args.json {
                     println!("forgotten_unmanaged_records {}", forgotten.records);
@@ -397,13 +406,12 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
             }
         }
         if !args.dry_run {
-            save_root(&conn, root)?;
+            save_root(db, root)?;
         }
     }
     if !args.dry_run {
-        sync_roots_to_config(paths, &conn)?;
         record_op(
-            &conn,
+            db,
             if track {
                 "path-tracked"
             } else {
@@ -413,6 +421,10 @@ fn update_explicit_tracking(paths: &Paths, args: PathTrackArgs, track: bool) -> 
             None,
             args.root.as_deref(),
         )?;
+    }
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+        sync_roots_to_config(paths, &conn)?;
     }
     if !track && (args.summary || args.quiet || args.json || args.dry_run) {
         if args.json {
@@ -711,18 +723,9 @@ fn forget_unmanaged_root_history(
     let ignore = build_ignore(root)?;
     let config = read_config(paths)?;
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
-    let mut stmt =
-        conn.prepare("select id, manifest_key, manifest_json from snapshots order by created_at")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
+    let snapshots = snapshot_manifest_rows(conn)?;
     let mut stats = ForgetUnmanagedStats::default();
-    for row in rows {
-        let (snapshot_id, manifest_key, manifest_json) = row?;
+    for (snapshot_id, manifest_key, manifest_json) in snapshots {
         let mut manifest: SnapshotManifest = if manifest_json.trim().is_empty() {
             read_metadata_manifest(paths, remote.as_ref(), &manifest_key)
                 .with_context(|| format!("read snapshot manifest {manifest_key}"))?
@@ -798,6 +801,19 @@ fn forget_unmanaged_root_history(
         crate::insert_snapshot_payload_index(conn, &manifest)?;
     }
     Ok(stats)
+}
+
+fn snapshot_manifest_rows(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt =
+        conn.prepare("select id, manifest_key, manifest_json from snapshots order by created_at")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[derive(Serialize)]
@@ -3150,7 +3166,8 @@ fn format_count(value: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_page_wide_output, terminal_width_from};
+    use super::{should_page_wide_output, snapshot_manifest_rows, terminal_width_from};
+    use rusqlite::Connection;
 
     #[test]
     fn root_list_pages_only_when_tty_output_exceeds_width_or_forced() {
@@ -3169,5 +3186,43 @@ mod tests {
         assert_eq!(terminal_width_from(None, Some(200)), 200);
         assert_eq!(terminal_width_from(Some(20), Some(200)), 200);
         assert_eq!(terminal_width_from(None, None), 100);
+    }
+
+    #[test]
+    fn snapshot_manifest_rows_release_read_snapshot_before_followup_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("state.sqlite");
+        let reader = Connection::open(&db).unwrap();
+        reader.pragma_update(None, "journal_mode", "WAL").unwrap();
+        reader
+            .execute_batch(
+                "create table snapshots(
+                    id text primary key,
+                    manifest_key text not null,
+                    manifest_json text not null,
+                    created_at text not null
+                );
+                insert into snapshots values ('snap-a', 'objects/a', '{}', '2026-01-01');",
+            )
+            .unwrap();
+        let writer = Connection::open(&db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+
+        let rows = snapshot_manifest_rows(&reader).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(reader.is_autocommit());
+
+        writer
+            .execute(
+                "insert into snapshots values ('snap-b', 'objects/b', '{}', '2026-01-02')",
+                [],
+            )
+            .unwrap();
+        reader
+            .execute(
+                "update snapshots set manifest_key='objects/a2' where id='snap-a'",
+                [],
+            )
+            .unwrap();
     }
 }

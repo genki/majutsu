@@ -2,6 +2,7 @@
 set -euo pipefail
 
 remote="${MAJUTSU_BUILD_REMOTE:-machinaai}"
+remote_worker="build-service/bin/majutsu-remote-build-worker.sh"
 target="${1:-aarch64-apple-darwin}"
 mode="${2:-release}"
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,7 +45,7 @@ rsync -a --delete \
   --exclude '.DS_Store' \
   "$repo_dir/" "$remote:$remote_job/source/"
 
-ssh "$remote" "\$HOME/build-service/bin/remote-build-worker.sh \"\$HOME/$remote_job\" '$target' '$mode' '$job_id'"
+ssh "$remote" "\$HOME/$remote_worker \"\$HOME/$remote_job\" '$target' '$mode' '$job_id'"
 
 if [[ "$mode" == "release" ]]; then
   mkdir -p "$local_out"

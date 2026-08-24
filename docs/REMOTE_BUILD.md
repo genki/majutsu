@@ -16,6 +16,16 @@ APIは設けない。
 - Cargo targetは一時directoryとして扱い、成果物回収後に削除する。
 - 同じtargetのjobは排他実行し、host負荷の無制限な増加を防ぐ。
 
+`scripts/setup-remote-builder.sh`が配置するworkerは
+`build-service/bin/majutsu-remote-build-worker.sh`という専用名を使う。
+WebSH/Yoloの汎用API worker (`build-service/bin/remote-build-worker.sh`)を上書きしないため、
+同じmachinaai hostで直接実行方式とAPI方式を併用できる。
+
+Linux cross buildのColima側target volumeとbuilder imageは、汎用APIではjob終了時に
+既定で削除される。再利用のために保持する場合は`BUILD_SERVICE_KEEP_TARGET_CACHE=1`または
+`BUILD_SERVICE_KEEP_BUILDER_IMAGE=1`を明示する。host空き容量が3 GiB未満の場合はAPIが
+新規jobを拒否する。
+
 ## 利用方法
 
 初回またはworker更新時の準備:

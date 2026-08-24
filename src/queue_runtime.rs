@@ -478,6 +478,7 @@ pub(crate) fn enqueue_live_diff_event_journals(
     paths: &Paths,
     current: Option<&SnapshotManifest>,
     roots: &[RootConfig],
+    changed_roots: Option<&BTreeSet<String>>,
 ) -> Result<usize> {
     let Some(current) = current else {
         return Ok(0);
@@ -487,6 +488,7 @@ pub(crate) fn enqueue_live_diff_event_journals(
     for root in roots
         .iter()
         .filter(|root| root.status == "active" && root.path.exists())
+        .filter(|root| changed_roots.is_none_or(|selected| selected.contains(&root.id)))
     {
         let snapshot_files = snapshot_root_file_map(paths, current, &root.id)?;
         let known_paths = journal_known_paths(paths, &root.id, &snapshot_files)?;

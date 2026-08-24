@@ -214,8 +214,9 @@ use root_state::{
     untracked_paths_for_root, update_root_degraded, update_root_status,
 };
 use snapshot_rules::{
-    build_ignore, classify_large, effective_large_config, large_pointer_compression, looks_binary,
-    root_dir_allows_descend, root_record_is_managed,
+    build_ignore, classify_large, effective_large_config, explicit_track_may_match_inside_dir,
+    explicitly_tracked, large_pointer_compression, looks_binary, root_dir_allows_descend,
+    root_record_is_managed,
 };
 use snapshot_state::{
     carry_forward_root_snapshot, current_snapshot, load_root_tree_entries, load_snapshot_by_id,
@@ -509,7 +510,26 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     let mut pending_blob_inserts = Vec::new();
     let mut pending_tracked_paths = Vec::new();
     let mut pending_operation_changes = Vec::new();
-    for root in roots(&conn)? {
+    let configured_roots = roots(&conn)?;
+    let requested_roots = args.changed_roots.iter().cloned().collect::<BTreeSet<_>>();
+    let configured_root_ids = configured_roots
+        .iter()
+        .map(|root| root.id.clone())
+        .collect::<BTreeSet<_>>();
+    let unknown_roots = requested_roots
+        .difference(&configured_root_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_roots.is_empty() {
+        bail!(
+            "snapshot changed-root contains unknown root(s): {}",
+            unknown_roots.join(", ")
+        );
+    }
+    // 親snapshotがない初回だけは、部分指定でも全rootを初期化する。
+    let partial_snapshot = parent_manifest.is_some() && !requested_roots.is_empty();
+    let mut scanned_roots = 0usize;
+    for root in configured_roots {
         if root.status != "active" {
             eprintln!("root {}, skipped: status={}", root.id, root.status);
             record_event(
@@ -527,6 +547,16 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             }
             continue;
         }
+        if partial_snapshot && !requested_roots.contains(&root.id) {
+            carry_forward_root_snapshot(
+                parent_manifest.as_ref(),
+                &root.id,
+                &mut root_trees,
+                &mut by_root,
+            );
+            continue;
+        }
+        scanned_roots += 1;
         if !root.path.exists() {
             update_root_status(&conn, &root.id, "missing")?;
             sync_roots_to_config(paths, &conn)?;
@@ -747,6 +777,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         let _ = compact_event_journal_force(paths);
         prune_noop_snapshot_cache(paths, &conn, &config);
         println!("snapshot unchanged {current_id}");
+        println!("roots_scanned {scanned_roots}");
         println!("files {total_files}, large {large_files}");
         if skipped_auto_track_large > 0 || skipped_auto_track_batch > 0 {
             println!(
@@ -815,6 +846,7 @@ fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     branch_runtime::update_active_branch_head(&tx, &snapshot_id)?;
     tx.commit()?;
     println!("snapshot {}", manifest.snapshot_id);
+    println!("roots_scanned {scanned_roots}");
     println!("files {total_files}, large {large_files}");
     if skipped_auto_track_large > 0 || skipped_auto_track_batch > 0 {
         println!(
@@ -1042,6 +1074,7 @@ fn replay_pending_journal_events(paths: &Paths) -> Result<bool> {
         paths,
         SnapshotArgs {
             message: Some("watch journal replay snapshot".into()),
+            changed_roots: Vec::new(),
             origin: None,
         },
     ) {
@@ -3104,6 +3137,19 @@ impl AutoTrackPolicy {
     fn unknown_batch_too_large(&self) -> bool {
         !self.initial_root_scan && self.unknown_add_count > self.max_auto_add
     }
+
+    fn may_descend(&self, root: &RootConfig, rel: &Path) -> bool {
+        if !self.unknown_batch_too_large() {
+            return true;
+        }
+        if explicitly_tracked(root, rel) || explicit_track_may_match_inside_dir(root, rel) {
+            return true;
+        }
+        let prefix = format!("{}/", path_to_slash(rel).trim_matches('/'));
+        self.known_paths
+            .iter()
+            .any(|known| known.starts_with(&prefix))
+    }
 }
 
 fn root_known_paths(
@@ -3214,7 +3260,9 @@ fn scan_root(
             let Ok(rel) = entry.path().strip_prefix(&root.path) else {
                 return true;
             };
-            !entry.file_type().is_dir() || root_dir_allows_descend(root, &ignore, rel)
+            !entry.file_type().is_dir()
+                || (root_dir_allows_descend(root, &ignore, rel)
+                    && auto_track.may_descend(root, rel))
         });
     for entry in walker {
         let entry = entry?;
@@ -4994,7 +5042,7 @@ pub(crate) fn encode_object_with_master_key_hex(
     )
 }
 
-pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_object_raw(paths: &Paths, key: &str) -> Result<Vec<u8>> {
     crate::util::validate_local_object_key(key)?;
     let path = paths.home.join(key);
     if !path.exists() {
@@ -5002,9 +5050,13 @@ pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
             .with_context(|| format!("hydrate missing local object {key}"))?;
     }
     let bytes = fs::read(paths.home.join(key))?;
-    let decoded = decode_object(paths, &bytes)?;
+    decode_object(paths, &bytes)
+}
+
+pub(crate) fn read_object(paths: &Paths, key: &str) -> Result<Vec<u8>> {
+    let decoded = read_object_raw(paths, key)?;
     if key.starts_with("objects/blobs/") && is_snapshot_manifest_object_key(paths, key)? {
-        return hydrate_compact_snapshot_manifest_payload(paths, key, decoded);
+        return hydrate_known_compact_snapshot_manifest_payload(paths, decoded);
     }
     Ok(decoded)
 }
@@ -5017,6 +5069,13 @@ pub(crate) fn hydrate_compact_snapshot_manifest_payload(
     if !is_snapshot_manifest_object_key(paths, key)? {
         return Ok(bytes);
     }
+    hydrate_known_compact_snapshot_manifest_payload(paths, bytes)
+}
+
+pub(crate) fn hydrate_known_compact_snapshot_manifest_payload(
+    paths: &Paths,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>> {
     let Ok(mut manifest) = serde_json::from_slice::<SnapshotManifest>(&bytes) else {
         return Ok(bytes);
     };
@@ -5027,7 +5086,7 @@ pub(crate) fn hydrate_compact_snapshot_manifest_payload(
         return Ok(bytes);
     }
     for (root_id, root_tree) in manifest.root_trees.clone() {
-        let tree_bytes = match read_object(paths, &root_tree.tree_key) {
+        let tree_bytes = match read_object_raw(paths, &root_tree.tree_key) {
             Ok(bytes) => bytes,
             Err(_) => return Ok(bytes),
         };
@@ -5709,6 +5768,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("initial".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5732,6 +5792,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("after-pack".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5769,6 +5830,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("initial".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5789,6 +5851,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("directory-mtime-only".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5832,6 +5895,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("initial".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5858,6 +5922,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("reuse-remote".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5892,6 +5957,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("initial".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5922,6 +5988,7 @@ tier = "Bulk"
             &paths,
             SnapshotArgs {
                 message: Some("reuse-remote-large".into()),
+                changed_roots: Vec::new(),
                 origin: None,
             },
         )
@@ -5929,6 +5996,74 @@ tier = "Bulk"
         assert!(
             chunk_keys.iter().all(|key| !paths.home.join(key).exists()),
             "synced chunks should remain remote-only during an unchanged scan"
+        );
+    }
+
+    #[test]
+    fn partial_snapshot_scans_changed_root_and_carries_other_trees_forward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_paths(Some(tmp.path().join("state"))).unwrap();
+        init(
+            &paths,
+            InitArgs {
+                remote: None,
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let root_a = tmp.path().join("root-a");
+        let root_b = tmp.path().join("root-b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        fs::write(root_a.join("note.txt"), b"a1\n").unwrap();
+        fs::write(root_b.join("note.txt"), b"b1\n").unwrap();
+        root_cmd(
+            &paths,
+            RootCommand::Add(test_root_add_args("a", root_a.clone())),
+        )
+        .unwrap();
+        root_cmd(
+            &paths,
+            RootCommand::Add(test_root_add_args("b", root_b.clone())),
+        )
+        .unwrap();
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("baseline".into()),
+                changed_roots: Vec::new(),
+                origin: None,
+            },
+        )
+        .unwrap();
+        let conn = open_db(&paths).unwrap();
+        let baseline_id = current_snapshot(&conn).unwrap().unwrap();
+        let baseline = load_snapshot_by_id(&paths, &conn, &baseline_id).unwrap();
+        drop(conn);
+
+        fs::write(root_a.join("note.txt"), b"a2\n").unwrap();
+        fs::write(root_b.join("note.txt"), b"b2\n").unwrap();
+        snapshot(
+            &paths,
+            SnapshotArgs {
+                message: Some("root-a-only".into()),
+                changed_roots: vec!["a".into()],
+                origin: None,
+            },
+        )
+        .unwrap();
+
+        let conn = open_db(&paths).unwrap();
+        let partial_id = current_snapshot(&conn).unwrap().unwrap();
+        let partial = load_snapshot_by_id(&paths, &conn, &partial_id).unwrap();
+        assert_ne!(
+            partial.root_trees["a"].tree_id,
+            baseline.root_trees["a"].tree_id
+        );
+        assert_eq!(
+            partial.root_trees["b"].tree_id,
+            baseline.root_trees["b"].tree_id
         );
     }
 

@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 fn mj() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
     command.env("MAJUTSU_AUTO_DAEMON", "0");
+    // 統合テストでは一時stateの破棄前に保守子プロセスを残さない。
+    command.env("MAJUTSU_WATCH_PRUNE_ASYNC", "0");
     command
 }
 
@@ -6693,6 +6695,167 @@ fn sync_wait_reports_status_when_existing_sync_lock_is_held() {
 }
 
 #[test]
+fn sync_wait_drains_durable_journal_that_arrives_after_heads_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+
+    fs::create_dir_all(state.join("locks")).unwrap();
+    let sync_lock = state.join("locks/sync.lock");
+    fs::write(&sync_lock, std::process::id().to_string()).unwrap();
+    let mut command = mj();
+    let child = command
+        .arg("--home")
+        .arg(&state)
+        .arg("sync")
+        .arg("--wait")
+        .arg("--timeout-secs")
+        .arg("10")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+
+    let event_dir = state.join("queue/events");
+    fs::create_dir_all(&event_dir).unwrap();
+    fs::write(
+        event_dir.join("event-late-durable.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "event_id": "event-late-durable",
+            "kind": "fs-event",
+            "observed_at": Utc::now().to_rfc3339(),
+            "detail": "late durable event",
+            "root_id": "sample",
+            "path": "alpha.txt",
+            "event_kind": "modify",
+            "raw_backend": "test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(sync_lock).unwrap();
+
+    let waited = child.wait_with_output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&waited.stdout),
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert!(waited.status.success(), "{combined}");
+    assert!(combined.contains("wait_resync"), "{combined}");
+    assert!(
+        find_file_ending(&remote, "journal/event-late-durable.json").exists(),
+        "late durable journal was not published: {combined}"
+    );
+}
+
+#[test]
+fn sync_changed_root_limits_live_diff_scan_to_selected_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    let root_a = tmp.path().join("root-a");
+    let root_b = tmp.path().join("root-b");
+    fs::create_dir_all(&root_a).unwrap();
+    fs::create_dir_all(&root_b).unwrap();
+    fs::write(root_a.join("note.txt"), b"a1\n").unwrap();
+    fs::write(root_b.join("note.txt"), b"b1\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    for (id, root) in [("a", &root_a), ("b", &root_b)] {
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(&state)
+                .arg("root")
+                .arg("add")
+                .arg(id)
+                .arg(root);
+            c
+        });
+    }
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("sync");
+        c
+    });
+    fs::write(root_a.join("note.txt"), b"a2\n").unwrap();
+    fs::write(root_b.join("note.txt"), b"b2\n").unwrap();
+
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .arg("--changed-root")
+            .arg("a");
+        c
+    });
+    assert!(sync.contains("live_diff_journal_enqueued 1"), "{sync}");
+    let event_records = fs::read_dir(state.join("queue/events"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        event_records
+            .iter()
+            .any(|event| event["root_id"] == "a" && event["path"] == "note.txt")
+    );
+    assert!(
+        event_records.iter().all(|event| event["root_id"] != "b"),
+        "unselected root was scanned: {event_records:?}"
+    );
+}
+
+#[test]
 fn split_remote_config_supports_file_and_s3_forms() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -10538,6 +10701,89 @@ fn sync_auto_pack_ignores_missing_unreferenced_loose_blob_metadata() {
         )
         .unwrap();
     assert_eq!(remaining, 0);
+}
+
+#[test]
+fn sync_auto_pack_ignores_missing_referenced_loose_blob_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let missing_key = "objects/blobs/fe/missing-referenced-auto-pack-test";
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let snapshot_id: String = conn
+        .query_row(
+            "select id from snapshots order by created_at desc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "insert into blobs(oid, size, object_key) values (?1, ?2, ?3)",
+        rusqlite::params!["missing-referenced-auto-pack-test", 7_i64, missing_key],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into snapshot_payloads(snapshot_id, kind, oid) values (?1, 'blob', ?2)",
+        rusqlite::params![snapshot_id, "missing-referenced-auto-pack-test"],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(!state.join(missing_key).exists());
+
+    let sync = output({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("sync")
+            .env("MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS", "2");
+        c
+    });
+    assert!(
+        !sync.contains("auto_pack unpacked_small_blobs "),
+        "missing referenced blob must not trigger auto-pack:\n{sync}"
+    );
+    assert!(
+        !sync.contains("skipped_missing_loose_blobs "),
+        "auto-pack should not be entered for missing referenced metadata:\n{sync}"
+    );
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "select count(*) from blobs where oid='missing-referenced-auto-pack-test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 1, "referenced missing metadata must be retained");
 }
 
 #[test]
@@ -19025,6 +19271,174 @@ fn untrack_supports_path_files_summary_and_excluded_cleanup() {
 }
 
 #[test]
+fn untrack_rolls_back_tracking_metadata_when_history_cleanup_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--no-default-excludes");
+        c
+    });
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(source.join("drop.tmp"), b"temporary\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
+            .arg("--exclude")
+            .arg("*.tmp")
+            .arg("--skip-history-rewrite");
+        c
+    });
+
+    let db = state.join("db/majutsu.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    let manifest_key: String = conn
+        .query_row(
+            "select manifest_key from snapshots order by created_at desc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    fs::remove_file(state.join(manifest_key)).unwrap();
+
+    let result = {
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("--excluded")
+            .arg("--summary");
+        c.output().unwrap()
+    };
+    assert!(!result.status.success());
+
+    let conn = Connection::open(&db).unwrap();
+    let status: String = conn
+        .query_row(
+            "select status from tracked_paths where root_id='sample' and path='drop.tmp'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "tracked");
+}
+
+#[test]
+fn untrack_keeps_chunk_metadata_when_a_live_large_manifest_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source)
+            .arg("--no-default-excludes")
+            .arg("--large-always")
+            .arg("*.bin");
+        c
+    });
+    fs::write(source.join("payload.bin"), vec![7u8; 16 * 1024]).unwrap();
+    fs::write(source.join("drop.tmp"), b"temporary\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("set")
+            .arg("sample")
+            .arg("--exclude")
+            .arg("*.tmp")
+            .arg("--skip-history-rewrite");
+        c
+    });
+
+    let db = state.join("db/majutsu.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    let manifest_key: String = conn
+        .query_row(
+            "select manifest_key from large_objects limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let chunks_before: i64 = conn
+        .query_row("select count(*) from chunks", [], |row| row.get(0))
+        .unwrap();
+    assert!(chunks_before > 0);
+    drop(conn);
+    fs::remove_file(state.join(manifest_key)).unwrap();
+
+    let result = {
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("untrack")
+            .arg("-r")
+            .arg("sample")
+            .arg("--excluded")
+            .arg("--summary");
+        c.output().unwrap()
+    };
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("skipped destructive chunk metadata prune")
+    );
+
+    let conn = Connection::open(&db).unwrap();
+    let chunks_after: i64 = conn
+        .query_row("select count(*) from chunks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(chunks_after, chunks_before);
+}
+
+#[test]
 fn fsck_accepts_path_track_operation_kinds() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -20942,6 +21356,85 @@ fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
 }
 
 #[test]
+fn health_reports_tracked_paths_that_current_rules_exclude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("generated.pyc"), b"generated").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "insert into tracked_paths(root_id, path, status, tracking_source, first_seen_at, last_seen_at, untracked_at)
+         values ('sample', 'generated.pyc', 'tracked', 'journal', ?1, ?1, null)",
+        [&now],
+    )
+    .unwrap();
+    drop(conn);
+
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&health).unwrap();
+    let issue = value["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["code"] == "tracked-paths-now-excluded")
+        .unwrap_or_else(|| panic!("missing excluded tracked path issue: {health}"));
+    assert!(
+        issue["message"]
+            .as_str()
+            .unwrap()
+            .contains("sample/generated.pyc"),
+        "{health}"
+    );
+
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("track")
+            .arg("-r")
+            .arg("sample")
+            .arg("generated.pyc");
+        c
+    });
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&health).unwrap();
+    assert!(
+        value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|issue| issue["code"] != "tracked-paths-now-excluded"),
+        "{health}"
+    );
+}
+
+#[test]
 fn health_reports_root_last_changed_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -20987,6 +21480,79 @@ fn health_reports_root_last_changed_snapshot() {
     assert_eq!(root["current_snapshot_includes"], true);
     assert_eq!(root["last_changed_snapshot"], value["current_snapshot"]);
     assert!(root["last_changed_at"].as_str().is_some(), "{health}");
+}
+
+#[test]
+fn health_does_not_expand_compact_snapshot_tree_payloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("root")
+            .arg("add")
+            .arg("sample")
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let snapshot_id: String = conn
+        .query_row(
+            "select id from snapshots order by created_at desc limit 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let manifest_key: String = conn
+        .query_row(
+            "select manifest_key from snapshots where id=?1",
+            [&snapshot_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let manifest_path = state.join(&manifest_key);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    manifest["roots"] = serde_json::json!({});
+    manifest["roots_omitted"] = serde_json::json!(true);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    drop(conn);
+    fs::remove_file(state.join(tree_key)).unwrap();
+
+    let health = output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("health").arg("--json");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(
+        value["roots"][0]["current_snapshot_includes"], true,
+        "{health}"
+    );
 }
 
 #[test]

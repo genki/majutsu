@@ -91,14 +91,14 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
     let current = current_snapshot(&conn)?;
     let current_manifest = current
         .as_deref()
-        .map(|id| load_snapshot_by_id(paths, &conn, id))
+        .map(|id| load_snapshot_header_by_id(paths, &conn, id))
         .transpose()?;
     let current_label = current.as_deref().unwrap_or("(none)");
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let remote_manifest = remote_head
         .remote_current
         .as_deref()
-        .and_then(|id| load_snapshot_by_id(paths, &conn, id).ok());
+        .and_then(|id| load_snapshot_header_by_id(paths, &conn, id).ok());
     let upload_stats = upload_queue_stats(paths)?;
     let event_records = event_journal_records(paths)?;
     let event_count = event_records.len();
@@ -611,14 +611,14 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
     let current = current_snapshot(&conn)?;
     let current_manifest = current
         .as_deref()
-        .map(|id| load_snapshot_by_id(paths, &conn, id))
+        .map(|id| load_snapshot_header_by_id(paths, &conn, id))
         .transpose()?;
     let remote = read_remote_status(&config)?;
     let remote_head = read_remote_head_status(&conn, &config, &remote, current.as_deref())?;
     let remote_manifest = remote_head
         .remote_current
         .as_deref()
-        .and_then(|id| load_snapshot_by_id(paths, &conn, id).ok());
+        .and_then(|id| load_snapshot_header_by_id(paths, &conn, id).ok());
     let upload_stats = upload_queue_stats(paths)?;
     let event_records = event_journal_records(paths)?;
     let pending_event_count = pending_journal_event_count(&event_records);
@@ -635,6 +635,7 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
                     args.sample,
                     args.timeout_secs.or(Some(15)),
                     !args.history,
+                    current.as_deref(),
                 )?),
                 Err(_) => None,
             }
@@ -933,6 +934,19 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         }
     }
 
+    let (excluded_tracked_count, excluded_tracked_examples) =
+        excluded_tracked_path_summary(conn, roots, 3)?;
+    if excluded_tracked_count > 0 {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "tracked-paths-now-excluded".into(),
+            message: format!(
+                "{excluded_tracked_count} tracked path(s) are now excluded by root rules (examples: {}); run `mj untrack -r <root> --excluded --dry-run --summary` before cleanup",
+                excluded_tracked_examples.join(", ")
+            ),
+        });
+    }
+
     if active_roots > 0 && !daemon.is_healthy() {
         issues.push(HealthIssue {
             severity: HealthSeverity::Critical,
@@ -1035,13 +1049,34 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
     }
     if let Some(deep) = deep_remote {
         if deep.missing > 0 {
+            let publish_in_progress = deep_remote_publish_in_progress(
+                remote_head.synced,
+                upload_stats.total,
+                durable_journal_pending,
+                sync_lock_pid,
+            );
             issues.push(HealthIssue {
-                severity: HealthSeverity::Critical,
-                code: "remote-objects-missing".into(),
-                message: format!(
-                    "deep remote check ({}) found {} missing object(s) after checking {}/{} via {}",
-                    deep.scope, deep.missing, deep.checked, deep.local_objects, deep.source
-                ),
+                severity: if publish_in_progress {
+                    HealthSeverity::Warning
+                } else {
+                    HealthSeverity::Critical
+                },
+                code: if publish_in_progress {
+                    "remote-objects-pending".into()
+                } else {
+                    "remote-objects-missing".into()
+                },
+                message: if publish_in_progress {
+                    format!(
+                        "deep remote check ({}) found {} object(s) not yet published while sync is in progress after checking {}/{} via {}",
+                        deep.scope, deep.missing, deep.checked, deep.local_objects, deep.source
+                    )
+                } else {
+                    format!(
+                        "deep remote check ({}) found {} missing object(s) after checking {}/{} via {}",
+                        deep.scope, deep.missing, deep.checked, deep.local_objects, deep.source
+                    )
+                },
             });
         } else if deep.limited {
             issues.push(HealthIssue {
@@ -1131,6 +1166,43 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         roots: root_health,
         issues,
     })
+}
+
+fn deep_remote_publish_in_progress(
+    remote_head_synced: bool,
+    queued_uploads: usize,
+    durable_journal_pending: usize,
+    sync_lock_pid: Option<u32>,
+) -> bool {
+    !remote_head_synced
+        || queued_uploads > 0
+        || durable_journal_pending > 0
+        || sync_lock_pid.is_some()
+}
+
+fn excluded_tracked_path_summary(
+    conn: &Connection,
+    roots: &[RootConfig],
+    example_limit: usize,
+) -> Result<(usize, Vec<String>)> {
+    let mut count = 0usize;
+    let mut examples = Vec::new();
+    for root in roots.iter().filter(|root| root.status != "deleted") {
+        let ignore = build_ignore(root)?;
+        for path in tracked_paths_for_root(conn, &root.id)? {
+            let relative = Path::new(&path);
+            let is_dir = fs::symlink_metadata(root.path.join(relative))
+                .is_ok_and(|metadata| metadata.is_dir());
+            if root_record_is_managed(root, &ignore, relative, is_dir) {
+                continue;
+            }
+            count += 1;
+            if examples.len() < example_limit {
+                examples.push(format!("{}/{}", root.id, path));
+            }
+        }
+    }
+    Ok((count, examples))
 }
 
 fn root_missing_recovery_message(root: &RootConfig) -> String {
@@ -7163,9 +7235,9 @@ fn print_snapshot_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        LogProducerMessage, StateStreamMode, effective_watch_backend,
-        prefetch_state_lines_for_viewer, read_remote_root_acks, should_page_status_with_tty,
-        state_lines_need_viewer, truncate_for_terminal,
+        LogProducerMessage, StateStreamMode, deep_remote_publish_in_progress,
+        effective_watch_backend, prefetch_state_lines_for_viewer, read_remote_root_acks,
+        should_page_status_with_tty, state_lines_need_viewer, truncate_for_terminal,
     };
     use crate::majutsu_db::EventJournalRecord;
     use chrono::{TimeZone, Utc};
@@ -7299,5 +7371,14 @@ mod tests {
         assert_eq!(by_prefix["sample"].tree_id, "tree-1");
         let by_id = read_remote_root_acks(&conn, "remote", "host-uuid").unwrap();
         assert_eq!(by_id["sample"].tree_id, "tree-old");
+    }
+
+    #[test]
+    fn deep_remote_missing_is_pending_while_snapshot_publish_runs() {
+        assert!(deep_remote_publish_in_progress(false, 0, 0, None));
+        assert!(deep_remote_publish_in_progress(true, 1, 0, None));
+        assert!(deep_remote_publish_in_progress(true, 0, 1, None));
+        assert!(deep_remote_publish_in_progress(true, 0, 0, Some(42)));
+        assert!(!deep_remote_publish_in_progress(true, 0, 0, None));
     }
 }

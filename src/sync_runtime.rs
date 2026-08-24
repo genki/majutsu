@@ -29,8 +29,8 @@ use crate::cache_runtime::{
 use crate::cli::{PackArgs, SyncArgs, SyncCommand};
 use crate::config::{Config, MetadataExport, Paths, maintenance_lock_path, read_config};
 use crate::db_refs::{
-    persist_export_remote_refs, prune_remote_refs_for_host, ref_value, restore_ref_value,
-    set_ref_value, set_remote_ref_value,
+    persist_export_remote_refs, prune_remote_refs_for_host, prune_remote_root_ack_refs, ref_value,
+    restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use crate::object_paths::{
     canonical_alias_for_legacy_key, local_object_keys, prefer_s3_canonical_remote_only,
@@ -55,7 +55,7 @@ use crate::root_state::roots;
 use crate::snapshot_state::{current_snapshot, load_snapshot_by_id};
 use crate::util::{REMOTE_HEAD_DECODE_LIMIT, blake3_hex, new_id, zstd_decode_all_limited};
 use crate::{
-    decode_object, encode_object, ensure_ready, export_metadata, open_db, read_object,
+    decode_object, encode_object, ensure_ready, export_metadata, open_db, query_blobs, read_object,
     remote_object_available_for_paths, remote_ref,
 };
 
@@ -166,6 +166,7 @@ fn persist_remote_root_acks(
     root_acks: &BTreeMap<String, RemoteRootAck>,
 ) -> Result<()> {
     prune_remote_refs_for_host(conn, remote, host_id)?;
+    prune_remote_root_ack_refs(conn, remote, host_id)?;
     for (root_id, ack) in root_acks {
         set_remote_ref_value(
             conn,
@@ -234,6 +235,8 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     )?;
     let host_label = remote_host_label(&config.host.name);
     prune_remote_refs_for_host(&conn, &remote.describe(), &host_label)?;
+    let changed_roots = (!args.changed_roots.is_empty())
+        .then(|| args.changed_roots.iter().cloned().collect::<BTreeSet<_>>());
     if let Some(SyncCommand::Status(status_args)) = args.command {
         if status_args.deep {
             return sync_status(paths, &conn, &remote, &status_args);
@@ -249,16 +252,19 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
                 &conn,
                 &config,
                 &remote,
-                &target_current,
-                args.timeout_secs,
-                None,
+                SyncWaitOptions {
+                    target_current: &target_current,
+                    timeout_secs: args.timeout_secs,
+                    allowed_lock_pid: None,
+                    changed_roots: changed_roots.as_ref(),
+                },
             );
         }
         println!("sync already running pid {pid}");
         sync_status_quick(paths, &conn, &remote)?;
         bail!("sync already running with pid {pid}; use `mj sync --wait` to wait for completion");
     }
-    sync_configured_remote(paths, &conn, &config, &remote)?;
+    sync_configured_remote(paths, &conn, &config, &remote, changed_roots.as_ref())?;
     if args.wait {
         let target_current = current_snapshot(&conn)?.unwrap_or_else(|| "(none)".into());
         wait_for_sync_catchup(
@@ -266,9 +272,12 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
             &conn,
             &config,
             &remote,
-            &target_current,
-            args.timeout_secs,
-            Some(std::process::id()),
+            SyncWaitOptions {
+                target_current: &target_current,
+                timeout_secs: args.timeout_secs,
+                allowed_lock_pid: Some(std::process::id()),
+                changed_roots: changed_roots.as_ref(),
+            },
         )?;
     }
     Ok(())
@@ -303,7 +312,7 @@ pub(crate) fn sync_current_if_remote(paths: &Paths) -> Result<AutoSyncResult> {
         config.large.max_parallel_uploads,
     )?;
     let conn = open_db(paths)?;
-    sync_configured_remote(paths, &conn, &config, &remote)?;
+    sync_configured_remote(paths, &conn, &config, &remote, None)?;
     Ok(AutoSyncResult::Synced)
 }
 
@@ -312,6 +321,7 @@ fn sync_configured_remote(
     conn: &Connection,
     config: &Config,
     remote: &RemoteStore,
+    changed_roots: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     let _remote_trace = RemoteTrafficTraceGuard::new("sync");
     let trace = SyncTrace::new();
@@ -327,8 +337,12 @@ fn sync_configured_remote(
         .map(|id| load_snapshot_by_id(paths, conn, id))
         .transpose()?;
     let configured_roots = roots(conn)?;
-    let enqueued_live_diff =
-        enqueue_live_diff_event_journals(paths, current_manifest.as_ref(), &configured_roots)?;
+    let enqueued_live_diff = enqueue_live_diff_event_journals(
+        paths,
+        current_manifest.as_ref(),
+        &configured_roots,
+        changed_roots,
+    )?;
     trace.mark("enqueue live diff journal");
     let host_label = remote_host_label(&config.host.name);
     let enqueued_remote_journal = enqueue_remote_event_journal_uploads(
@@ -498,6 +512,16 @@ impl SyncWaitStatus {
             && self.durable_journal_pending == 0
             && self.sync_lock_pid.is_none()
     }
+
+    fn should_resync(&self, allowed_lock_pid: Option<u32>) -> bool {
+        let lock_is_allowed = self
+            .sync_lock_pid
+            .zip(allowed_lock_pid)
+            .is_some_and(|(lock_pid, allowed_pid)| lock_pid == allowed_pid);
+        (self.sync_lock_pid.is_none() || lock_is_allowed)
+            && self.queued_uploads == 0
+            && (self.local_current != self.remote_current || self.durable_journal_pending > 0)
+    }
 }
 
 fn sync_wait_status(
@@ -575,17 +599,22 @@ fn print_sync_wait_status(status: &SyncWaitStatus) {
     );
 }
 
+struct SyncWaitOptions<'a> {
+    target_current: &'a str,
+    timeout_secs: u64,
+    allowed_lock_pid: Option<u32>,
+    changed_roots: Option<&'a BTreeSet<String>>,
+}
+
 fn wait_for_sync_catchup(
     paths: &Paths,
     conn: &Connection,
     config: &Config,
     remote: &RemoteStore,
-    target_current: &str,
-    timeout_secs: u64,
-    allowed_lock_pid: Option<u32>,
+    options: SyncWaitOptions<'_>,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let mut target_current = target_current.to_string();
+    let deadline = Instant::now() + Duration::from_secs(options.timeout_secs);
+    let mut target_current = options.target_current.to_string();
     loop {
         if let Some(latest_current) = current_snapshot(conn)?
             && latest_current != target_current
@@ -619,20 +648,17 @@ fn wait_for_sync_catchup(
             println!("status_mode quick");
             return Ok(());
         }
-        let allowed_lock_pid = allowed_lock_pid.or(Some(std::process::id()));
+        let allowed_lock_pid = options.allowed_lock_pid.or(Some(std::process::id()));
         let lock_is_allowed = status
             .sync_lock_pid
             .zip(allowed_lock_pid)
             .is_some_and(|(lock_pid, allowed_pid)| lock_pid == allowed_pid);
-        if (status.sync_lock_pid.is_none() || lock_is_allowed)
-            && status.queued_uploads == 0
-            && status.local_current != status.remote_current
-        {
+        if status.should_resync(allowed_lock_pid) {
             println!("wait_resync {}", status.local_current);
             if lock_is_allowed {
                 let _ = fs::remove_file(&paths.sync_lock);
             }
-            sync_configured_remote(paths, conn, config, remote)?;
+            sync_configured_remote(paths, conn, config, remote, options.changed_roots)?;
             continue;
         }
         if Instant::now() >= deadline {
@@ -641,7 +667,7 @@ fn wait_for_sync_catchup(
             bail!(
                 "timed out waiting for sync target {} after {}s; local_current={} remote_current={} queued_uploads={} delayed={} event_journal_pending={} durable_journal_pending={} lock_pid={}",
                 target_current,
-                timeout_secs,
+                options.timeout_secs,
                 status.local_current,
                 status.remote_current,
                 status.queued_uploads,
@@ -664,13 +690,18 @@ fn auto_pack_before_sync(paths: &Paths, conn: &Connection) -> Result<()> {
     }
     let threshold = env::var("MAJUTSU_SYNC_AUTO_PACK_MIN_BLOBS")
         .ok()
-        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(128);
-    let unpacked_small_blobs: i64 = conn.query_row(
-        "select count(*) from blobs where pack_id is null and size <= 131072",
-        [],
-        |row| row.get(0),
-    )?;
+    // DBに残った欠落blobは復旧用の参照情報であり、pack対象ではない。
+    // これを閾値へ含めると、実体が増えていない同期のたびにpackを起動する。
+    let unpacked_small_blobs = query_blobs(conn)?
+        .into_iter()
+        .filter(|blob| {
+            blob.pack_id.is_none()
+                && blob.size <= 131072
+                && paths.home.join(&blob.object_key).is_file()
+        })
+        .count();
     if unpacked_small_blobs >= threshold {
         println!("auto_pack unpacked_small_blobs {unpacked_small_blobs}");
         pack_cmd(paths, PackArgs { compact: false })?;
@@ -1758,6 +1789,7 @@ struct SyncStatusDeepOptions {
     progress: bool,
     started: Instant,
     current_only: bool,
+    pinned_current: Option<String>,
 }
 
 impl SyncStatusDeepOptions {
@@ -1770,6 +1802,7 @@ impl SyncStatusDeepOptions {
             progress: args.progress,
             started: Instant::now(),
             current_only: !args.history,
+            pinned_current: None,
         }
     }
 
@@ -1829,6 +1862,7 @@ pub(crate) fn sync_deep_health_summary(
     sample: Option<usize>,
     timeout_secs: Option<u64>,
     current_only: bool,
+    current_snapshot_id: Option<&str>,
 ) -> Result<SyncDeepHealthSummary> {
     let options = SyncStatusDeepOptions {
         sample,
@@ -1836,6 +1870,7 @@ pub(crate) fn sync_deep_health_summary(
         progress: false,
         started: Instant::now(),
         current_only,
+        pinned_current: current_snapshot_id.map(str::to_string),
     };
     let status = sync_status_snapshot(paths, conn, remote, &options)?;
     Ok(SyncDeepHealthSummary {
@@ -1854,7 +1889,11 @@ fn sync_status_snapshot(
     remote: &RemoteStore,
     options: &SyncStatusDeepOptions,
 ) -> Result<SyncStatusSnapshot> {
-    let local_current = current_snapshot(conn)?;
+    // health集計中にdaemonがcurrentを進めても、開始時点のsnapshotだけを検査する。
+    let local_current = match options.pinned_current.as_ref() {
+        Some(current) => Some(current.clone()),
+        None => current_snapshot(conn)?,
+    };
     let config = read_config(paths)?;
     let host_label = remote_host_label(&config.host.name);
     let canonical_current = host_current_ref_key(&host_label);
@@ -2521,4 +2560,47 @@ fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> 
         &remote_gc_tombstone_key(host_id, &new_id("tombstone")),
         &serde_json::to_vec_pretty(&tombstone)?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caught_up_wait_status() -> SyncWaitStatus {
+        SyncWaitStatus {
+            remote: "file://test".into(),
+            local_current: "snap-current".into(),
+            remote_current: "snap-current".into(),
+            remote_last_synced: "now".into(),
+            queued_uploads: 0,
+            queued_uploads_retrying: 0,
+            queued_uploads_delayed: 0,
+            queued_upload_next_retry_after: "(none)".into(),
+            queued_upload_attempts: 0,
+            queued_upload_max_attempts: 0,
+            upload_queue_backpressure: false,
+            event_journal_pending: 0,
+            durable_journal_pending: 0,
+            sync_lock_pid: None,
+        }
+    }
+
+    #[test]
+    fn sync_wait_resyncs_durable_journal_even_when_heads_match() {
+        let mut status = caught_up_wait_status();
+        status.durable_journal_pending = 1;
+
+        assert!(!status.is_caught_up());
+        assert!(status.should_resync(None));
+    }
+
+    #[test]
+    fn sync_wait_does_not_compete_with_another_sync_owner() {
+        let mut status = caught_up_wait_status();
+        status.durable_journal_pending = 1;
+        status.sync_lock_pid = Some(42);
+
+        assert!(!status.should_resync(Some(7)));
+        assert!(status.should_resync(Some(42)));
+    }
 }

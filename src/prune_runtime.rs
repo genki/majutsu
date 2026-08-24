@@ -94,6 +94,7 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
                 crate::cli::SyncArgs {
                     wait: false,
                     timeout_secs: 300,
+                    changed_roots: Vec::new(),
                     command: None,
                 },
             )?;
@@ -249,6 +250,84 @@ pub(crate) fn prune_unreferenced_metadata(
 ) -> Result<PrunedMetadata> {
     let config = read_config(paths)?;
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
+    let (live, _incomplete_metadata_graph) =
+        if let Some(live) = indexed_live_metadata_references(conn)? {
+            (live, false)
+        } else {
+            scan_live_metadata_references(paths, conn, remote.as_ref())?
+        };
+    let blobs = delete_rows_not_in(conn, "blobs", "oid", &live.blobs)?;
+    let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live.large_objects)?;
+    let large_pins = delete_rows_not_in(conn, "large_pins", "oid", &live.large_objects)?;
+    let chunks = match live_chunks_from_remaining_large_objects(paths, conn, remote.as_ref())? {
+        Some(live_chunks) => delete_rows_not_in(conn, "chunks", "oid", &live_chunks)?,
+        None => {
+            eprintln!(
+                "warning: skipped destructive chunk metadata prune because the metadata graph is incomplete"
+            );
+            0
+        }
+    };
+    let packs = delete_packs_without_blobs(conn)?;
+    let pack_indexes = prune_stale_pack_indexes(paths, conn)?;
+    let (snapshot_payload_indexes, snapshot_payload_rows) =
+        delete_snapshot_payload_indexes_without_snapshots(conn)?;
+    Ok(PrunedMetadata {
+        blobs,
+        large_objects,
+        chunks,
+        packs,
+        pack_indexes,
+        snapshot_payload_indexes,
+        snapshot_payload_rows,
+        large_pins,
+    })
+}
+
+fn indexed_live_metadata_references(conn: &Connection) -> Result<Option<LiveMetadataReferences>> {
+    let snapshot_count: i64 =
+        conn.query_row("select count(*) from snapshots", [], |row| row.get(0))?;
+    let indexed_count: i64 = conn.query_row(
+        "select count(*) from snapshots
+         inner join snapshot_payload_index on snapshot_payload_index.snapshot_id=snapshots.id",
+        [],
+        |row| row.get(0),
+    )?;
+    if indexed_count != snapshot_count {
+        return Ok(None);
+    }
+
+    let payloads = {
+        let mut stmt = conn.prepare(
+            "select distinct snapshot_payloads.kind, snapshot_payloads.oid
+             from snapshot_payloads
+             inner join snapshots on snapshots.id=snapshot_payloads.snapshot_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut live = LiveMetadataReferences::default();
+    for (kind, oid) in payloads {
+        match kind.as_str() {
+            "blob" => {
+                live.blobs.insert(oid);
+            }
+            "large" => {
+                live.large_objects.insert(oid);
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(live))
+}
+
+fn scan_live_metadata_references(
+    paths: &Paths,
+    conn: &Connection,
+    remote: Option<&RemoteStore>,
+) -> Result<(LiveMetadataReferences, bool)> {
     let mut live = LiveMetadataReferences::default();
     let mut incomplete_metadata_graph = false;
     let mut stmt = conn.prepare("select id, manifest_key, manifest_json from snapshots")?;
@@ -268,7 +347,7 @@ pub(crate) fn prune_unreferenced_metadata(
             &manifest_json,
         )?;
         for manifest_key in live.add_snapshot_manifest(&manifest) {
-            match read_large_manifest_for_prune(paths, remote.as_ref(), &manifest_key) {
+            match read_large_manifest_for_prune(paths, remote, &manifest_key) {
                 Ok(large_manifest) => live.add_large_manifest(large_manifest),
                 Err(err) => {
                     incomplete_metadata_graph = true;
@@ -284,7 +363,7 @@ pub(crate) fn prune_unreferenced_metadata(
                     live.blobs.insert(oid.to_string());
                 } else if let Some((oid, manifest_key, _)) = payload_large_ref(&record.payload) {
                     live.large_objects.insert(oid.to_string());
-                    match read_large_manifest_for_prune(paths, remote.as_ref(), manifest_key) {
+                    match read_large_manifest_for_prune(paths, remote, manifest_key) {
                         Ok(large_manifest) => live.add_large_manifest(large_manifest),
                         Err(err) => {
                             incomplete_metadata_graph = true;
@@ -298,35 +377,7 @@ pub(crate) fn prune_unreferenced_metadata(
             })?;
         }
     }
-    let blobs = delete_rows_not_in(conn, "blobs", "oid", &live.blobs)?;
-    let large_objects = delete_rows_not_in(conn, "large_objects", "oid", &live.large_objects)?;
-    let large_pins = delete_rows_not_in(conn, "large_pins", "oid", &live.large_objects)?;
-    let chunks = if let Some(live_chunks) =
-        live_chunks_from_remaining_large_objects(paths, conn, remote.as_ref())?
-    {
-        delete_rows_not_in(conn, "chunks", "oid", &live_chunks)?
-    } else if incomplete_metadata_graph {
-        eprintln!(
-            "warning: skipped destructive chunk metadata prune because the metadata graph is incomplete"
-        );
-        0
-    } else {
-        delete_rows_not_in(conn, "chunks", "oid", &live.chunks)?
-    };
-    let packs = delete_packs_without_blobs(conn)?;
-    let pack_indexes = prune_stale_pack_indexes(paths, conn)?;
-    let (snapshot_payload_indexes, snapshot_payload_rows) =
-        delete_snapshot_payload_indexes_without_snapshots(conn)?;
-    Ok(PrunedMetadata {
-        blobs,
-        large_objects,
-        chunks,
-        packs,
-        pack_indexes,
-        snapshot_payload_indexes,
-        snapshot_payload_rows,
-        large_pins,
-    })
+    Ok((live, incomplete_metadata_graph))
 }
 
 fn live_chunks_from_remaining_large_objects(
@@ -402,11 +453,13 @@ fn delete_snapshot_payload_indexes_without_snapshots(conn: &Connection) -> Resul
 }
 
 fn delete_packs_without_blobs(conn: &Connection) -> Result<usize> {
-    let mut stmt = conn.prepare("select pack_id from packs")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let pack_ids = {
+        let mut stmt = conn.prepare("select pack_id from packs")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
     let mut removed = 0usize;
-    for row in rows {
-        let pack_id = row?;
+    for pack_id in pack_ids {
         let references: i64 = conn.query_row(
             "select count(*) from blobs where pack_id=?1",
             params![pack_id],
@@ -469,11 +522,13 @@ fn delete_rows_not_in(
     column: &str,
     live: &BTreeSet<String>,
 ) -> Result<usize> {
-    let mut stmt = conn.prepare(&format!("select {column} from {table}"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = {
+        let mut stmt = conn.prepare(&format!("select {column} from {table}"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
     let mut removed = 0usize;
-    for row in rows {
-        let id = row?;
+    for id in ids {
         if !live.contains(&id) {
             conn.execute(
                 &format!("delete from {table} where {column}=?1"),
@@ -600,19 +655,10 @@ fn normalize_queue_source_path(paths: &Paths, source: &str) -> PathBuf {
 }
 
 fn compact_snapshot_manifest_metadata(paths: &Paths, conn: &Connection) -> Result<(usize, usize)> {
-    let mut stmt =
-        conn.prepare("select id, manifest_key, manifest_json from snapshots order by created_at")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
+    let snapshots = snapshot_manifest_rows_for_compaction(conn)?;
     let mut compacted_metadata = 0usize;
     let mut compacted_objects = 0usize;
-    for row in rows {
-        let (id, manifest_key, manifest_json) = row?;
+    for (id, manifest_key, manifest_json) in snapshots {
         if manifest_json.is_empty()
             && local_snapshot_manifest_object_is_compact(paths, &manifest_key)?
         {
@@ -638,6 +684,21 @@ fn compact_snapshot_manifest_metadata(paths: &Paths, conn: &Connection) -> Resul
     Ok((compacted_metadata, compacted_objects))
 }
 
+fn snapshot_manifest_rows_for_compaction(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt =
+        conn.prepare("select id, manifest_key, manifest_json from snapshots order by created_at")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn local_snapshot_manifest_object_is_compact(paths: &Paths, manifest_key: &str) -> Result<bool> {
     let bytes = fs::read(paths.home.join(manifest_key))?;
     let decoded = crate::decode_object(paths, &bytes)?;
@@ -651,4 +712,59 @@ fn local_snapshot_manifest_object_is_compact(paths: &Paths, manifest_key: &str) 
         .and_then(serde_json::Value::as_object)
         .is_some_and(serde_json::Map::is_empty);
     Ok(roots_omitted && roots_empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::indexed_live_metadata_references;
+    use rusqlite::Connection;
+
+    fn payload_index_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table snapshots(id text primary key);
+             create table snapshot_payload_index(snapshot_id text primary key, indexed_at text not null);
+             create table snapshot_payloads(
+                 snapshot_id text not null,
+                 kind text not null,
+                 oid text not null,
+                 primary key(snapshot_id, kind, oid)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn complete_snapshot_payload_index_supplies_live_metadata() {
+        let conn = payload_index_db();
+        conn.execute_batch(
+            "insert into snapshots values ('snap-a'), ('snap-b');
+             insert into snapshot_payload_index values ('snap-a', 'now'), ('snap-b', 'now');
+             insert into snapshot_payloads values
+                 ('snap-a', 'blob', 'blob-a'),
+                 ('snap-b', 'large', 'large-b');",
+        )
+        .unwrap();
+
+        let live = indexed_live_metadata_references(&conn).unwrap().unwrap();
+        assert_eq!(live.blobs.into_iter().collect::<Vec<_>>(), ["blob-a"]);
+        assert_eq!(
+            live.large_objects.into_iter().collect::<Vec<_>>(),
+            ["large-b"]
+        );
+    }
+
+    #[test]
+    fn incomplete_snapshot_payload_index_falls_back_to_tree_scan() {
+        let conn = payload_index_db();
+        conn.execute_batch(
+            "insert into snapshots values ('snap-a'), ('snap-b');
+             insert into snapshot_payload_index values ('snap-a', 'now');
+             insert into snapshot_payloads values ('snap-a', 'blob', 'blob-a');",
+        )
+        .unwrap();
+
+        assert!(indexed_live_metadata_references(&conn).unwrap().is_none());
+    }
 }

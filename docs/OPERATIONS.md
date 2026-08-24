@@ -219,6 +219,11 @@ snapshot を実行した結果 current snapshot が変化しなかった場合�
 省略される。これにより、除外ファイルの更新や変更が元に戻った短時間の編集で不要な GCS/S3
 通信が発生しない。
 
+filesystem eventから対象rootを一意に判定できる場合、watchはdurable journalのlive diff走査と
+snapshot走査を、そのpathを管理するrootだけに限定する。nested rootでは親子双方を更新する。
+pathnameを取得できないevent、daemon起動時のjournal replay、手動snapshot、periodic rescanは
+保全漏れを避けるため全active rootを走査する。
+
 ## local fsck
 
 通常運用の保護状態確認では full fsck ではなく `mj health` を使う。
@@ -237,6 +242,9 @@ pending event journal、sync lock、暗号化key fileの基本状態から、`pr
 `mj health --json` には root 別に `present`、`current_snapshot_includes`、
 `current_file_count`、`current_tree_id`、`last_changed_snapshot`、`last_changed_at` も含まれる。
 `mj status` の Roots 表も current snapshot 上の file count、tree id、最終変更時刻を表示する。
+現在のroot rulesでは除外対象なのにtracked metadataへ残るpathがある場合、`mj health` は
+`tracked-paths-now-excluded`を報告する。まず`mj untrack -r <root> --excluded --dry-run --summary`
+で対象を確認し、暗号化して保護すべきsecretは`mj track`またはroot rulesの修正で明示的に残す。
 root が `permission-denied` など degraded 状態になった場合は、root別に `degraded_kind`、
 `degraded_at`、`degraded_message` も出力される。`mj status` の Roots 表では `ISSUE` 列で
 degraded kind と発生時刻を確認できる。
@@ -264,7 +272,12 @@ snapshot 以外の snapshot metadata を残さず、GCS/S3 の実サイズが cu
 ```sh
 MAJUTSU_WATCH_PRUNE_KEEP_DAILY=7
 MAJUTSU_WATCH_PRUNE_KEEP_MONTHLY=3
+MAJUTSU_WATCH_PRUNE_INTERVAL_SECS=3600
 ```
+
+`MAJUTSU_WATCH_PRUNE_INTERVAL_SECS`を設定すると、watch後の自動pruneは指定秒数
+以内に成功済みなら延期される。snapshot同期自体は延期されず、pruneだけを
+maintenanceのhot pathから外せる。
 
 daemon による自動pruneを止める場合は `MAJUTSU_WATCH_AUTO_PRUNE=0` を設定する。
 自動pruneは保持期間にかかわらず、remote payloadが既に欠損して復元不能になったcurrent以外の

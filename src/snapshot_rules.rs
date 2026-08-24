@@ -33,18 +33,18 @@ pub fn expanded_directory_exclude_patterns(pattern: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    push_unique(&mut out, base.to_string());
+    push_unique(&mut out, format!("{base}/"));
     let unanchored = base.trim_start_matches('/');
     if !unanchored.is_empty() {
-        push_unique(&mut out, unanchored.to_string());
+        push_unique(&mut out, format!("{unanchored}/"));
     }
     if let Some(inner) = unanchored.strip_prefix("**/") {
         if !inner.is_empty() {
-            push_unique(&mut out, inner.to_string());
-            push_unique(&mut out, format!("/{inner}"));
+            push_unique(&mut out, format!("{inner}/"));
+            push_unique(&mut out, format!("/{inner}/"));
         }
     } else if !unanchored.is_empty() {
-        push_unique(&mut out, format!("**/{unanchored}"));
+        push_unique(&mut out, format!("**/{unanchored}/"));
     }
     out
 }
@@ -53,6 +53,9 @@ pub fn root_preset_excludes(preset: &str) -> Result<Vec<String>> {
     match preset {
         "default" | "best-practice" => Ok(default_root_excludes()),
         "git" | "git-working-tree" => Ok(vec![
+            ".git",
+            "/.git",
+            "**/.git",
             ".git/**",
             "/.git/**",
             "**/.git/**",
@@ -96,6 +99,9 @@ pub fn root_preset_excludes(preset: &str) -> Result<Vec<String>> {
 
 pub fn default_root_excludes() -> Vec<String> {
     [
+        ".git",
+        "/.git",
+        "**/.git",
         ".git/**",
         "/.git/**",
         "**/.git/**",
@@ -120,7 +126,6 @@ pub fn default_root_excludes() -> Vec<String> {
         "build/**",
         "/build/**",
         "**/build/**",
-        "build-*",
         "build-*/**",
         "/build-*/**",
         "**/build-*/**",
@@ -176,6 +181,9 @@ pub fn default_root_excludes() -> Vec<String> {
         "Caches/**",
         "/Caches/**",
         "**/Caches/**",
+        "gke_gcloud_auth_plugin_cache*",
+        "/gke_gcloud_auth_plugin_cache*",
+        "**/gke_gcloud_auth_plugin_cache*",
         "AppData/Local/Temp/**",
         "/AppData/Local/Temp/**",
         "**/AppData/Local/Temp/**",
@@ -227,6 +235,10 @@ pub fn default_root_excludes() -> Vec<String> {
         "__pycache__/**",
         "/__pycache__/**",
         "**/__pycache__/**",
+        "*.pyc",
+        "**/*.pyc",
+        "*.pyo",
+        "**/*.pyo",
         ".pytest_cache/**",
         "/.pytest_cache/**",
         "**/.pytest_cache/**",
@@ -242,7 +254,6 @@ pub fn default_root_excludes() -> Vec<String> {
         ".venv/**",
         "/.venv/**",
         "**/.venv/**",
-        ".venv-*",
         ".venv-*/**",
         "/.venv-*/**",
         "**/.venv-*/**",
@@ -909,9 +920,9 @@ mod moon_root_tests {
     #[test]
     fn expands_directory_child_globs_to_directory_entries() {
         let expanded = expanded_directory_exclude_patterns("**/.git/**");
-        assert!(expanded.contains(&".git".to_string()));
-        assert!(expanded.contains(&"/.git".to_string()));
-        assert!(expanded.contains(&"**/.git".to_string()));
+        assert!(expanded.contains(&".git/".to_string()));
+        assert!(expanded.contains(&"/.git/".to_string()));
+        assert!(expanded.contains(&"**/.git/".to_string()));
     }
 
     #[test]
@@ -940,7 +951,6 @@ mod moon_root_tests {
             ".majutsu/config.toml",
             "node_modules",
             "target",
-            "build-device-check",
             "logs/app.log",
             "artifacts/e2e/screen.png",
             "shell_snapshots/019ef612-b3c1.sh",
@@ -950,6 +960,10 @@ mod moon_root_tests {
             "db/app.db-shm",
             "db/app.sqlite-journal",
             "cache/model-recommendations.json",
+            "gke_gcloud_auth_plugin_cache",
+            "gke_gcloud_auth_plugin_cache123456",
+            "src/__pycache__/worker.cpython-312.pyc",
+            "src/legacy.pyc",
             "AppData/Local/Temp/mj-smoke/home/config.toml",
             "AppData/Local/Packages/MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy/AC/INetCache/5HLB4PUV/wdgts_conf.json",
             ".vagrant.d/data/checkpoint_cache/foo",
@@ -984,6 +998,51 @@ mod moon_root_tests {
             !exclude_covers_path(&excludes, "model-latest.tgz"),
             "default excludes must not silently drop authored archives"
         );
+    }
+
+    #[test]
+    fn directory_excludes_do_not_hide_similarly_named_source_files() {
+        let root_path = tempfile::tempdir().unwrap();
+        let root = RootConfig {
+            id: "sample".into(),
+            name: "sample".into(),
+            path: root_path.path().to_path_buf(),
+            include: vec!["**".into()],
+            exclude: default_root_excludes(),
+            explicit_track: Vec::new(),
+            explicit_untrack: Vec::new(),
+            follow_symlinks: false,
+            require_mount: false,
+            status: "active".into(),
+            degraded: None,
+            snapshot_mode: "default".into(),
+            pre_snapshot: None,
+            post_snapshot: None,
+            snapshot_source: None,
+            application_plugin: None,
+            large: None,
+            volatile: None,
+        };
+        let ignore = build_ignore(&root).unwrap();
+
+        assert!(!is_ignored(
+            &ignore,
+            Path::new("scripts/build-server.mjs"),
+            false
+        ));
+        assert!(!is_ignored(
+            &ignore,
+            Path::new("config/.venv-template"),
+            false
+        ));
+        assert!(is_ignored(&ignore, Path::new(".git"), false));
+        assert!(is_ignored(&ignore, Path::new("build-device-check"), true));
+        assert!(is_ignored(&ignore, Path::new(".venv-local"), true));
+        assert!(is_ignored(
+            &ignore,
+            Path::new("build-device-check/output.bin"),
+            false
+        ));
     }
 
     #[test]

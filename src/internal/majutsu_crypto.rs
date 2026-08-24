@@ -4,10 +4,13 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 const ENC_MAGIC: &[u8] = b"MJENC1\n";
 const AGE_MAGIC: &[u8] = b"age-encryption.org/v1";
@@ -67,7 +70,7 @@ pub struct KeyMaterial {
     pub hex_key: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgeKeyring {
     #[serde(default)]
     pub recipients: Vec<String>,
@@ -269,12 +272,78 @@ fn restrict_key_file_permissions(_: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn read_age_keyring(recipients_path: &Path) -> Result<AgeKeyring> {
-    if !recipients_path.exists() {
-        return Ok(AgeKeyring::default());
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgeKeyringFileSignature {
+    exists: bool,
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct CachedAgeKeyring {
+    signature: AgeKeyringFileSignature,
+    keyring: AgeKeyring,
+    recipients: Option<Vec<age::x25519::Recipient>>,
+    identities: Option<Vec<age::x25519::Identity>>,
+}
+
+static AGE_KEYRING_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, CachedAgeKeyring>>> = OnceLock::new();
+
+fn age_keyring_cache() -> &'static Mutex<BTreeMap<PathBuf, CachedAgeKeyring>> {
+    AGE_KEYRING_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn age_keyring_file_signature(path: &Path) -> Result<AgeKeyringFileSignature> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(AgeKeyringFileSignature {
+            exists: true,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AgeKeyringFileSignature {
+            exists: false,
+            length: 0,
+            modified: None,
+        }),
+        Err(err) => Err(err.into()),
     }
-    toml::from_str(&fs::read_to_string(recipients_path)?)
-        .with_context(|| format!("parse age keyring {}", recipients_path.display()))
+}
+
+fn cached_age_keyring(recipients_path: &Path) -> Result<CachedAgeKeyring> {
+    let signature = age_keyring_file_signature(recipients_path)?;
+    if let Ok(cache) = age_keyring_cache().lock()
+        && let Some(cached) = cache.get(recipients_path)
+        && cached.signature == signature
+    {
+        return Ok(cached.clone());
+    }
+
+    let keyring = if signature.exists {
+        toml::from_str(&fs::read_to_string(recipients_path)?)
+            .with_context(|| format!("parse age keyring {}", recipients_path.display()))?
+    } else {
+        AgeKeyring::default()
+    };
+    let cached = CachedAgeKeyring {
+        signature,
+        keyring,
+        recipients: None,
+        identities: None,
+    };
+    if let Ok(mut cache) = age_keyring_cache().lock() {
+        cache.insert(recipients_path.to_path_buf(), cached.clone());
+    }
+    Ok(cached)
+}
+
+fn invalidate_age_keyring_cache(recipients_path: &Path) {
+    if let Ok(mut cache) = age_keyring_cache().lock() {
+        cache.remove(recipients_path);
+    }
+}
+
+pub fn read_age_keyring(recipients_path: &Path) -> Result<AgeKeyring> {
+    Ok(cached_age_keyring(recipients_path)?.keyring)
 }
 
 pub fn write_age_keyring(recipients_path: &Path, keyring: &AgeKeyring) -> Result<()> {
@@ -284,6 +353,7 @@ pub fn write_age_keyring(recipients_path: &Path, keyring: &AgeKeyring) -> Result
     }
     write_key_atomic(recipients_path, toml::to_string_pretty(keyring)?.as_bytes())?;
     restrict_key_file_permissions(recipients_path)?;
+    invalidate_age_keyring_cache(recipients_path);
     Ok(())
 }
 
@@ -388,27 +458,51 @@ fn age_decrypt_object(recipients_path: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn read_age_recipients(recipients_path: &Path) -> Result<Vec<age::x25519::Recipient>> {
-    read_age_keyring(recipients_path)?
+    let cached = cached_age_keyring(recipients_path)?;
+    if let Some(recipients) = cached.recipients {
+        return Ok(recipients);
+    }
+    let recipients = cached
+        .keyring
         .recipients
-        .into_iter()
+        .iter()
         .map(|recipient| {
             recipient
                 .parse()
                 .map_err(|err| anyhow!("invalid age recipient {recipient}: {err}"))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if let Ok(mut cache) = age_keyring_cache().lock()
+        && let Some(entry) = cache.get_mut(recipients_path)
+        && entry.signature == cached.signature
+    {
+        entry.recipients = Some(recipients.clone());
+    }
+    Ok(recipients)
 }
 
 fn read_age_identities(recipients_path: &Path) -> Result<Vec<age::x25519::Identity>> {
-    read_age_keyring(recipients_path)?
+    let cached = cached_age_keyring(recipients_path)?;
+    if let Some(identities) = cached.identities {
+        return Ok(identities);
+    }
+    let identities = cached
+        .keyring
         .identities
-        .into_iter()
+        .iter()
         .map(|identity| {
             identity
                 .parse()
                 .map_err(|err| anyhow!("invalid age identity: {err}"))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if let Ok(mut cache) = age_keyring_cache().lock()
+        && let Some(entry) = cache.get_mut(recipients_path)
+        && entry.signature == cached.signature
+    {
+        entry.identities = Some(identities.clone());
+    }
+    Ok(identities)
 }
 
 #[cfg(test)]

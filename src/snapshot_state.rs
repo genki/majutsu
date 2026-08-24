@@ -134,14 +134,15 @@ pub(crate) fn snapshot_manifest_from_parts(
         return serde_json::from_str(manifest_json)
             .with_context(|| format!("parse snapshot manifest metadata {id}"));
     }
-    let bytes = match crate::read_object(paths, manifest_key) {
+    let bytes = match crate::read_object_raw(paths, manifest_key) {
         Ok(bytes) => bytes,
         Err(local_err) => hydrate_snapshot_manifest_from_remote(paths, manifest_key)
-            .and_then(|_| crate::read_object(paths, manifest_key))
+            .and_then(|_| crate::read_object_raw(paths, manifest_key))
             .with_context(|| {
                 format!("read snapshot manifest object {id} {manifest_key}: {local_err}")
             })?,
     };
+    let bytes = crate::hydrate_known_compact_snapshot_manifest_payload(paths, bytes)?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse snapshot manifest object {id} {manifest_key}"))
 }
@@ -151,7 +152,7 @@ fn read_snapshot_manifest_object_raw(
     id: &str,
     manifest_key: &str,
 ) -> Result<Vec<u8>> {
-    crate::read_object(paths, manifest_key)
+    crate::read_object_raw(paths, manifest_key)
         .with_context(|| format!("read snapshot manifest object {id} {manifest_key}"))
 }
 
@@ -159,7 +160,7 @@ pub(crate) fn load_root_tree_entries(
     paths: &Paths,
     root_tree: &RootSnapshot,
 ) -> Result<BTreeMap<String, FileRecord>> {
-    let tree_bytes = crate::read_object(paths, &root_tree.tree_key)
+    let tree_bytes = crate::read_object_raw(paths, &root_tree.tree_key)
         .with_context(|| format!("read root tree {}", root_tree.tree_key))?;
     let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
         .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
@@ -174,7 +175,7 @@ pub(crate) fn tree_entries_from_manifest(
         return Ok(tree.entries);
     }
     let root_node = tree.root_node.expect("checked above");
-    let node_bytes = crate::read_object(paths, &root_node.node_key)
+    let node_bytes = crate::read_object_raw(paths, &root_node.node_key)
         .with_context(|| format!("read root tree node {}", root_node.node_key))?;
     let node: TreeNodeManifest = serde_json::from_slice(&node_bytes)
         .with_context(|| format!("parse root tree node {}", root_node.node_key))?;
@@ -189,7 +190,7 @@ pub(crate) fn visit_tree_records<F>(
 where
     F: FnMut(&FileRecord) -> Result<()>,
 {
-    let tree_bytes = crate::read_object(paths, &root_tree.tree_key)
+    let tree_bytes = crate::read_object_raw(paths, &root_tree.tree_key)
         .with_context(|| format!("read root tree {}", root_tree.tree_key))?;
     let tree: TreeManifest = serde_json::from_slice(&tree_bytes)
         .with_context(|| format!("parse root tree {}", root_tree.tree_key))?;
@@ -211,7 +212,7 @@ pub(crate) fn visit_tree_node_records<F>(
 where
     F: FnMut(&FileRecord) -> Result<()>,
 {
-    let node_bytes = crate::read_object(paths, node_key)
+    let node_bytes = crate::read_object_raw(paths, node_key)
         .with_context(|| format!("read tree node {node_key}"))?;
     let node: TreeNodeManifest = serde_json::from_slice(&node_bytes)
         .with_context(|| format!("parse tree node {node_key}"))?;
@@ -230,7 +231,7 @@ pub(crate) fn tree_entries_from_node(
 ) -> Result<BTreeMap<String, FileRecord>> {
     let mut entries = node.entries;
     for child in node.child_nodes.values() {
-        let child_bytes = crate::read_object(paths, &child.node_key)
+        let child_bytes = crate::read_object_raw(paths, &child.node_key)
             .with_context(|| format!("read child tree node {}", child.node_key))?;
         let child_node: TreeNodeManifest = serde_json::from_slice(&child_bytes)
             .with_context(|| format!("parse child tree node {}", child.node_key))?;
