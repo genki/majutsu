@@ -52,7 +52,11 @@ MAJUTSU_SYNC_REMOTE_PRUNE=0 mj sync
 MAJUTSU_SYNC_REMOTE_OBJECT_PRUNE=0 mj sync
 ```
 
-remote cleanup の成功後は `~/.majutsu/cache/remote-prune-state.json` に状態を記録し、同じ remote / state fingerprint の no-op sync では backend prefix 全体の list を繰り返さない。強制的に remote cleanup を再実行する場合は次を使う。
+remote cleanup の成功後は `~/.majutsu/cache/remote-prune-state.json` に最終実行時刻を記録し、
+S3/GCS互換remoteではスナップショットが変わっただけで backend prefix 全体の list を繰り返さない。
+既定では1時間間隔で実行され、間隔中の同期では不要な cleanup request とGC mark更新を発生させない。
+file remoteはローカル検証用途の従来仕様を維持し、状態変更時の即時cleanupを行う。
+強制的に remote cleanup を再実行する場合は次を使う。
 
 ```sh
 MAJUTSU_SYNC_REMOTE_PRUNE_FORCE=1 mj sync

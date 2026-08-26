@@ -60,9 +60,14 @@ old compatibility 比で request 数が少ない。
 
 ## GC mark
 
-S3/GCS 互換 backend では compact head を通常復旧の正とするため、remote prune を無効化している場合の
-GC mark は初回だけ seed し、通常の小変更 sync では毎回 publish しない。GC mark は remote prune の
-保護集合として使うため、remote prune を実行する同期では最新状態を強制 publish してから prune する。
+S3/GCS 互換 backend では compact head を通常復旧の正とするため、GC mark は初回、保護集合が
+変化した同期、または remote prune を実行する同期で publish する。remote prune を実行する同期
+では、最新状態を強制 publish してから prune する。保護集合が変わらない通常の同期では毎回
+publish しない。
+
+GC mark の `marked_at`、chunk index の `updated_at`、metadata export の `exported_at` は
+内容判定から除外する。同期cacheに保存した論理fingerprintが一致する場合、時刻だけが進んだ
+同一内容のPUTを省略する。cacheがない、または内容が変わった場合は通常通り再publishする。
 remote prune は通常有効で、旧 retention から残った pack、tree、large chunk などの content object を
 自動的に整理する。
 

@@ -451,6 +451,7 @@ fn sync_configured_remote(
         config,
         remote,
         &trace,
+        should_prune_remote,
         SyncJournalFastLane {
             enqueued_live_diff,
             enqueued_remote_journal,
@@ -725,6 +726,7 @@ fn enqueue_and_drain_sync(
     config: &Config,
     remote: &RemoteStore,
     trace: &SyncTrace,
+    should_prune_remote: bool,
     journal: SyncJournalFastLane,
 ) -> Result<()> {
     let SyncJournalFastLane {
@@ -746,13 +748,17 @@ fn enqueue_and_drain_sync(
     trace.mark("metadata fingerprints");
     let state_fingerprint = remote_sync_state_cache_key(paths, config, &remote_export)?;
     trace.mark("state fingerprint 2");
-    let should_prune_remote =
-        sync_remote_prune_enabled() && remote_prune_due(paths, remote, &state_fingerprint)?;
     let remote_metadata_json = metadata_export_json_for_remote(remote, &remote_export)?;
     trace.mark("metadata json");
     let host_metadata_plain = host_metadata_key(&host_label);
-    let host_metadata =
-        enqueue_metadata_uploads(paths, remote, &host_metadata_plain, &remote_metadata_json)?;
+    let host_metadata = enqueue_metadata_uploads(
+        paths,
+        remote,
+        &sync_cache,
+        &mut sync_fingerprints,
+        &host_metadata_plain,
+        &remote_metadata_json,
+    )?;
     for snapshot in &remote_export.snapshots {
         enqueue_snapshot_uploads_if_needed(paths, remote, &sync_cache, &host_label, snapshot)?;
     }
@@ -833,11 +839,21 @@ fn enqueue_and_drain_sync(
         )?;
     }
     if !remote_export.chunks.is_empty() {
-        enqueue_inline_upload(
-            paths,
-            &host_remote_key(&host_label, REMOTE_CHUNK_INDEX_SHARD_KEY),
-            encode_canonical_remote_export(paths, &build_chunk_index_shard(&remote_export))?,
-        )?;
+        let key = host_remote_key(&host_label, REMOTE_CHUNK_INDEX_SHARD_KEY);
+        let shard = build_chunk_index_shard(&remote_export);
+        let bytes = encode_canonical_remote_export(paths, &shard)?;
+        if matches!(remote, RemoteStore::S3(_)) {
+            enqueue_cached_inline_upload_with_fingerprint(
+                paths,
+                &sync_cache,
+                &mut sync_fingerprints,
+                &key,
+                chunk_index_shard_fingerprint(&shard)?,
+                bytes,
+            )?;
+        } else {
+            enqueue_inline_upload(paths, &key, bytes)?;
+        }
     }
     trace.mark("metadata queue");
 
@@ -929,7 +945,16 @@ fn enqueue_and_drain_sync(
         }
     }
     trace.mark("content queue");
-    enqueue_gc_mark_if_needed(paths, remote, &host_label, config, &content_export)?;
+    enqueue_gc_mark_if_needed(
+        paths,
+        remote,
+        &host_label,
+        config,
+        &content_export,
+        &sync_cache,
+        &mut sync_fingerprints,
+        should_prune_remote,
+    )?;
     trace.mark("gc mark");
     let mut upload_drain = drain_upload_queue(paths, remote, config.large.max_parallel_uploads)?;
     upload_drain.uploaded += journal_upload_drain.uploaded;
@@ -1311,16 +1336,38 @@ fn remote_prune_due(paths: &Paths, remote: &RemoteStore, state_fingerprint: &str
     let Some(state) = read_remote_prune_state(paths)? else {
         return Ok(true);
     };
-    if state.version != 1
-        || state.remote != remote.describe()
-        || state.state_fingerprint != state_fingerprint
-    {
-        return Ok(true);
+    Ok(remote_prune_state_is_due(
+        &state,
+        &remote.describe(),
+        matches!(remote, RemoteStore::S3(_)),
+        state_fingerprint,
+        SystemTime::now(),
+        remote_prune_interval(),
+    ))
+}
+
+fn remote_prune_state_is_due(
+    state: &RemotePruneState,
+    remote_description: &str,
+    use_interval_only: bool,
+    state_fingerprint: &str,
+    now: SystemTime,
+    interval: Duration,
+) -> bool {
+    if state.version != 1 || state.remote != remote_description {
+        return true;
     }
-    let elapsed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(state.pruned_at_unix_secs))
-        .unwrap_or(Duration::MAX);
-    Ok(elapsed >= remote_prune_interval())
+    if !use_interval_only && state.state_fingerprint != state_fingerprint {
+        return true;
+    }
+    remote_prune_elapsed_due(state.pruned_at_unix_secs, now, interval)
+}
+
+fn remote_prune_elapsed_due(pruned_at_unix_secs: u64, now: SystemTime, interval: Duration) -> bool {
+    let pruned_at = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(pruned_at_unix_secs))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    now.duration_since(pruned_at).unwrap_or(Duration::MAX) >= interval
 }
 
 fn remote_prune_interval() -> Duration {
@@ -1475,6 +1522,8 @@ fn compact_snapshot_manifest_value(value: &mut serde_json::Value) {
 fn enqueue_metadata_uploads(
     paths: &Paths,
     remote: &RemoteStore,
+    cache: &RemoteSyncCache,
+    fingerprints: &mut BTreeMap<String, String>,
     host_key: &str,
     metadata_json: &[u8],
 ) -> Result<String> {
@@ -1483,8 +1532,16 @@ fn enqueue_metadata_uploads(
         return Ok(host_key.to_string());
     }
     let compressed = zstd::stream::encode_all(metadata_json, 3)?;
-    enqueue_inline_upload(paths, &compressed_metadata_key(host_key), compressed)?;
-    Ok(compressed_metadata_key(host_key))
+    let key = compressed_metadata_key(host_key);
+    enqueue_cached_inline_upload_with_fingerprint(
+        paths,
+        cache,
+        fingerprints,
+        &key,
+        stable_metadata_fingerprint(metadata_json)?,
+        compressed,
+    )?;
+    Ok(key)
 }
 
 fn compressed_metadata_key(key: &str) -> String {
@@ -1541,6 +1598,24 @@ fn enqueue_cached_inline_upload(
     bytes: Vec<u8>,
 ) -> Result<()> {
     let fingerprint = payload_fingerprint(&bytes);
+    enqueue_cached_inline_upload_with_fingerprint(
+        paths,
+        cache,
+        fingerprints,
+        key,
+        fingerprint,
+        bytes,
+    )
+}
+
+fn enqueue_cached_inline_upload_with_fingerprint(
+    paths: &Paths,
+    cache: &RemoteSyncCache,
+    fingerprints: &mut BTreeMap<String, String>,
+    key: &str,
+    fingerprint: String,
+    bytes: Vec<u8>,
+) -> Result<()> {
     fingerprints.insert(key.to_string(), fingerprint.clone());
     if cache_matches(cache, key, &fingerprint) {
         return Ok(());
@@ -1769,6 +1844,39 @@ fn cache_matches(cache: &RemoteSyncCache, key: &str, fingerprint: &str) -> bool 
 
 fn payload_fingerprint(bytes: &[u8]) -> String {
     blake3_hex(bytes)
+}
+
+fn stable_metadata_fingerprint(metadata_json: &[u8]) -> Result<String> {
+    let mut value: serde_json::Value = serde_json::from_slice(metadata_json)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("exported_at");
+    }
+    Ok(format!(
+        "metadata-v1:{}",
+        payload_fingerprint(&serde_json::to_vec(&value)?)
+    ))
+}
+
+fn chunk_index_shard_fingerprint(shard: &ChunkIndexShard) -> Result<String> {
+    let mut value = serde_json::to_value(shard)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("updated_at");
+    }
+    Ok(format!(
+        "chunk-index-v1:{}",
+        payload_fingerprint(&serde_json::to_vec(&value)?)
+    ))
+}
+
+fn gc_mark_fingerprint(mark: &GcMarkExport) -> Result<String> {
+    let mut value = serde_json::to_value(mark)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("marked_at");
+    }
+    Ok(format!(
+        "gc-mark-v1:{}",
+        payload_fingerprint(&serde_json::to_vec(&value)?)
+    ))
 }
 
 fn sync_status(
@@ -2178,21 +2286,38 @@ fn build_gc_mark_export(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue_gc_mark_if_needed(
     paths: &Paths,
     remote: &RemoteStore,
     host_label: &str,
     config: &Config,
     export: &MetadataExport,
+    cache: &RemoteSyncCache,
+    fingerprints: &mut BTreeMap<String, String>,
+    should_prune_remote: bool,
 ) -> Result<()> {
     let key = remote_gc_mark_key(host_label);
-    enqueue_inline_upload(
-        paths,
-        &key,
-        serde_json::to_vec_pretty(&build_gc_mark_export(
-            paths, host_label, config, remote, export,
-        )?)?,
-    )
+    let mark = build_gc_mark_export(paths, host_label, config, remote, export)?;
+    let bytes = serde_json::to_vec_pretty(&mark)?;
+    if !matches!(remote, RemoteStore::S3(_)) {
+        return enqueue_inline_upload(paths, &key, bytes);
+    }
+    let fingerprint = gc_mark_fingerprint(&mark)?;
+    fingerprints.insert(key.clone(), fingerprint.clone());
+    if !sync_gc_mark_every_time()
+        && !should_prune_remote
+        && cache_matches(cache, &key, &fingerprint)
+    {
+        return Ok(());
+    }
+    enqueue_inline_upload(paths, &key, bytes)
+}
+
+fn sync_gc_mark_every_time() -> bool {
+    env::var("MAJUTSU_SYNC_GC_MARK_EVERY_TIME")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn encode_canonical_local_object(
@@ -2565,6 +2690,7 @@ fn write_remote_gc_tombstone(remote: &RemoteStore, host_id: &str, key: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
 
     fn caught_up_wait_status() -> SyncWaitStatus {
         SyncWaitStatus {
@@ -2602,5 +2728,91 @@ mod tests {
 
         assert!(!status.should_resync(Some(7)));
         assert!(status.should_resync(Some(42)));
+    }
+
+    #[test]
+    fn remote_prune_schedule_uses_elapsed_interval_even_when_state_changes() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(5_000);
+        let state = RemotePruneState {
+            version: 1,
+            remote: "file://test".into(),
+            state_fingerprint: "old-state".into(),
+            pruned_at_unix_secs: 2_000,
+        };
+
+        assert!(!remote_prune_state_is_due(
+            &state,
+            "file://test",
+            true,
+            "new-state",
+            now,
+            Duration::from_secs(3_600)
+        ));
+        assert!(remote_prune_state_is_due(
+            &state,
+            "file://test",
+            false,
+            "new-state",
+            now,
+            Duration::from_secs(3_600)
+        ));
+        assert!(remote_prune_elapsed_due(0, now, Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn stable_metadata_fingerprint_ignores_export_time_only() {
+        let first =
+            br#"{"exported_at":"2026-08-27T00:00:00Z","version":1,"refs":{"current":"snap-1"}}"#;
+        let second =
+            br#"{"exported_at":"2026-08-27T00:01:00Z","version":1,"refs":{"current":"snap-1"}}"#;
+        let changed =
+            br#"{"exported_at":"2026-08-27T00:01:00Z","version":1,"refs":{"current":"snap-2"}}"#;
+
+        assert_eq!(
+            stable_metadata_fingerprint(first).unwrap(),
+            stable_metadata_fingerprint(second).unwrap()
+        );
+        assert_ne!(
+            stable_metadata_fingerprint(first).unwrap(),
+            stable_metadata_fingerprint(changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn generated_times_do_not_change_index_or_gc_mark_fingerprints() {
+        let first_shard = ChunkIndexShard::new(
+            DateTime::<Utc>::UNIX_EPOCH,
+            vec![ChunkIndexEntry::new(
+                "oid-1".into(),
+                10,
+                "objects/chunks/oid-1".into(),
+                None,
+            )],
+        );
+        let second_shard = ChunkIndexShard::new(
+            DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(1),
+            first_shard.chunks.clone(),
+        );
+        assert_eq!(
+            chunk_index_shard_fingerprint(&first_shard).unwrap(),
+            chunk_index_shard_fingerprint(&second_shard).unwrap()
+        );
+
+        let first_mark = GcMarkExport::new(
+            "host-1".into(),
+            DateTime::<Utc>::UNIX_EPOCH,
+            Some("snap-1".into()),
+            vec!["host-1/objects/a".into()],
+        );
+        let second_mark = GcMarkExport::new(
+            "host-1".into(),
+            DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(1),
+            Some("snap-1".into()),
+            first_mark.object_keys.clone(),
+        );
+        assert_eq!(
+            gc_mark_fingerprint(&first_mark).unwrap(),
+            gc_mark_fingerprint(&second_mark).unwrap()
+        );
     }
 }
