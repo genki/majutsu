@@ -260,7 +260,7 @@ tokenはログへ出さない。listenerはLAN／VPN内だけから到達可能�
 public networkへ公開しない。
 
 ACK意味論の変更に伴いcluster protocolはv2である。v1とv2はfail-fastし、slave queueを保持する。
-upgrade時はslave daemonを停止してqueueを保持し、masterを`0.8.1`へ更新してからslaveを更新する。
+upgrade時はslave daemonを停止してqueueを保持し、masterを`0.8.2`へ更新してからslaveを更新する。
 v2ではslaveのremote sync cacheを更新し、同期時の存在判定にはmaster-local専用LISTを使うため、
 最初のfull syncで現在参照されるobjectがS3だけに存在していてもslaveからmasterへ再複製される。
 全nodeの更新後、各slaveで`mj sync --wait`を完了させ、master-local ACK、S3 lag、

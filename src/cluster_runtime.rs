@@ -3134,8 +3134,21 @@ fn drain_backend_queue(state: &MasterServerState, force: bool) -> Result<usize> 
     if !force && !backend_flush_due(&stats, now) {
         return Ok(0);
     }
-    let selected = backend_queue_items(state)?
+    let queued = backend_queue_items(state)?;
+    // Deletes for a host remain blocked while that host has pending PUTs. Do
+    // not let those blocked deletes occupy every batch slot: otherwise the
+    // same prefix is selected forever and the PUTs they depend on starve.
+    let hosts_with_pending_puts = queued
+        .iter()
+        .filter(|(_, item)| matches!(&item.operation, BackendQueueOperation::Put { .. }))
+        .map(|(_, item)| item.source_host.clone())
+        .collect::<BTreeSet<_>>();
+    let selected = queued
         .into_iter()
+        .filter(|(_, item)| {
+            !matches!(&item.operation, BackendQueueOperation::Delete)
+                || !hosts_with_pending_puts.contains(&item.source_host)
+        })
         .filter(|(_, item)| {
             force
                 || item
@@ -4298,6 +4311,45 @@ mod tests {
             b"payload"
         );
         assert_eq!(backend_queue_stats(&state).unwrap().objects, 0);
+    }
+
+    #[test]
+    fn backend_worker_does_not_starve_puts_behind_blocked_delete_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let backend_root = root.path().join("backend");
+        let state = test_master_state(root.path(), &backend_root);
+        let delete_count = backend_flush_max_objects() + 1;
+        for index in 0..delete_count {
+            enqueue_backend_delete(
+                &state,
+                "test-host",
+                &format!("test-host/objects/blobs/aa/delete-{index:04}"),
+            )
+            .unwrap();
+        }
+        let put_key = "test-host/objects/blobs/zz/payload";
+        dispatch_operation(
+            &state,
+            "test-host",
+            ClusterOperation::Put {
+                key: put_key.into(),
+                bytes: b"payload".to_vec(),
+                conditional: false,
+            },
+        )
+        .unwrap();
+
+        let queued = backend_queue_items(&state).unwrap();
+        assert!(
+            queued
+                .iter()
+                .take(backend_flush_max_objects())
+                .all(|(_, item)| matches!(&item.operation, BackendQueueOperation::Delete))
+        );
+
+        assert_eq!(drain_backend_queue(&state, true).unwrap(), 1);
+        assert_eq!(fs::read(backend_root.join(put_key)).unwrap(), b"payload");
+        assert_eq!(backend_queue_stats(&state).unwrap().objects, delete_count);
     }
 
     #[test]
