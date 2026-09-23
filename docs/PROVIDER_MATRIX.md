@@ -15,6 +15,9 @@
 | AWS S3 | yes | yes | yes | yes | yes | yes | yes | yes | experimental until release validation | `scripts/e2e-aws-archive-restore.sh` |
 | Cloudflare R2 | yes | yes | yes | provider-specific | provider-specific | limited | provider-specific | no Glacier-style restore | experimental | manual validation required |
 
+master／slave profileのmaster-local storeはproviderではなく、上表のS3互換backendを
+二次backup先として利用する。slave ACKはprovider requestの成否に依存しない。
+
 ## release 判定方針
 
 release は `Status` が `local gate verified` または当該 release candidate で

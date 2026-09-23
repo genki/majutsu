@@ -1,7 +1,7 @@
 use crate::majutsu_core::{
     FileRecord, LargeManifest, TreeManifest, TreeNodeManifest, payload_blob_ref, payload_large_ref,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use walkdir::WalkDir;
@@ -9,7 +9,6 @@ use walkdir::WalkDir;
 use crate::config::{MetadataExport, Paths};
 use crate::majutsu_store::{canonical_remote_alias, canonical_remote_aliases};
 use crate::util::{path_to_slash, validate_local_object_key};
-use std::fs;
 
 pub(crate) fn local_object_keys(paths: &Paths, export: &MetadataExport) -> Result<Vec<String>> {
     local_object_keys_inner(paths, export, None, None)
@@ -47,10 +46,16 @@ fn local_object_keys_inner(
     let snapshot_total = snapshots.len();
     for (index, snapshot) in snapshots.iter().enumerate() {
         keys.push(snapshot.manifest_key.clone());
-        if let Ok(manifest) = snapshot_manifest_for_object_keys(paths, snapshot) {
+        {
+            let manifest = snapshot_manifest_for_object_keys(paths, snapshot)
+                .with_context(|| format!("snapshot依存集合を列挙できません: {}", snapshot.id))?;
             for root_tree in manifest.root_trees.values() {
                 keys.push(root_tree.tree_key.clone());
-                if let Ok(tree) = tree_manifest_for_object_keys(paths, &root_tree.tree_key) {
+                {
+                    let tree = tree_manifest_for_object_keys(paths, &root_tree.tree_key)
+                        .with_context(|| {
+                            format!("tree依存集合を列挙できません: {}", root_tree.tree_key)
+                        })?;
                     if let Some(root_node) = &tree.root_node {
                         keys.push(root_node.node_key.clone());
                         push_child_tree_node_keys(paths, &mut keys, &root_node.node_key)?;
@@ -65,7 +70,11 @@ fn local_object_keys_inner(
                         }
                         if let Some((_, manifest_key, _)) = payload_large_ref(&record.payload) {
                             keys.push(manifest_key.to_string());
-                            if let Ok(large) = large_manifest_for_object_keys(paths, manifest_key) {
+                            {
+                                let large = large_manifest_for_object_keys(paths, manifest_key)
+                                    .with_context(|| {
+                                        format!("large依存集合を列挙できません: {manifest_key}")
+                                    })?;
                                 for chunk in large.chunks {
                                     keys.push(chunk.object_key);
                                 }
@@ -121,25 +130,24 @@ fn snapshot_manifest_for_object_keys(
         return Ok(serde_json::from_str(&snapshot.manifest_json)?);
     }
     validate_local_object_key(&snapshot.manifest_key)?;
-    let bytes = fs::read(paths.home.join(&snapshot.manifest_key))?;
-    Ok(serde_json::from_slice(&crate::decode_object(
-        paths, &bytes,
+    Ok(serde_json::from_slice(&crate::read_object_raw(
+        paths,
+        &snapshot.manifest_key,
     )?)?)
 }
 
 fn tree_manifest_for_object_keys(paths: &Paths, tree_key: &str) -> Result<TreeManifest> {
     validate_local_object_key(tree_key)?;
-    let bytes = fs::read(paths.home.join(tree_key))?;
-    Ok(serde_json::from_slice(&crate::decode_object(
-        paths, &bytes,
+    Ok(serde_json::from_slice(&crate::read_object_raw(
+        paths, tree_key,
     )?)?)
 }
 
 fn large_manifest_for_object_keys(paths: &Paths, manifest_key: &str) -> Result<LargeManifest> {
     validate_local_object_key(manifest_key)?;
-    let bytes = fs::read(paths.home.join(manifest_key))?;
-    Ok(serde_json::from_slice(&crate::decode_object(
-        paths, &bytes,
+    Ok(serde_json::from_slice(&crate::read_object_raw(
+        paths,
+        manifest_key,
     )?)?)
 }
 
@@ -152,8 +160,8 @@ fn tree_entries_for_object_keys(
     }
     let root_node = tree.root_node.as_ref().expect("checked above");
     validate_local_object_key(&root_node.node_key)?;
-    let bytes = fs::read(paths.home.join(&root_node.node_key))?;
-    let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
+    let node: TreeNodeManifest =
+        serde_json::from_slice(&crate::read_object_raw(paths, &root_node.node_key)?)?;
     tree_entries_from_node_for_object_keys(paths, node)
 }
 
@@ -164,9 +172,8 @@ fn tree_entries_from_node_for_object_keys(
     let mut entries = node.entries;
     for child in node.child_nodes.values() {
         validate_local_object_key(&child.node_key)?;
-        let bytes = fs::read(paths.home.join(&child.node_key))?;
         let child_node: TreeNodeManifest =
-            serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
+            serde_json::from_slice(&crate::read_object_raw(paths, &child.node_key)?)?;
         entries.extend(tree_entries_from_node_for_object_keys(paths, child_node)?);
     }
     Ok(entries)
@@ -174,8 +181,7 @@ fn tree_entries_from_node_for_object_keys(
 
 fn push_child_tree_node_keys(paths: &Paths, keys: &mut Vec<String>, node_key: &str) -> Result<()> {
     validate_local_object_key(node_key)?;
-    let bytes = fs::read(paths.home.join(node_key))?;
-    let node: TreeNodeManifest = serde_json::from_slice(&crate::decode_object(paths, &bytes)?)?;
+    let node: TreeNodeManifest = serde_json::from_slice(&crate::read_object_raw(paths, node_key)?)?;
     for child in node.child_nodes.values() {
         keys.push(child.node_key.clone());
         push_child_tree_node_keys(paths, keys, &child.node_key)?;

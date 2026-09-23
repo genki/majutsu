@@ -100,7 +100,7 @@ pub(crate) fn clone_cmd(paths: &Paths, args: CloneArgs) -> Result<()> {
             download_compact_snapshot_manifests(&staging_paths, &remote, &export)?;
         }
         trace.mark("write bootstrap files");
-        if !matches!(remote, RemoteStore::S3(_)) {
+        if !remote.is_s3_like() {
             crate::validate_clone_remote_lifecycle_artifacts(&remote)?;
             crate::validate_clone_remote_gc_mark(
                 &staging_paths,
@@ -226,7 +226,7 @@ fn snapshot_metadata_is_compact(snapshot: &crate::majutsu_core::SnapshotExport) 
 }
 
 fn clone_metadata_bytes(remote: &RemoteStore, key: &str) -> Result<Vec<u8>> {
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         if key.ends_with(".zst") {
             let bytes = remote
                 .get(key)
@@ -281,7 +281,7 @@ fn refresh_s3_bootstrap_host_summary(
     loaded: &mut CloneLoadedMetadata,
     export: &MetadataExport,
 ) {
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         return;
     }
     let Some(host) = loaded.selection.host.as_mut() else {
@@ -365,7 +365,7 @@ fn materialize_clone_objects(
 }
 
 fn materialize_keys(paths: &Paths, remote: &RemoteStore, keys: Vec<String>) -> Result<()> {
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         return materialize_keys_parallel(paths, remote, keys);
     }
     for key in keys {
@@ -461,7 +461,7 @@ fn clone_parallel_downloads() -> usize {
 }
 
 fn clone_should_materialize_objects(remote: &RemoteStore) -> bool {
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         return true;
     }
     env::var("MAJUTSU_CLONE_FULL_MATERIALIZE")

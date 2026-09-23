@@ -18,6 +18,10 @@ use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
 use crate::cli::{ResolvedWatchArgs, SnapshotArgs, WatchArgs};
+use crate::cluster_runtime::{
+    cluster_heartbeat_interval, cluster_master_mode_enabled, cluster_slave_heartbeat,
+    serve_master_from_env,
+};
 use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
 use crate::daemon_runtime::{
     ForegroundDaemonRuntime, WatchDaemonLaunchConfig, acquire_daemon_lock, child_process_exe,
@@ -30,9 +34,11 @@ use crate::operation_log::origin_override_from_pid;
 use crate::platform_runtime::configure_background_command;
 use crate::process_runtime::{
     ProcessIdentity, acquire_process_lock, pid_alive, process_identity, process_identity_matches,
+    process_lock_owner,
 };
 use crate::queue_runtime::{
-    event_journal_records, record_event, record_file_event, upload_queue_stats,
+    UploadQueueStats, event_journal_records, record_event, record_file_event,
+    remote_event_journal_stats, upload_queue_stats,
 };
 use crate::root_state::roots;
 use crate::snapshot_rules::{
@@ -95,6 +101,16 @@ pub(crate) fn watch_cmd(paths: &Paths, args: WatchArgs) -> Result<()> {
     let _lock = acquire_daemon_lock(paths)?;
     let _runtime = ForegroundDaemonRuntime::register(paths)?;
     start_daemon_ipc(paths)?;
+    if cluster_master_mode_enabled() {
+        write_active_watch_backend(paths, "cluster-master")?;
+        return serve_master_from_env(paths);
+    }
+    if !args.once {
+        if configured_remote_is_cluster(paths) {
+            start_cluster_heartbeat_scheduler(paths)?;
+        }
+        start_upload_retry_scheduler(paths)?;
+    }
     match backend {
         "fanotify" => match watch_fanotify(paths, args.clone(), &config) {
             Ok(()) => Ok(()),
@@ -1199,13 +1215,8 @@ fn sync_current_external(paths: &Paths, prune_after: bool, changed_roots: &[Stri
     }
     let exe = child_process_exe()?;
     let mut command = std::process::Command::new(&exe);
-    command
-        .arg("--home")
-        .arg(&paths.home)
-        .arg("sync")
-        .arg("--wait")
-        .arg("--timeout-secs")
-        .arg("300");
+    command.arg("--home").arg(&paths.home).arg("sync");
+    configure_watch_sync_wait(&mut command, configured_remote_is_cluster(paths));
     for root_id in changed_roots {
         command.arg("--changed-root").arg(root_id);
     }
@@ -1223,6 +1234,239 @@ fn sync_current_external(paths: &Paths, prune_after: bool, changed_roots: &[Stri
         )?;
     }
     Ok(())
+}
+
+fn configure_watch_sync_wait(command: &mut std::process::Command, cluster_remote: bool) {
+    if !cluster_remote {
+        command.arg("--wait").arg("--timeout-secs").arg("300");
+    }
+}
+
+fn start_cluster_heartbeat_scheduler(paths: &Paths) -> Result<()> {
+    let paths = paths.clone();
+    std::thread::Builder::new()
+        .name("mj-cluster-heartbeat".into())
+        .spawn(move || cluster_heartbeat_scheduler_loop(paths))
+        .context("start cluster heartbeat scheduler")?;
+    Ok(())
+}
+
+fn cluster_heartbeat_scheduler_loop(paths: Paths) {
+    let heartbeat_interval = cluster_heartbeat_interval();
+    loop {
+        match cluster_slave_heartbeat(&paths) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("cluster master heartbeat error: {err:#}");
+                let _ = record_cluster_master_unavailable(&paths, &err);
+            }
+        }
+        std::thread::sleep(heartbeat_interval);
+    }
+}
+
+fn start_upload_retry_scheduler(paths: &Paths) -> Result<()> {
+    let paths = paths.clone();
+    std::thread::Builder::new()
+        .name("mj-upload-retry".into())
+        .spawn(move || upload_retry_scheduler_loop(paths))
+        .context("start upload retry scheduler")?;
+    Ok(())
+}
+
+fn upload_retry_scheduler_loop(paths: Paths) {
+    loop {
+        let work_sleep = match upload_retry_scheduler_work(&paths) {
+            Ok(work) if work.is_empty() => Duration::from_secs(30),
+            Ok(_)
+                if process_lock_owner(&paths.sync_lock)
+                    .ok()
+                    .flatten()
+                    .is_some() =>
+            {
+                Duration::from_secs(5)
+            }
+            Ok(work) if work.only_delayed_uploads() => work
+                .uploads
+                .next_retry_after
+                .and_then(|retry_after| {
+                    (retry_after - Utc::now())
+                        .to_std()
+                        .ok()
+                        .map(|duration| duration.max(Duration::from_secs(1)))
+                })
+                .unwrap_or_else(|| Duration::from_secs(5))
+                .min(Duration::from_secs(30)),
+            Ok(work) => {
+                let pending_before = work.pending_items();
+                if let Err(err) = retry_queued_uploads_external(&paths) {
+                    eprintln!("upload retry scheduler error: {err:#}");
+                    let _ = record_cluster_master_unavailable(&paths, &err);
+                    Duration::from_secs(30)
+                } else {
+                    clear_cluster_master_unavailable(&paths);
+                    let pending_after = upload_retry_scheduler_work(&paths)
+                        .map(|work| work.pending_items())
+                        .unwrap_or(pending_before);
+                    retry_scheduler_success_delay(pending_before, pending_after)
+                }
+            }
+            Err(err) => {
+                eprintln!("upload retry scheduler queue inspection failed: {err:#}");
+                Duration::from_secs(30)
+            }
+        };
+        std::thread::sleep(work_sleep);
+    }
+}
+
+#[derive(Debug)]
+struct UploadRetrySchedulerWork {
+    uploads: UploadQueueStats,
+    durable_journal_pending: usize,
+}
+
+impl UploadRetrySchedulerWork {
+    fn is_empty(&self) -> bool {
+        self.uploads.total == 0 && self.durable_journal_pending == 0
+    }
+
+    fn only_delayed_uploads(&self) -> bool {
+        self.durable_journal_pending == 0
+            && self.uploads.total > 0
+            && self.uploads.delayed >= self.uploads.total
+    }
+
+    fn pending_items(&self) -> usize {
+        self.uploads
+            .total
+            .saturating_add(self.durable_journal_pending)
+    }
+}
+
+fn upload_retry_scheduler_work(paths: &Paths) -> Result<UploadRetrySchedulerWork> {
+    Ok(UploadRetrySchedulerWork {
+        uploads: upload_queue_stats(paths)?,
+        durable_journal_pending: remote_event_journal_stats(paths)?.pending,
+    })
+}
+
+fn retry_scheduler_success_delay(pending_before: usize, pending_after: usize) -> Duration {
+    if pending_after < pending_before {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+fn retry_queued_uploads_external(paths: &Paths) -> Result<()> {
+    let exe = child_process_exe()?;
+    let status = std::process::Command::new(exe)
+        .arg("--home")
+        .arg(&paths.home)
+        .arg("sync")
+        .arg("--retry-queued-only")
+        .status()?;
+    if !status.success() {
+        bail!("retry sync exited with status {status}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ClusterUnavailableState {
+    first_failure_at: chrono::DateTime<Utc>,
+    last_failure_at: chrono::DateTime<Utc>,
+    failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_notice_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn configured_remote_is_cluster(paths: &Paths) -> bool {
+    read_config(paths)
+        .ok()
+        .and_then(|config| config.remote)
+        .and_then(|remote| remote.url().ok())
+        .is_some_and(|url| url.starts_with("cluster://"))
+}
+
+fn cluster_unavailable_state_path(paths: &Paths) -> PathBuf {
+    paths.runtime.join("cluster-master-unavailable.json")
+}
+
+fn record_cluster_master_unavailable(paths: &Paths, error: &anyhow::Error) -> Result<()> {
+    if !configured_remote_is_cluster(paths) {
+        return Ok(());
+    }
+    let path = cluster_unavailable_state_path(paths);
+    let now = Utc::now();
+    let mut state = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClusterUnavailableState>(&bytes).ok())
+        .unwrap_or(ClusterUnavailableState {
+            first_failure_at: now,
+            last_failure_at: now,
+            failures: 0,
+            last_notice_at: None,
+        });
+    state.last_failure_at = now;
+    state.failures = state.failures.saturating_add(1);
+    let minimum_failures = env_u64("MAJUTSU_CLUSTER_UNAVAILABLE_NOTICE_FAILURES", 3);
+    let minimum_age = env_u64("MAJUTSU_CLUSTER_UNAVAILABLE_NOTICE_AFTER_SECS", 300) as i64;
+    let outage_age = now
+        .signed_duration_since(state.first_failure_at)
+        .num_seconds()
+        .max(0);
+    let rate_limit = env_u64("MAJUTSU_CLUSTER_NOTICE_RATE_LIMIT_SECS", 3600) as i64;
+    let rate_limited = state
+        .last_notice_at
+        .is_some_and(|last| now.signed_duration_since(last).num_seconds() < rate_limit);
+    let should_notice =
+        state.failures >= minimum_failures && outage_age >= minimum_age && !rate_limited;
+    if should_notice
+        && let Some(command) = std::env::var("MAJUTSU_CLUSTER_NOTICE_CMD")
+            .ok()
+            .filter(|command| !command.trim().is_empty())
+    {
+        let status = crate::platform_runtime::shell_command(&command)
+            .env("MAJUTSU_HOME", &paths.home)
+            .env("MAJUTSU_CLUSTER_NOTICE_ISSUES", "master-unavailable")
+            .env(
+                "MAJUTSU_CLUSTER_UNAVAILABLE_FAILURES",
+                state.failures.to_string(),
+            )
+            .env(
+                "MAJUTSU_CLUSTER_UNAVAILABLE_AGE_SECS",
+                outage_age.to_string(),
+            )
+            .env("MAJUTSU_CLUSTER_LAST_ERROR", format!("{error:#}"))
+            .status();
+        match status {
+            Ok(status) if status.success() => {
+                state.last_notice_at = Some(now);
+                record_event(
+                    paths,
+                    "cluster-master-unavailable-notice",
+                    &format!("failures={} age_secs={outage_age}", state.failures),
+                )?;
+            }
+            Ok(status) => record_event(
+                paths,
+                "cluster-master-unavailable-notice-error",
+                &format!("notice command exited with status {status}"),
+            )?,
+            Err(err) => record_event(
+                paths,
+                "cluster-master-unavailable-notice-error",
+                &format!("notice command failed: {err}"),
+            )?,
+        }
+    }
+    crate::atomic_io::write_atomic(&path, &serde_json::to_vec_pretty(&state)?)
+}
+
+fn clear_cluster_master_unavailable(paths: &Paths) {
+    let _ = fs::remove_file(cluster_unavailable_state_path(paths));
 }
 
 fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
@@ -1281,7 +1525,17 @@ fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
     let mut command = std::process::Command::new(&exe);
     command.args(prune_args);
     configure_background_command(&mut command);
-    let mut child = command.spawn().context("spawn asynchronous watch prune")?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            record_event(
+                paths,
+                "watch-prune-deferred",
+                &format!("reason=spawn-failed error={error}"),
+            )?;
+            return Ok(());
+        }
+    };
     let job_path = watch_prune_job_path(paths);
     let job = WatchPruneJob {
         version: 1,
@@ -1333,7 +1587,7 @@ fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
         paths,
         "watch-prune-started",
         &format!(
-            "auto prune started keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=true interval_secs={}",
+            "auto prune started keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=false interval_secs={}",
             prune_interval.map_or(0, |interval| interval.as_secs())
         ),
     )?;
@@ -1350,7 +1604,7 @@ fn record_watch_prune_completed(
         paths,
         "watch-prune",
         &format!(
-            "auto prune completed keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=true interval_secs={}",
+            "auto prune completed keep_daily={keep_daily} keep_monthly={keep_monthly} drop_missing_remote_history=false interval_secs={}",
             prune_interval.map_or(0, |interval| interval.as_secs())
         ),
     )?;
@@ -1467,7 +1721,6 @@ fn auto_prune_args(paths: &Paths, keep_daily: &str, keep_monthly: &str) -> Vec<O
         keep_daily.into(),
         "--keep-monthly".into(),
         keep_monthly.into(),
-        "--drop-missing-remote-history".into(),
     ]
 }
 
@@ -2304,6 +2557,54 @@ mod tests {
     }
 
     #[test]
+    fn upload_retry_scheduler_treats_remote_journal_as_work_without_uploads() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_file_event(
+            &paths,
+            "sample",
+            "pending.txt",
+            "modify",
+            "test",
+            "remote journal retry",
+        )
+        .unwrap();
+
+        let work = upload_retry_scheduler_work(&paths).unwrap();
+
+        assert_eq!(work.uploads.total, 0);
+        assert_eq!(work.durable_journal_pending, 1);
+        assert!(!work.is_empty());
+        assert!(!work.only_delayed_uploads());
+    }
+
+    #[test]
+    fn upload_retry_scheduler_backs_off_when_retry_makes_no_progress() {
+        assert_eq!(retry_scheduler_success_delay(7, 7), Duration::from_secs(30));
+        assert_eq!(retry_scheduler_success_delay(8, 7), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cluster_watch_sync_does_not_wait_for_permanently_unreadable_journal() {
+        let mut command = std::process::Command::new("mj");
+        configure_watch_sync_wait(&mut command, true);
+
+        assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[test]
+    fn standalone_watch_sync_keeps_legacy_wait_behavior() {
+        let mut command = std::process::Command::new("mj");
+        configure_watch_sync_wait(&mut command, false);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, ["--wait", "--timeout-secs", "300"]);
+    }
+
+    #[test]
     fn active_watch_backend_state_survives_event_journal_compaction() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path().join("home"));
@@ -2317,7 +2618,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_prune_always_drops_unrecoverable_history() {
+    fn auto_prune_preserves_history_when_remote_catalog_is_incomplete() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path().join("home"));
         let args = auto_prune_args(&paths, "7", "3");
@@ -2327,7 +2628,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            args.iter()
+            !args
+                .iter()
                 .any(|arg| arg == "--drop-missing-remote-history")
         );
         assert!(args.windows(2).any(|pair| pair == ["--keep-daily", "7"]));

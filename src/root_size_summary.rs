@@ -93,7 +93,7 @@ impl SummaryRemoteSizes {
                 .iter()
                 .map(|object| (object.key.clone(), object.size))
                 .collect(),
-            is_s3_remote: matches!(remote, RemoteStore::S3(_)),
+            is_s3_remote: remote.is_s3_like(),
             host_prefix: remote_host_label(&config.host.name),
         }
     }

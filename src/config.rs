@@ -127,6 +127,21 @@ impl RemoteConfig {
                     Ok(format!("s3://{bucket}/{prefix}"))
                 }
             }
+            Some("cluster") => {
+                let endpoint = self
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("cluster remote requires [remote].endpoint"))?
+                    .trim();
+                if endpoint.is_empty() {
+                    bail!("cluster remote endpoint must not be empty");
+                }
+                if endpoint.starts_with("cluster://") {
+                    Ok(endpoint.to_string())
+                } else {
+                    Ok(format!("cluster://{endpoint}"))
+                }
+            }
             Some(other) => bail!("unsupported remote type: {other}"),
             None => bail!("remote requires url, or type plus path/bucket"),
         }

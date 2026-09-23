@@ -711,6 +711,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(about = "マスターとスレーブ間のremote中継を管理します")]
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
     #[command(about = "Export, import, or rotate the encryption master key")]
     Key {
         #[command(subcommand)]
@@ -1709,6 +1714,8 @@ pub(crate) struct SyncArgs {
     pub(crate) timeout_secs: u64,
     #[arg(long = "changed-root", value_name = "ROOT", hide = true)]
     pub(crate) changed_roots: Vec<String>,
+    #[arg(long, default_value_t = false, hide = true)]
+    pub(crate) retry_queued_only: bool,
     #[command(subcommand)]
     pub(crate) command: Option<SyncCommand>,
 }
@@ -1819,6 +1826,17 @@ pub(crate) enum RemoteCommand {
             help = "Stop scanning after this many seconds and repair only discovered missing objects"
         )]
         timeout_secs: Option<u64>,
+    },
+    #[command(about = "記録済みhashと一致する元ファイルから欠損chunkを復元し、送信queueへ登録する")]
+    RecoverChunk {
+        #[arg(long, help = "chunkを参照する登録済みlarge manifestのkey")]
+        manifest: String,
+        #[arg(long, help = "復元する登録済みchunkのkey")]
+        key: String,
+        #[arg(long, help = "元ファイルまたは内容が一致する退避ファイル")]
+        source: PathBuf,
+        #[arg(long, help = "hash照合だけを行い、書込みと送信登録はしない")]
+        dry_run: bool,
     },
     #[command(about = "Explain where a referenced object key is used locally")]
     Explain {
@@ -2050,6 +2068,36 @@ pub(crate) enum DaemonCommand {
     Status,
     #[command(about = "Export daemon health metrics in text form")]
     Metrics,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ClusterCommand {
+    #[command(about = "masterをデータ保持サーバーとしてforeground起動します")]
+    Serve(ClusterServeArgs),
+    #[command(about = "master-local保護とS3転送queueの状態を表示します")]
+    Status {
+        #[arg(long, default_value_t = false, help = "JSON形式で表示します")]
+        json: bool,
+    },
+    #[command(about = "非同期S3転送queueのflushをmasterへ要求します")]
+    Flush {
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "flush完了を待つ最大秒数。0は要求だけを記録します"
+        )]
+        wait_secs: u64,
+    },
+}
+
+#[derive(Args)]
+pub(crate) struct ClusterServeArgs {
+    #[arg(
+        long,
+        default_value = "0.0.0.0:4581",
+        help = "中継サーバーのlisten address"
+    )]
+    pub(crate) listen: String,
 }
 
 #[derive(Args, Clone, Default)]

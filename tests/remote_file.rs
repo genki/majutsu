@@ -1,4 +1,191 @@
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+
+#[test]
+fn recover_chunk_requires_exact_content_and_preserves_snapshot() {
+    for (encrypted, extension) in [(false, "zip"), (true, "bin")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let source = tmp.path().join("source");
+        let remote = tmp.path().join("remote");
+        fs::create_dir_all(&source).unwrap();
+        let content = vec![7u8; 32 * 1024];
+        let file = source.join(format!("payload.{extension}"));
+        fs::write(&file, &content).unwrap();
+        let mut init = mj();
+        init.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        if encrypted {
+            init.arg("--encrypt");
+        }
+        run(init);
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(&state)
+                .args(["root", "add", "sample"])
+                .arg(&source)
+                .arg("--large-always")
+                .arg(format!("*.{extension}"));
+            c
+        });
+        run({
+            let mut c = mj();
+            c.arg("--home").arg(&state).arg("snapshot");
+            c
+        });
+        let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+        let manifest: String = conn
+            .query_row("select manifest_key from large_objects limit 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let key: String = conn
+            .query_row("select object_key from chunks limit 1", [], |r| r.get(0))
+            .unwrap();
+        let before: String = conn
+            .query_row("select value from refs where name='current'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        fs::remove_file(state.join(&key)).unwrap();
+        let recovery = || {
+            let mut c = mj();
+            c.arg("--home")
+                .arg(&state)
+                .args(["remote", "recover-chunk", "--manifest"])
+                .arg(&manifest)
+                .arg("--key")
+                .arg(&key)
+                .arg("--source")
+                .arg(&file);
+            c
+        };
+        let mut dry = recovery();
+        dry.arg("--dry-run");
+        assert!(output(dry).contains("source_digest_matches true"));
+        assert!(!state.join(&key).exists());
+        fs::write(&file, vec![8u8; content.len()]).unwrap();
+        assert!(!recovery().output().unwrap().status.success());
+        assert!(!state.join(&key).exists());
+        fs::write(&file, &content).unwrap();
+        run(recovery());
+        let restored_object = fs::read(state.join(&key)).unwrap();
+        if encrypted {
+            assert!(restored_object.starts_with(b"age-encryption.org/v1"));
+        } else {
+            assert_eq!(restored_object, content);
+        }
+        run(recovery());
+        assert_eq!(restored_object, fs::read(state.join(&key)).unwrap());
+        let after: String = conn
+            .query_row("select value from refs where name='current'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, after);
+        let restore = tmp.path().join("restore");
+        run({
+            let mut c = mj();
+            c.arg("--home")
+                .arg(&state)
+                .args(["restore", "apply", "--to"])
+                .arg(&restore);
+            c
+        });
+        assert_eq!(
+            fs::read(restore.join(format!("sample/payload.{extension}"))).unwrap(),
+            content
+        );
+        // 不一致の既存objectを自動上書きしない。
+        fs::write(state.join(&key), b"corrupt").unwrap();
+        assert!(!recovery().output().unwrap().status.success());
+        assert_eq!(fs::read(state.join(&key)).unwrap(), b"corrupt");
+    }
+}
+
+#[test]
+fn prune_failure_rolls_back_snapshot_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept.txt"), vec![b'a'; 4096]).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .args(["root", "add", "sample"])
+            .arg(&source);
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    fs::write(source.join("history-only.txt"), vec![b'b'; 4096]).unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("pack");
+        c
+    });
+    fs::rename(
+        source.join("history-only.txt"),
+        tmp.path().join("history-only.saved"),
+    )
+    .unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("snapshot");
+        c
+    });
+    let conn = Connection::open(state.join("db/majutsu.sqlite")).unwrap();
+    let count = || {
+        conn.query_row("select count(*) from snapshots", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    let before = count();
+    let index: String = conn
+        .query_row("select index_key from packs limit 1", [], |row| row.get(0))
+        .unwrap();
+    // 本番とは独立したfixtureのindexだけを退避し、後段の読取り失敗を注入する。
+    fs::rename(state.join(&index), tmp.path().join("index.saved")).unwrap();
+    let result = mj()
+        .arg("--home")
+        .arg(&state)
+        .args([
+            "prune",
+            "--dry-run=false",
+            "--keep-daily",
+            "0",
+            "--keep-monthly",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let after = count();
+    assert_eq!(after, before);
+    println!(
+        "回帰確認: prune失敗時にsnapshot数を保持={before}→{after}、エラー={}",
+        String::from_utf8_lossy(&result.stderr).trim()
+    );
+}
 use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::fs;
@@ -90,6 +277,24 @@ fn set_watch_backend(state: &std::path::Path, backend: &str) {
         ),
     )
     .unwrap();
+}
+
+fn wait_for_watch_ready(state: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let event_dir = state.join("queue/events");
+    while Instant::now() < deadline {
+        let ready = fs::read_dir(&event_dir).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                fs::read_to_string(entry.path())
+                    .is_ok_and(|event| event.contains("\"kind\": \"watch-root\""))
+            })
+        });
+        if ready {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("watch did not become ready within 10 seconds");
 }
 
 fn set_host_id(state: &std::path::Path, host_id: &str) {
@@ -8782,6 +8987,7 @@ fn log_does_not_warn_when_pruned_snapshot_had_only_directory_metadata_changes() 
     run({
         let mut c = mj();
         c.arg("--home").arg(&state).arg("snapshot");
+        c.env("MAJUTSU_SNAPSHOT_ALLOW_NOOP", "1");
         c
     });
 
@@ -13351,6 +13557,8 @@ fn restore_resume_uses_s3_range_get_for_packed_blobs() {
     let addr = listener.local_addr().unwrap();
     let remote_root = remote.clone();
     let pack_key_for_server = pack_key.clone();
+    let pack_alias_for_server = pack_key.strip_prefix("objects/").map(str::to_string);
+    let pack_alias_for_server_in_thread = pack_alias_for_server.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
@@ -13421,7 +13629,9 @@ fn restore_resume_uses_s3_range_get_for_packed_blobs() {
             let mut body = fs::read(&path).unwrap();
             let mut status = "200 OK";
             if let Some(range) = &range {
-                if key == pack_key_for_server {
+                if key == pack_key_for_server
+                    || pack_alias_for_server_in_thread.as_deref() == Some(key.as_str())
+                {
                     range_seen_at = Some(std::time::Instant::now());
                 }
                 let spec = range.strip_prefix("bytes=").unwrap();
@@ -13491,7 +13701,10 @@ signature_version = "s3v4"
     server.join().unwrap();
     assert!(seen.iter().any(|(line, range)| {
         line.starts_with("GET ")
-            && line.contains(&pack_key)
+            && (line.contains(&pack_key)
+                || pack_alias_for_server
+                    .as_deref()
+                    .is_some_and(|alias| line.contains(alias)))
             && range
                 .as_deref()
                 .is_some_and(|range| range.starts_with("bytes="))
@@ -22201,7 +22414,7 @@ fn watch_once_creates_snapshot_without_daemonizing() {
         .arg("50")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    wait_for_watch_ready(&state);
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
@@ -22284,7 +22497,7 @@ fn watch_skips_followup_sync_when_event_snapshot_is_noop() {
         .arg("50")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    wait_for_watch_ready(&state);
     fs::write(source.join("alpha.txt"), b"temporary\n").unwrap();
     thread::sleep(Duration::from_millis(10));
     fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
@@ -22403,7 +22616,7 @@ fn watch_uses_configured_timing_defaults() {
         .arg("--once")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    wait_for_watch_ready(&state);
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
@@ -22449,7 +22662,6 @@ fn watch_strict_mode_snapshots_each_observed_event_without_debounce() {
         c
     });
 
-    let start = std::time::Instant::now();
     let mut child = mj()
         .arg("--home")
         .arg(&state)
@@ -22461,7 +22673,8 @@ fn watch_strict_mode_snapshots_each_observed_event_without_debounce() {
         .arg("strict")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    wait_for_watch_ready(&state);
+    let start = std::time::Instant::now();
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
@@ -22525,7 +22738,7 @@ fn linux_inotify_backend_records_native_events() {
         .arg("50")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    wait_for_watch_ready(&state);
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
@@ -23731,26 +23944,7 @@ fn daemon_watch_snapshot_can_sync_clone_and_restore() {
         c
     });
     assert!(started.contains("started daemon pid"));
-    for _ in 0..50 {
-        if state.join("runtime/daemon.sock").exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    for _ in 0..100 {
-        let events = fs::read_dir(state.join("queue/events"))
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if events.contains("watch-root") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_watch_ready(&state);
     fs::write(source.join("alpha.txt"), b"daemon captured\n").unwrap();
     let mut captured = false;
     for _ in 0..400 {
@@ -23897,26 +24091,7 @@ fn daemon_watch_snapshot_survives_sync_retry_and_remote_recovery() {
         c
     });
     assert!(started.contains("started daemon pid"));
-    for _ in 0..50 {
-        if state.join("runtime/daemon.sock").exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    for _ in 0..100 {
-        let events = fs::read_dir(state.join("queue/events"))
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if events.contains("watch-root") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_watch_ready(&state);
     fs::write(source.join("alpha.txt"), b"daemon retry captured\n").unwrap();
     let mut captured = false;
     for _ in 0..400 {
@@ -24060,26 +24235,7 @@ fn daemon_watch_large_snapshot_sync_clone_restore_preserves_chunks() {
         c
     });
     assert!(started.contains("started daemon pid"));
-    for _ in 0..50 {
-        if state.join("runtime/daemon.sock").exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    for _ in 0..100 {
-        let events = fs::read_dir(state.join("queue/events"))
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if events.contains("watch-root") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_watch_ready(&state);
 
     let mut payload = vec![4u8; 4096];
     payload.extend(vec![5u8; 4096]);

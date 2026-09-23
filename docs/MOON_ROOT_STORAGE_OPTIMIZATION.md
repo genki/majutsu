@@ -65,6 +65,16 @@ MAJUTSU_SYNC_REMOTE_PRUNE_INTERVAL_SECS=3600 mj sync
 
 cleanup は remote list で存在する content object を絞り込み、S3 upload 並列度の設定を使って delete を並列化する。削除された旧 object は current retention metadata から到達不能なため、通常の clone / restore には不要。
 
+同期後に作成する root-size summary の remote object 一覧も、ホスト別にローカルキャッシュする。
+既定のTTLは1時間で、通常同期では `ListObjects` を毎回発行しない。pruneでremote objectを削除した場合は、そのホストのキャッシュを無効化する。
+root-size の鮮度より API 回数を優先する環境では、次でTTLを延長できる。
+
+```sh
+MAJUTSU_SYNC_ROOT_SIZE_REMOTE_LIST_TTL_SECS=86400 mj sync
+```
+
+値を `0` にすると毎回再取得する。キャッシュはremoteの説明とhost labelにも紐付くため、別remoteや別hostの一覧を誤って再利用しない。
+
 S3/GCS 互換 remote の 1 request timeout は既定で 60 秒。低速または高遅延の backend を使う場合は `MAJUTSU_S3_REQUEST_TIMEOUT_SECS` と `MAJUTSU_S3_CONNECT_TIMEOUT_SECS` で調整できる。timeout を長くしすぎると daemon 子プロセスが `sync.lock` を長時間保持し、後続の保全処理を待たせる原因になる。
 
 `mj sync` 成功後は、ローカルに pack と pack index が揃っている pack 済み blob の旧 loose file も削除する。これにより auto pack 後の `~/.majutsu` 使用量が blob と pack の二重保持で増え続けることを抑える。pack から読める状態を確認してから削除するため、restore / fsck / remote sync の参照先は維持される。
@@ -100,3 +110,7 @@ mj remote fsck --deep
 ```
 
 quick mode は通常運用の疎通確認向け、deep mode は release 検証、定期監査、remote corruption が疑われる場合向けとする。
+
+## master／slave中継
+
+複数hostで同じS3/GCS backendを共有する場合は、[CLUSTER_MASTER_SLAVE.md](CLUSTER_MASTER_SLAVE.md)のmaster／slave構成を使える。masterだけがS3/GCSへ接続し、slaveはqueueをまとまったRPC batchでmasterへ送る。これによりslaveへのS3 credential配布をなくし、master側でcontent-addressed uploadの重複を抑制できる。

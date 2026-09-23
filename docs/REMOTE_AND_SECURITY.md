@@ -5,9 +5,15 @@ boundaries. For first-time setup, start with [Getting Started](GETTING_STARTED.m
 
 ## Remote sync
 
-`mj sync` writes hot metadata and all referenced local objects to the configured
-remote. Remote metadata is the critical path for host-disk-loss recovery: a
-fresh state directory can be reconstructed from remote metadata.
+In the standalone profile, `mj sync` writes hot metadata and all referenced
+local objects to the configured remote. Remote metadata is the critical path
+for host-disk-loss recovery: a fresh state directory can be reconstructed from
+remote metadata.
+
+In the master／slave profile, slave-to-master local replication is the normal
+crash-recovery path and S3/GCS is an asynchronous secondary backup. Credentials
+remain only on the master. See [Master／Slave](CLUSTER_MASTER_SLAVE.md) for the
+fsync-before-ACK boundary and delayed backend policy.
 
 For S3-compatible storage:
 

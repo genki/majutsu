@@ -201,6 +201,8 @@ pub(crate) fn prune_synced_metadata_cache(
             local_missing,
             ..CachePrunePlan::default()
         }
+    } else if remote.is_master_proxy() {
+        filter_backend_committed_for_cluster(paths, remote, local_candidates)?
     } else if local_candidates.len() <= 64 {
         filter_remote_available_by_head(paths, remote, local_candidates)?
     } else {
@@ -286,7 +288,9 @@ fn build_cache_prune_plan(
         });
     }
     let config = read_config(paths)?;
-    let mut plan = if local_candidates.len() <= 64 {
+    let mut plan = if remote.is_master_proxy() {
+        filter_backend_committed_for_cluster(paths, remote, local_candidates)?
+    } else if local_candidates.len() <= 64 {
         filter_remote_available_by_head(paths, remote, local_candidates)?
     } else {
         let remote_keys =
@@ -295,6 +299,40 @@ fn build_cache_prune_plan(
     };
     plan.local_missing = local_missing;
     plan.candidates.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(plan)
+}
+
+fn filter_backend_committed_for_cluster(
+    paths: &Paths,
+    remote: &RemoteStore,
+    candidates: Vec<CachePruneCandidate>,
+) -> Result<CachePrunePlan> {
+    let RemoteStore::MasterProxy(master) = remote else {
+        anyhow::bail!("backend commit照会にはcluster remoteが必要です");
+    };
+    let host = remote_host_label(&read_config(paths)?.host.name);
+    let keys = candidates
+        .iter()
+        .flat_map(|candidate| {
+            let mut keys = vec![host_remote_key(&host, &candidate.key)];
+            if let Some(alias) = canonical_remote_alias(&candidate.key) {
+                keys.push(host_remote_key(&host, &alias));
+            }
+            keys
+        })
+        .collect::<Vec<_>>();
+    let committed = master.backend_committed_keys(&keys)?;
+    let mut plan = CachePrunePlan::default();
+    for candidate in candidates {
+        let ready = committed.contains(&host_remote_key(&host, &candidate.key))
+            || canonical_remote_alias(&candidate.key)
+                .is_some_and(|alias| committed.contains(&host_remote_key(&host, &alias)));
+        if ready {
+            plan.candidates.push(candidate);
+        } else {
+            plan.remote_missing += 1;
+        }
+    }
     Ok(plan)
 }
 

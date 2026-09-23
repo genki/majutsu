@@ -3,8 +3,37 @@
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
+
+/// 通知hookの停止で保全workerを無期限に止めない。
+pub(crate) fn command_status_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("通知commandが制限時間を超過しました");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 #[cfg(unix)]
 pub(crate) use std::os::unix::net::{UnixListener, UnixStream};
@@ -111,14 +140,11 @@ pub(crate) fn configure_background_command(command: &mut Command) {
     {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::{
-            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
         };
-        command.creation_flags(
-            CREATE_NEW_PROCESS_GROUP
-                | CREATE_NO_WINDOW
-                | DETACHED_PROCESS
-                | CREATE_BREAKAWAY_FROM_JOB,
-        );
+        // Task Schedulerのジョブからの離脱は環境によって拒否されるため、
+        // 保守子プロセスは同じジョブ内で実行できるフラグだけを指定する。
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
     #[cfg(not(windows))]
     {

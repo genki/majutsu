@@ -1115,7 +1115,7 @@ fn root_size_cmd(paths: &Paths, conn: &Connection, args: &RootSizeArgs) -> Resul
     let config = read_config(paths)?;
     let host_prefix = remote_host_label(&config.host.name);
     let remote = config.remote.as_ref().map(open_remote).transpose()?;
-    let is_s3_remote = matches!(remote, Some(RemoteStore::S3(_)));
+    let is_s3_remote = remote.as_ref().is_some_and(RemoteStore::is_s3_like);
     if !args.no_remote_cache
         && !args.history
         && let Some(summary) = read_cached_root_size_summary(paths, &config.host.id)?
@@ -1975,7 +1975,7 @@ fn read_metadata_manifest<T: for<'de> serde::Deserialize<'de>>(
     };
     let mut remote_key =
         crate::majutsu_store::canonical_remote_alias(key).unwrap_or_else(|| key.to_string());
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         let config = read_config(paths)?;
         let host_prefix = remote_host_label(&config.host.name);
         remote_key = crate::majutsu_store::host_remote_key(&host_prefix, &remote_key);

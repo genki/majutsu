@@ -85,6 +85,7 @@ mod branch_runtime;
 mod cache_runtime;
 mod cli;
 mod clone_runtime;
+mod cluster_runtime;
 mod config;
 mod daemon_runtime;
 mod db_refs;
@@ -288,6 +289,7 @@ fn real_main() -> Result<()> {
         Command::Clone(args) => clone_cmd(&paths, args),
         Command::Watch(args) => watch_cmd(&paths, args),
         Command::Daemon { command } => daemon_cmd(&paths, command),
+        Command::Cluster { command } => cluster_runtime::cluster_cmd(&paths, command),
         Command::Key { command } => key_cmd(&paths, command),
         Command::Pack(args) => pack_cmd(&paths, args),
         Command::Prune(args) => prune_cmd(&paths, args),
@@ -356,6 +358,13 @@ fn majutsu_capabilities() -> &'static [&'static str] {
         "track-untrack",
         "daemon-health",
         "durable-journal",
+        "cluster-protocol-v2",
+        "cluster-master-durable-store",
+        "cluster-async-backend",
+        "cluster-host-acl",
+        "cluster-capability-handshake",
+        "cluster-local-retention",
+        "cluster-backend-batch-delete",
         "s3-multipart",
         "age-encryption",
     ]
@@ -485,6 +494,7 @@ fn file_size(path: &Path) -> u64 {
 
 fn snapshot(paths: &Paths, args: SnapshotArgs) -> Result<()> {
     ensure_ready(paths)?;
+    cluster_runtime::ensure_data_producer_allowed("snapshot")?;
     let _lock = acquire_process_lock(&paths.snapshot_lock, "snapshot")?;
     let _maintenance_lock = acquire_process_lock(&maintenance_lock_path(paths), "maintenance")?;
     record_event(
@@ -1678,7 +1688,7 @@ pub(crate) fn validate_clone_remote_refs(
         return Ok(());
     };
     let host_prefix = remote_host_prefix_from_summary(host);
-    if matches!(remote, RemoteStore::S3(_)) && !clone_validates_s3_remote_refs() {
+    if remote.is_s3_like() && !clone_validates_s3_remote_refs() {
         return Ok(());
     }
     let expected_ref_keys = [
@@ -1687,7 +1697,7 @@ pub(crate) fn validate_clone_remote_refs(
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         for key in remote.list(&format!("{host_prefix}/refs/"))? {
             if !expected_ref_keys.contains(&key) {
                 bail!("remote has unexpected host ref {key}");
@@ -2163,7 +2173,7 @@ pub(crate) fn download_local_object_from_remote(
     key: &str,
 ) -> Result<Vec<u8>> {
     crate::util::validate_local_object_key(key)?;
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         let config = read_config(paths)?;
         let host_prefix = remote_host_label(&config.host.name);
         if let Some(alias) = canonical_remote_alias(key)
@@ -2268,7 +2278,7 @@ pub(crate) fn hydrate_local_objects_from_remote(
         return Ok(HydrateStats::default());
     };
     let remote = open_remote(remote_config)?;
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         let mut stats = HydrateStats::default();
         for key in keys {
             stats.add(hydrate_one_local_object_from_remote(paths, &remote, &key)?);
@@ -2493,7 +2503,7 @@ pub(crate) fn remote_object_available_for_paths(
     remote: &RemoteStore,
     key: &str,
 ) -> Result<bool> {
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         return remote_object_available(remote, key);
     }
     for remote_key in remote_key_candidates_for_paths(paths, key)? {
@@ -2521,7 +2531,7 @@ pub(crate) fn remote_available_key_for_paths(
     remote: &RemoteStore,
     key: &str,
 ) -> Result<String> {
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         return remote_available_key(remote, key);
     }
     for remote_key in remote_key_candidates_for_paths(paths, key)? {
@@ -2543,7 +2553,6 @@ fn remote_key_candidates_for_paths(paths: &Paths, key: &str) -> Result<Vec<Strin
         candidates.push(host_remote_key(&host_prefix, &alias));
     }
     candidates.push(host_remote_key(&host_prefix, key));
-    candidates.sort();
     candidates.dedup();
     Ok(candidates)
 }
@@ -2570,7 +2579,7 @@ pub(crate) fn remote_local_object_variants(
     key: &str,
 ) -> Result<Vec<RemoteObjectVariant>> {
     let mut variants = Vec::new();
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         for remote_key in remote_key_candidates_for_paths(paths, key)? {
             if remote.exists(&remote_key)? {
                 let bytes = remote
@@ -4160,11 +4169,21 @@ fn existing_chunk_object_key(
         return Ok(None);
     };
     let object_key: String = row.get(0)?;
-    if reuse_remote_chunks || paths.home.join(&object_key).exists() {
+    // remote同期済みのremote-only運用は通常維持する。remote側の欠損を検出した保守時だけ、
+    // 環境変数で入力ファイルからchunkを再生成できるようにする。
+    if paths.home.join(&object_key).exists()
+        || reuse_remote_chunks && !rebuild_missing_large_chunks()
+    {
         Ok(Some(object_key))
     } else {
         Ok(None)
     }
+}
+
+fn rebuild_missing_large_chunks() -> bool {
+    std::env::var("MAJUTSU_REBUILD_MISSING_LARGE_CHUNKS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn existing_large_object_manifest(

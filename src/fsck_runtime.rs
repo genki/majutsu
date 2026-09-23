@@ -270,7 +270,7 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
     }
     let remote_payload_keys = if use_remote_payload_index {
         let remote = remote.as_ref().expect("remote exists");
-        if matches!(remote, RemoteStore::S3(_)) {
+        if remote.is_s3_like() {
             Some(remote_payload_key_index_for_host(
                 remote,
                 &remote_host_label(&config.host.name),
@@ -453,13 +453,13 @@ pub(crate) fn fsck(paths: &Paths, args: FsckArgs) -> Result<()> {
 fn fsck_payload_cache_prune_enabled() -> bool {
     std::env::var("MAJUTSU_FSCK_PRUNE_PAYLOAD_CACHE")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn fsck_metadata_cache_prune_enabled() -> bool {
     std::env::var("MAJUTSU_FSCK_PRUNE_METADATA_CACHE")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 #[derive(Default)]
@@ -1933,7 +1933,7 @@ pub(crate) fn validate_remote_gc_records(
 ) -> Result<()> {
     let mark_key = remote_gc_mark_key(host_id);
     let compact_head_authoritative =
-        matches!(remote, RemoteStore::S3(_)) && read_remote_head(paths, remote, host_id)?.is_some();
+        remote.is_s3_like() && read_remote_head(paths, remote, host_id)?.is_some();
     if !remote.exists(&mark_key)? {
         if !compact_head_authoritative {
             *missing += 1;
@@ -1993,7 +1993,7 @@ pub(crate) fn expected_gc_mark_object_keys(
     export: &crate::MetadataExport,
 ) -> Result<BTreeSet<String>> {
     let export = export_with_hydrated_remote_snapshot_manifests(paths, remote, export)?;
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         let mut expected = s3_remote_live_object_keys_for_local(paths, &export)?
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -2152,7 +2152,7 @@ pub(crate) fn validate_remote_oplog(
 ) -> Result<()> {
     let canonical_key = host_oplog_canonical_key(host_id);
     if !remote.exists(&canonical_key)? {
-        if !matches!(remote, RemoteStore::S3(_)) {
+        if !remote.is_s3_like() {
             *missing += 1;
             eprintln!("missing canonical host operation log {canonical_key}");
         }
@@ -2820,7 +2820,7 @@ pub(crate) fn remote_fsck_with_options(
                 );
             }
             let head = read_remote_head(paths, remote, &host_prefix)?;
-            let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
+            let compact_head_authoritative = remote.is_s3_like() && head.is_some();
             let current = export.refs.get("current");
             if host.current_snapshot.as_ref() != current && !compact_head_authoritative {
                 missing += 1;
@@ -2872,7 +2872,7 @@ pub(crate) fn remote_fsck_with_options(
                 match remote_ref(remote, &current_ref_key)? {
                     Some(remote_current) if remote_current == *current => {}
                     Some(remote_current) => {
-                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                        if !remote.is_s3_like() || head.is_none() {
                             missing += 1;
                             eprintln!(
                                 "{current_ref_key} points to {remote_current}, expected {current}"
@@ -2880,7 +2880,7 @@ pub(crate) fn remote_fsck_with_options(
                         }
                     }
                     None => {
-                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                        if !remote.is_s3_like() || head.is_none() {
                             missing += 1;
                             eprintln!("missing remote ref {current_ref_key}");
                         }
@@ -2919,7 +2919,7 @@ pub(crate) fn remote_fsck_with_options(
                 match remote_ref(remote, &last_synced_ref_key)? {
                     Some(remote_last_synced) if remote_last_synced == *last_synced => {}
                     Some(remote_last_synced) => {
-                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                        if !remote.is_s3_like() || head.is_none() {
                             missing += 1;
                             eprintln!(
                                 "{last_synced_ref_key} points to {remote_last_synced}, expected {last_synced}"
@@ -2927,7 +2927,7 @@ pub(crate) fn remote_fsck_with_options(
                         }
                     }
                     None => {
-                        if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                        if !remote.is_s3_like() || head.is_none() {
                             missing += 1;
                             eprintln!("missing remote ref {last_synced_ref_key}");
                         }
@@ -3427,7 +3427,7 @@ fn validate_remote_timeline_prefixes(
                 host_operation_canonical_key(host_id, &operation.id),
             ]
         })
-        .chain(if matches!(remote, RemoteStore::S3(_)) {
+        .chain(if remote.is_s3_like() {
             Vec::new()
         } else {
             vec![host_oplog_key(host_id), host_oplog_canonical_key(host_id)]

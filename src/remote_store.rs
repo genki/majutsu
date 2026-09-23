@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use md5::Md5;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::blocking::{Body, Client, Response};
@@ -12,14 +13,15 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, ETAG, HOST, RANGE};
 use reqwest::redirect::Policy as RedirectPolicy;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 use walkdir::WalkDir;
 
@@ -37,6 +39,8 @@ pub(crate) const DEFAULT_S3_TRANSIENT_RETRY_ATTEMPTS: usize = 4;
 pub(crate) const DEFAULT_S3_TRANSIENT_RETRY_BASE_MS: u64 = 250;
 const FILE_REMOTE_LOCK_RETRIES: usize = 200;
 const FILE_REMOTE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const DEFAULT_S3_NEGATIVE_EXISTS_TTL_SECS: u64 = 30;
+const MAX_S3_NEGATIVE_EXISTS_CACHE_ENTRIES: usize = 8192;
 
 pub(crate) fn adaptive_multipart_part_size(len: usize, endpoint: &str) -> usize {
     let requested = env::var("MAJUTSU_S3_MULTIPART_PART_SIZE")
@@ -68,12 +72,23 @@ fn default_part_size_for_endpoint(endpoint: &str) -> usize {
 pub(crate) enum RemoteStore {
     File(FileRemote),
     S3(Box<S3Remote>),
+    MasterProxy(ClusterRemote),
 }
 
 #[derive(Clone)]
 pub(crate) struct FileRemote {
     pub(crate) root: PathBuf,
 }
+
+#[derive(Debug)]
+pub(crate) struct BatchDeleteUnsupported;
+
+impl std::fmt::Display for BatchDeleteUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("backendはmulti-object DELETEに非対応です")
+    }
+}
+impl std::error::Error for BatchDeleteUnsupported {}
 
 fn s3_timeout_secs_env(name: &str, default: u64) -> Result<u64> {
     match env::var(name) {
@@ -190,6 +205,7 @@ static S3_POST_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static S3_DELETE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static S3_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static S3_DOWNLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+static S3_NEGATIVE_EXISTS_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 pub(crate) struct RemoteTrafficTraceGuard {
     label: &'static str,
@@ -285,6 +301,70 @@ fn record_s3_delete() {
     S3_DELETE_REQUESTS.fetch_add(1, Ordering::Relaxed);
 }
 
+fn s3_negative_exists_ttl() -> Option<Duration> {
+    let seconds = env::var("MAJUTSU_S3_NEGATIVE_EXISTS_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_S3_NEGATIVE_EXISTS_TTL_SECS);
+    (seconds > 0).then(|| Duration::from_secs(seconds.min(300)))
+}
+
+fn s3_negative_exists_cache_key(remote: &S3Remote, key: &str) -> String {
+    format!(
+        "{}\n{}\n{}\n{}",
+        remote.endpoint,
+        remote.bucket,
+        remote.prefix,
+        remote.remote_key(key)
+    )
+}
+
+fn s3_negative_exists_cached(cache_key: &str) -> bool {
+    let Some(ttl) = s3_negative_exists_ttl() else {
+        return false;
+    };
+    let now = Instant::now();
+    let Some(cache) = S3_NEGATIVE_EXISTS_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+    else {
+        return false;
+    };
+    cache
+        .get(cache_key)
+        .is_some_and(|expires_at| *expires_at > now && ttl > Duration::ZERO)
+}
+
+fn remember_s3_negative_exists(cache_key: String) {
+    let Some(ttl) = s3_negative_exists_ttl() else {
+        return;
+    };
+    let now = Instant::now();
+    let Ok(mut cache) = S3_NEGATIVE_EXISTS_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        return;
+    };
+    cache.retain(|_, expires_at| *expires_at > now);
+    if cache.len() >= MAX_S3_NEGATIVE_EXISTS_CACHE_ENTRIES
+        && let Some(oldest_key) = cache.keys().next().cloned()
+    {
+        cache.remove(&oldest_key);
+    }
+    cache.insert(cache_key, now + ttl);
+}
+
+fn invalidate_s3_negative_exists(remote: &S3Remote, key: &str) {
+    let cache_key = s3_negative_exists_cache_key(remote, key);
+    if let Some(cache) = S3_NEGATIVE_EXISTS_CACHE.get()
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.remove(&cache_key);
+    }
+}
+
 fn env_bool(name: &str) -> bool {
     env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -311,6 +391,19 @@ pub(crate) struct S3Remote {
 pub(crate) struct RemoteObjectStat {
     pub(crate) key: String,
     pub(crate) size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteDeleteResult {
+    pub(crate) key: String,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClusterRemote {
+    pub(crate) endpoint: String,
+    pub(crate) token: String,
+    pub(crate) host_id: String,
 }
 
 pub(crate) fn open_remote(config: &RemoteConfig) -> Result<RemoteStore> {
@@ -498,6 +591,18 @@ pub(crate) fn remote_config_diagnostics(config: &RemoteConfig) -> Result<Vec<(St
             ),
         ]);
     }
+    if remote_url.starts_with("cluster://") {
+        let endpoint = remote_url.trim_start_matches("cluster://").to_string();
+        return Ok(vec![
+            ("remote_type".into(), "cluster".into()),
+            ("remote_url".into(), remote_url),
+            ("cluster_endpoint".into(), endpoint),
+            (
+                "cluster_token_source".into(),
+                crate::cluster_runtime::cluster_token_source(),
+            ),
+        ]);
+    }
     Ok(vec![
         ("remote_type".into(), "unsupported".into()),
         ("remote_url".into(), remote_url),
@@ -550,6 +655,11 @@ pub(crate) fn open_remote_with_upload_policy(
             max_parallel_uploads: max_parallel_uploads.max(1),
             client: s3_http_client()?,
         })));
+    }
+    if remote_url.starts_with("cluster://") {
+        return Ok(RemoteStore::MasterProxy(
+            crate::cluster_runtime::cluster_remote_from_url(&remote_url)?,
+        ));
     }
     bail!("unsupported remote URL: {remote_url}");
 }
@@ -722,7 +832,16 @@ impl RemoteStore {
                 };
                 format!("s3://{}{}", remote.bucket, prefix)
             }
+            RemoteStore::MasterProxy(remote) => format!("cluster://{}", remote.endpoint),
         }
+    }
+
+    pub(crate) fn is_s3_like(&self) -> bool {
+        matches!(self, RemoteStore::S3(_) | RemoteStore::MasterProxy(_))
+    }
+
+    pub(crate) fn is_master_proxy(&self) -> bool {
+        matches!(self, RemoteStore::MasterProxy(_))
     }
 
     pub(crate) fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -732,6 +851,7 @@ impl RemoteStore {
                 file_remote_put_atomic(&path, bytes)
             }
             RemoteStore::S3(remote) => remote.put(key, bytes),
+            RemoteStore::MasterProxy(remote) => remote.put(key, bytes),
         }
     }
 
@@ -742,6 +862,7 @@ impl RemoteStore {
                 file_remote_put_file_atomic(&path, source)
             }
             RemoteStore::S3(remote) => remote.put_file(key, source),
+            RemoteStore::MasterProxy(remote) => remote.put_file(key, source),
         }
     }
 
@@ -755,6 +876,7 @@ impl RemoteStore {
                 })
             }
             RemoteStore::S3(remote) => remote.put_if_absent(key, bytes),
+            RemoteStore::MasterProxy(remote) => remote.put_if_absent(key, bytes),
         }
     }
 
@@ -769,6 +891,7 @@ impl RemoteStore {
                 })
             }
             RemoteStore::S3(remote) => remote.put_file_if_absent(key, source),
+            RemoteStore::MasterProxy(remote) => remote.put_file_if_absent(key, source),
         }
     }
 
@@ -776,6 +899,7 @@ impl RemoteStore {
         match self {
             RemoteStore::File(remote) => Ok(fs::read(file_remote_path(&remote.root, key)?)?),
             RemoteStore::S3(remote) => remote.get(key),
+            RemoteStore::MasterProxy(remote) => remote.get(key),
         }
     }
 
@@ -794,6 +918,7 @@ impl RemoteStore {
                 Err(err) => Err(err.into()),
             },
             RemoteStore::S3(remote) => remote.get_optional(key),
+            RemoteStore::MasterProxy(remote) => remote.get_optional(key),
         }
     }
 
@@ -807,6 +932,36 @@ impl RemoteStore {
                 Ok(())
             }
             RemoteStore::S3(remote) => remote.delete(key),
+            RemoteStore::MasterProxy(remote) => remote.delete(key),
+        }
+    }
+
+    pub(crate) fn delete_batch(&self, keys: &[String]) -> Result<Vec<RemoteDeleteResult>> {
+        match self {
+            RemoteStore::File(remote) => keys
+                .iter()
+                .map(|key| {
+                    let path = file_remote_path(&remote.root, key)?;
+                    if path.exists() {
+                        fs::remove_file(path)?;
+                    }
+                    Ok(RemoteDeleteResult {
+                        key: key.clone(),
+                        error: None,
+                    })
+                })
+                .collect(),
+            RemoteStore::S3(remote) => remote.delete_batch(keys),
+            RemoteStore::MasterProxy(remote) => keys
+                .iter()
+                .map(|key| {
+                    remote.delete(key)?;
+                    Ok(RemoteDeleteResult {
+                        key: key.clone(),
+                        error: None,
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -821,6 +976,7 @@ impl RemoteStore {
                 Ok(limited)
             }
             RemoteStore::S3(remote) => remote.get_range(key, start, len),
+            RemoteStore::MasterProxy(remote) => remote.get_range(key, start, len),
         }
     }
 
@@ -828,6 +984,7 @@ impl RemoteStore {
         match self {
             RemoteStore::File(remote) => Ok(file_remote_path(&remote.root, key)?.exists()),
             RemoteStore::S3(remote) => remote.exists(key),
+            RemoteStore::MasterProxy(remote) => remote.exists(key),
         }
     }
 
@@ -835,6 +992,7 @@ impl RemoteStore {
         match self {
             RemoteStore::File(remote) => list_file_remote(&remote.root, prefix),
             RemoteStore::S3(remote) => remote.list(prefix),
+            RemoteStore::MasterProxy(remote) => remote.list(prefix),
         }
     }
 
@@ -842,6 +1000,7 @@ impl RemoteStore {
         match self {
             RemoteStore::File(remote) => list_file_remote_common_prefixes(&remote.root, prefix),
             RemoteStore::S3(remote) => remote.list_common_prefixes(prefix),
+            RemoteStore::MasterProxy(remote) => remote.list_common_prefixes(prefix),
         }
     }
 
@@ -849,6 +1008,15 @@ impl RemoteStore {
         match self {
             RemoteStore::File(remote) => list_file_remote_with_sizes(&remote.root, prefix),
             RemoteStore::S3(remote) => remote.list_with_sizes(prefix),
+            RemoteStore::MasterProxy(remote) => remote.list_with_sizes(prefix),
+        }
+    }
+
+    pub(crate) fn list_primary_with_sizes(&self, prefix: &str) -> Result<Vec<RemoteObjectStat>> {
+        match self {
+            RemoteStore::File(remote) => list_file_remote_with_sizes(&remote.root, prefix),
+            RemoteStore::S3(remote) => remote.list_with_sizes(prefix),
+            RemoteStore::MasterProxy(remote) => remote.list_master_local_with_sizes(prefix),
         }
     }
 
@@ -856,6 +1024,7 @@ impl RemoteStore {
         match self {
             RemoteStore::File(_) => Ok(true),
             RemoteStore::S3(remote) => remote.restore_archive(key, days, tier),
+            RemoteStore::MasterProxy(remote) => remote.restore_archive(key, days, tier),
         }
     }
 
@@ -867,6 +1036,7 @@ impl RemoteStore {
                 remote.put_lifecycle_configuration(&policy_xml)?;
                 Ok(true)
             }
+            RemoteStore::MasterProxy(remote) => remote.apply_s3_lifecycle_policy(policy),
         }
     }
 
@@ -876,12 +1046,14 @@ impl RemoteStore {
             RemoteStore::S3(remote) => {
                 RemoteCapabilities::s3(remote.uses_sigv2(), remote.multipart_enabled)
             }
+            RemoteStore::MasterProxy(_) => RemoteCapabilities::s3(false, true),
         }
     }
 }
 
 impl S3Remote {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        invalidate_s3_negative_exists(self, key);
         self.put_object(key, bytes, false).map(|_| ())
     }
 
@@ -889,10 +1061,12 @@ impl S3Remote {
         if self.uses_sigv2() {
             bail!("conditional put requires S3 Signature V4");
         }
+        invalidate_s3_negative_exists(self, key);
         self.put_object(key, bytes, true)
     }
 
     fn put_file(&self, key: &str, source: &Path) -> Result<()> {
+        invalidate_s3_negative_exists(self, key);
         self.put_file_object(key, source, false).map(|_| ())
     }
 
@@ -900,6 +1074,7 @@ impl S3Remote {
         if self.uses_sigv2() {
             bail!("conditional put requires S3 Signature V4");
         }
+        invalidate_s3_negative_exists(self, key);
         self.put_file_object(key, source, true)
     }
 
@@ -1044,6 +1219,7 @@ impl S3Remote {
     }
 
     pub(crate) fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        invalidate_s3_negative_exists(self, key);
         let remote_key = self.remote_key(key);
         let upload_id = self.initiate_multipart(key, &remote_key)?;
         let result = (|| {
@@ -1058,6 +1234,7 @@ impl S3Remote {
     }
 
     fn put_multipart_file(&self, key: &str, source: &Path, len: u64) -> Result<()> {
+        invalidate_s3_negative_exists(self, key);
         let remote_key = self.remote_key(key);
         let upload_id = self.initiate_multipart(key, &remote_key)?;
         let result = (|| {
@@ -1519,6 +1696,7 @@ impl S3Remote {
                 Ok(response) => {
                     record_s3_delete();
                     if response.status().is_success() || response.status().as_u16() == 404 {
+                        invalidate_s3_negative_exists(self, key);
                         return Ok(());
                     }
                     if attempt + 1 < attempts && s3_status_is_transient(response.status()) {
@@ -1535,6 +1713,90 @@ impl S3Remote {
             }
         }
         unreachable!("s3 retry loop always returns")
+    }
+
+    fn delete_batch(&self, keys: &[String]) -> Result<Vec<RemoteDeleteResult>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if keys.len() > 1000 {
+            bail!("s3 multi-object delete supports at most 1000 keys per request");
+        }
+        let remote_to_local = keys
+            .iter()
+            .map(|key| (self.remote_key(key), key.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut body = String::from("<Delete>");
+        for remote_key in remote_to_local.keys() {
+            body.push_str("<Object><Key>");
+            body.push_str(&xml_escape(remote_key));
+            body.push_str("</Key></Object>");
+        }
+        body.push_str("<Quiet>False</Quiet></Delete>");
+        let body_len = body.len() as u64;
+        let content_md5 =
+            base64::engine::general_purpose::STANDARD.encode(Md5::digest(body.as_bytes()));
+        let query = "delete=";
+        let response = if self.uses_sigv2() {
+            send_s3_with_retry(|| {
+                let date = http_date();
+                let path = format!("/{}/?delete", self.bucket);
+                let auth = self.auth_v2("POST", &content_md5, "application/xml", &date, &path)?;
+                Ok(self
+                    .client
+                    .post(self.bucket_url_query(query))
+                    .header(DATE, date)
+                    .header("Content-MD5", content_md5.clone())
+                    .header(CONTENT_TYPE, "application/xml")
+                    .header(AUTHORIZATION, auth)
+                    .body(body.clone())
+                    .send()?)
+            })?
+        } else {
+            let payload_hash = sha256_hex(body.as_bytes());
+            send_s3_with_retry(|| {
+                let auth = self.auth_v4(
+                    "POST",
+                    "",
+                    query,
+                    &payload_hash,
+                    &[("content-md5".into(), content_md5.clone())],
+                )?;
+                Ok(self
+                    .client
+                    .post(self.bucket_url_query(query))
+                    .header(HOST, self.host_header()?)
+                    .header("x-amz-date", auth.amz_date)
+                    .header("x-amz-content-sha256", payload_hash.clone())
+                    .header("Content-MD5", content_md5.clone())
+                    .header(AUTHORIZATION, auth.authorization)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .body(body.clone())
+                    .send()?)
+            })?
+        };
+        let status = response.status();
+        let response_body = response.text().unwrap_or_default();
+        record_s3_post(body_len, response_body.len() as u64);
+        if !status.is_success() {
+            if matches!(status.as_u16(), 405 | 501)
+                || response_body.contains("<Code>NotImplemented</Code>")
+            {
+                return Err(BatchDeleteUnsupported.into());
+            }
+            bail!("s3 multi-object delete failed: HTTP {status} {response_body}");
+        }
+        let errors = parse_s3_multi_delete_errors(&response_body)?;
+        Ok(remote_to_local
+            .into_iter()
+            .map(|(remote_key, key)| {
+                let error = errors.get(&remote_key).cloned();
+                if error.is_none() {
+                    invalidate_s3_negative_exists(self, &key);
+                }
+                RemoteDeleteResult { key, error }
+            })
+            .collect())
     }
 
     fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Vec<u8>> {
@@ -1588,6 +1850,7 @@ impl S3Remote {
         })?;
         if !response.status().is_success() && response.status().as_u16() == 404 {
             record_s3_get(0);
+            remember_s3_negative_exists(s3_negative_exists_cache_key(self, key));
             return Ok(None);
         }
         if !response.status().is_success() {
@@ -1596,10 +1859,15 @@ impl S3Remote {
         }
         let bytes = response.bytes()?.to_vec();
         record_s3_get(bytes.len() as u64);
+        invalidate_s3_negative_exists(self, key);
         Ok(Some(bytes))
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
+        let cache_key = s3_negative_exists_cache_key(self, key);
+        if s3_negative_exists_cached(&cache_key) {
+            return Ok(false);
+        }
         let remote_key = self.remote_key(key);
         let response = send_s3_with_retry(|| {
             if self.uses_sigv2() {
@@ -1627,8 +1895,10 @@ impl S3Remote {
         })?;
         record_s3_head();
         if response.status().is_success() {
+            invalidate_s3_negative_exists(self, key);
             Ok(true)
         } else if response.status().as_u16() == 404 {
+            remember_s3_negative_exists(cache_key);
             Ok(false)
         } else {
             bail!("s3 head failed for {key}: HTTP {}", response.status());
@@ -2258,6 +2528,57 @@ fn parse_xml_text(xml: &str, tag: &str) -> Result<Option<String>> {
     }
 }
 
+fn parse_s3_multi_delete_errors(xml: &str) -> Result<BTreeMap<String, String>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut current = String::new();
+    let mut in_error = false;
+    let mut key = None::<String>;
+    let mut code = None::<String>;
+    let mut message = None::<String>;
+    let mut errors = BTreeMap::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) => {
+                current = std::str::from_utf8(event.name().as_ref())?.to_string();
+                if current == "Error" {
+                    in_error = true;
+                    key = None;
+                    code = None;
+                    message = None;
+                }
+            }
+            Ok(Event::End(event)) => {
+                if event.name().as_ref() == b"Error" {
+                    if let Some(key) = key.take() {
+                        let detail = match (code.take(), message.take()) {
+                            (Some(code), Some(message)) => format!("{code}: {message}"),
+                            (Some(code), None) => code,
+                            (None, Some(message)) => message,
+                            (None, None) => "unknown multi-object delete error".into(),
+                        };
+                        errors.insert(key, detail);
+                    }
+                    in_error = false;
+                }
+                current.clear();
+            }
+            Ok(Event::Text(text)) if in_error => {
+                let value = text.unescape()?.into_owned();
+                match current.as_str() {
+                    "Key" => key = Some(value),
+                    "Code" => code = Some(value),
+                    "Message" => message = Some(value),
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => return Ok(errors),
+            Err(err) => return Err(err.into()),
+            _ => {}
+        }
+    }
+}
+
 fn xml_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -2286,6 +2607,19 @@ mod storage_characteristic_tests {
         assert_eq!(page.common_prefixes, vec!["vagrant/", "mba22/"]);
         assert_eq!(page.objects.len(), 1);
         assert_eq!(page.objects[0].key, "vagrant/head.cbor.zst.enc");
+    }
+
+    #[test]
+    fn parses_multi_object_delete_partial_errors() {
+        let errors = parse_s3_multi_delete_errors(
+            "<DeleteResult><Deleted><Key>prefix/ok</Key></Deleted><Error><Key>prefix/denied</Key><Code>AccessDenied</Code><Message>denied</Message></Error></DeleteResult>",
+        )
+        .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors.get("prefix/denied").map(String::as_str),
+            Some("AccessDenied: denied")
+        );
     }
 
     #[test]
@@ -2371,6 +2705,131 @@ mod storage_characteristic_tests {
 
         assert!(remote.exists("objects/sample").unwrap());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn s3_negative_exists_cache_avoids_repeated_head_for_missing_object() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let remote = S3Remote {
+            bucket: "negative-cache-bucket".to_string(),
+            prefix: "majutsu/v1".to_string(),
+            endpoint: format!("http://{address}"),
+            region: "us-test-1".to_string(),
+            signature_version: "s3v4".to_string(),
+            access_key: "dummy".to_string(),
+            secret_key: "dummy".to_string(),
+            storage_class: None,
+            object_tags: Vec::new(),
+            multipart_enabled: true,
+            max_parallel_uploads: 1,
+            client: s3_http_client().unwrap(),
+        };
+
+        assert!(!remote.exists("objects/missing").unwrap());
+        assert!(!remote.exists("objects/missing").unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn s3_multi_object_delete_uses_bucket_post_and_reports_partial_errors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            request_tx.send(request).unwrap();
+            let response = "<DeleteResult><Deleted><Key>majutsu/v1/host/ok</Key></Deleted><Error><Key>majutsu/v1/host/denied</Key><Code>AccessDenied</Code><Message>denied</Message></Error></DeleteResult>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let remote = S3Remote {
+            bucket: "bucket".to_string(),
+            prefix: "majutsu/v1".to_string(),
+            endpoint: format!("http://{address}"),
+            region: "us-test-1".to_string(),
+            signature_version: "s3v4".to_string(),
+            access_key: "dummy".to_string(),
+            secret_key: "dummy".to_string(),
+            storage_class: None,
+            object_tags: Vec::new(),
+            multipart_enabled: true,
+            max_parallel_uploads: 1,
+            client: s3_http_client().unwrap(),
+        };
+        let results = remote
+            .delete_batch(&["host/ok".into(), "host/denied".into()])
+            .unwrap();
+        server.join().unwrap();
+        let request = String::from_utf8(request_rx.recv().unwrap()).unwrap();
+        assert!(
+            request.starts_with("POST /bucket/?delete= HTTP/1.1"),
+            "{request}"
+        );
+        let request_lower = request.to_ascii_lowercase();
+        assert!(
+            request_lower.contains("content-md5: tn5sq4jz2np9d2ll4rwfnw=="),
+            "{request}"
+        );
+        assert!(
+            request_lower
+                .contains("signedheaders=content-md5;host;x-amz-content-sha256;x-amz-date"),
+            "{request}"
+        );
+        assert!(
+            request.contains("<Key>majutsu/v1/host/ok</Key>"),
+            "{request}"
+        );
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|result| result.key == "host/ok" && result.error.is_none())
+        );
+        assert!(results.iter().any(|result| {
+            result.key == "host/denied" && result.error.as_deref() == Some("AccessDenied: denied")
+        }));
     }
 
     #[test]
@@ -2490,7 +2949,9 @@ aws_secret_access_key=backup-secret
                 RemoteStore::File(file) => {
                     assert_eq!(file.root, PathBuf::from(r"C:\Users\genta\remote"));
                 }
-                RemoteStore::S3(_) => panic!("expected file remote for {url}"),
+                RemoteStore::S3(_) | RemoteStore::MasterProxy(_) => {
+                    panic!("expected file remote for {url}")
+                }
             }
         }
     }

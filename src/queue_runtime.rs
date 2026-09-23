@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 
 use crate::atomic_io::write_atomic;
 use crate::cli::EventCommand;
+use crate::cluster_runtime::{ClusterPutItem, ClusterPutResult};
 use crate::config::{Config, Paths, RootConfig};
 use crate::object_paths::prefer_canonical_remote_only;
 use crate::remote_store::RemoteStore;
@@ -25,7 +26,7 @@ use crate::snapshot_rules::{
 use crate::snapshot_state::{current_snapshot, load_root_tree_entries, load_snapshot_by_id};
 use crate::util::{blake3_hex, new_id, path_to_slash, stable_read, stable_read_in_root};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct UploadQueueStats {
     pub(crate) total: usize,
     pub(crate) retrying: usize,
@@ -162,27 +163,14 @@ pub(crate) fn upload_queue_items(paths: &Paths) -> Result<Vec<(PathBuf, UploadQu
             Err(err) => return Err(err.into()),
         };
         if bytes.is_empty() {
-            discard_upload_queue_file(paths, &entry.path());
-            continue;
+            bail!("upload queue item is empty: {}", entry.path().display());
         }
-        let item: UploadQueueItem = match serde_json::from_slice(&bytes) {
-            Ok(item) => item,
-            Err(_) => {
-                discard_upload_queue_file(paths, &entry.path());
-                continue;
-            }
-        };
+        let item: UploadQueueItem = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode upload queue item {}", entry.path().display()))?;
         items.push((entry.path(), item));
     }
     items.sort_by(|a, b| a.1.key.cmp(&b.1.key));
     Ok(items)
-}
-
-fn discard_upload_queue_file(paths: &Paths, path: &Path) {
-    if let Some(stem) = path.file_stem().and_then(OsStr::to_str) {
-        let _ = remove_upload_payload(paths, stem);
-    }
-    let _ = fs::remove_file(path);
 }
 
 pub(crate) fn upload_queue_stats(paths: &Paths) -> Result<UploadQueueStats> {
@@ -220,60 +208,70 @@ pub(crate) fn drain_upload_queue(
     remote: &RemoteStore,
     max_parallel_uploads: usize,
 ) -> Result<UploadDrainStats> {
+    if let RemoteStore::MasterProxy(proxy) = remote {
+        return drain_upload_queue_via_master(paths, proxy, max_parallel_uploads);
+    }
     let mut stats = UploadDrainStats::default();
-    let mut items = upload_queue_items(paths)?;
-    items.sort_by(|a, b| {
-        upload_publish_priority(&a.1.key)
-            .cmp(&upload_publish_priority(&b.1.key))
-            .then_with(|| a.1.key.cmp(&b.1.key))
-    });
-    let total = items.len();
+    let items = upload_queue_items(paths)?;
+    let mut priority_groups = BTreeMap::<u8, Vec<(PathBuf, UploadQueueItem)>>::new();
+    for item in items {
+        priority_groups
+            .entry(upload_publish_priority(&item.1.key))
+            .or_default()
+            .push(item);
+    }
+    for items in priority_groups.values_mut() {
+        items.sort_by(|left, right| left.1.key.cmp(&right.1.key));
+    }
+    let total = priority_groups.values().map(Vec::len).sum::<usize>();
     let progress_enabled = total > 0;
     let parallelism = upload_queue_parallelism(remote, max_parallel_uploads);
     let mut last_progress = Instant::now()
         .checked_sub(StdDuration::from_secs(10))
         .unwrap_or_else(Instant::now);
-    for batch in items.chunks(parallelism) {
-        if progress_enabled
-            && (stats.uploaded == 0
-                || stats.uploaded % 25 == 0
-                || last_progress.elapsed() >= StdDuration::from_secs(5))
-        {
-            let key = batch
-                .first()
-                .map(|(_, item)| item.key.as_str())
-                .unwrap_or("(none)");
-            eprintln!(
-                "sync upload progress {}/{} key={key}",
-                stats.uploaded, total
-            );
-            last_progress = Instant::now();
-        }
+    for items in priority_groups.values() {
+        for batch in items.chunks(parallelism) {
+            if progress_enabled
+                && (stats.uploaded == 0
+                    || stats.uploaded % 25 == 0
+                    || last_progress.elapsed() >= StdDuration::from_secs(5))
+            {
+                let key = batch
+                    .first()
+                    .map(|(_, item)| item.key.as_str())
+                    .unwrap_or("(none)");
+                eprintln!(
+                    "sync upload progress {}/{} key={key}",
+                    stats.uploaded, total
+                );
+                last_progress = Instant::now();
+            }
 
-        let results = std::thread::scope(|scope| {
-            let handles = batch
-                .iter()
-                .map(|(path, item)| {
-                    scope.spawn(move || upload_queue_item(paths, remote, path, item.clone()))
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("upload queue worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        for result in results {
-            match result {
-                UploadQueueItemResult::Uploaded { bytes } => {
-                    stats.uploaded += 1;
-                    stats.uploaded_bytes += bytes;
-                }
-                UploadQueueItemResult::Skipped => {
-                    stats.skipped += 1;
+            let results = std::thread::scope(|scope| {
+                let handles = batch
+                    .iter()
+                    .map(|(path, item)| {
+                        scope.spawn(move || upload_queue_item(paths, remote, path, item.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("upload queue worker panicked"))?
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            for result in results {
+                match result {
+                    UploadQueueItemResult::Uploaded { bytes } => {
+                        stats.uploaded += 1;
+                        stats.uploaded_bytes += bytes;
+                    }
+                    UploadQueueItemResult::Skipped => {
+                        stats.skipped += 1;
+                    }
                 }
             }
         }
@@ -282,6 +280,132 @@ pub(crate) fn drain_upload_queue(
         eprintln!("sync upload progress {}/{} done", stats.uploaded, total);
     }
     Ok(stats)
+}
+
+fn drain_upload_queue_via_master(
+    paths: &Paths,
+    proxy: &crate::remote_store::ClusterRemote,
+    max_parallel_uploads: usize,
+) -> Result<UploadDrainStats> {
+    let mut stats = UploadDrainStats::default();
+    let mut items = upload_queue_items(paths)?;
+    items.sort_by(|a, b| {
+        upload_publish_priority(&a.1.key)
+            .cmp(&upload_publish_priority(&b.1.key))
+            .then_with(|| a.1.key.cmp(&b.1.key))
+    });
+    let total = items.len();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    let capabilities = proxy.capabilities()?;
+    let max_objects = std::env::var("MAJUTSU_CLUSTER_BATCH_MAX_OBJECTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128)
+        .min(capabilities.max_batch_objects);
+    let max_bytes = std::env::var("MAJUTSU_CLUSTER_BATCH_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 1024 * 1024)
+        .unwrap_or(64 * 1024 * 1024) as usize;
+    let max_bytes = max_bytes.min(capabilities.max_batch_payload_bytes);
+
+    for (path, item) in items {
+        if !item.overwrite
+            && queued_upload_can_be_skipped(paths, &RemoteStore::MasterProxy(proxy.clone()), &item)
+        {
+            fs::remove_file(path)?;
+            stats.skipped += 1;
+            continue;
+        }
+        let bytes = if let Some(inline) = item.inline.clone() {
+            inline
+        } else if let Some(source) = &item.source {
+            fs::read(source).with_context(|| format!("read upload source {source}"))?
+        } else {
+            bail!(
+                "queued upload has neither inline payload nor source: {}",
+                item.key
+            );
+        };
+        if !batch.is_empty()
+            && (batch.len() >= max_objects || batch_bytes.saturating_add(bytes.len()) > max_bytes)
+        {
+            send_cluster_upload_batch(paths, proxy, &mut batch, &mut stats)?;
+            batch_bytes = 0;
+        }
+        batch_bytes = batch_bytes.saturating_add(bytes.len());
+        batch.push((path, item, bytes));
+    }
+    if !batch.is_empty() {
+        send_cluster_upload_batch(paths, proxy, &mut batch, &mut stats)?;
+    }
+    if total > 0 {
+        eprintln!(
+            "sync upload progress {}/{} done via cluster master",
+            stats.uploaded, total
+        );
+    }
+    let _ = max_parallel_uploads;
+    Ok(stats)
+}
+
+fn send_cluster_upload_batch(
+    paths: &Paths,
+    proxy: &crate::remote_store::ClusterRemote,
+    batch: &mut Vec<(PathBuf, UploadQueueItem, Vec<u8>)>,
+    stats: &mut UploadDrainStats,
+) -> Result<()> {
+    let request = batch
+        .iter()
+        .map(|(_, item, bytes)| ClusterPutItem {
+            key: item.key.clone(),
+            bytes: bytes.clone(),
+            conditional: !item.overwrite && is_content_addressed_remote_key(&item.key),
+        })
+        .collect::<Vec<_>>();
+    let results = match proxy.batch_put(request) {
+        Ok(results) => results,
+        Err(err) => {
+            for (path, item, _) in batch.iter_mut() {
+                let next_attempt = item.attempts.saturating_add(1);
+                item.record_attempt(Some(next_retry_after(Utc::now(), next_attempt)));
+                write_atomic(path, &serde_json::to_vec_pretty(item)?)?;
+            }
+            return Err(err).context("cluster master batch upload failed");
+        }
+    };
+    if results.len() != batch.len() {
+        bail!(
+            "cluster master returned {} upload results for {} objects",
+            results.len(),
+            batch.len()
+        );
+    }
+    if results.iter().any(|result| !result.master_durable) {
+        for (path, item, _) in batch.iter_mut() {
+            let next_attempt = item.attempts.saturating_add(1);
+            item.record_attempt(Some(next_retry_after(Utc::now(), next_attempt)));
+            write_atomic(path, &serde_json::to_vec_pretty(item)?)?;
+        }
+        bail!("cluster master returned an acknowledgement without durable storage");
+    }
+    for ((path, item, _), result) in batch.drain(..).zip(results) {
+        remove_upload_payload(paths, &item.id)?;
+        fs::remove_file(path)?;
+        apply_cluster_upload_result(stats, &result);
+    }
+    Ok(())
+}
+
+fn apply_cluster_upload_result(stats: &mut UploadDrainStats, result: &ClusterPutResult) {
+    if result.newly_stored {
+        stats.uploaded += 1;
+        stats.uploaded_bytes += result.stored_bytes;
+    } else {
+        stats.skipped += 1;
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -366,10 +490,11 @@ fn upload_queue_parallelism(remote: &RemoteStore, max_parallel_uploads: usize) -
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_else(|| match remote {
             RemoteStore::S3(_) => max_parallel_uploads.max(32),
+            RemoteStore::MasterProxy(_) => 1,
             RemoteStore::File(_) => max_parallel_uploads,
         });
     match remote {
-        RemoteStore::S3(_) => configured.max(1),
+        RemoteStore::S3(_) | RemoteStore::MasterProxy(_) => configured.max(1),
         RemoteStore::File(_) => 1,
     }
 }
@@ -384,7 +509,10 @@ fn upload_publish_priority(key: &str) -> u8 {
     {
         return 3;
     }
-    if key.starts_with("metadata/")
+    if key.contains("/journal/")
+        || key.starts_with("journal/")
+        || key.starts_with("metadata/")
+        || key.ends_with("/metadata/export.json.zst")
         || key.ends_with("/metadata/export.json")
         || key == "metadata/export.json"
     {
@@ -398,6 +526,11 @@ fn queued_upload_can_be_skipped(
     remote: &RemoteStore,
     item: &UploadQueueItem,
 ) -> bool {
+    if remote.is_master_proxy() {
+        // master側のbatch処理でconditional PUTと重複cacheを一括判定する。
+        // slaveごとの事前HEADは、RPCとS3 APIの双方を増やすため行わない。
+        return false;
+    }
     if !prefer_canonical_remote_only(&item.key) {
         return false;
     }
@@ -432,7 +565,10 @@ fn remove_upload_payload(paths: &Paths, id: &str) -> Result<()> {
 }
 
 pub(crate) fn next_retry_after(now: DateTime<Utc>, attempts: u32) -> DateTime<Utc> {
-    now + Duration::seconds(retry_backoff_secs(attempts))
+    let base = retry_backoff_secs(attempts);
+    let jitter_bound = (base / 5).max(1) as u64;
+    let jitter = (rand::random::<u64>() % (jitter_bound * 2 + 1)) as i64 - jitter_bound as i64;
+    now + Duration::seconds((base + jitter).max(1))
 }
 
 fn retry_backoff_secs(attempts: u32) -> i64 {
@@ -568,16 +704,28 @@ pub(crate) fn import_remote_event_journals(
     host_id: &str,
 ) -> Result<usize> {
     let prefix = remote_event_journal_prefix(host_id);
+    let keys = remote.list(&prefix)?;
+    import_remote_event_journal_keys(paths, remote, keys)
+}
+
+fn import_remote_event_journal_keys(
+    paths: &Paths,
+    remote: &RemoteStore,
+    mut keys: Vec<String>,
+) -> Result<usize> {
     let mut imported = 0usize;
-    let mut keys = remote.list(&prefix)?;
     keys.sort();
     for key in keys {
         if !key.ends_with(".json") {
             continue;
         }
-        let bytes = remote
-            .get(&key)
-            .with_context(|| format!("read remote durable journal {key}"))?;
+        let Some(bytes) = remote
+            .get_optional(&key)
+            .with_context(|| format!("read remote durable journal {key}"))?
+        else {
+            // ホットclone中は一覧取得後に保持期限GCが走り得るため、消えた項目は無視する。
+            continue;
+        };
         let mut record: EventJournalRecord = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse remote durable journal {key}"))?;
         record.remote_journal_key = Some(key);
@@ -969,7 +1117,17 @@ pub(crate) fn enqueue_remote_event_journal_uploads(
     {
         let key = remote_event_journal_key(host_id, &record.event_id);
         record.remote_journal_key = Some(key.clone());
-        enrich_remote_event_journal_payload(paths, config, host_id, roots, &mut record)?;
+        if let Err(err) =
+            enrich_remote_event_journal_payload(paths, config, host_id, roots, &mut record)
+        {
+            eprintln!(
+                "durable journal payload deferred event={} root={} path={}: {err:#}",
+                record.event_id,
+                record.root_id.as_deref().unwrap_or("(none)"),
+                record.path.as_deref().unwrap_or("(none)")
+            );
+            continue;
+        }
         let bytes = serde_json::to_vec_pretty(&record)?;
         enqueue_inline_upload_overwrite(paths, &key, bytes)?;
         write_event_record(paths, record)?;
@@ -1131,10 +1289,11 @@ fn enqueue_large_manifest_uploads(
 }
 
 fn event_payload_remote_key(config: &Config, host_id: &str, key: &str) -> String {
-    let is_s3_remote = config
-        .remote
-        .as_ref()
-        .is_some_and(|remote| remote.url().is_ok_and(|url| url.starts_with("s3://")));
+    let is_s3_remote = config.remote.as_ref().is_some_and(|remote| {
+        remote
+            .url()
+            .is_ok_and(|url| url.starts_with("s3://") || url.starts_with("cluster://"))
+    });
     if is_s3_remote {
         host_remote_key(host_id, key)
     } else {
@@ -1198,7 +1357,7 @@ fn remote_event_payload_is_durable(
 }
 
 fn durable_payload_remote_key(remote: &RemoteStore, host_id: &str, key: &str) -> String {
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         host_remote_key(host_id, key)
     } else {
         key.to_string()
@@ -1535,7 +1694,10 @@ fn durable_event_matches_snapshot_record(event: &EventJournalRecord, record: &Fi
 
 #[cfg(test)]
 mod tests {
-    use super::upload_publish_priority;
+    use super::{import_remote_event_journal_keys, upload_publish_priority};
+    use crate::config::Paths;
+    use crate::remote_store::{FileRemote, RemoteStore};
+    use std::path::PathBuf;
 
     #[test]
     fn upload_publish_priority_keeps_current_refs_last() {
@@ -1552,8 +1714,59 @@ mod tests {
                 < upload_publish_priority("example/refs/current")
         );
         assert!(
+            upload_publish_priority("example/journal/2026-09-12.json")
+                < upload_publish_priority("example/refs/current")
+        );
+        assert_eq!(
+            upload_publish_priority("example/metadata/export.json.zst"),
+            upload_publish_priority("example/metadata/export.json")
+        );
+        assert!(
             upload_publish_priority("example/metadata/export.json")
                 < upload_publish_priority("example/head.cbor.zst.enc")
         );
+    }
+
+    #[test]
+    fn remote_journal_import_skips_key_deleted_after_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        let remote = RemoteStore::File(FileRemote {
+            root: temp.path().join("remote"),
+        });
+
+        let imported = import_remote_event_journal_keys(
+            &paths,
+            &remote,
+            vec!["host-a/journal/deleted.json".into()],
+        )
+        .unwrap();
+
+        assert_eq!(imported, 0);
+        assert!(!paths.event_queue.exists());
+    }
+
+    fn test_paths(home: PathBuf) -> Paths {
+        Paths {
+            db: home.join("db/majutsu.sqlite"),
+            config: home.join("config.toml"),
+            host: home.join("host"),
+            objects: home.join("objects"),
+            trees: home.join("trees"),
+            large_chunks: home.join("large/chunks"),
+            large_manifests: home.join("large/manifests"),
+            packs: home.join("packs"),
+            pack_indexes: home.join("pack-indexes"),
+            logs: home.join("logs"),
+            runtime: home.join("runtime"),
+            daemon_pid: home.join("runtime/daemon.pid"),
+            daemon_lock: home.join("runtime/daemon.lock"),
+            snapshot_lock: home.join("runtime/snapshot.lock"),
+            sync_lock: home.join("runtime/sync.lock"),
+            upload_queue: home.join("queue/uploads"),
+            event_queue: home.join("queue/events"),
+            master_key: home.join("keys/master"),
+            home,
+        }
     }
 }

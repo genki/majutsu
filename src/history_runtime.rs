@@ -63,6 +63,9 @@ use crate::util::{
 };
 
 pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
+    if crate::cluster_runtime::cluster_master_mode_enabled() {
+        return crate::cluster_runtime::cluster_status_cmd(paths, false);
+    }
     crate::ensure_ready(paths)?;
     let conn = crate::open_db(paths)?;
     let config = read_config(paths)?;
@@ -99,7 +102,13 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         .remote_current
         .as_deref()
         .and_then(|id| load_snapshot_header_by_id(paths, &conn, id).ok());
-    let upload_stats = upload_queue_stats(paths)?;
+    let (upload_stats, upload_queue_error) = match upload_queue_stats(paths) {
+        Ok(stats) => (stats, None),
+        Err(err) => {
+            eprintln!("upload queueの読取りに失敗しました: {err:#}");
+            (Default::default(), Some(format!("{err:#}")))
+        }
+    };
     let event_records = event_journal_records(paths)?;
     let event_count = event_records.len();
     let pending_event_count = pending_journal_event_count(&event_records);
@@ -126,6 +135,9 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
         durable_journal_count: remote_journal_stats.durable,
         durable_journal_pending: remote_journal_stats.pending,
         watch_attribution_issue,
+        watch_prune_issue: watch_prune_issue(&event_records),
+        upload_queue_error,
+        deep_remote_error: None,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
         deep_remote: None,
@@ -579,6 +591,9 @@ pub(crate) fn status_cmd(paths: &Paths, args: StatusArgs) -> Result<()> {
 }
 
 pub(crate) fn health_cmd(paths: &Paths, args: HealthArgs) -> Result<()> {
+    if crate::cluster_runtime::cluster_master_mode_enabled() {
+        return crate::cluster_runtime::cluster_status_cmd(paths, args.json);
+    }
     crate::ensure_ready(paths)?;
     let report = current_health_report(paths, &args)?;
     if args.json {
@@ -619,16 +634,26 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
         .remote_current
         .as_deref()
         .and_then(|id| load_snapshot_header_by_id(paths, &conn, id).ok());
-    let upload_stats = upload_queue_stats(paths)?;
+    let (upload_stats, upload_queue_error) = match upload_queue_stats(paths) {
+        Ok(stats) => (stats, None),
+        Err(err) => {
+            eprintln!("upload queueの読取りに失敗しました: {err:#}");
+            (Default::default(), Some(format!("{err:#}")))
+        }
+    };
     let event_records = event_journal_records(paths)?;
     let pending_event_count = pending_journal_event_count(&event_records);
     let watch_attribution_issue = watch_attribution_issue(&event_records);
     let remote_journal_stats = remote_event_journal_stats(paths)?;
     let daemon = daemon_health(paths)?;
-    let deep_remote = if args.deep && remote.configured && remote.open_error.is_none() {
-        if let Some(remote_config) = config.remote.as_ref() {
+    let mut deep_remote_error = None;
+    let deep_remote = if args.deep && remote.configured {
+        if let Some(error) = remote.open_error.as_deref() {
+            deep_remote_error = Some(error.to_string());
+            read_deep_health_record(paths)
+        } else if let Some(remote_config) = config.remote.as_ref() {
             match open_remote(remote_config) {
-                Ok(remote_store) => Some(sync_deep_health_summary(
+                Ok(remote_store) => match sync_deep_health_summary(
                     paths,
                     &conn,
                     &remote_store,
@@ -636,14 +661,30 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
                     args.timeout_secs.or(Some(15)),
                     !args.history,
                     current.as_deref(),
-                )?),
-                Err(_) => None,
+                ) {
+                    Ok(summary) => {
+                        let report = deep_remote_health_from_summary(&summary);
+                        // sample／timeoutで全件確認できていない結果は、最後の完全検査を上書きしない。
+                        if !report.limited {
+                            write_deep_health_record(paths, &report)?;
+                        }
+                        Some(report)
+                    }
+                    Err(error) => {
+                        deep_remote_error = Some(format!("{error:#}"));
+                        read_deep_health_record(paths)
+                    }
+                },
+                Err(error) => {
+                    deep_remote_error = Some(format!("{error:#}"));
+                    read_deep_health_record(paths)
+                }
             }
         } else {
             None
         }
     } else {
-        None
+        read_deep_health_record(paths)
     };
     build_health_report(HealthInputs {
         paths,
@@ -659,6 +700,9 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
         durable_journal_count: remote_journal_stats.durable,
         durable_journal_pending: remote_journal_stats.pending,
         watch_attribution_issue,
+        watch_prune_issue: watch_prune_issue(&event_records),
+        upload_queue_error,
+        deep_remote_error,
         current_manifest: current_manifest.as_ref(),
         remote_manifest: remote_manifest.as_ref(),
         deep_remote: deep_remote.as_ref(),
@@ -750,23 +794,35 @@ struct HealthReport {
     queued_uploads: usize,
     queued_uploads_retrying: usize,
     queued_uploads_delayed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload_queue_error: Option<String>,
     pending_journal_events: usize,
     durable_journal_pending: usize,
     sync_lock_pid: Option<u32>,
     encryption: String,
     deep_remote: Option<DeepRemoteHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deep_remote_error: Option<String>,
     roots: Vec<RootHealth>,
     issues: Vec<HealthIssue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeepRemoteHealth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at: Option<String>,
     scope: String,
     local_objects: usize,
     checked: usize,
     missing: usize,
     limited: bool,
     source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeepHealthRecord {
+    observed_at: DateTime<Utc>,
+    report: DeepRemoteHealth,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -805,9 +861,12 @@ struct HealthInputs<'a> {
     durable_journal_count: usize,
     durable_journal_pending: usize,
     watch_attribution_issue: Option<String>,
+    watch_prune_issue: Option<String>,
+    upload_queue_error: Option<String>,
+    deep_remote_error: Option<String>,
     current_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
     remote_manifest: Option<&'a crate::majutsu_core::SnapshotManifest>,
-    deep_remote: Option<&'a SyncDeepHealthSummary>,
+    deep_remote: Option<&'a DeepRemoteHealth>,
     conn: &'a Connection,
 }
 
@@ -826,6 +885,9 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         durable_journal_count,
         durable_journal_pending,
         watch_attribution_issue,
+        watch_prune_issue,
+        upload_queue_error,
+        deep_remote_error,
         current_manifest,
         remote_manifest,
         deep_remote,
@@ -963,6 +1025,13 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
             message,
         });
     }
+    if let Some(message) = watch_prune_issue {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "watch-prune-failed".into(),
+            message: format!("自動pruneに失敗しました。保護履歴は削除していません: {message}"),
+        });
+    }
     if let Some(error) = auto_daemon_error {
         issues.push(HealthIssue {
             severity: HealthSeverity::Warning,
@@ -1028,6 +1097,24 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
             ),
         });
     }
+    if let Some(error) = upload_queue_error.as_deref() {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Critical,
+            code: "upload-queue-unreadable".into(),
+            message: format!(
+                "upload queueを読み取れません。queueファイルは保持しています: {error}"
+            ),
+        });
+    }
+    if let Some(error) = deep_remote_error.as_deref() {
+        issues.push(HealthIssue {
+            severity: HealthSeverity::Critical,
+            code: "remote-objects-check-failed".into(),
+            message: format!(
+                "deep remote検査に失敗しました。直近の検査結果を保持しています: {error}"
+            ),
+        });
+    }
 
     if pending_event_count > 0 && durable_journal_pending > 0 {
         issues.push(HealthIssue {
@@ -1086,6 +1173,24 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
                     "deep remote check ({}) was limited after checking {}/{} object(s)",
                     deep.scope, deep.checked, deep.local_objects
                 ),
+            });
+        }
+        let stale_secs = std::env::var("MAJUTSU_DEEP_HEALTH_STALE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(24 * 60 * 60);
+        if deep
+            .observed_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|observed_at| {
+                Utc::now().signed_duration_since(observed_at).num_seconds() > stale_secs
+            })
+        {
+            issues.push(HealthIssue {
+                severity: HealthSeverity::Warning,
+                code: "remote-objects-check-stale".into(),
+                message: format!("最後の完全なdeep remote検査から{stale_secs}秒以上経過しています"),
             });
         }
     }
@@ -1151,18 +1256,13 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         queued_uploads: upload_stats.total,
         queued_uploads_retrying: upload_stats.retrying,
         queued_uploads_delayed: upload_stats.delayed,
+        upload_queue_error,
         pending_journal_events: pending_event_count,
         durable_journal_pending,
         sync_lock_pid,
         encryption: config.security.encryption.clone(),
-        deep_remote: deep_remote.map(|deep| DeepRemoteHealth {
-            scope: deep.scope.to_string(),
-            local_objects: deep.local_objects,
-            checked: deep.checked,
-            missing: deep.missing,
-            limited: deep.limited,
-            source: deep.source.clone(),
-        }),
+        deep_remote: deep_remote.cloned(),
+        deep_remote_error,
         roots: root_health,
         issues,
     })
@@ -1325,6 +1425,43 @@ fn runtime_health_path(paths: &Paths) -> std::path::PathBuf {
     paths.runtime.join("health.json")
 }
 
+fn deep_health_path(paths: &Paths) -> std::path::PathBuf {
+    paths.runtime.join("deep-health.json")
+}
+
+fn deep_remote_health_from_summary(summary: &SyncDeepHealthSummary) -> DeepRemoteHealth {
+    DeepRemoteHealth {
+        observed_at: Some(Utc::now().to_rfc3339()),
+        scope: summary.scope.to_string(),
+        local_objects: summary.local_objects,
+        checked: summary.checked,
+        missing: summary.missing,
+        limited: summary.limited,
+        source: summary.source.clone(),
+    }
+}
+
+fn write_deep_health_record(paths: &Paths, report: &DeepRemoteHealth) -> Result<()> {
+    fs::create_dir_all(&paths.runtime)?;
+    write_atomic(
+        &deep_health_path(paths),
+        &serde_json::to_vec_pretty(&DeepHealthRecord {
+            observed_at: Utc::now(),
+            report: report.clone(),
+        })?,
+    )
+}
+
+fn read_deep_health_record(paths: &Paths) -> Option<DeepRemoteHealth> {
+    let bytes = fs::read(deep_health_path(paths)).ok()?;
+    let record = serde_json::from_slice::<DeepHealthRecord>(&bytes).ok()?;
+    let mut report = record.report;
+    report
+        .observed_at
+        .get_or_insert_with(|| record.observed_at.to_rfc3339());
+    Some(report)
+}
+
 fn maybe_send_health_notice(paths: &Paths, record: &RuntimeHealthRecord) -> Result<()> {
     if record.report.state == ProtectionState::Protected {
         let _ = fs::remove_file(health_notice_marker_path(paths));
@@ -1346,7 +1483,8 @@ fn maybe_send_health_notice(paths: &Paths, record: &RuntimeHealthRecord) -> Resu
     if health_notice_recently_sent(paths, record.report.state, &issue_codes) {
         return Ok(());
     }
-    let status = crate::platform_runtime::shell_command(&command)
+    let mut notice = crate::platform_runtime::shell_command(&command);
+    notice
         .env("MAJUTSU_HOME", &paths.home)
         .env("MAJUTSU_HEALTH_STATE", record.report.state.as_str())
         .env(
@@ -1361,8 +1499,17 @@ fn maybe_send_health_notice(paths: &Paths, record: &RuntimeHealthRecord) -> Resu
                 .current_snapshot
                 .as_deref()
                 .unwrap_or("(none)"),
-        )
-        .status();
+        );
+    let status = crate::platform_runtime::command_status_with_timeout(
+        &mut notice,
+        StdDuration::from_secs(
+            std::env::var("MAJUTSU_HEALTH_NOTICE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(10)
+                .clamp(1, 60),
+        ),
+    );
     match status {
         Ok(status) if status.success() => {
             let marker = HealthNoticeMarker {
@@ -1453,6 +1600,9 @@ fn print_health_report(report: &HealthReport, verbose: bool) {
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "(none)".into())
     );
+    if let Some(error) = &report.upload_queue_error {
+        println!("queue_error uploads={error}");
+    }
     println!(
         "roots active={} total={} missing={} unsynced={} degraded={}",
         report.active_roots,
@@ -4221,6 +4371,19 @@ fn watch_attribution_issue(records: &[crate::majutsu_db::EventJournalRecord]) ->
     }
 }
 
+fn watch_prune_issue(records: &[crate::majutsu_db::EventJournalRecord]) -> Option<String> {
+    let latest = records
+        .iter()
+        .filter(|event| matches!(event.kind.as_str(), "watch-prune" | "watch-prune-error"))
+        .max_by_key(|event| event.observed_at)?;
+    (latest.kind == "watch-prune-error").then(|| {
+        format!(
+            "自動pruneに失敗しました。保護履歴は保持されています: {}",
+            latest.detail
+        )
+    })
+}
+
 fn effective_watch_backend(
     paths: &Paths,
     configured: &str,
@@ -5324,6 +5487,8 @@ fn read_remote_status(config: &Config) -> Result<RemoteStatus> {
         "file"
     } else if remote_url.starts_with("s3://") {
         "s3"
+    } else if remote_url.starts_with("cluster://") {
+        "cluster"
     } else {
         "unknown"
     };

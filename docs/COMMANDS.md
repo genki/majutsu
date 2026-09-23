@@ -14,7 +14,7 @@ Daily use: status, health, state, log, diff, snapshot, commit, note, track, untr
 History: branch, switch, op
 Recovery: restore, restore mount, restore unmount, restore hydrate, mount, unmount, hydrate, clone
 Remote: sync, remote, lifecycle
-Service: watch, daemon
+Service: watch, daemon, cluster
 Security: key
 Storage maintenance: large, cache, pack, prune, gc, fsck
 Advanced/debug: version, event
@@ -35,6 +35,24 @@ number, git commit when available, and a capability list. Use it instead of
 mj version
 mj version --json
 ```
+
+## Cluster master commands
+
+`mj cluster serve` starts a protocol v2 data-holder master in the foreground.
+`mj cluster status` separates master-local protected data from the asynchronous
+S3 secondary-backup backlog. `mj cluster flush` requests an immediate backend
+flush without placing S3 in the slave ACK path.
+
+```sh
+mj cluster serve --listen 0.0.0.0:4581
+mj cluster status
+mj cluster status --json
+mj cluster metrics
+mj cluster flush --wait-secs 300
+```
+
+See [Master／Slave](CLUSTER_MASTER_SLAVE.md) for profile selection, durability,
+upgrade order, and recovery behavior.
 
 ## State and diff inspection
 
@@ -317,6 +335,24 @@ metadata、timeline/ref、参照される content object を新 prefix にコピ
 だけで、旧 prefix や旧 global object は削除しません。mj remote check と
 clone/restore の検証後に、旧データを backend の運用手順で削除してください。
 
+欠損chunkを元ファイルまたは内容が一致する退避ファイルから復元する場合は、まずdry-runで
+記録済みhashを照合します。指定したmanifest／chunkがDBに登録済みであることを確認し、
+一致しない入力や既存objectの不一致では書き込みません。zstd圧縮chunkにも対応します。
+
+```sh
+mj remote recover-chunk \
+  --manifest objects/large/manifests/<manifest-key> \
+  --key objects/large/chunks/fixed/<chunk-key> \
+  --source /path/to/original-file --dry-run
+mj remote recover-chunk \
+  --manifest objects/large/manifests/<manifest-key> \
+  --key objects/large/chunks/fixed/<chunk-key> \
+  --source /path/to/original-file
+```
+
+復元後はlocal objectを変更せず、remote送信queueへ登録する。cluster slaveではmasterへ、
+standaloneでは通常のremoteへ後続syncで送信する。master roleではこの操作を拒否する。
+
 Pause and resume roots:
 
 ```sh
@@ -469,12 +505,10 @@ every event-driven sync, set `MAJUTSU_WATCH_PRUNE_INTERVAL_SECS` to a positive
 number; the last successful watch prune is recorded under
 `$MAJUTSU_HOME/cache/watch-prune-state.json`.
 
-Use `--drop-missing-remote-history` when `mj health --deep --history` reports
-missing remote objects for old history, while current health remains protected.
-The option scans retained, unprotected history snapshots against the remote
-payload index and adds snapshots with missing remote objects to the prune
-candidate set. The current snapshot and snapshots protected by refs or branches
-remain protected.
+自動pruneはremote一覧の一時的な欠損を履歴削除の根拠にしない。current以外の履歴を
+「remoteにない」ことを理由に削除する`--drop-missing-remote-history`は自動pruneでは渡されず、
+明示操作だけで実行される。cluster remoteではmaster-localとS3の完全な一覧を同時に保証できないため、
+この明示オプションも拒否する。S3-only履歴を含む破損調査は一覧とproviderの世代保持を確認してから行う。
 
 Pack normal blob objects:
 

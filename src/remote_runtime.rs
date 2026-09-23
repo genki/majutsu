@@ -7,6 +7,7 @@ use crate::majutsu_store::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 
+use crate::cache_runtime::{remote_payload_index_contains, remote_payload_key_index_for_host};
 use crate::cli::RemoteCommand;
 use crate::config::{MetadataExport, Paths, read_config};
 use crate::fsck_runtime::{RemoteFsckOptions, remote_fsck_with_options};
@@ -31,6 +32,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -215,6 +217,14 @@ pub(crate) fn remote_cmd(paths: &Paths, command: RemoteCommand) -> Result<()> {
                     "re-uploaded missing remote objects"
                 }),
             )?;
+        }
+        RemoteCommand::RecoverChunk {
+            manifest,
+            key,
+            source,
+            dry_run,
+        } => {
+            recover_chunk_from_source(paths, &manifest, &key, &source, dry_run)?;
         }
         RemoteCommand::Explain { key } => {
             remote_explain_object(paths, &key)?;
@@ -474,7 +484,7 @@ fn validate_quick_host_metadata(
     }
     let head = read_remote_head(paths, remote, &host_prefix)?;
     context.ensure("head")?;
-    let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
+    let compact_head_authoritative = remote.is_s3_like() && head.is_some();
     let current = export.refs.get("current");
     if host.current_snapshot.as_ref() != current && !compact_head_authoritative {
         *missing += 1;
@@ -526,13 +536,13 @@ fn validate_quick_host_metadata(
         match remote_ref(remote, &key)? {
             Some(value) if value == *current => {}
             Some(value) => {
-                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                if !remote.is_s3_like() || head.is_none() {
                     *missing += 1;
                     eprintln!("{key} points to {value}, expected {current}");
                 }
             }
             None => {
-                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                if !remote.is_s3_like() || head.is_none() {
                     *missing += 1;
                     eprintln!("missing remote ref {key}");
                 }
@@ -569,13 +579,13 @@ fn validate_quick_host_metadata(
         match remote_ref(remote, &key)? {
             Some(value) if value == *last_synced => {}
             Some(value) => {
-                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                if !remote.is_s3_like() || head.is_none() {
                     *missing += 1;
                     eprintln!("{key} points to {value}, expected {last_synced}");
                 }
             }
             None => {
-                if !matches!(remote, RemoteStore::S3(_)) || head.is_none() {
+                if !remote.is_s3_like() || head.is_none() {
                     *missing += 1;
                     eprintln!("missing remote ref {key}");
                 }
@@ -702,7 +712,7 @@ fn validate_quick_gc_records(
     context: QuickFsckContext,
     missing: &mut usize,
 ) -> Result<()> {
-    let compact_head_authoritative = matches!(remote, RemoteStore::S3(_)) && head.is_some();
+    let compact_head_authoritative = remote.is_s3_like() && head.is_some();
     context.ensure("gc-mark")?;
     let mark_key = remote_gc_mark_key(host_id);
     let Some(bytes) = remote.get_optional(&mark_key)? else {
@@ -786,6 +796,20 @@ struct RemoteObjectScan {
     session_fingerprint: Option<String>,
 }
 
+fn remote_payload_index_for_paths(
+    paths: &Paths,
+    remote: &RemoteStore,
+) -> Result<Option<BTreeSet<String>>> {
+    if !remote.is_s3_like() {
+        return Ok(None);
+    }
+    let config = read_config(paths)?;
+    Ok(Some(remote_payload_key_index_for_host(
+        remote,
+        &remote_host_label(&config.host.name),
+    )?))
+}
+
 fn remote_fsck_objects(
     paths: &Paths,
     remote: &RemoteStore,
@@ -847,6 +871,8 @@ fn scan_remote_object_availability(
     let start = Instant::now();
     let deadline = options.timeout.map(|timeout| start + timeout);
     let parallelism = options.parallelism.clamp(1, 128).min(total.max(1));
+    let remote_payload_keys = remote_payload_index_for_paths(paths, remote)?;
+    let remote_payload_keys = remote_payload_keys.as_ref();
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
         for worker in 0..parallelism {
@@ -863,7 +889,13 @@ fn scan_remote_object_availability(
                         timed_out = true;
                         break;
                     }
-                    match remote_object_available_for_paths(paths, remote, key) {
+                    let available = if let Some(remote_payload_keys) = remote_payload_keys.as_ref()
+                    {
+                        Ok(remote_payload_index_contains(remote_payload_keys, key))
+                    } else {
+                        remote_object_available_for_paths(paths, remote, key)
+                    };
+                    match available {
                         Ok(true) => {}
                         Ok(false) => missing.push(key.clone()),
                         Err(err) => {
@@ -940,6 +972,106 @@ enum RemoteObjectWorkerResult {
         missing: Vec<String>,
         timed_out: bool,
     },
+}
+
+fn recover_chunk_from_source(
+    paths: &Paths,
+    manifest_key: &str,
+    key: &str,
+    source: &std::path::Path,
+    dry_run: bool,
+) -> Result<()> {
+    crate::cluster_runtime::ensure_data_producer_allowed("remote recover-chunk")?;
+    let _lock = crate::process_runtime::acquire_process_lock(
+        &crate::config::maintenance_lock_path(paths),
+        "maintenance",
+    )?;
+    crate::util::validate_local_object_key(manifest_key)?;
+    crate::util::validate_local_object_key(key)?;
+    let conn = open_db(paths)?;
+    let known: bool = conn.query_row(
+        "select exists(select 1 from large_objects where manifest_key=?1)",
+        [manifest_key],
+        |row| row.get(0),
+    )?;
+    if !known {
+        bail!("未登録のlarge manifestは復元に使用できません");
+    }
+    let manifest: LargeManifest = serde_json::from_slice(&read_object(paths, manifest_key)?)?;
+    let chunk = manifest
+        .chunks
+        .iter()
+        .find(|chunk| chunk.object_key == key)
+        .ok_or_else(|| anyhow!("指定manifestは対象chunkを参照していません"))?;
+    let registered: bool = conn.query_row(
+        "select exists(select 1 from chunks where oid=?1 and object_key=?2)",
+        rusqlite::params![chunk.oid, key],
+        |row| row.get(0),
+    )?;
+    if !registered
+        || !matches!(chunk.compression.as_str(), "none" | "zstd")
+        || chunk.len > 64 * 1024 * 1024
+    {
+        bail!(
+            "登録済み・対応圧縮形式(none/zstd)・64MiB以下のchunkだけを元ファイルから復元できます"
+        );
+    }
+    let mut file = fs::File::open(source)?;
+    file.seek(SeekFrom::Start(chunk.offset))?;
+    let mut bytes = vec![0; usize::try_from(chunk.len)?];
+    file.read_exact(&mut bytes)?;
+    if blake3_hex(&bytes) != chunk.oid {
+        bail!("元ファイルの内容は記録済みchunk hashと一致しません。書込みは行いません");
+    }
+    println!("source_digest_matches true");
+    if dry_run {
+        println!("dry_run true");
+        return Ok(());
+    }
+    let config = read_config(paths)?;
+    let stored_bytes = match chunk.compression.as_str() {
+        "none" => bytes,
+        "zstd" => zstd::stream::encode_all(bytes.as_slice(), config.large.compression.level)?,
+        other => bail!("unsupported large chunk compression: {other}"),
+    };
+    let remote = config
+        .remote
+        .as_ref()
+        .ok_or_else(|| anyhow!("remoteの設定が必要です"))?;
+    let _ = remote.url()?;
+    let dest = paths.home.join(key);
+    if dest.exists() {
+        let existing_stored = read_object(paths, key)?;
+        let existing_plain = crate::decode_large_chunk_stored_bytes(chunk, &existing_stored)?;
+        if blake3_hex(&existing_plain) != chunk.oid {
+            bail!("既存local objectの内容が不一致です。自動上書きはしません");
+        }
+    } else {
+        let expected_storage_id = crate::object_storage_id(paths, &chunk.oid)?;
+        if !key.ends_with(&format!(
+            "{}/{}",
+            &expected_storage_id[..2],
+            &expected_storage_id[2..]
+        )) {
+            bail!("現在の暗号鍵では記録済みobject keyを再現できません");
+        }
+        let parent = dest
+            .parent()
+            .ok_or_else(|| anyhow!("objectの親directoryがありません"))?;
+        fs::create_dir_all(parent)?;
+        crate::atomic_io::fsync_parent_dir(parent)?;
+        crate::atomic_io::write_atomic(&dest, &crate::encode_object(paths, &stored_bytes)?)?;
+    }
+    let alias = canonical_remote_alias(key).unwrap_or_else(|| key.to_string());
+    let remote_key = if remote.url()?.starts_with("file://") {
+        key.to_string()
+    } else {
+        host_remote_key(&remote_host_label(&config.host.name), &alias)
+    };
+    crate::queue_runtime::enqueue_file_upload(paths, &remote_key, &dest)?;
+    println!("recovered_local_object {key}");
+    println!("queued_remote_object {remote_key}");
+    Ok(())
 }
 
 fn remote_repair(
@@ -1104,7 +1236,7 @@ fn remote_repair_canonical_aliases(
 
     for (key, alias) in alias_candidates {
         checked += 1;
-        let remote_alias = if matches!(remote, RemoteStore::S3(_)) {
+        let remote_alias = if remote.is_s3_like() {
             host_remote_key(&host_label, &alias)
         } else {
             alias.clone()
@@ -1171,7 +1303,7 @@ fn list_remote_alias_candidate_keys(
     }
     for prefix in prefixes {
         let started = Instant::now();
-        let list_prefix = if matches!(remote, RemoteStore::S3(_)) {
+        let list_prefix = if remote.is_s3_like() {
             host_remote_key(host_label, &prefix)
         } else {
             prefix.clone()
@@ -1252,6 +1384,8 @@ fn scan_remote_object_availability_for_repair(
     let mut cursor = session.next_index;
     let mut checked_this_run = 0usize;
     let mut timed_out = false;
+    let remote_payload_keys = remote_payload_index_for_paths(paths, remote)?;
+    let remote_payload_keys = remote_payload_keys.as_ref();
 
     while cursor < total {
         if let Some(deadline) = deadline
@@ -1267,8 +1401,12 @@ fn scan_remote_object_availability_for_repair(
             for key in batch {
                 let tx = tx.clone();
                 scope.spawn(move || {
-                    let result = crate::remote_object_available_for_paths(paths, remote, key)
-                        .with_context(|| format!("check remote object {key}"));
+                    let result = if let Some(remote_payload_keys) = remote_payload_keys.as_ref() {
+                        Ok(remote_payload_index_contains(remote_payload_keys, key))
+                    } else {
+                        crate::remote_object_available_for_paths(paths, remote, key)
+                    }
+                    .with_context(|| format!("check remote object {key}"));
                     let _ = tx.send((key.clone(), result));
                 });
             }
@@ -1353,7 +1491,7 @@ fn repair_source_and_remote_key(
     if !source.exists() {
         return None;
     }
-    let remote_key = repair_remote_key(matches!(remote, RemoteStore::S3(_)), host_label, key);
+    let remote_key = repair_remote_key(remote.is_s3_like(), host_label, key);
     Some((source, remote_key))
 }
 
@@ -1684,9 +1822,8 @@ fn migrate_legacy_remote(
     let host = select_legacy_remote_host(candidates, selector)?;
     let target_prefix = remote_host_label(&host.name);
     let metadata_json = crate::sync_runtime::metadata_export_json_for_remote(remote, &host.export)?;
-    let metadata_destination =
-        legacy_metadata_destination(matches!(remote, RemoteStore::S3(_)), &target_prefix);
-    let metadata_bytes = if matches!(remote, RemoteStore::S3(_)) {
+    let metadata_destination = legacy_metadata_destination(remote.is_s3_like(), &target_prefix);
+    let metadata_bytes = if remote.is_s3_like() {
         zstd::stream::encode_all(metadata_json.as_slice(), 3)?
     } else {
         metadata_json
@@ -1723,7 +1860,7 @@ fn migrate_legacy_remote(
     let content_keys = legacy_remote_content_keys(paths, remote, &host)?;
     for key in content_keys {
         let (source, destination_relative) = resolve_legacy_content_source(remote, &host, &key)?;
-        let destination = if matches!(remote, RemoteStore::S3(_)) {
+        let destination = if remote.is_s3_like() {
             host_remote_key(&target_prefix, &destination_relative)
         } else {
             destination_relative
@@ -1756,7 +1893,7 @@ fn migrate_legacy_remote(
                 .get_optional(&source)?
                 .ok_or_else(|| anyhow!("legacy migration source is missing: {source}"))?
         };
-        if matches!(remote, RemoteStore::S3(_))
+        if remote.is_s3_like()
             && let Some(logical_key) = item.logical_key.as_deref()
             && (snapshot_manifest_keys.contains(logical_key)
                 || legacy_structured_alias(logical_key))
@@ -2151,7 +2288,7 @@ fn resolve_legacy_content_source(
     } else {
         source.clone()
     };
-    let destination = if matches!(remote, RemoteStore::S3(_)) {
+    let destination = if remote.is_s3_like() {
         canonical_remote_alias(key).unwrap_or_else(|| key.to_string())
     } else if relative == key || canonical_remote_alias(key).as_deref() == Some(relative.as_str()) {
         relative

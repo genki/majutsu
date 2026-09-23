@@ -25,8 +25,8 @@ cargo install --path .
 
 ## 2. Choose a Remote
 
-Remote sync is the critical path for host-loss recovery. In production, start
-with an S3-compatible backend and encryption:
+For the standalone profile, remote sync is the critical path for host-loss
+recovery. In production, start with an S3-compatible backend and encryption:
 
 ```sh
 export AWS_ACCESS_KEY_ID=...
@@ -49,6 +49,10 @@ mj remote check
 
 Use a dedicated backend prefix per host or per majutsu instance unless you
 explicitly want to share a remote for multi-host recovery browsing.
+
+For a master／slave deployment, first complete this standalone flow, then follow
+[Master／Slave](CLUSTER_MASTER_SLAVE.md). In that profile the master-local copy
+is the normal crash-recovery target and S3 becomes a delayed secondary backup.
 
 For a local-only trial, use a file remote instead:
 

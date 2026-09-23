@@ -280,9 +280,10 @@ MAJUTSU_WATCH_PRUNE_INTERVAL_SECS=3600
 maintenanceのhot pathから外せる。
 
 daemon による自動pruneを止める場合は `MAJUTSU_WATCH_AUTO_PRUNE=0` を設定する。
-自動pruneは保持期間にかかわらず、remote payloadが既に欠損して復元不能になったcurrent以外の
-snapshot metadataも削除する。これにより、復元不能な履歴だけが残ってfull fsckを継続的に
-失敗させる状態を防ぐ。S3 backendでは現在hostのprefixだけを判定対象にする。
+自動pruneはremote一覧の一時的な欠損を履歴削除の根拠にしない。current以外の履歴を
+「remoteにない」ことを理由に削除する`--drop-missing-remote-history`は自動pruneでは渡されず、
+明示操作だけで実行される。cluster remoteではmaster-localとS3の完全な一覧を同時に保証できないため、
+この明示オプションも拒否する。S3-only履歴を含む破損調査は一覧とproviderの世代保持を確認してから行う。
 
 health が `degraded` / `unprotected` になった時に通知したい場合は
 `MAJUTSU_HEALTH_NOTICE_CMD` を設定する。通知コマンドには `MAJUTSU_HOME`、
@@ -539,9 +540,9 @@ tree metadata cache は `mj state`、`mj log`、`mj root size` などのCLI応�
 metadata cache も同期後に削除したい場合は `MAJUTSU_SYNC_LOCAL_METADATA_CACHE_PRUNE=1` を指定する。
 
 remote が設定されている通常の `mj fsck` は、検査のため一時的に hydrate した同期済み
-payload cache と tree metadata を成功後に自動 prune する。未同期、または remote に存在しない
-object は削除しない。調査目的で検査後の cache を残したい場合は
-`MAJUTSU_FSCK_PRUNE_PAYLOAD_CACHE=0` や `MAJUTSU_FSCK_PRUNE_METADATA_CACHE=0` を指定する。
+payload cache と tree metadata を既定では削除しない。検査結果を再確認できるよう、診断コマンド
+自体が保全用cacheを破棄することを避けている。明示的にcacheを削除する場合だけ
+`MAJUTSU_FSCK_PRUNE_PAYLOAD_CACHE=1` や `MAJUTSU_FSCK_PRUNE_METADATA_CACHE=1` を指定する。
 
 新規に作成される tree manifest は compact JSON として保存される。既存の pretty JSON tree
 manifest も引き続き読み取り可能で、restore / diff / fsck の互換性は維持される。

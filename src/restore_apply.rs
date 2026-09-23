@@ -310,11 +310,10 @@ pub(crate) fn restore_special_matches(meta: &fs::Metadata, special_kind: &str) -
     Ok(special_file_kind(meta).as_deref() == Some(special_kind))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn ensure_restore_parent_beneath_rejects_parent_symlink() {
         use std::os::unix::fs::symlink;

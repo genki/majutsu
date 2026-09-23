@@ -1,7 +1,7 @@
 use crate::majutsu_core::{LargeManifest, LiveMetadataReferences, payload_large_ref};
 use crate::majutsu_pack::PackIndex;
 use crate::majutsu_policy::{SnapshotPruneInput, SnapshotPrunePlan, build_snapshot_prune_plan};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use std::collections::BTreeSet;
 use std::fs;
@@ -45,19 +45,26 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
     if args.dry_run {
         println!("dry_run true");
     } else {
+        // DB変更とoperation記録を同一transactionに閉じ、後段の失敗で部分削除を残さない。
+        let transaction = conn.unchecked_transaction()?;
         let deleted_snapshots = plan.delete.len();
         let before = current_snapshot(&conn)?;
         for snapshot in &plan.delete {
             conn.execute("delete from snapshots where id=?1", params![snapshot])?;
         }
         let removed = prune_unreferenced_metadata(paths, &conn)?;
-        record_op(
+        transaction.commit()?;
+        // operation logは外部ファイルにも追記するため、DB commit前に呼ぶと
+        // commit失敗時にghost recordが残る。削除を確定した後に記録する。
+        if let Err(err) = record_op(
             &conn,
             "prune",
             before.as_deref(),
             before.as_deref(),
             Some(&format!("deleted {} snapshots", plan.delete.len())),
-        )?;
+        ) {
+            eprintln!("prune operation logの記録に失敗しました: {err:#}");
+        }
         println!("dry_run false");
         println!("deleted_snapshots {}", plan.delete.len());
         println!("removed_blob_metadata {}", removed.blobs);
@@ -74,7 +81,11 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
             removed.snapshot_payload_rows
         );
         println!("removed_large_pins {}", removed.large_pins);
-        let remote_cleanup = args.remote_cleanup && read_config(paths)?.remote.is_some();
+        let remote_cleanup = args.remote_cleanup
+            && read_config(paths)?
+                .remote
+                .as_ref()
+                .is_some_and(|remote| !remote.url().is_ok_and(|url| url.starts_with("cluster://")));
         if remote_cleanup {
             println!("remote_cleanup true");
         } else {
@@ -95,6 +106,7 @@ pub(crate) fn prune_cmd(paths: &Paths, args: PruneArgs) -> Result<()> {
                     wait: false,
                     timeout_secs: 300,
                     changed_roots: Vec::new(),
+                    retry_queued_only: false,
                     command: None,
                 },
             )?;
@@ -217,7 +229,12 @@ fn missing_remote_history_snapshots(
         return Ok(Vec::new());
     };
     let remote = open_remote(remote_config)?;
-    let remote_keys = if matches!(remote, crate::remote_store::RemoteStore::S3(_)) {
+    if remote.is_master_proxy() {
+        bail!(
+            "cluster remoteでは--drop-missing-remote-historyを使用できません。master-localとS3の一覧を完全に照合できないため、通常のpruneを使用してください"
+        );
+    }
+    let remote_keys = if remote.is_s3_like() {
         remote_payload_key_index_for_host(
             &remote,
             &crate::majutsu_store::remote_host_label(&config.host.name),
@@ -231,8 +248,30 @@ fn missing_remote_history_snapshots(
         if current == Some(snapshot.id.as_str()) {
             continue;
         }
-        let keys =
-            crate::object_paths::local_object_keys_for_snapshot(paths, &export, &snapshot.id)?;
+        let keys = match crate::object_paths::local_object_keys_for_snapshot(
+            paths,
+            &export,
+            &snapshot.id,
+        ) {
+            Ok(keys) => keys,
+            Err(err) => {
+                // 明示的な履歴破棄では、snapshot manifest自体がremoteから失われている
+                // 場合に限って、ローカルの古い依存オブジェクト欠損を「履歴欠損」として
+                // 扱う。manifestがremoteに残っているのにローカルだけ読めない場合は、
+                // ストレージ障害を履歴欠損と誤認して削除しない。
+                if !remote_payload_index_contains(&remote_keys, &snapshot.manifest_key) {
+                    eprintln!(
+                        "remote履歴manifestが見つからないためsnapshotを欠損扱いにします: {} ({err:#})",
+                        snapshot.id
+                    );
+                    missing.push((snapshot.id.clone(), 1));
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!("snapshot {}のremote履歴を検証できません", snapshot.id)
+                });
+            }
+        };
         let missing_count = keys
             .iter()
             .filter(|key| !remote_payload_index_contains(&remote_keys, key))
@@ -417,9 +456,15 @@ fn read_large_manifest_for_prune(
     }
     let remote = remote
         .ok_or_else(|| anyhow::anyhow!("large manifest is not cached locally: {manifest_key}"))?;
-    let remote_key = crate::majutsu_store::canonical_remote_alias(manifest_key)
-        .unwrap_or_else(|| manifest_key.to_string());
-    crate::decode_canonical_remote_export(paths, &remote.get(&remote_key)?)
+    // cluster／S3のhost prefixと旧形式の差を共通の復号経路で吸収する。
+    let variants = crate::remote_local_object_variants(paths, remote, manifest_key)?;
+    for variant in variants {
+        let decoded = crate::decode_object(paths, &variant.bytes)?;
+        if let Ok(manifest) = serde_json::from_slice(&decoded) {
+            return Ok(manifest);
+        }
+    }
+    anyhow::bail!("pruneに必要なlarge manifestを取得できません: {manifest_key}")
 }
 
 fn delete_snapshot_payload_indexes_without_snapshots(conn: &Connection) -> Result<(usize, usize)> {
@@ -494,7 +539,11 @@ fn prune_stale_pack_indexes(paths: &Paths, conn: &Connection) -> Result<usize> {
         if live_oids.is_empty() {
             continue;
         }
-        let mut index: PackIndex = serde_json::from_slice(&read_object(paths, &index_key)?)?;
+        let mut index: PackIndex = serde_json::from_slice(
+            &read_object(paths, &index_key)
+                .with_context(|| format!("prune pack={pack_id} index={index_key}"))?,
+        )
+        .with_context(|| format!("prune pack indexの解析: {index_key}"))?;
         let before = index.entries.len();
         index.pack_id = pack_id.clone();
         index.pack_key = pack_key.clone();
@@ -502,14 +551,18 @@ fn prune_stale_pack_indexes(paths: &Paths, conn: &Connection) -> Result<usize> {
         if index.entries.len() == before && object_count == index.entries.len() {
             continue;
         }
-        let index_path = paths.home.join(&index_key);
+        // 旧indexを上書きしない。DBがrollbackしても旧世代を引き続き復旧に使える。
+        let bytes = serde_json::to_vec_pretty(&index)?;
+        let digest = blake3::hash(&bytes).to_hex();
+        let new_index_key = format!("objects/indexes/pack/{pack_id}-{digest}.json");
+        let index_path = paths.home.join(&new_index_key);
         if let Some(parent) = index_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(index_path, serde_json::to_vec_pretty(&index)?)?;
+        crate::atomic_io::write_atomic(&index_path, &bytes)?;
         conn.execute(
-            "update packs set object_count=?2 where pack_id=?1",
-            params![pack_id, index.entries.len()],
+            "update packs set object_count=?2, index_key=?3 where pack_id=?1",
+            params![pack_id, index.entries.len(), new_index_key],
         )?;
         rewritten += 1;
     }

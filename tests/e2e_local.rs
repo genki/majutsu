@@ -565,8 +565,8 @@ fn cache_prune_evicts_synced_payload_cache_and_restore_hydrates() {
 
     assert_success(run_mj(&home, ["fsck"]), "fsck after cache prune");
     assert!(
-        !home.join(&tree_key).exists(),
-        "fsck should prune synced tree manifest after temporary hydration"
+        home.join(&tree_key).exists(),
+        "fsck should preserve the hydrated metadata cache by default"
     );
     assert_success(
         run_mj(

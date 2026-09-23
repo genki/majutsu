@@ -43,6 +43,9 @@ including uncommitted files and selected non-repository directories.
 - Remote fsck for metadata and object reachability.
 - Lifecycle policy generation for GCS and S3.
 - Persistent upload queue with retry/backoff on later `mj sync`.
+- Protocol v2 master／slave profile with fsync-before-ACK master-local replication.
+- Cost-oriented asynchronous S3 secondary-backup queue with status, manual flush,
+  mutable-ref coalescing, and autonomous retry.
 
 ## Security and recovery
 
@@ -64,6 +67,8 @@ including uncommitted files and selected non-repository directories.
 - Watch-created snapshots can auto-sync after each batch.
 - Daemon status and metrics expose root health, upload backlog, journal replay,
   and restore queue state.
+- A cluster master daemon runs as a data-holder only; standalone daemons retain
+  the existing local watch and direct-remote behavior.
 - systemd user/system service rendering and launchd plist rendering.
 
 ## Platform support

@@ -33,8 +33,9 @@ use crate::db_refs::{
     restore_ref_value, set_ref_value, set_remote_ref_value,
 };
 use crate::object_paths::{
-    canonical_alias_for_legacy_key, local_object_keys, prefer_s3_canonical_remote_only,
-    remote_live_object_keys_for_local, s3_remote_live_object_keys_for_local,
+    canonical_alias_for_legacy_key, local_object_keys, local_object_keys_for_snapshot,
+    prefer_s3_canonical_remote_only, remote_live_object_keys_for_local,
+    s3_remote_live_object_keys_for_local,
 };
 use crate::operation_log::{OperationDetails, record_op_with_details, update_operation_result};
 use crate::pack_runtime::{auto_compact_packs_if_needed, pack_cmd};
@@ -46,7 +47,9 @@ use crate::queue_runtime::{
     event_journal_stats, remote_event_journal_stats, upload_queue_contains_key, upload_queue_stats,
 };
 use crate::remote_runtime::repair_missing_referenced_objects;
-use crate::remote_store::{RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy};
+use crate::remote_store::{
+    RemoteObjectStat, RemoteStore, RemoteTrafficTraceGuard, open_remote_with_upload_policy,
+};
 use crate::root_size_summary::{
     RootSizeSummary, build_root_size_summary_with_remote_objects, encode_root_size_summary,
     root_size_summary_key, write_cached_root_size_summary,
@@ -59,9 +62,10 @@ use crate::{
     remote_object_available_for_paths, remote_ref,
 };
 
-const REMOTE_SYNC_CACHE_VERSION: u32 = 2;
+const REMOTE_SYNC_CACHE_VERSION: u32 = 3;
 const REMOTE_SYNC_STATE_VERSION: &str = "remote-metadata-v9-host-scoped";
 const REMOTE_HEAD_VERSION: u32 = 1;
+const ROOT_SIZE_REMOTE_OBJECT_CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteHeadExport {
@@ -223,6 +227,7 @@ impl SyncTrace {
 
 pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     ensure_ready(paths)?;
+    crate::cluster_runtime::ensure_data_producer_allowed("sync")?;
     let config = read_config(paths)?;
     let conn = open_db(paths)?;
     let remote = open_remote_with_upload_policy(
@@ -235,8 +240,12 @@ pub(crate) fn sync_cmd(paths: &Paths, args: SyncArgs) -> Result<()> {
     )?;
     let host_label = remote_host_label(&config.host.name);
     prune_remote_refs_for_host(&conn, &remote.describe(), &host_label)?;
-    let changed_roots = (!args.changed_roots.is_empty())
-        .then(|| args.changed_roots.iter().cloned().collect::<BTreeSet<_>>());
+    let changed_roots = if args.retry_queued_only {
+        Some(BTreeSet::new())
+    } else {
+        (!args.changed_roots.is_empty())
+            .then(|| args.changed_roots.iter().cloned().collect::<BTreeSet<_>>())
+    };
     if let Some(SyncCommand::Status(status_args)) = args.command {
         if status_args.deep {
             return sync_status(paths, &conn, &remote, &status_args);
@@ -759,11 +768,44 @@ fn enqueue_and_drain_sync(
         &host_metadata_plain,
         &remote_metadata_json,
     )?;
+    // cluster slaveでは、個別HEADの代わりにmasterの一覧を一度だけ取得して再利用する。
+    // 一覧取得に失敗した場合は、後段でconditional PUTに任せて同期を継続する。
+    let mut root_size_remote_objects = if remote.is_master_proxy() {
+        match root_size_summary_remote_objects(paths, remote, &host_label) {
+            Ok(objects) => Some(objects),
+            Err(err) => {
+                eprintln!("warning: skipped cluster remote object prefetch: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let known_remote_keys = root_size_remote_objects.as_ref().map(|objects| {
+        objects
+            .iter()
+            .map(|object| object.key.clone())
+            .collect::<BTreeSet<_>>()
+    });
     for snapshot in &remote_export.snapshots {
-        enqueue_snapshot_uploads_if_needed(paths, remote, &sync_cache, &host_label, snapshot)?;
+        enqueue_snapshot_uploads_if_needed(
+            paths,
+            remote,
+            &sync_cache,
+            &host_label,
+            snapshot,
+            known_remote_keys.as_ref(),
+        )?;
     }
     for operation in &remote_export.operations {
-        enqueue_operation_uploads_if_needed(paths, remote, &sync_cache, &host_label, operation)?;
+        enqueue_operation_uploads_if_needed(
+            paths,
+            remote,
+            &sync_cache,
+            &host_label,
+            operation,
+            known_remote_keys.as_ref(),
+        )?;
     }
     if matches!(remote, RemoteStore::File(_)) {
         enqueue_inline_upload(
@@ -842,7 +884,7 @@ fn enqueue_and_drain_sync(
         let key = host_remote_key(&host_label, REMOTE_CHUNK_INDEX_SHARD_KEY);
         let shard = build_chunk_index_shard(&remote_export);
         let bytes = encode_canonical_remote_export(paths, &shard)?;
-        if matches!(remote, RemoteStore::S3(_)) {
+        if remote.is_s3_like() {
             enqueue_cached_inline_upload_with_fingerprint(
                 paths,
                 &sync_cache,
@@ -858,6 +900,14 @@ fn enqueue_and_drain_sync(
     trace.mark("metadata queue");
 
     let content_keys = sync_content_local_object_keys(paths, remote, &content_export, &sync_cache)?;
+    let current_snapshot_keys = content_export
+        .refs
+        .get("current")
+        .map(|current| {
+            local_object_keys_for_snapshot(paths, &content_export, current)
+                .map(|keys| keys.into_iter().collect::<BTreeSet<_>>())
+        })
+        .transpose()?;
     let snapshot_manifest_keys = content_keys
         .iter()
         .filter(|key| {
@@ -875,7 +925,11 @@ fn enqueue_and_drain_sync(
         .collect::<BTreeSet<_>>();
     let existing_canonical_aliases =
         if remote_prefers_canonical_only(remote) && sync_verify_cached_remote_aliases() {
-            Some(list_remote_canonical_content_aliases(remote, &host_label)?)
+            Some(list_remote_canonical_content_aliases(
+                remote,
+                &host_label,
+                None,
+            )?)
         } else {
             None
         };
@@ -885,6 +939,20 @@ fn enqueue_and_drain_sync(
             remote_prefers_canonical_only(remote) && s3_prefers_canonical_remote_only(&key);
         let aliases = canonical_remote_aliases(&key);
         if !local.exists() {
+            if current_snapshot_keys
+                .as_ref()
+                .is_some_and(|keys| !keys.contains(&key))
+                && known_remote_keys.is_some()
+                && !prefetched_remote_object_exists(
+                    remote,
+                    &host_label,
+                    &key,
+                    known_remote_keys.as_ref().expect("checked above"),
+                )
+            {
+                eprintln!("warning: skipped unavailable historical object during sync: {key}");
+                continue;
+            }
             if canonical_only
                 && canonical_aliases_available_without_local(
                     paths,
@@ -895,11 +963,19 @@ fn enqueue_and_drain_sync(
                     &sync_cache,
                     &mut sync_fingerprints,
                     existing_canonical_aliases.as_ref(),
+                    known_remote_keys.as_ref(),
                 )?
             {
                 continue;
             }
             if !crate::hydrate_local_object_from_remote(paths, &key)? {
+                if current_snapshot_keys
+                    .as_ref()
+                    .is_some_and(|keys| !keys.contains(&key))
+                {
+                    eprintln!("warning: skipped unavailable historical object during sync: {key}");
+                    continue;
+                }
                 bail!(
                     "cannot sync referenced object {key}: local object is missing and remote hydration failed"
                 );
@@ -909,7 +985,14 @@ fn enqueue_and_drain_sync(
             if !canonical_only {
                 let force = snapshot_manifest_keys.contains(key.as_str());
                 let upload_key = remote_upload_key(remote, &host_label, &key);
-                enqueue_file_upload_if_needed(paths, remote, &upload_key, &local, force)?;
+                enqueue_file_upload_if_needed(
+                    paths,
+                    remote,
+                    &upload_key,
+                    &local,
+                    force,
+                    known_remote_keys.as_ref(),
+                )?;
             }
             for alias in aliases {
                 let upload_alias = remote_upload_key(remote, &host_label, &alias);
@@ -963,23 +1046,36 @@ fn enqueue_and_drain_sync(
     trace.mark("drain content queue");
 
     let mut root_size_summary_cache = None::<RootSizeSummary>;
-    match root_size_summary_remote_objects(remote, &host_label).and_then(|objects| {
-        build_root_size_summary_with_remote_objects(paths, config, &remote_export, remote, &objects)
-    }) {
-        Ok(Some(summary)) => {
-            let key = root_size_summary_key(&host_label);
-            let fingerprint = payload_fingerprint(&serde_json::to_vec(&summary)?);
-            sync_fingerprints.insert(key.clone(), fingerprint.clone());
-            if !cache_matches(&sync_cache, &key, &fingerprint) {
-                let bytes = encode_root_size_summary(paths, &summary)?;
-                enqueue_inline_upload_overwrite(paths, &key, bytes)?;
-            }
-            root_size_summary_cache = Some(summary);
-            trace.mark("root size summary");
+    if !remote.is_master_proxy() {
+        match root_size_summary_remote_objects(paths, remote, &host_label) {
+            Ok(objects) => root_size_remote_objects = Some(objects),
+            Err(err) => eprintln!("warning: skipped root size remote object list: {err:#}"),
         }
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("warning: skipped root size summary publish: {err:#}");
+    }
+    if let Some(objects) = root_size_remote_objects.as_ref() {
+        let summary_result = build_root_size_summary_with_remote_objects(
+            paths,
+            config,
+            &remote_export,
+            remote,
+            objects,
+        );
+        match summary_result {
+            Ok(Some(summary)) => {
+                let key = root_size_summary_key(&host_label);
+                let fingerprint = payload_fingerprint(&serde_json::to_vec(&summary)?);
+                sync_fingerprints.insert(key.clone(), fingerprint.clone());
+                if !cache_matches(&sync_cache, &key, &fingerprint) {
+                    let bytes = encode_root_size_summary(paths, &summary)?;
+                    enqueue_inline_upload_overwrite(paths, &key, bytes)?;
+                }
+                root_size_summary_cache = Some(summary);
+                trace.mark("root size summary");
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("warning: skipped root size summary publish: {err:#}");
+            }
         }
     }
     let summary_upload_drain =
@@ -1001,12 +1097,13 @@ fn enqueue_and_drain_sync(
     let (pruned_remote_exports, pruned_remote_objects, pruned_remote_journals) =
         if should_prune_remote {
             let pruned_remote_exports =
-                prune_remote_host_exports(remote, &host_label, &remote_export)?;
+                prune_remote_host_exports(remote, &host_label, &remote_export, None)?;
             let pruned_remote_journals = prune_remote_stale_event_journals(
                 paths,
                 remote,
                 &host_label,
                 config.large.max_parallel_uploads,
+                None,
             )?;
             let pruned_remote_objects = prune_remote_unreferenced_content_objects(
                 paths,
@@ -1014,10 +1111,12 @@ fn enqueue_and_drain_sync(
                 &host_label,
                 &content_export,
                 config.large.max_parallel_uploads,
+                root_size_remote_objects.as_deref(),
             )? + prune_remote_legacy_canonical_objects(
                 remote,
                 &host_label,
                 config.large.max_parallel_uploads,
+                root_size_remote_objects.as_deref(),
             )?;
             write_remote_prune_state(paths, remote, &state_fingerprint)?;
             (
@@ -1041,11 +1140,11 @@ fn enqueue_and_drain_sync(
         Default::default()
     };
     if pruned_remote_objects > 0 {
-        invalidate_root_size_remote_object_cache(paths)?;
+        invalidate_root_size_remote_object_cache(paths, &host_label)?;
     }
     trace.mark("local prune");
     persist_export_remote_refs(conn, &remote.describe(), &host_label, &remote_export.refs)?;
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         persist_remote_root_acks(
             conn,
             &remote.describe(),
@@ -1101,6 +1200,7 @@ fn canonical_aliases_available_without_local(
     sync_cache: &RemoteSyncCache,
     sync_fingerprints: &mut BTreeMap<String, String>,
     existing_canonical_aliases: Option<&BTreeSet<String>>,
+    known_remote_keys: Option<&BTreeSet<String>>,
 ) -> Result<bool> {
     if aliases.is_empty() {
         return Ok(false);
@@ -1122,35 +1222,145 @@ fn canonical_aliases_available_without_local(
     if all_cached {
         return Ok(true);
     }
+    if let Some(known_remote_keys) = known_remote_keys {
+        // masterから取得した一覧を再利用し、履歴オブジェクトごとのExistsを発行しない。
+        return Ok(prefetched_remote_object_exists(
+            remote,
+            host_label,
+            key,
+            known_remote_keys,
+        ));
+    }
     remote_object_available_for_paths(paths, remote, key)
 }
 
 fn remote_prefers_canonical_only(remote: &RemoteStore) -> bool {
-    matches!(remote, RemoteStore::S3(_))
+    remote.is_s3_like()
 }
 
 fn remote_upload_key(remote: &RemoteStore, host_id: &str, key: &str) -> String {
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         host_remote_key(host_id, key)
     } else {
         key.to_string()
     }
 }
 
+fn prefetched_remote_object_exists(
+    remote: &RemoteStore,
+    host_id: &str,
+    key: &str,
+    known_remote_keys: &BTreeSet<String>,
+) -> bool {
+    std::iter::once(key)
+        .chain(canonical_remote_aliases(key).iter().map(String::as_str))
+        .map(|candidate| remote_upload_key(remote, host_id, candidate))
+        .any(|candidate| known_remote_keys.contains(&candidate))
+}
+
 fn s3_prefers_canonical_remote_only(key: &str) -> bool {
     prefer_s3_canonical_remote_only(key)
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct RootSizeRemoteObjectCache {
+    version: u32,
+    remote: String,
+    host_label: String,
+    refreshed_at_unix_secs: u64,
+    objects: Vec<RemoteObjectStat>,
+}
+
 fn root_size_summary_remote_objects(
+    paths: &Paths,
     remote: &RemoteStore,
     host_label: &str,
-) -> Result<Vec<crate::remote_store::RemoteObjectStat>> {
-    let prefix = if matches!(remote, RemoteStore::S3(_)) {
+) -> Result<Vec<RemoteObjectStat>> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = root_size_remote_object_cache_path(paths, host_label);
+    if let Some(cache) = read_root_size_remote_object_cache(&path)
+        && root_size_remote_object_cache_is_fresh(
+            &cache,
+            &remote.describe(),
+            host_label,
+            now,
+            root_size_remote_object_cache_ttl(),
+        )
+    {
+        return Ok(cache.objects);
+    }
+    let prefix = if remote.is_s3_like() {
         format!("{host_label}/")
     } else {
         String::new()
     };
-    remote.list_with_sizes(&prefix)
+    let objects = remote.list_primary_with_sizes(&prefix)?;
+    write_root_size_remote_object_cache(
+        &path,
+        &RootSizeRemoteObjectCache {
+            version: ROOT_SIZE_REMOTE_OBJECT_CACHE_VERSION,
+            remote: remote.describe(),
+            host_label: host_label.to_string(),
+            refreshed_at_unix_secs: now,
+            objects: objects.clone(),
+        },
+    )?;
+    Ok(objects)
+}
+
+fn root_size_remote_object_cache_ttl() -> Duration {
+    env::var("MAJUTSU_SYNC_ROOT_SIZE_REMOTE_LIST_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(3_600))
+}
+
+fn root_size_remote_object_cache_is_fresh(
+    cache: &RootSizeRemoteObjectCache,
+    remote: &str,
+    host_label: &str,
+    now_unix_secs: u64,
+    ttl: Duration,
+) -> bool {
+    cache.version == ROOT_SIZE_REMOTE_OBJECT_CACHE_VERSION
+        && cache.remote == remote
+        && cache.host_label == host_label
+        && now_unix_secs.saturating_sub(cache.refreshed_at_unix_secs) <= ttl.as_secs()
+}
+
+fn root_size_remote_object_cache_path(paths: &Paths, host_label: &str) -> std::path::PathBuf {
+    let safe_host_label = host_label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    paths
+        .home
+        .join("cache")
+        .join(format!("root-size-remote-objects-{safe_host_label}.json"))
+}
+
+fn read_root_size_remote_object_cache(path: &std::path::Path) -> Option<RootSizeRemoteObjectCache> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn write_root_size_remote_object_cache(
+    path: &std::path::Path,
+    cache: &RootSizeRemoteObjectCache,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_io::write_atomic(path, &serde_json::to_vec(cache)?)
 }
 
 fn content_object_fingerprint(key: &str) -> String {
@@ -1339,10 +1549,10 @@ fn remote_prune_due(paths: &Paths, remote: &RemoteStore, state_fingerprint: &str
     Ok(remote_prune_state_is_due(
         &state,
         &remote.describe(),
-        matches!(remote, RemoteStore::S3(_)),
+        remote.is_s3_like(),
         state_fingerprint,
         SystemTime::now(),
-        remote_prune_interval(),
+        remote_prune_interval(remote),
     ))
 }
 
@@ -1370,12 +1580,18 @@ fn remote_prune_elapsed_due(pruned_at_unix_secs: u64, now: SystemTime, interval:
     now.duration_since(pruned_at).unwrap_or(Duration::MAX) >= interval
 }
 
-fn remote_prune_interval() -> Duration {
+fn remote_prune_interval(remote: &RemoteStore) -> Duration {
     env::var("MAJUTSU_SYNC_REMOTE_PRUNE_INTERVAL_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(3600))
+        .unwrap_or_else(|| {
+            if remote.is_master_proxy() {
+                Duration::from_secs(24 * 60 * 60)
+            } else {
+                Duration::from_secs(3600)
+            }
+        })
 }
 
 fn remote_prune_state_path(paths: &Paths) -> std::path::PathBuf {
@@ -1419,8 +1635,8 @@ fn write_remote_prune_state(
     Ok(())
 }
 
-fn invalidate_root_size_remote_object_cache(paths: &Paths) -> Result<()> {
-    let path = paths.home.join("cache/root-size-remote-objects.json");
+fn invalidate_root_size_remote_object_cache(paths: &Paths, host_label: &str) -> Result<()> {
+    let path = root_size_remote_object_cache_path(paths, host_label);
     if path.exists() {
         fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
@@ -1527,7 +1743,7 @@ fn enqueue_metadata_uploads(
     host_key: &str,
     metadata_json: &[u8],
 ) -> Result<String> {
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         enqueue_inline_upload(paths, host_key, metadata_json.to_vec())?;
         return Ok(host_key.to_string());
     }
@@ -1552,14 +1768,14 @@ fn should_upload_full_remote_oplog(remote: &RemoteStore) -> bool {
     if env::var("MAJUTSU_SYNC_FULL_REMOTE_OPLOG").as_deref() == Ok("1") {
         return true;
     }
-    !matches!(remote, RemoteStore::S3(_))
+    !remote.is_s3_like()
 }
 
 fn should_upload_remote_ref_objects(remote: &RemoteStore) -> bool {
     if env::var("MAJUTSU_SYNC_REMOTE_REF_OBJECTS").as_deref() == Ok("1") {
         return true;
     }
-    !matches!(remote, RemoteStore::S3(_))
+    !remote.is_s3_like()
 }
 
 fn enqueue_remote_head_if_supported(
@@ -1570,7 +1786,7 @@ fn enqueue_remote_head_if_supported(
     export: &MetadataExport,
     metadata_key: &str,
 ) -> Result<()> {
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         return Ok(());
     }
     let key = remote_head_key(host_label);
@@ -1629,6 +1845,7 @@ fn enqueue_snapshot_uploads_if_needed(
     cache: &RemoteSyncCache,
     host_id: &str,
     snapshot: &crate::majutsu_core::SnapshotExport,
+    known_remote_keys: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     let canonical_key = host_snapshot_canonical_key(host_id, &snapshot.id);
     let fingerprint = payload_fingerprint(&serde_json::to_vec(snapshot)?);
@@ -1646,7 +1863,8 @@ fn enqueue_snapshot_uploads_if_needed(
     if cache_matches(cache, &canonical_key, &fingerprint) {
         return Ok(());
     }
-    if upload_queue_contains_key(paths, &canonical_key) || remote_key_exists(remote, &canonical_key)
+    if upload_queue_contains_key(paths, &canonical_key)
+        || remote_key_exists(remote, &canonical_key, known_remote_keys)
     {
         return Ok(());
     }
@@ -1659,6 +1877,7 @@ fn enqueue_operation_uploads_if_needed(
     cache: &RemoteSyncCache,
     host_id: &str,
     operation: &OperationExport,
+    known_remote_keys: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     let canonical_key = host_operation_canonical_key(host_id, &operation.id);
     let fingerprint = payload_fingerprint(&serde_json::to_vec(operation)?);
@@ -1672,7 +1891,8 @@ fn enqueue_operation_uploads_if_needed(
     if cache_matches(cache, &canonical_key, &fingerprint) {
         return Ok(());
     }
-    if upload_queue_contains_key(paths, &canonical_key) || remote_key_exists(remote, &canonical_key)
+    if upload_queue_contains_key(paths, &canonical_key)
+        || remote_key_exists(remote, &canonical_key, known_remote_keys)
     {
         return Ok(());
     }
@@ -1685,8 +1905,9 @@ fn enqueue_file_upload_if_needed(
     key: &str,
     source: &std::path::Path,
     force: bool,
+    known_remote_keys: Option<&BTreeSet<String>>,
 ) -> Result<()> {
-    if !force && remote_key_can_be_skipped(paths, remote, key) {
+    if !force && remote_key_can_be_skipped(paths, remote, key, known_remote_keys) {
         return Ok(());
     }
     if force {
@@ -1696,17 +1917,34 @@ fn enqueue_file_upload_if_needed(
     }
 }
 
-fn remote_key_can_be_skipped(paths: &Paths, remote: &RemoteStore, key: &str) -> bool {
+fn remote_key_can_be_skipped(
+    paths: &Paths,
+    remote: &RemoteStore,
+    key: &str,
+    known_remote_keys: Option<&BTreeSet<String>>,
+) -> bool {
     if !is_content_addressed_remote_key(key) {
         return false;
     }
     if upload_queue_contains_key(paths, key) {
         return true;
     }
-    remote_key_exists(remote, key)
+    remote_key_exists(remote, key, known_remote_keys)
 }
 
-fn remote_key_exists(remote: &RemoteStore, key: &str) -> bool {
+fn remote_key_exists(
+    remote: &RemoteStore,
+    key: &str,
+    known_remote_keys: Option<&BTreeSet<String>>,
+) -> bool {
+    if let Some(keys) = known_remote_keys {
+        return keys.contains(key);
+    }
+    if remote.is_master_proxy() {
+        // master一覧が取得できない場合も、slaveから個別HEADを大量発行しない。
+        // content-addressed objectは後段のconditional PUTで競合なく判定できる。
+        return false;
+    }
     remote.exists(key).unwrap_or(false)
 }
 
@@ -2035,17 +2273,27 @@ fn sync_status_snapshot(
         .unwrap_or(total_local_objects)
         .min(total_local_objects);
     let keys_to_check = local_keys.iter().take(check_limit).collect::<Vec<_>>();
-    let mut remote_object_check_source = if options.prefer_head_checks() {
+    let mut remote_object_check_source = if remote.is_master_proxy() {
+        "master-local-list".to_string()
+    } else if options.prefer_head_checks() {
         "head".to_string()
     } else {
         "list".to_string()
     };
     let mut missing_remote = 0usize;
     let mut checked = 0usize;
-    let remote_keys = if options.prefer_head_checks() {
+    let remote_keys = if options.prefer_head_checks() && !remote.is_master_proxy() {
         None
     } else {
-        let remote_index = if matches!(remote, RemoteStore::S3(_)) {
+        let remote_index = if remote.is_master_proxy() {
+            let prefix = format!("{host_label}/");
+            remote.list_primary_with_sizes(&prefix).map(|objects| {
+                objects
+                    .into_iter()
+                    .filter_map(|object| object.key.strip_prefix(&prefix).map(str::to_string))
+                    .collect::<BTreeSet<_>>()
+            })
+        } else if remote.is_s3_like() {
             remote_payload_key_index_for_host(remote, &host_label)
         } else {
             remote_payload_key_index(remote)
@@ -2053,6 +2301,10 @@ fn sync_status_snapshot(
         match remote_index {
             Ok(keys) => Some(keys),
             Err(err) => {
+                if remote.is_master_proxy() {
+                    return Err(err)
+                        .context("master-localの完全な一覧を取得できず、二重化を検証できません");
+                }
                 eprintln!(
                     "sync status warning: remote object index unavailable; falling back to HEAD checks: {err}"
                 );
@@ -2068,7 +2320,11 @@ fn sync_status_snapshot(
             break;
         }
         checked += 1;
-        let available = if let Some(remote_keys) = remote_keys.as_ref()
+        let available = if remote.is_master_proxy() {
+            remote_keys
+                .as_ref()
+                .is_some_and(|keys| remote_payload_index_contains(keys, key))
+        } else if let Some(remote_keys) = remote_keys.as_ref()
             && remote_payload_index_contains(remote_keys, key)
         {
             true
@@ -2076,6 +2332,7 @@ fn sync_status_snapshot(
             remote_object_available_for_paths(paths, remote, key)?
         };
         if !available {
+            eprintln!("remote objectが見つかりません: {key}");
             missing_remote += 1;
         }
         options.maybe_progress(checked, check_limit, &remote_object_check_source);
@@ -2269,7 +2526,7 @@ fn build_gc_mark_export(
         remote_live_object_keys_for_local(paths, export)?
     };
     object_keys.extend(durable_journal_live_keys(paths)?);
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         object_keys = object_keys
             .into_iter()
             .map(|key| host_remote_key(host_label, &key))
@@ -2300,7 +2557,7 @@ fn enqueue_gc_mark_if_needed(
     let key = remote_gc_mark_key(host_label);
     let mark = build_gc_mark_export(paths, host_label, config, remote, export)?;
     let bytes = serde_json::to_vec_pretty(&mark)?;
-    if !matches!(remote, RemoteStore::S3(_)) {
+    if !remote.is_s3_like() {
         return enqueue_inline_upload(paths, &key, bytes);
     }
     let fingerprint = gc_mark_fingerprint(&mark)?;
@@ -2363,6 +2620,7 @@ fn prune_remote_host_exports(
     remote: &RemoteStore,
     host_id: &str,
     export: &MetadataExport,
+    remote_objects: Option<&[RemoteObjectStat]>,
 ) -> Result<usize> {
     let live_snapshots = export
         .snapshots
@@ -2389,7 +2647,9 @@ fn prune_remote_host_exports(
         live_ops.insert(host_oplog_canonical_key(host_id));
     }
     let mut removed = 0usize;
-    for key in remote.list(&host_snapshots_prefix(host_id))? {
+    for key in
+        remote_list_with_optional_cache(remote, &host_snapshots_prefix(host_id), remote_objects)?
+    {
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc"))
             && !live_snapshots.contains(&key)
         {
@@ -2398,7 +2658,7 @@ fn prune_remote_host_exports(
             removed += 1;
         }
     }
-    for key in remote.list(&host_ops_prefix(host_id))? {
+    for key in remote_list_with_optional_cache(remote, &host_ops_prefix(host_id), remote_objects)? {
         if (key.ends_with(".json") || key.ends_with(".cbor.zst.enc")) && !live_ops.contains(&key) {
             write_remote_gc_tombstone(remote, host_id, &key)?;
             remote.delete(&key)?;
@@ -2414,11 +2674,12 @@ fn prune_remote_unreferenced_content_objects(
     host_id: &str,
     export: &MetadataExport,
     max_parallel_deletes: usize,
+    remote_objects: Option<&[RemoteObjectStat]>,
 ) -> Result<usize> {
     if env::var("MAJUTSU_SYNC_REMOTE_OBJECT_PRUNE").as_deref() == Ok("0") {
         return Ok(0);
     }
-    let mut live = if matches!(remote, RemoteStore::S3(_)) {
+    let mut live = if remote.is_s3_like() {
         s3_remote_live_object_keys_for_local(paths, export)?
     } else {
         remote_live_object_keys_for_local(paths, export)?
@@ -2426,7 +2687,7 @@ fn prune_remote_unreferenced_content_objects(
     .into_iter()
     .collect::<BTreeSet<_>>();
     live.extend(durable_journal_live_keys(paths)?);
-    if matches!(remote, RemoteStore::S3(_)) {
+    if remote.is_s3_like() {
         live = live
             .into_iter()
             .map(|key| host_remote_key(host_id, &key))
@@ -2436,7 +2697,7 @@ fn prune_remote_unreferenced_content_objects(
         live.insert(host_remote_key(host_id, REMOTE_CHUNK_INDEX_SHARD_KEY));
     }
     live.extend(remote_gc_mark_live_keys(remote, host_id)?);
-    let delete_keys = remote_content_object_keys(remote, host_id)?
+    let delete_keys = remote_content_object_keys(remote, host_id, remote_objects)?
         .into_iter()
         .filter(|key| !live.contains(key))
         .collect::<Vec<_>>();
@@ -2449,6 +2710,7 @@ fn prune_remote_stale_event_journals(
     remote: &RemoteStore,
     host_id: &str,
     max_parallel_deletes: usize,
+    remote_objects: Option<&[RemoteObjectStat]>,
 ) -> Result<usize> {
     if env::var("MAJUTSU_SYNC_REMOTE_JOURNAL_PRUNE").as_deref() == Ok("0") {
         return Ok(0);
@@ -2458,8 +2720,7 @@ fn prune_remote_stale_event_journals(
         .filter_map(|record| record.remote_journal_key)
         .collect::<BTreeSet<_>>();
     let prefix = format!("{host_id}/journal/");
-    let delete_keys = remote
-        .list(&prefix)?
+    let delete_keys = remote_list_with_optional_cache(remote, &prefix, remote_objects)?
         .into_iter()
         .filter(|key| key.ends_with(".json") && !live.contains(key))
         .collect::<Vec<_>>();
@@ -2494,7 +2755,11 @@ fn durable_journal_live_keys(paths: &Paths) -> Result<BTreeSet<String>> {
     Ok(keys)
 }
 
-fn remote_content_object_keys(remote: &RemoteStore, host_id: &str) -> Result<BTreeSet<String>> {
+fn remote_content_object_keys(
+    remote: &RemoteStore,
+    host_id: &str,
+    remote_objects: Option<&[RemoteObjectStat]>,
+) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for prefix in [
         "blobs/loose/",
@@ -2514,12 +2779,16 @@ fn remote_content_object_keys(remote: &RemoteStore, host_id: &str) -> Result<BTr
         "objects/large/chunks/fixed/",
         "objects/large/chunks/fastcdc/",
     ] {
-        let prefix = if matches!(remote, RemoteStore::S3(_)) || prefix == "indexes/chunk-index/" {
+        let prefix = if remote.is_s3_like() || prefix == "indexes/chunk-index/" {
             host_remote_key(host_id, prefix)
         } else {
             prefix.to_string()
         };
-        keys.extend(remote.list(&prefix)?);
+        keys.extend(remote_list_with_optional_cache(
+            remote,
+            &prefix,
+            remote_objects,
+        )?);
     }
     Ok(keys)
 }
@@ -2528,6 +2797,7 @@ fn prune_remote_legacy_canonical_objects(
     remote: &RemoteStore,
     host_id: &str,
     max_parallel_deletes: usize,
+    remote_objects: Option<&[RemoteObjectStat]>,
 ) -> Result<usize> {
     if !remote_prefers_canonical_only(remote) {
         return Ok(0);
@@ -2536,7 +2806,7 @@ fn prune_remote_legacy_canonical_objects(
         return Ok(0);
     }
     let protected = remote_gc_mark_live_keys(remote, host_id)?;
-    let canonical_keys = list_remote_canonical_content_aliases(remote, host_id)?;
+    let canonical_keys = list_remote_canonical_content_aliases(remote, host_id, remote_objects)?;
     let mut candidates = BTreeSet::new();
     for prefix in [
         "objects/blobs/",
@@ -2548,7 +2818,7 @@ fn prune_remote_legacy_canonical_objects(
         "objects/large/chunks/fastcdc/",
     ] {
         let remote_prefix = host_remote_key(host_id, prefix);
-        for key in remote.list(&remote_prefix)? {
+        for key in remote_list_with_optional_cache(remote, &remote_prefix, remote_objects)? {
             if protected.contains(&key) {
                 continue;
             }
@@ -2572,6 +2842,7 @@ fn prune_remote_legacy_canonical_objects(
 fn list_remote_canonical_content_aliases(
     remote: &RemoteStore,
     host_id: &str,
+    remote_objects: Option<&[RemoteObjectStat]>,
 ) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for prefix in [
@@ -2585,9 +2856,37 @@ fn list_remote_canonical_content_aliases(
         "large/chunks/fixed-8m/",
         "large/chunks/fastcdc/",
     ] {
-        keys.extend(remote.list(&host_remote_key(host_id, prefix))?);
+        keys.extend(remote_list_with_optional_cache(
+            remote,
+            &host_remote_key(host_id, prefix),
+            remote_objects,
+        )?);
     }
     Ok(keys)
+}
+
+fn remote_list_with_optional_cache(
+    remote: &RemoteStore,
+    prefix: &str,
+    remote_objects: Option<&[RemoteObjectStat]>,
+) -> Result<Vec<String>> {
+    if let Some(objects) = remote_objects {
+        return Ok(objects
+            .iter()
+            .filter(|object| object.key.starts_with(prefix))
+            .map(|object| object.key.clone())
+            .collect());
+    }
+    if remote.is_master_proxy() {
+        // clusterの自動pruneではS3 fallbackの不完全な一覧を削除根拠にしない。
+        // master-local一覧だけを対象にし、S3にしかない孤立objectは別途明示調査へ残す。
+        return Ok(remote
+            .list_primary_with_sizes(prefix)?
+            .into_iter()
+            .map(|object| object.key)
+            .collect());
+    }
+    remote.list(prefix)
 }
 
 fn prune_local_packed_blob_objects(
@@ -2814,5 +3113,41 @@ mod tests {
             gc_mark_fingerprint(&first_mark).unwrap(),
             gc_mark_fingerprint(&second_mark).unwrap()
         );
+    }
+
+    #[test]
+    fn root_size_remote_object_cache_is_scoped_and_expires() {
+        let cache = RootSizeRemoteObjectCache {
+            version: ROOT_SIZE_REMOTE_OBJECT_CACHE_VERSION,
+            remote: "s3://bucket/prefix".into(),
+            host_label: "vagrant".into(),
+            refreshed_at_unix_secs: 1_000,
+            objects: vec![RemoteObjectStat {
+                key: "vagrant/trees/tree-1".into(),
+                size: 42,
+            }],
+        };
+
+        assert!(root_size_remote_object_cache_is_fresh(
+            &cache,
+            "s3://bucket/prefix",
+            "vagrant",
+            1_300,
+            Duration::from_secs(300),
+        ));
+        assert!(!root_size_remote_object_cache_is_fresh(
+            &cache,
+            "s3://bucket/prefix",
+            "mba22",
+            1_300,
+            Duration::from_secs(300),
+        ));
+        assert!(!root_size_remote_object_cache_is_fresh(
+            &cache,
+            "s3://bucket/prefix",
+            "vagrant",
+            1_301,
+            Duration::from_secs(300),
+        ));
     }
 }

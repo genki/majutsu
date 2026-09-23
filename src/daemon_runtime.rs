@@ -261,6 +261,21 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
         }
         DaemonCommand::Status => {
             let health = daemon_health(paths)?;
+            if crate::cluster_runtime::cluster_master_mode_enabled() {
+                match health.state {
+                    DaemonHealthState::Running => {
+                        println!("running pid {}", health.pid.unwrap_or_default());
+                    }
+                    DaemonHealthState::Stale => {
+                        println!("stale pid {}", health.pid.unwrap_or_default());
+                    }
+                    DaemonHealthState::Stopped => println!("stopped"),
+                }
+                println!("profile master-data-holder");
+                println!("ipc not-applicable");
+                crate::cluster_runtime::cluster_status_cmd(paths, false)?;
+                return Ok(());
+            }
             match health.state {
                 DaemonHealthState::Running => {
                     let pid = health.pid.unwrap_or_default();
@@ -278,6 +293,19 @@ pub(crate) fn daemon_cmd(paths: &Paths, command: DaemonCommand) -> Result<()> {
                     println!("stopped");
                 }
             }
+        }
+        DaemonCommand::Metrics if crate::cluster_runtime::cluster_master_mode_enabled() => {
+            let health = daemon_health(paths)?;
+            println!("# TYPE majutsu_daemon_up gauge");
+            println!(
+                "majutsu_daemon_up {}",
+                if health.state == DaemonHealthState::Running {
+                    1
+                } else {
+                    0
+                }
+            );
+            crate::cluster_runtime::cluster_metrics_cmd(paths)?;
         }
         DaemonCommand::Metrics => match daemon_health(paths)? {
             DaemonHealth {
@@ -1499,8 +1527,12 @@ pub(crate) fn daemon_ipc_request(paths: &Paths, command: &str) -> Result<String>
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_daemon_env_file, watch_command_matches};
+    use super::parse_daemon_env_file;
+    #[cfg(unix)]
+    use super::watch_command_matches;
+    #[cfg(unix)]
     use crate::config::resolve_paths;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     #[test]
