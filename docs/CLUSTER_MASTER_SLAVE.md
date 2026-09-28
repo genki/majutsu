@@ -237,7 +237,11 @@ standalone profileのwatch同期は、従来どおり`sync --wait --timeout-secs
 | slaveとmasterの同時喪失 | 最後にflush済みのS3二次backup |
 
 S3のRPOはflush intervalと容量thresholdで決まる。低コスト化の代わりに同時喪失時の最新分が
-未転送となり得るため、`backend_queue_oldest_created_at`を監視する。
+未転送となり得る。`backend_queue_oldest_created_at`はqueue全体の最古時刻であり、公開順序の
+依存itemにより待機中のrefも含む。滞留アラートは、同一hostの低優先度PUTにブロックされて
+いない最古itemを基準とする。運用では両方を確認し、raw ageだけで障害と判定しない。
+Prometheus形式では`majutsu_cluster_backend_queue_oldest_age_seconds`がraw age、
+`majutsu_cluster_backend_queue_oldest_unblocked_age_seconds`がアラート判定用ageを表す。
 
 運用上の受入基準は、masterが返す`master_durable` ACK以降の一次保全RPOを0とし、二次S3
 バックアップのRPO上限を既定の1時間または1 GiB到達までの短い方とする。master再起動後は
@@ -260,8 +264,9 @@ tokenはログへ出さない。listenerはLAN／VPN内だけから到達可能�
 public networkへ公開しない。
 
 ACK意味論の変更に伴いcluster protocolはv2である。v1とv2はfail-fastし、slave queueを保持する。
-upgrade時はslave daemonを停止してqueueを保持し、masterを`0.8.2`へ更新してからslaveを更新する。
-v2ではslaveのremote sync cacheを更新し、同期時の存在判定にはmaster-local専用LISTを使うため、
+互換性のあるreleaseへupgradeする場合はslave daemonを停止してqueueを保持し、masterを先行更新する。
+slaveの更新要否はrelease noteに従う。v2への初回upgradeではslaveのremote sync cacheを更新し、
+同期時の存在判定にはmaster-local専用LISTを使うため、
 最初のfull syncで現在参照されるobjectがS3だけに存在していてもslaveからmasterへ再複製される。
 全nodeの更新後、各slaveで`mj sync --wait`を完了させ、master-local ACK、S3 lag、
 clone／restoreを確認してdaemonを通常運用へ戻す。

@@ -160,6 +160,8 @@ struct BackendQueueStats {
     bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     oldest_created_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_unblocked_created_at: Option<DateTime<Utc>>,
     retrying: usize,
 }
 
@@ -1514,6 +1516,10 @@ pub(crate) fn cluster_status_cmd(paths: &Paths, json: bool) -> Result<()> {
         "backend_queue_oldest_created_at {}",
         json_optional_string(&queue["oldest_created_at"])
     );
+    println!(
+        "backend_queue_oldest_unblocked_created_at {}",
+        json_optional_string(&queue["oldest_unblocked_created_at"])
+    );
     let retained = &value["retained_deleted"];
     println!(
         "retained_deleted_objects {}",
@@ -1595,6 +1601,10 @@ pub(crate) fn cluster_metrics_cmd(paths: &Paths) -> Result<()> {
     println!(
         "majutsu_cluster_backend_queue_oldest_age_seconds {}",
         json_age_seconds(&queue["oldest_created_at"])
+    );
+    println!(
+        "majutsu_cluster_backend_queue_oldest_unblocked_age_seconds {}",
+        json_age_seconds(&queue["oldest_unblocked_created_at"])
     );
     println!(
         "majutsu_cluster_retained_deleted_objects {}",
@@ -2965,8 +2975,12 @@ fn backend_queue_items(state: &MasterServerState) -> Result<Vec<(PathBuf, Backen
 }
 
 fn backend_queue_stats(state: &MasterServerState) -> Result<BackendQueueStats> {
-    let mut stats = BackendQueueStats::default();
-    for (_, item) in backend_queue_items(state)? {
+    let items = backend_queue_items(state)?;
+    let mut stats = BackendQueueStats {
+        oldest_unblocked_created_at: backend_queue_oldest_unblocked_created_at(&items),
+        ..BackendQueueStats::default()
+    };
+    for (_, item) in items {
         stats.objects += 1;
         if let BackendQueueOperation::Put { size, .. } = item.operation {
             stats.bytes = stats.bytes.saturating_add(size);
@@ -2980,6 +2994,40 @@ fn backend_queue_stats(state: &MasterServerState) -> Result<BackendQueueStats> {
         }
     }
     Ok(stats)
+}
+
+fn backend_queue_oldest_unblocked_created_at(
+    items: &[(PathBuf, BackendQueueItem)],
+) -> Option<DateTime<Utc>> {
+    // Match upload_backend_queue_item's per-host dependency gate. A ref held
+    // behind newer metadata must not make the actively draining queue look stale.
+    let mut lowest_put_priority_by_host = BTreeMap::<&str, u8>::new();
+    let mut hosts_with_pending_puts = BTreeSet::<&str>::new();
+    for (_, item) in items {
+        if matches!(&item.operation, BackendQueueOperation::Put { .. }) {
+            let priority = backend_publish_priority(&item.key);
+            lowest_put_priority_by_host
+                .entry(item.source_host.as_str())
+                .and_modify(|lowest| *lowest = (*lowest).min(priority))
+                .or_insert(priority);
+            hosts_with_pending_puts.insert(item.source_host.as_str());
+        }
+    }
+
+    items
+        .iter()
+        .filter_map(|(_, item)| {
+            let unblocked = match &item.operation {
+                BackendQueueOperation::Put { .. } => lowest_put_priority_by_host
+                    .get(item.source_host.as_str())
+                    .is_none_or(|lowest| *lowest >= backend_publish_priority(&item.key)),
+                BackendQueueOperation::Delete => {
+                    !hosts_with_pending_puts.contains(item.source_host.as_str())
+                }
+            };
+            unblocked.then_some(item.created_at)
+        })
+        .min()
 }
 
 fn backend_publish_priority(key: &str) -> u8 {
@@ -3706,8 +3754,10 @@ fn maybe_send_cluster_notice(state: &MasterServerState) -> Result<()> {
     {
         issue_codes.push("store-quota-high".to_string());
     }
+    // oldest_created_at intentionally remains the raw queue age; notices use
+    // the oldest item that is not waiting on a lower-priority PUT.
     let lag_secs = queue
-        .oldest_created_at
+        .oldest_unblocked_created_at
         .map(|created_at| {
             Utc::now()
                 .signed_duration_since(created_at)
@@ -3952,6 +4002,43 @@ mod tests {
         assert!(marker.sent_at.is_some());
         assert!(marker.last_attempt_at.is_none());
         assert_eq!(marker.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn backend_lag_age_ignores_old_ref_blocked_by_newer_metadata() {
+        let now = Utc::now();
+        let old_ref_at = now - ChronoDuration::hours(3);
+        let recent_metadata_at = now - ChronoDuration::minutes(30);
+        let put_item = |key: &str, source_host: &str, created_at| BackendQueueItem {
+            version: BACKEND_QUEUE_VERSION,
+            generation: "test-generation".into(),
+            key: key.into(),
+            source_host: source_host.into(),
+            operation: BackendQueueOperation::Put {
+                digest: "0".repeat(64),
+                size: 1,
+                conditional: false,
+            },
+            created_at,
+            updated_at: created_at,
+            attempts: 0,
+            retry_after: None,
+        };
+        let old_ref = put_item("host-a/refs/current", "host-a", old_ref_at);
+        let recent_metadata = put_item("host-a/metadata/export.json", "host-a", recent_metadata_at);
+        let queued = vec![
+            (PathBuf::new(), old_ref.clone()),
+            (PathBuf::new(), recent_metadata),
+        ];
+
+        let unblocked_oldest = backend_queue_oldest_unblocked_created_at(&queued).unwrap();
+        assert_eq!(unblocked_oldest, recent_metadata_at);
+        assert!(now.signed_duration_since(unblocked_oldest).num_seconds() < 7200);
+        let ref_only_oldest =
+            backend_queue_oldest_unblocked_created_at(&[(PathBuf::new(), old_ref.clone())])
+                .unwrap();
+        assert!(now.signed_duration_since(ref_only_oldest).num_seconds() >= 7200);
+        assert_eq!(ref_only_oldest, old_ref_at);
     }
 
     #[test]
