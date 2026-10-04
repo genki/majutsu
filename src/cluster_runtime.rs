@@ -41,6 +41,7 @@ const DEFAULT_BACKEND_DEDUPE_LIST_MIN_OBJECTS: usize = 32;
 const BACKEND_QUEUE_VERSION: u32 = 1;
 const LOCAL_GC_VERSION: u32 = 1;
 const DEFAULT_LOCAL_DELETE_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_LOCAL_GC_CATALOG_REFRESH_SECS: u64 = 300;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ClusterRequestFrame {
@@ -165,6 +166,50 @@ struct BackendQueueStats {
     retrying: usize,
 }
 
+#[derive(Debug, Default)]
+struct BackendQueueDependencies {
+    earliest_put_updated_at_by_host: BTreeMap<String, [Option<DateTime<Utc>>; 4]>,
+}
+
+impl BackendQueueDependencies {
+    fn from_items(items: &[(PathBuf, BackendQueueItem)]) -> Self {
+        let mut dependencies = Self::default();
+        for (_, item) in items {
+            if !matches!(&item.operation, BackendQueueOperation::Put { .. }) {
+                continue;
+            }
+            let priority = backend_publish_priority(&item.key) as usize;
+            let by_priority = dependencies
+                .earliest_put_updated_at_by_host
+                .entry(item.source_host.clone())
+                .or_insert_with(|| std::array::from_fn(|_| None));
+            let earliest = &mut by_priority[priority];
+            if earliest
+                .as_ref()
+                .is_none_or(|current| item.updated_at < *current)
+            {
+                *earliest = Some(item.updated_at);
+            }
+        }
+        dependencies
+    }
+
+    fn blocks(&self, item: &BackendQueueItem) -> bool {
+        let Some(by_priority) = self.earliest_put_updated_at_by_host.get(&item.source_host) else {
+            return false;
+        };
+        match &item.operation {
+            // 同じhostにpending PUTがある間は、従来どおりDELETEを保留する。
+            BackendQueueOperation::Delete => true,
+            BackendQueueOperation::Put { .. } => by_priority
+                .iter()
+                .take(backend_publish_priority(&item.key) as usize)
+                .flatten()
+                .any(|updated_at| updated_at <= &item.updated_at),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalGcItem {
     version: u32,
@@ -175,6 +220,52 @@ struct LocalGcItem {
     size: u64,
     deleted_from_backend_at: DateTime<Utc>,
     delete_after: DateTime<Utc>,
+}
+
+// 永続JSONを正とし、key・時刻・容量の索引だけを共有して全件走査の反復を避ける。
+#[derive(Default)]
+struct LocalGcCatalog {
+    items: BTreeMap<String, LocalGcItem>,
+    deleted_at: BTreeSet<(DateTime<Utc>, String)>,
+    delete_after: BTreeSet<(DateTime<Utc>, String)>,
+    bytes: u64,
+}
+
+impl LocalGcCatalog {
+    fn insert(&mut self, item: LocalGcItem) {
+        self.remove(&item.key);
+        self.bytes = self.bytes.saturating_add(item.size);
+        self.deleted_at
+            .insert((item.deleted_from_backend_at, item.key.clone()));
+        self.delete_after
+            .insert((item.delete_after, item.key.clone()));
+        self.items.insert(item.key.clone(), item);
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(item) = self.items.remove(key) {
+            self.bytes = self.bytes.saturating_sub(item.size);
+            self.deleted_at
+                .remove(&(item.deleted_from_backend_at, item.key.clone()));
+            self.delete_after.remove(&(item.delete_after, item.key));
+        }
+    }
+
+    fn stats(&self) -> LocalGcStats {
+        LocalGcStats {
+            objects: self.items.len(),
+            bytes: self.bytes,
+            oldest_deleted_from_backend_at: self.deleted_at.first().map(|(at, _)| *at),
+            next_delete_after: self.delete_after.first().map(|(at, _)| *at),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LocalGcCatalogCache {
+    catalog: Option<LocalGcCatalog>,
+    last_refresh_attempt: Option<Instant>,
+    error: Option<String>,
 }
 
 // payloadを変更する前に転送意図を保存する。ACK前の停止でも再生できる。
@@ -1181,6 +1272,7 @@ struct MasterServerState {
     write_intent_dir: PathBuf,
     backend_receipt_dir: PathBuf,
     local_gc_dir: PathBuf,
+    local_gc_catalog: Mutex<LocalGcCatalogCache>,
     status_path: PathBuf,
     flush_request_path: PathBuf,
     store_bytes: AtomicU64,
@@ -1336,6 +1428,7 @@ fn master_server_state(paths: &Paths, config: &Config) -> Result<Arc<MasterServe
         write_intent_dir,
         backend_receipt_dir,
         local_gc_dir,
+        local_gc_catalog: Mutex::new(LocalGcCatalogCache::default()),
         metrics: Mutex::new(read_master_metrics(&status_path)),
         last_status_write: Mutex::new(None),
         client_limiter: Arc::new(ClientLimiter::new(cluster_max_clients())),
@@ -2751,8 +2844,29 @@ fn read_local_gc_item_optional(path: &Path) -> Result<Option<LocalGcItem>> {
     }
 }
 
-fn local_gc_items(state: &MasterServerState) -> Result<Vec<(PathBuf, LocalGcItem)>> {
-    let mut items = Vec::new();
+fn validate_local_gc_item(
+    state: &MasterServerState,
+    path: &Path,
+    item: &LocalGcItem,
+) -> Result<()> {
+    if item.version != LOCAL_GC_VERSION {
+        bail!(
+            "unsupported cluster local GC version {} in {}",
+            item.version,
+            path.display()
+        );
+    }
+    if local_gc_path(state, &item.key) != path {
+        bail!(
+            "cluster local GC key does not match filename: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn load_local_gc_catalog(state: &MasterServerState) -> Result<LocalGcCatalog> {
+    let mut catalog = LocalGcCatalog::default();
     for entry in fs::read_dir(&state.local_gc_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -2766,45 +2880,73 @@ fn local_gc_items(state: &MasterServerState) -> Result<Vec<(PathBuf, LocalGcItem
         let Some(item) = read_local_gc_item_optional(&path)? else {
             continue;
         };
-        if item.version != LOCAL_GC_VERSION {
-            bail!(
-                "unsupported cluster local GC version {} in {}",
-                item.version,
-                path.display()
-            );
-        }
-        if local_gc_path(state, &item.key) != path {
-            bail!(
-                "cluster local GC key does not match filename: {}",
-                path.display()
-            );
-        }
-        items.push((path, item));
+        validate_local_gc_item(state, &path, &item)?;
+        catalog.insert(item);
     }
-    items.sort_by(|left, right| {
-        left.1
-            .delete_after
-            .cmp(&right.1.delete_after)
-            .then_with(|| left.1.key.cmp(&right.1.key))
+    Ok(catalog)
+}
+
+fn with_local_gc_catalog<T>(
+    state: &MasterServerState,
+    read: impl FnOnce(&LocalGcCatalog) -> T,
+) -> Result<T> {
+    let mut cache = state
+        .local_gc_catalog
+        .lock()
+        .map_err(|_| anyhow!("master local GC catalog lock poisoned"))?;
+    let refresh_secs = env_u64(
+        "MAJUTSU_CLUSTER_LOCAL_GC_CATALOG_REFRESH_SECS",
+        DEFAULT_LOCAL_GC_CATALOG_REFRESH_SECS,
+    )
+    .max(1);
+    // 破損時も要求ごとの再走査を避けるが、修復の検出は最大30秒で再試行する。
+    let interval = Duration::from_secs(if cache.error.is_some() {
+        refresh_secs.min(30)
+    } else {
+        refresh_secs
     });
-    Ok(items)
+    if cache
+        .last_refresh_attempt
+        .is_none_or(|last| last.elapsed() >= interval)
+    {
+        // このlockからdurable_lockは取得しない。書込み側は永続化後に同じ索引を更新する。
+        match load_local_gc_catalog(state) {
+            Ok(catalog) => {
+                cache.catalog = Some(catalog);
+                cache.error = None;
+            }
+            Err(err) => cache.error = Some(format!("{err:#}")),
+        }
+        cache.last_refresh_attempt = Some(Instant::now());
+    }
+    if let Some(error) = &cache.error {
+        bail!("{error}");
+    }
+    Ok(read(cache.catalog.as_ref().ok_or_else(|| {
+        anyhow!("master local GC catalog is not initialized")
+    })?))
+}
+
+fn update_local_gc_catalog(
+    state: &MasterServerState,
+    key: &str,
+    item: Option<LocalGcItem>,
+) -> Result<()> {
+    let mut cache = state
+        .local_gc_catalog
+        .lock()
+        .map_err(|_| anyhow!("master local GC catalog lock poisoned"))?;
+    if let Some(catalog) = &mut cache.catalog {
+        match item {
+            Some(item) => catalog.insert(item),
+            None => catalog.remove(key),
+        }
+    }
+    Ok(())
 }
 
 fn local_gc_stats(state: &MasterServerState) -> Result<LocalGcStats> {
-    let mut stats = LocalGcStats::default();
-    for (_, item) in local_gc_items(state)? {
-        stats.objects += 1;
-        stats.bytes = stats.bytes.saturating_add(item.size);
-        stats.oldest_deleted_from_backend_at = stats
-            .oldest_deleted_from_backend_at
-            .map(|current| current.min(item.deleted_from_backend_at))
-            .or(Some(item.deleted_from_backend_at));
-        stats.next_delete_after = stats
-            .next_delete_after
-            .map(|current| current.min(item.delete_after))
-            .or(Some(item.delete_after));
-    }
-    Ok(stats)
+    with_local_gc_catalog(state, LocalGcCatalog::stats)
 }
 
 fn local_delete_grace() -> Duration {
@@ -2831,21 +2973,25 @@ fn logically_deleted_keys(state: &MasterServerState, prefix: &str) -> Result<BTr
         })
         .map(|(_, item)| item.key)
         .collect::<BTreeSet<_>>();
-    keys.extend(
-        local_gc_items(state)?
-            .into_iter()
-            .filter(|(_, item)| item.key.starts_with(prefix))
-            .map(|(_, item)| item.key),
-    );
+    keys.extend(with_local_gc_catalog(state, |catalog| {
+        catalog
+            .items
+            .range(prefix.to_string()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>()
+    })?);
     Ok(keys)
 }
 
 fn cancel_local_gc(state: &MasterServerState, key: &str) -> Result<bool> {
     let path = local_gc_path(state, key);
     if !path.exists() {
+        update_local_gc_catalog(state, key, None)?;
         return Ok(false);
     }
     remove_backend_queue_file(&path)?;
+    update_local_gc_catalog(state, key, None)?;
     Ok(true)
 }
 
@@ -2854,7 +3000,8 @@ fn retain_local_after_backend_delete(
     item: &BackendQueueItem,
 ) -> Result<()> {
     let Some(bytes) = state.store.get_optional(&item.key)? else {
-        let _ = remove_backend_queue_file(&local_gc_path(state, &item.key));
+        remove_backend_queue_file(&local_gc_path(state, &item.key))?;
+        update_local_gc_catalog(state, &item.key, None)?;
         return Ok(());
     };
     let now = Utc::now();
@@ -2873,29 +3020,59 @@ fn retain_local_after_backend_delete(
     crate::atomic_io::write_atomic(
         &local_gc_path(state, &item.key),
         &serde_json::to_vec_pretty(&retained)?,
-    )
+    )?;
+    update_local_gc_catalog(state, &item.key, Some(retained))
 }
 
 fn run_local_gc(state: &MasterServerState) -> Result<usize> {
     let now = Utc::now();
     let mut removed = 0usize;
-    for (path, item) in local_gc_items(state)? {
-        if item.delete_after > now {
-            continue;
-        }
+    let due = with_local_gc_catalog(state, |catalog| {
+        catalog
+            .delete_after
+            .iter()
+            .take_while(|(at, _)| *at <= now)
+            .filter_map(|(_, key)| catalog.items.get(key).cloned())
+            .collect::<Vec<_>>()
+    })?;
+    for item in due {
+        let path = local_gc_path(state, &item.key);
         let _guard = state
             .durable_lock
             .lock()
             .map_err(|_| anyhow!("master durable store lock poisoned"))?;
-        let Some(current) = read_local_gc_item_optional(&path)? else {
+        let current = read_local_gc_item_optional(&path).and_then(|current| {
+            if let Some(item) = &current {
+                validate_local_gc_item(state, &path, item)?;
+            }
+            Ok(current)
+        });
+        let Some(current) = (match current {
+            Ok(current) => current,
+            Err(err) => {
+                // 期限到来分の再確認で発見した破損も、次のstatus・通知へ即時反映する。
+                let mut cache = state
+                    .local_gc_catalog
+                    .lock()
+                    .map_err(|_| anyhow!("master local GC catalog lock poisoned"))?;
+                cache.error = Some(format!("{err:#}"));
+                cache.last_refresh_attempt = Some(Instant::now());
+                return Err(err);
+            }
+        }) else {
+            update_local_gc_catalog(state, &item.key, None)?;
             continue;
         };
-        if current.generation != item.generation || backend_queue_path(state, &item.key).exists() {
+        if current.generation != item.generation || current.delete_after > now {
+            update_local_gc_catalog(state, &item.key, Some(current))?;
+            continue;
+        }
+        if backend_queue_path(state, &item.key).exists() {
             continue;
         }
         if let Some(bytes) = state.store.get_optional(&item.key)? {
             let digest = blake3::hash(&bytes).to_hex().to_string();
-            if digest == item.digest {
+            if digest == current.digest {
                 state.store.delete(&item.key)?;
                 crate::atomic_io::fsync_parent_dir(&state.store_dir.join(&item.key))?;
                 update_store_bytes(state, bytes.len() as u64, 0);
@@ -2903,6 +3080,7 @@ fn run_local_gc(state: &MasterServerState) -> Result<usize> {
             }
         }
         remove_backend_queue_file(&path)?;
+        update_local_gc_catalog(state, &item.key, None)?;
     }
     Ok(removed)
 }
@@ -2999,34 +3177,11 @@ fn backend_queue_stats(state: &MasterServerState) -> Result<BackendQueueStats> {
 fn backend_queue_oldest_unblocked_created_at(
     items: &[(PathBuf, BackendQueueItem)],
 ) -> Option<DateTime<Utc>> {
-    // Match upload_backend_queue_item's per-host dependency gate. A ref held
-    // behind newer metadata must not make the actively draining queue look stale.
-    let mut lowest_put_priority_by_host = BTreeMap::<&str, u8>::new();
-    let mut hosts_with_pending_puts = BTreeSet::<&str>::new();
-    for (_, item) in items {
-        if matches!(&item.operation, BackendQueueOperation::Put { .. }) {
-            let priority = backend_publish_priority(&item.key);
-            lowest_put_priority_by_host
-                .entry(item.source_host.as_str())
-                .and_modify(|lowest| *lowest = (*lowest).min(priority))
-                .or_insert(priority);
-            hosts_with_pending_puts.insert(item.source_host.as_str());
-        }
-    }
-
+    let dependencies = BackendQueueDependencies::from_items(items);
     items
         .iter()
-        .filter_map(|(_, item)| {
-            let unblocked = match &item.operation {
-                BackendQueueOperation::Put { .. } => lowest_put_priority_by_host
-                    .get(item.source_host.as_str())
-                    .is_none_or(|lowest| *lowest >= backend_publish_priority(&item.key)),
-                BackendQueueOperation::Delete => {
-                    !hosts_with_pending_puts.contains(item.source_host.as_str())
-                }
-            };
-            unblocked.then_some(item.created_at)
-        })
+        .filter(|(_, item)| !dependencies.blocks(item))
+        .map(|(_, item)| item.created_at)
         .min()
 }
 
@@ -3182,81 +3337,155 @@ fn drain_backend_queue(state: &MasterServerState, force: bool) -> Result<usize> 
     if !force && !backend_flush_due(&stats, now) {
         return Ok(0);
     }
-    let queued = backend_queue_items(state)?;
-    // Deletes for a host remain blocked while that host has pending PUTs. Do
-    // not let those blocked deletes occupy every batch slot: otherwise the
-    // same prefix is selected forever and the PUTs they depend on starve.
-    let hosts_with_pending_puts = queued
+    let max_objects = backend_flush_max_objects();
+    let initial_queue = backend_queue_items(state)?;
+    let initial_put_hosts = initial_queue
         .iter()
-        .filter(|(_, item)| matches!(&item.operation, BackendQueueOperation::Put { .. }))
+        .filter(|(_, item)| matches!(item.operation, BackendQueueOperation::Put { .. }))
         .map(|(_, item)| item.source_host.clone())
         .collect::<BTreeSet<_>>();
-    let selected = queued
-        .into_iter()
-        .filter(|(_, item)| {
-            !matches!(&item.operation, BackendQueueOperation::Delete)
-                || !hosts_with_pending_puts.contains(&item.source_host)
-        })
-        .filter(|(_, item)| {
-            force
-                || item
-                    .retry_after
-                    .is_none_or(|retry_after| retry_after <= now)
-        })
-        .take(backend_flush_max_objects())
-        .collect::<Vec<_>>();
-    let existing_backend_keys = list_existing_conditional_backend_keys(state, &selected);
+    let mut queued_snapshot = Some(initial_queue);
+    let mut selected_objects = 0usize;
     let mut completed = 0usize;
-    let mut first_error = None;
-    let mut delete_items = Vec::new();
-    for (path, item) in selected {
-        if item.operation == BackendQueueOperation::Delete {
-            delete_items.push((path, item));
-            continue;
+    while selected_objects < max_objects {
+        let queued = match queued_snapshot.take() {
+            Some(queued) => queued,
+            None => backend_queue_items(state)?,
+        };
+        let dependencies = BackendQueueDependencies::from_items(&queued);
+        let selected = queued
+            .into_iter()
+            .filter(|(_, item)| !dependencies.blocks(item))
+            .filter(|(_, item)| {
+                !matches!(item.operation, BackendQueueOperation::Delete)
+                    || !initial_put_hosts.contains(&item.source_host)
+            })
+            .filter(|(_, item)| {
+                force
+                    || item
+                        .retry_after
+                        .is_none_or(|retry_after| retry_after <= now)
+            })
+            .take(max_objects - selected_objects)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            break;
         }
-        let skip_existing = matches!(
-            item.operation,
-            BackendQueueOperation::Put {
-                conditional: true,
-                ..
+        selected_objects += selected.len();
+        let existing_backend_keys = list_existing_conditional_backend_keys(state, &selected);
+        let mut round_completed = 0usize;
+        let mut first_error = None;
+        let mut delete_items = Vec::new();
+        let mut upload_items_by_priority = BTreeMap::<u8, Vec<(PathBuf, BackendQueueItem)>>::new();
+        for (path, item) in selected {
+            if item.operation == BackendQueueOperation::Delete {
+                delete_items.push((path, item));
+            } else {
+                upload_items_by_priority
+                    .entry(backend_publish_priority(&item.key))
+                    .or_default()
+                    .push((path, item));
             }
-        ) && existing_backend_keys
-            .get(&item.source_host)
-            .is_some_and(|keys| keys.contains(&item.key));
-        if skip_existing {
-            if complete_backend_queue_item_without_upload(state, &path, &item)? {
-                completed += 1;
-                record_backend_success(state, &item, true);
-            }
-            continue;
         }
-        match upload_backend_queue_item(state, &path, &item) {
-            Ok(true) => {
-                completed += 1;
-                record_backend_success(state, &item, false);
-            }
-            Ok(false) => {}
-            Err(err) => {
-                record_backend_queue_failure(state, &path, &item, &err)?;
-                record_backend_error(state, Some(&item.source_host), &err);
-                write_master_status(state)?;
-                if first_error.is_none() {
-                    first_error = Some(err);
+
+        // 先行する優先度のPUTを完了してから次の層を公開する。
+        // 同じ層のitemは独立しており、設定済みのbackend並列数を使用できる。
+        for (_, candidates) in upload_items_by_priority {
+            let mut upload_items = Vec::new();
+            for (path, item) in candidates {
+                let skip_existing = matches!(
+                    item.operation,
+                    BackendQueueOperation::Put {
+                        conditional: true,
+                        ..
+                    }
+                ) && existing_backend_keys
+                    .get(&item.source_host)
+                    .is_some_and(|keys| keys.contains(&item.key));
+                if skip_existing {
+                    if complete_backend_queue_item_without_upload(state, &path, &item)? {
+                        round_completed += 1;
+                        record_backend_success(state, &item, true);
+                    }
+                } else {
+                    upload_items.push((path, item));
                 }
             }
+            for upload_batch in upload_items.chunks(state.backend_gate.max_concurrency.max(1)) {
+                let upload_results = run_backend_queue_upload_batch(upload_batch, |path, item| {
+                    upload_backend_queue_item(state, path, item, &dependencies)
+                });
+                for ((path, item), result) in upload_batch.iter().zip(upload_results) {
+                    match result {
+                        Ok(true) => {
+                            round_completed += 1;
+                            record_backend_success(state, item, false);
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            record_backend_queue_failure(state, path, item, &err)?;
+                            record_backend_error(state, Some(&item.source_host), &err);
+                            write_master_status(state)?;
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                }
+                write_master_status_throttled(state)?;
+            }
+            if first_error.is_some() {
+                break;
+            }
+        }
+        if first_error.is_none() {
+            match upload_backend_delete_items(state, &delete_items, &dependencies) {
+                Ok(count) => round_completed = round_completed.saturating_add(count),
+                Err(err) => first_error = Some(err),
+            }
+        }
+        completed = completed.saturating_add(round_completed);
+        write_master_status(state)?;
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        if round_completed == 0 {
+            break;
         }
     }
-    completed = completed.saturating_add(upload_backend_delete_items(state, &delete_items)?);
-    write_master_status(state)?;
-    if let Some(err) = first_error {
-        return Err(err);
-    }
     Ok(completed)
+}
+
+fn run_backend_queue_upload_batch<F>(
+    items: &[(PathBuf, BackendQueueItem)],
+    upload: F,
+) -> Vec<Result<bool>>
+where
+    F: Fn(&Path, &BackendQueueItem) -> Result<bool> + Sync,
+{
+    thread::scope(|scope| {
+        let handles = items
+            .iter()
+            .map(|(path, item)| {
+                let upload = &upload;
+                scope.spawn(move || upload(path, item))
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow!("backend queue upload worker panicked")))
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 fn upload_backend_delete_items(
     state: &MasterServerState,
     items: &[(PathBuf, BackendQueueItem)],
+    dependencies: &BackendQueueDependencies,
 ) -> Result<usize> {
     if items.is_empty() {
         return Ok(0);
@@ -3266,14 +3495,17 @@ fn upload_backend_delete_items(
         || items.len() == 1
         || !state.backend_batch_delete_enabled.load(Ordering::Relaxed)
     {
-        return upload_backend_delete_items_individually(state, items);
+        return upload_backend_delete_items_individually(state, items, dependencies);
     }
 
     let mut completed = 0usize;
     for chunk in items.chunks(batch_max) {
         if !state.backend_batch_delete_enabled.load(Ordering::Relaxed) {
-            completed =
-                completed.saturating_add(upload_backend_delete_items_individually(state, chunk)?);
+            completed = completed.saturating_add(upload_backend_delete_items_individually(
+                state,
+                chunk,
+                dependencies,
+            )?);
             continue;
         }
         let active = {
@@ -3325,8 +3557,11 @@ fn upload_backend_delete_items(
                 eprintln!(
                     "cluster backend multi-object delete unavailable: {err:#}; using individual DELETE for this process"
                 );
-                completed = completed
-                    .saturating_add(upload_backend_delete_items_individually(state, &active)?);
+                completed = completed.saturating_add(upload_backend_delete_items_individually(
+                    state,
+                    &active,
+                    dependencies,
+                )?);
                 continue;
             }
             Err(err) => {
@@ -3381,10 +3616,25 @@ fn upload_backend_delete_items(
 fn upload_backend_delete_items_individually(
     state: &MasterServerState,
     items: &[(PathBuf, BackendQueueItem)],
+    dependencies: &BackendQueueDependencies,
 ) -> Result<usize> {
+    let pending_hosts = {
+        let _guard = state
+            .durable_lock
+            .lock()
+            .map_err(|_| anyhow!("master durable store lock poisoned"))?;
+        backend_queue_items(state)?
+            .into_iter()
+            .filter(|(_, item)| matches!(item.operation, BackendQueueOperation::Put { .. }))
+            .map(|(_, item)| item.source_host)
+            .collect::<BTreeSet<_>>()
+    };
     let mut completed = 0usize;
     for (path, item) in items {
-        match upload_backend_queue_item(state, path, item) {
+        if pending_hosts.contains(&item.source_host) || dependencies.blocks(item) {
+            continue;
+        }
+        match upload_backend_queue_item(state, path, item, dependencies) {
             Ok(true) => {
                 completed += 1;
                 record_backend_success(state, item, false);
@@ -3463,6 +3713,7 @@ fn upload_backend_queue_item(
     state: &MasterServerState,
     path: &Path,
     item: &BackendQueueItem,
+    dependencies: &BackendQueueDependencies,
 ) -> Result<bool> {
     let payload = {
         let _guard = state
@@ -3475,17 +3726,9 @@ fn upload_backend_queue_item(
         if current.generation != item.generation {
             return Ok(false);
         }
-        // retry待ち・選択上限の外にある依存層も含めて公開を保留する。
-        // 他hostの失敗では止めず、同じhostのcontent→metadata/journal→refだけを順序付ける。
-        let priority = backend_publish_priority(&item.key);
-        if (priority > 1 || item.operation == BackendQueueOperation::Delete)
-            && backend_queue_items(state)?.iter().any(|(_, dependency)| {
-                dependency.source_host == item.source_host
-                    && matches!(dependency.operation, BackendQueueOperation::Put { .. })
-                    && (item.operation == BackendQueueOperation::Delete
-                        || backend_publish_priority(&dependency.key) < priority)
-            })
-        {
+        // retry待ち・選択上限外も含めたflush開始時の依存索引を再利用する。
+        // 後から追加されたcontentは先行するmetadata/refの依存ではない。
+        if dependencies.blocks(item) {
             return Ok(false);
         }
         match &item.operation {
@@ -4005,6 +4248,109 @@ mod tests {
     }
 
     #[test]
+    fn backend_queue_upload_batch_uses_configured_concurrency() {
+        let now = Utc::now();
+        let items = (0..8)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("queue-{index}.json")),
+                    BackendQueueItem {
+                        version: BACKEND_QUEUE_VERSION,
+                        generation: format!("generation-{index}"),
+                        key: format!("host-a/objects/{index}"),
+                        source_host: "host-a".into(),
+                        operation: BackendQueueOperation::Put {
+                            digest: "0".repeat(64),
+                            size: 1,
+                            conditional: false,
+                        },
+                        created_at: now,
+                        updated_at: now,
+                        attempts: 0,
+                        retry_after: None,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let active = AtomicUsize::new(0);
+        let peak_active = AtomicUsize::new(0);
+
+        let results = items
+            .chunks(4)
+            .flat_map(|batch| {
+                run_backend_queue_upload_batch(batch, |_, _| {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_active.fetch_max(current, Ordering::SeqCst);
+                    barrier.wait();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), items.len());
+        assert!(results.into_iter().all(|result| result.unwrap()));
+        assert_eq!(peak_active.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn newer_content_does_not_block_older_metadata_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let backend_root = root.path().join("backend");
+        let state = test_master_state(root.path(), &backend_root);
+        let now = Utc::now();
+        let metadata_key = "test-host/metadata/export.json";
+        let content_key = "test-host/objects/blobs/aa/bb";
+        dispatch_operation(
+            &state,
+            "test-host",
+            ClusterOperation::BatchPut {
+                items: vec![
+                    ClusterPutItem {
+                        key: metadata_key.into(),
+                        bytes: b"older metadata".to_vec(),
+                        conditional: false,
+                    },
+                    ClusterPutItem {
+                        key: content_key.into(),
+                        bytes: b"newer content".to_vec(),
+                        conditional: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let metadata_at = now - ChronoDuration::hours(3);
+        let newer_content_at = now - ChronoDuration::minutes(1);
+        for (path, mut item) in backend_queue_items(&state).unwrap() {
+            if item.key == metadata_key {
+                item.created_at = metadata_at;
+                item.updated_at = metadata_at;
+            } else {
+                item.created_at = newer_content_at;
+                item.updated_at = newer_content_at;
+                item.attempts = 1;
+                item.retry_after = Some(now + ChronoDuration::hours(1));
+            }
+            crate::atomic_io::write_atomic(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        }
+
+        assert_eq!(
+            backend_queue_oldest_unblocked_created_at(&backend_queue_items(&state).unwrap()),
+            Some(metadata_at)
+        );
+        assert_eq!(drain_backend_queue(&state, false).unwrap(), 1);
+        assert!(
+            backend_root
+                .join("test-host/metadata/export.json")
+                .is_file()
+        );
+        assert!(!backend_root.join("test-host/objects/blobs/aa/bb").exists());
+        assert_eq!(backend_queue_stats(&state).unwrap().objects, 1);
+    }
+
+    #[test]
     fn backend_lag_age_ignores_old_ref_blocked_by_newer_metadata() {
         let now = Utc::now();
         let old_ref_at = now - ChronoDuration::hours(3);
@@ -4024,7 +4370,8 @@ mod tests {
             attempts: 0,
             retry_after: None,
         };
-        let old_ref = put_item("host-a/refs/current", "host-a", old_ref_at);
+        let mut old_ref = put_item("host-a/refs/current", "host-a", old_ref_at);
+        old_ref.updated_at = recent_metadata_at;
         let recent_metadata = put_item("host-a/metadata/export.json", "host-a", recent_metadata_at);
         let queued = vec![
             (PathBuf::new(), old_ref.clone()),
@@ -4151,6 +4498,7 @@ mod tests {
             write_intent_dir,
             backend_receipt_dir,
             local_gc_dir,
+            local_gc_catalog: Mutex::new(LocalGcCatalogCache::default()),
             status_path: runtime_dir.join("cluster-master-status.json"),
             flush_request_path: runtime_dir.join("cluster-backend-flush.request"),
             store_bytes: AtomicU64::new(store_bytes),
@@ -4173,6 +4521,293 @@ mod tests {
             ClusterValue::BatchPut(results) => results,
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    fn expire_test_local_gc_catalog(state: &MasterServerState) {
+        state.local_gc_catalog.lock().unwrap().last_refresh_attempt = None;
+    }
+
+    fn write_test_local_gc(
+        state: &MasterServerState,
+        key: &str,
+        bytes: &[u8],
+        delete_after: DateTime<Utc>,
+    ) -> LocalGcItem {
+        state.store.put(key, bytes).unwrap();
+        let item = LocalGcItem {
+            version: LOCAL_GC_VERSION,
+            generation: Uuid::new_v4().to_string(),
+            key: key.into(),
+            source_host: key.split('/').next().unwrap().into(),
+            digest: blake3::hash(bytes).to_hex().to_string(),
+            size: bytes.len() as u64,
+            deleted_from_backend_at: delete_after - ChronoDuration::days(7),
+            delete_after,
+        };
+        crate::atomic_io::write_atomic(
+            &local_gc_path(state, key),
+            &serde_json::to_vec(&item).unwrap(),
+        )
+        .unwrap();
+        item
+    }
+
+    #[test]
+    fn local_gc_catalog_replacement_updates_size_and_time_indexes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_master_state(root.path(), &root.path().join("backend"));
+        let now = Utc::now();
+        let first = write_test_local_gc(&state, "host-a/refs/old", b"aaa", now);
+        let second = write_test_local_gc(
+            &state,
+            "host-b/refs/old",
+            b"bb",
+            now + ChronoDuration::days(1),
+        );
+        let mut catalog = LocalGcCatalog::default();
+        catalog.insert(first.clone());
+        catalog.insert(second.clone());
+        assert_eq!(catalog.stats().bytes, 5);
+        assert_eq!(catalog.stats().next_delete_after, Some(now));
+        let mut replaced = first;
+        replaced.size = 7;
+        replaced.deleted_from_backend_at = second.deleted_from_backend_at + ChronoDuration::days(1);
+        replaced.delete_after = second.delete_after + ChronoDuration::days(1);
+        catalog.insert(replaced.clone());
+        let stats = catalog.stats();
+        assert_eq!(stats.objects, 2);
+        assert_eq!(stats.bytes, 9);
+        assert_eq!(stats.next_delete_after, Some(second.delete_after));
+        assert_eq!(
+            stats.oldest_deleted_from_backend_at,
+            Some(second.deleted_from_backend_at)
+        );
+        catalog.remove(&second.key);
+        assert_eq!(catalog.stats().bytes, 7);
+        assert_eq!(
+            catalog.stats().next_delete_after,
+            Some(replaced.delete_after)
+        );
+        catalog.remove(&replaced.key);
+        assert_eq!(catalog.stats().objects, 0);
+        assert_eq!(catalog.stats().bytes, 0);
+        assert!(catalog.stats().next_delete_after.is_none());
+        assert!(catalog.stats().oldest_deleted_from_backend_at.is_none());
+    }
+
+    #[test]
+    fn local_gc_catalog_reuses_index_and_detects_corruption_on_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_master_state(root.path(), &root.path().join("backend"));
+        let key = "host-a/refs/old";
+        let item = write_test_local_gc(&state, key, b"old", Utc::now() + ChronoDuration::days(1));
+        write_test_local_gc(
+            &state,
+            "host-b/refs/old",
+            b"another",
+            Utc::now() + ChronoDuration::days(1),
+        );
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 2);
+        let path = local_gc_path(&state, key);
+        crate::atomic_io::write_atomic(&path, b"invalid JSON").unwrap();
+        // 新鮮な索引のstatus・prefix・期限検査はtombstoneを読み直さない。
+        assert_eq!(local_gc_stats(&state).unwrap().bytes, 10);
+        assert_eq!(
+            logically_deleted_keys(&state, "host-a/").unwrap(),
+            BTreeSet::from([key.to_string()])
+        );
+        assert!(
+            logically_deleted_keys(&state, "missing/")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(logically_deleted_keys(&state, "").unwrap().len(), 2);
+        assert_eq!(run_local_gc(&state).unwrap(), 0);
+        expire_test_local_gc_catalog(&state);
+        assert!(local_gc_stats(&state).is_err());
+        assert!(logically_deleted_keys(&state, "host-a/").is_err());
+        write_master_status(&state).unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state.status_path).unwrap()).unwrap();
+        assert!(status["retained_deleted"].is_null());
+        assert!(
+            status["catalog_errors"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("local-gc:")
+        );
+        crate::atomic_io::write_atomic(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        // エラー状態は無検証で既存索引へ戻さない。
+        assert!(local_gc_stats(&state).is_err());
+        expire_test_local_gc_catalog(&state);
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 2);
+        let restarted = test_master_state(root.path(), &root.path().join("backend"));
+        assert_eq!(local_gc_stats(&restarted).unwrap().bytes, 10);
+    }
+
+    #[test]
+    fn local_gc_catalog_rejects_invalid_version_and_filename() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_master_state(root.path(), &root.path().join("backend"));
+        let key = "host-a/refs/old";
+        let mut item = write_test_local_gc(&state, key, b"old", Utc::now());
+        let path = local_gc_path(&state, key);
+        item.version += 1;
+        crate::atomic_io::write_atomic(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        assert!(
+            local_gc_stats(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
+        item.version = LOCAL_GC_VERSION;
+        item.key = "host-b/refs/old".into();
+        crate::atomic_io::write_atomic(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        expire_test_local_gc_catalog(&state);
+        assert!(
+            local_gc_stats(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("filename")
+        );
+    }
+
+    #[test]
+    fn local_gc_corrupt_due_item_invalidates_fresh_catalog_without_deleting_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_master_state(root.path(), &root.path().join("backend"));
+        let key = "test-host/refs/old";
+        write_test_local_gc(&state, key, b"old", Utc::now() - ChronoDuration::seconds(1));
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 1);
+        crate::atomic_io::write_atomic(&local_gc_path(&state, key), b"invalid JSON").unwrap();
+        assert!(run_local_gc(&state).is_err());
+        assert!(local_gc_stats(&state).is_err());
+        assert!(logically_deleted_keys(&state, "test-host/").is_err());
+        assert_eq!(state.store.get(key).unwrap(), b"old");
+    }
+
+    #[test]
+    fn local_gc_rechecks_generation_and_deadline_before_removing_payload() {
+        for replace_generation in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_master_state(root.path(), &root.path().join("backend"));
+            let key = "test-host/refs/old";
+            let mut item =
+                write_test_local_gc(&state, key, b"old", Utc::now() - ChronoDuration::seconds(1));
+            assert_eq!(local_gc_stats(&state).unwrap().objects, 1);
+            if replace_generation {
+                item.generation = Uuid::new_v4().to_string();
+            } else {
+                item.delete_after = Utc::now() + ChronoDuration::days(1);
+            }
+            crate::atomic_io::write_atomic(
+                &local_gc_path(&state, key),
+                &serde_json::to_vec(&item).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(run_local_gc(&state).unwrap(), 0);
+            assert_eq!(state.store.get(key).unwrap(), b"old");
+            assert_eq!(
+                local_gc_stats(&state).unwrap().next_delete_after,
+                Some(item.delete_after)
+            );
+        }
+    }
+
+    #[test]
+    fn local_gc_preserves_queued_or_changed_payload_and_reconciles_disappearance() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_master_state(root.path(), &root.path().join("backend"));
+        let due = Utc::now() - ChronoDuration::seconds(1);
+        let queued = "test-host/refs/queued";
+        let changed = "test-host/refs/changed";
+        let vanished = "test-host/refs/vanished";
+        for key in [queued, changed, vanished] {
+            write_test_local_gc(&state, key, b"old", due);
+        }
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 3);
+        enqueue_backend_delete(&state, "test-host", queued).unwrap();
+        state.store.put(changed, b"new").unwrap();
+        remove_backend_queue_file(&local_gc_path(&state, vanished)).unwrap();
+        assert_eq!(run_local_gc(&state).unwrap(), 0);
+        assert_eq!(state.store.get(queued).unwrap(), b"old");
+        assert_eq!(state.store.get(changed).unwrap(), b"new");
+        assert_eq!(state.store.get(vanished).unwrap(), b"old");
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 1);
+        assert!(local_gc_path(&state, queued).exists());
+        assert!(!local_gc_path(&state, changed).exists());
+    }
+
+    #[test]
+    fn put_cancels_retention_in_shared_catalog_and_publishes_again() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_master_state(root.path(), &root.path().join("backend"));
+        let key = "test-host/refs/old";
+        write_test_local_gc(&state, key, b"old", Utc::now() + ChronoDuration::days(1));
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 1);
+        dispatch_operation(
+            &state,
+            "test-host",
+            ClusterOperation::Put {
+                key: key.into(),
+                bytes: b"new".to_vec(),
+                conditional: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 0);
+        assert_eq!(local_gc_stats(&state).unwrap().bytes, 0);
+        assert!(
+            logically_deleted_keys(&state, "test-host/")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(backend_queue_stats(&state).unwrap().objects, 1);
+        assert_eq!(drain_backend_queue(&state, true).unwrap(), 1);
+        assert_eq!(state.backend.get(key).unwrap(), b"new");
+    }
+
+    #[test]
+    fn local_gc_catalog_concurrent_refresh_and_durable_changes_agree_with_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(test_master_state(root.path(), &root.path().join("backend")));
+        assert_eq!(local_gc_stats(&state).unwrap().objects, 0);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let reader_state = Arc::clone(&state);
+        let reader_barrier = Arc::clone(&barrier);
+        let reader = thread::spawn(move || {
+            reader_barrier.wait();
+            for _ in 0..64 {
+                expire_test_local_gc_catalog(&reader_state);
+                local_gc_stats(&reader_state).unwrap();
+                logically_deleted_keys(&reader_state, "test-host/").unwrap();
+            }
+        });
+        barrier.wait();
+        for index in 0..32 {
+            let _guard = state.durable_lock.lock().unwrap();
+            let key = format!("test-host/refs/old-{index}");
+            state.store.put(&key, b"old").unwrap();
+            enqueue_backend_delete(&state, "test-host", &key).unwrap();
+            let item = read_backend_queue_item_optional(&backend_queue_path(&state, &key))
+                .unwrap()
+                .unwrap();
+            retain_local_after_backend_delete(&state, &item).unwrap();
+            remove_backend_queue_file(&backend_queue_path(&state, &key)).unwrap();
+            if index % 2 == 0 {
+                cancel_local_gc(&state, &key).unwrap();
+            }
+        }
+        reader.join().unwrap();
+        let disk = load_local_gc_catalog(&state).unwrap();
+        let stats = local_gc_stats(&state).unwrap();
+        assert_eq!(stats.objects, 16);
+        assert_eq!(stats.bytes, disk.stats().bytes);
+        assert_eq!(stats.next_delete_after, disk.stats().next_delete_after);
+        assert_eq!(
+            logically_deleted_keys(&state, "test-host/").unwrap(),
+            disk.items.keys().cloned().collect()
+        );
     }
 
     #[test]
@@ -4649,6 +5284,7 @@ mod tests {
         let mut retained = read_local_gc_item_optional(&path).unwrap().unwrap();
         retained.delete_after = Utc::now() - ChronoDuration::seconds(1);
         crate::atomic_io::write_atomic(&path, &serde_json::to_vec(&retained).unwrap()).unwrap();
+        expire_test_local_gc_catalog(&state);
         assert_eq!(run_local_gc(&state).unwrap(), 1);
         assert!(!state.store.exists(key).unwrap());
         assert_eq!(local_gc_stats(&state).unwrap().objects, 0);

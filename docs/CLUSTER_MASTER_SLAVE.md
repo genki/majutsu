@@ -164,8 +164,16 @@ payloadはS3側DELETEの成功後も既定7日間保持し、`cluster/local-gc`�
 local GCは、保持期限の経過、同じkeyのbackend queueがないこと、payload digestがDELETE時と
 一致することをすべて確認してから実行する。
 
+tombstoneのkey・期限・容量を共有メモリ索引に保持し、status・通知・LIST・期限検査のたびに
+保持中の全JSONを読み直さない。通常の追加・取消・削除は永続化後に索引へ即時反映する。
+起動時と既定300秒間隔の再照合で永続JSONを検証し、破損時は既存の集計値や0件を返さず
+catalog errorと不明値を報告する。外部からの手動変更は次の再照合で検出し、エラー発生後は
+最大30秒間隔で再試行する。期限到来分だけを取り出すが、実体削除の直前にも永続tombstoneの
+世代・保持期限・payload digestを再確認するため、古い索引だけを根拠に削除しない。
+
 ```text
 MAJUTSU_CLUSTER_LOCAL_DELETE_GRACE_SECS=604800
+MAJUTSU_CLUSTER_LOCAL_GC_CATALOG_REFRESH_SECS=300
 ```
 
 ## 状態確認と手動flush
@@ -238,8 +246,11 @@ standalone profileのwatch同期は、従来どおり`sync --wait --timeout-secs
 
 S3のRPOはflush intervalと容量thresholdで決まる。低コスト化の代わりに同時喪失時の最新分が
 未転送となり得る。`backend_queue_oldest_created_at`はqueue全体の最古時刻であり、公開順序の
-依存itemにより待機中のrefも含む。滞留アラートは、同一hostの低優先度PUTにブロックされて
-いない最古itemを基準とする。運用では両方を確認し、raw ageだけで障害と判定しない。
+依存itemにより待機中のrefも含む。滞留アラートは、同一hostで公開順序上先行するPUTに
+ブロックされていない最古itemを基準とする。依存判定は各queue itemの最終更新時刻で行い、
+後から追加されたcontentが、それ以前のmetadata/journal/refを不必要に止めない。DELETEは
+同一hostにpending PUTがある間は従来どおり保留する。依存索引はflushごとに一度構築し、
+itemごとのqueue全件再走査を避ける。運用ではraw ageとunblocked ageを併せて確認する。
 Prometheus形式では`majutsu_cluster_backend_queue_oldest_age_seconds`がraw age、
 `majutsu_cluster_backend_queue_oldest_unblocked_age_seconds`がアラート判定用ageを表す。
 
