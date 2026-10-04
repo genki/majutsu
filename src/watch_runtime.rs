@@ -13,7 +13,7 @@ use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, TryLockError, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
@@ -22,7 +22,9 @@ use crate::cluster_runtime::{
     cluster_heartbeat_interval, cluster_master_mode_enabled, cluster_slave_heartbeat,
     serve_master_from_env,
 };
-use crate::config::{Paths, RootConfig, WatchConfig, read_config, validate_watch_mode};
+use crate::config::{
+    Paths, RootConfig, WatchConfig, maintenance_lock_path, read_config, validate_watch_mode,
+};
 use crate::daemon_runtime::{
     ForegroundDaemonRuntime, WatchDaemonLaunchConfig, acquire_daemon_lock, child_process_exe,
     ensure_daemon_ipc, start_daemon_ipc, start_watch_daemon,
@@ -48,6 +50,16 @@ use crate::snapshot_rules::{
 use crate::snapshot_state::current_snapshot;
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
 use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
+
+// watchと再送schedulerが、子プロセスのsync lock取得前に競合するのを防ぐ。
+// clusterでは単発syncの終了だけを待ち、全journalのACK待機は追加しない。
+static WATCH_SYNC_SLOT: Mutex<()> = Mutex::new(());
+
+fn watch_sync_slot() -> Result<MutexGuard<'static, ()>> {
+    WATCH_SYNC_SLOT
+        .lock()
+        .map_err(|_| anyhow::anyhow!("watch同期の排他状態が破損しています"))
+}
 
 pub fn normalize_watch_backend(backend: &str) -> Result<&'static str> {
     crate::majutsu_watch::WatchBackend::normalize(backend)
@@ -1038,7 +1050,11 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             record_watch_sync_skipped(paths, after_snapshot.as_deref())?;
             return Ok(());
         }
-        match sync_current_if_remote(paths) {
+        let sync_result = {
+            let _slot = watch_sync_slot()?;
+            sync_current_if_remote(paths)
+        };
+        match sync_result {
             Ok(AutoSyncResult::Synced) => {
                 record_event(paths, "watch-sync", "synced current snapshot to remote")?;
                 auto_prune_after_sync(paths)?;
@@ -1197,6 +1213,7 @@ fn sync_current_external(paths: &Paths, prune_after: bool, changed_roots: &[Stri
     if read_config(paths)?.remote.is_none() {
         return Ok(());
     }
+    let slot = watch_sync_slot()?;
     let upload_stats = upload_queue_stats(paths)?;
     if upload_stats.delayed > 0 {
         record_event(
@@ -1221,6 +1238,7 @@ fn sync_current_external(paths: &Paths, prune_after: bool, changed_roots: &[Stri
         command.arg("--changed-root").arg(root_id);
     }
     let status = command.status()?;
+    drop(slot);
     if status.success() {
         record_event(paths, "watch-sync", "external sync completed")?;
         if prune_after {
@@ -1299,16 +1317,20 @@ fn upload_retry_scheduler_loop(paths: Paths) {
                 .min(Duration::from_secs(30)),
             Ok(work) => {
                 let pending_before = work.pending_items();
-                if let Err(err) = retry_queued_uploads_external(&paths) {
-                    eprintln!("upload retry scheduler error: {err:#}");
-                    let _ = record_cluster_master_unavailable(&paths, &err);
-                    Duration::from_secs(30)
-                } else {
-                    clear_cluster_master_unavailable(&paths);
-                    let pending_after = upload_retry_scheduler_work(&paths)
-                        .map(|work| work.pending_items())
-                        .unwrap_or(pending_before);
-                    retry_scheduler_success_delay(pending_before, pending_after)
+                match retry_queued_uploads_external(&paths) {
+                    Err(err) => {
+                        eprintln!("upload retry scheduler error: {err:#}");
+                        let _ = record_cluster_master_unavailable(&paths, &err);
+                        Duration::from_secs(30)
+                    }
+                    Ok(RetrySyncOutcome::Deferred) => Duration::from_secs(5),
+                    Ok(RetrySyncOutcome::Completed) => {
+                        clear_cluster_master_unavailable(&paths);
+                        let pending_after = upload_retry_scheduler_work(&paths)
+                            .map(|work| work.pending_items())
+                            .unwrap_or(pending_before);
+                        retry_scheduler_success_delay(pending_before, pending_after)
+                    }
                 }
             }
             Err(err) => {
@@ -1359,18 +1381,72 @@ fn retry_scheduler_success_delay(pending_before: usize, pending_after: usize) ->
     }
 }
 
-fn retry_queued_uploads_external(paths: &Paths) -> Result<()> {
-    let exe = child_process_exe()?;
-    let status = std::process::Command::new(exe)
-        .arg("--home")
-        .arg(&paths.home)
-        .arg("sync")
-        .arg("--retry-queued-only")
-        .status()?;
-    if !status.success() {
-        bail!("retry sync exited with status {status}");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrySyncOutcome {
+    Completed,
+    Deferred,
+}
+
+fn retry_sync_if_needed(
+    paths: &Paths,
+    slot: &Mutex<()>,
+    sync: impl FnOnce() -> Result<RetrySyncOutcome>,
+) -> Result<RetrySyncOutcome> {
+    let _slot = match slot.try_lock() {
+        Ok(slot) => slot,
+        Err(TryLockError::WouldBlock) => return Ok(RetrySyncOutcome::Deferred),
+        Err(TryLockError::Poisoned(_)) => bail!("watch同期の排他状態が破損しています"),
+    };
+    // schedulerの最初の検査以降に、watchや手動syncが作業を引き受ける場合がある。
+    if process_lock_owner(&paths.sync_lock)?.is_some()
+        || process_lock_owner(&maintenance_lock_path(paths))?.is_some()
+    {
+        return Ok(RetrySyncOutcome::Deferred);
     }
-    Ok(())
+    let work = upload_retry_scheduler_work(paths)?;
+    if work.is_empty() || work.only_delayed_uploads() {
+        return Ok(RetrySyncOutcome::Deferred);
+    }
+    sync()
+}
+
+fn retry_queued_uploads_external(paths: &Paths) -> Result<RetrySyncOutcome> {
+    retry_sync_if_needed(paths, &WATCH_SYNC_SLOT, || {
+        let exe = child_process_exe()?;
+        let mut command = std::process::Command::new(exe);
+        command
+            .arg("--home")
+            .arg(&paths.home)
+            .arg("sync")
+            .arg("--retry-queued-only");
+        run_retry_sync_child(paths, &mut command)
+    })
+}
+
+fn run_retry_sync_child(
+    paths: &Paths,
+    command: &mut std::process::Command,
+) -> Result<RetrySyncOutcome> {
+    let output = command.stdout(std::process::Stdio::inherit()).output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        eprint!("{stderr}");
+        return Ok(RetrySyncOutcome::Completed);
+    }
+    // 事前確認後に別プロセスがlockを取得する競合も、通信障害と区別する。
+    let detail = stderr.trim();
+    let lock_error = detail.strip_prefix("Error: ").unwrap_or(detail);
+    if lock_error.starts_with("maintenance already running with pid ")
+        || lock_error.starts_with("sync already running with pid ")
+    {
+        record_event(paths, "watch-retry-sync-deferred", detail)?;
+        return Ok(RetrySyncOutcome::Deferred);
+    }
+    bail!(
+        "retry sync exited with status {}: {}",
+        output.status,
+        detail
+    )
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2582,6 +2658,178 @@ mod tests {
     fn upload_retry_scheduler_backs_off_when_retry_makes_no_progress() {
         assert_eq!(retry_scheduler_success_delay(7, 7), Duration::from_secs(30));
         assert_eq!(retry_scheduler_success_delay(8, 7), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retry_sync_defers_while_watch_owns_slot_without_losing_pending_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_file_event(&paths, "sample", "pending.txt", "modify", "test", "未送信").unwrap();
+        let slot = Mutex::new(());
+        let watch = slot.lock().unwrap();
+        let deferred = thread::scope(|scope| {
+            scope
+                .spawn(|| retry_sync_if_needed(&paths, &slot, || panic!("競合中に再送を起動した")))
+                .join()
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(deferred, RetrySyncOutcome::Deferred);
+        assert_eq!(
+            upload_retry_scheduler_work(&paths).unwrap().pending_items(),
+            1
+        );
+        drop(watch);
+        let mut attempts = 0;
+        assert_eq!(
+            retry_sync_if_needed(&paths, &slot, || {
+                attempts += 1;
+                Ok(RetrySyncOutcome::Completed)
+            })
+            .unwrap(),
+            RetrySyncOutcome::Completed
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn retry_sync_rechecks_work_drained_by_watch_and_keeps_outage_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_file_event(&paths, "sample", "pending.txt", "modify", "test", "未送信").unwrap();
+        assert_eq!(
+            upload_retry_scheduler_work(&paths).unwrap().pending_items(),
+            1
+        );
+        let mut event = event_journal_records(&paths).unwrap().remove(0);
+        event.remote_journal_key = Some("host/journal/pending.json".into());
+        event.remote_journal_synced_at = Some(Utc::now());
+        fs::write(
+            paths.event_queue.join(format!("{}.json", event.event_id)),
+            serde_json::to_vec(&event).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(&paths.runtime).unwrap();
+        let outage = cluster_unavailable_state_path(&paths);
+        fs::write(&outage, b"outage marker").unwrap();
+        assert_eq!(
+            retry_sync_if_needed(&paths, &Mutex::new(()), || panic!(
+                "処理済みの再送を起動した"
+            ))
+            .unwrap(),
+            RetrySyncOutcome::Deferred
+        );
+        assert_eq!(fs::read(&outage).unwrap(), b"outage marker");
+    }
+
+    #[test]
+    fn retry_sync_rechecks_process_lock_and_preserves_real_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_file_event(&paths, "sample", "pending.txt", "modify", "test", "未送信").unwrap();
+        let slot = Mutex::new(());
+        let other_sync = acquire_process_lock(&paths.sync_lock, "sync").unwrap();
+        assert_eq!(
+            retry_sync_if_needed(&paths, &slot, || panic!("既存syncと競合した")).unwrap(),
+            RetrySyncOutcome::Deferred
+        );
+        drop(other_sync);
+        let error = retry_sync_if_needed(&paths, &slot, || bail!("通信失敗"));
+        assert_eq!(error.unwrap_err().to_string(), "通信失敗");
+        assert!(slot.try_lock().is_ok());
+        assert_eq!(
+            upload_retry_scheduler_work(&paths).unwrap().pending_items(),
+            1
+        );
+    }
+
+    #[test]
+    fn retry_sync_defers_maintenance_without_losing_pending_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_file_event(&paths, "sample", "pending.txt", "modify", "test", "未送信").unwrap();
+        let slot = Mutex::new(());
+        let maintenance =
+            acquire_process_lock(&maintenance_lock_path(&paths), "maintenance").unwrap();
+        assert_eq!(
+            retry_sync_if_needed(&paths, &slot, || panic!("保守中に再送を起動した")).unwrap(),
+            RetrySyncOutcome::Deferred
+        );
+        assert_eq!(
+            upload_retry_scheduler_work(&paths).unwrap().pending_items(),
+            1
+        );
+        drop(maintenance);
+        assert_eq!(
+            retry_sync_if_needed(&paths, &slot, || Ok(RetrySyncOutcome::Completed)).unwrap(),
+            RetrySyncOutcome::Completed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_sync_child_defers_lock_race_and_preserves_network_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        record_file_event(&paths, "sample", "pending.txt", "modify", "test", "未送信").unwrap();
+        fs::create_dir_all(&paths.runtime).unwrap();
+        let outage = cluster_unavailable_state_path(&paths);
+        fs::write(&outage, b"outage marker").unwrap();
+        for lock in ["maintenance", "sync"] {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(format!(
+                "echo 'Error: {lock} already running with pid 42' >&2; exit 1"
+            ));
+            assert_eq!(
+                run_retry_sync_child(&paths, &mut command).unwrap(),
+                RetrySyncOutcome::Deferred
+            );
+        }
+        assert_eq!(fs::read(&outage).unwrap(), b"outage marker");
+        assert_eq!(
+            upload_retry_scheduler_work(&paths).unwrap().pending_items(),
+            1
+        );
+        let mut failure = std::process::Command::new("sh");
+        failure.arg("-c").arg(
+            "echo 'Error: connection failed: maintenance already running with pid 42' >&2; exit 1",
+        );
+        assert!(
+            run_retry_sync_child(&paths, &mut failure)
+                .unwrap_err()
+                .to_string()
+                .contains("connection failed")
+        );
+        let mut success = std::process::Command::new("sh");
+        success.arg("-c").arg("exit 0");
+        assert_eq!(
+            run_retry_sync_child(&paths, &mut success).unwrap(),
+            RetrySyncOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn retry_sync_rechecks_backoff_before_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path().join("home"));
+        crate::queue_runtime::enqueue_inline_upload(&paths, "objects/blobs/test", vec![1]).unwrap();
+        let (item_path, mut item) = crate::queue_runtime::upload_queue_items(&paths)
+            .unwrap()
+            .remove(0);
+        item.record_attempt(Some(Utc::now() + chrono::Duration::minutes(5)));
+        fs::write(item_path, serde_json::to_vec(&item).unwrap()).unwrap();
+        assert_eq!(
+            retry_sync_if_needed(&paths, &Mutex::new(()), || panic!("backoff中に再送した"))
+                .unwrap(),
+            RetrySyncOutcome::Deferred
+        );
+        // 未ACKのjournalが別にあれば、遅延uploadだけを理由に全体を止めない。
+        record_file_event(&paths, "sample", "pending.txt", "modify", "test", "未送信").unwrap();
+        assert_eq!(
+            retry_sync_if_needed(&paths, &Mutex::new(()), || Ok(RetrySyncOutcome::Completed))
+                .unwrap(),
+            RetrySyncOutcome::Completed
+        );
     }
 
     #[test]

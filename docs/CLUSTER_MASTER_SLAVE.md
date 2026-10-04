@@ -231,6 +231,13 @@ retryはlive rootを再走査しない単発のqueue-only syncとして実行し
 backoffする。1件のsourceがACLなどで読めなくても、他のjournal recordは先に送る。master復帰後の
 手動syncは不要であり、恒久的に読めない1件がwatch本体を5分間待機させることもない。
 
+同じdaemon内ではwatch同期と再送schedulerのsync実行を直列化する。再送側はwatch同期中なら
+子プロセスを起動せず、次の周期で再確認する。起動直前にもsync/maintenance lock・残queue・journal・
+backoffを確認し、既に処理済みの作業を再実行しない。見送った再送は通信成功とは扱わず、
+master障害の記録を解除しない。watch側は進行中の単発syncの終了後に自身の同期を実行する。
+事前確認後に保守処理や手動syncがlockを取得した場合も、再送子プロセスのlock競合は
+次の周期へ見送る。ローカルの競合でmaster障害を新規記録せず、実際の通信失敗は記録する。
+
 standalone profileのwatch同期は、従来どおり`sync --wait --timeout-secs 300`でS3直結の追従を
 待つ。待機を外す変更はcluster remoteだけに限定している。
 
