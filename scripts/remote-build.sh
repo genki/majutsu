@@ -5,6 +5,7 @@ remote="${MAJUTSU_BUILD_REMOTE:-machinaai}"
 remote_worker="build-service/bin/majutsu-remote-build-worker.sh"
 target="${1:-aarch64-apple-darwin}"
 mode="${2:-release}"
+dev_build="${MAJUTSU_DEV_BUILD:-0}"
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 job_id="majutsu-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 remote_job="build-service/workspaces/$target"
@@ -13,6 +14,10 @@ local_out="${MAJUTSU_REMOTE_BUILD_OUT:-$repo_dir/target/remote-dist/$job_id}"
 case "$target" in
   aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu) ;;
   *) echo "未対応のtargetです: $target" >&2; exit 2 ;;
+esac
+case "$dev_build" in
+  0|1) ;;
+  *) echo "MAJUTSU_DEV_BUILDは0または1を指定してください" >&2; exit 2 ;;
 esac
 
 lock_acquired=false
@@ -45,7 +50,7 @@ rsync -a --delete \
   --exclude '.DS_Store' \
   "$repo_dir/" "$remote:$remote_job/source/"
 
-ssh "$remote" "\$HOME/$remote_worker \"\$HOME/$remote_job\" '$target' '$mode' '$job_id'"
+ssh "$remote" "MAJUTSU_DEV_BUILD='$dev_build' \"\$HOME/$remote_worker\" \"\$HOME/$remote_job\" '$target' '$mode' '$job_id'"
 
 if [[ "$mode" == "release" ]]; then
   mkdir -p "$local_out"
