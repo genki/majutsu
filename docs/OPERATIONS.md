@@ -263,6 +263,16 @@ daemon は watch loop の起動時、periodic rescan 後、filesystem event snap
 `$MAJUTSU_HOME/runtime/health.json` を更新する。外部監視はこのファイルを読むことで、
 full fsck を回さずに直近の保護状態を確認できる。
 
+`mj health --deep` の完全検査は `runtime/deep-health.json` に保存する。JSONの
+`deep_remote.snapshot_id` は検査対象、`publish_in_progress` は検査開始時の同期状態を表す。
+同期中に見つかった未公開objectは `remote-objects-pending` とし、同期完了後も過去の結果を
+欠損確定へ変更しない。`remote-objects-recheck-required` は、同期中・別snapshot・旧形式の
+検査結果に未確認objectが残っている状態なので、同期が落ち着いてから
+`mj health --deep --timeout-secs 60` で再検査する。再検査までは警告を残し、正常とは扱わない。
+現在のsnapshotを同期処理のない時点に検査して欠損がある場合は、従来どおり
+`remote-objects-missing` の重大警告とする。sampleやtimeoutによる未完了検査では、
+最後の完全検査を上書きしない。通常の `mj health` に新たなremote API呼出しは追加しない。
+
 remote を設定した watch daemon は、snapshot を backend に同期できた後で retention
 prune も自動実行する。既定では `keep_daily=0` / `keep_monthly=0` として current
 snapshot 以外の snapshot metadata を残さず、GCS/S3 の実サイズが current の復元に

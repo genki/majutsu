@@ -21569,6 +21569,108 @@ fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
 }
 
 #[test]
+fn health_deep_cached_pending_requires_recheck_and_keeps_real_missing_critical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"alpha\n").unwrap();
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .arg("init")
+            .arg("--remote")
+            .arg(format!("file://{}", remote.display()));
+        c
+    });
+    run({
+        let mut c = mj();
+        c.arg("--home")
+            .arg(&state)
+            .args(["root", "add", "sample"])
+            .arg(&source);
+        c
+    });
+    let command = |args: &[&str]| {
+        let mut c = mj();
+        c.arg("--home").arg(&state).args(args);
+        c
+    };
+    let health = |args: &[&str]| -> serde_json::Value {
+        serde_json::from_str(&output(command(args))).unwrap()
+    };
+    let object_issue = |value: &serde_json::Value, code: &str| {
+        value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["code"] == code)
+            .cloned()
+    };
+
+    run(command(&["snapshot"]));
+    // 同期前の全件検査を保存し、同期完了だけでは欠損確定へ昇格しないことを確認する。
+    let pending = health(&["health", "--deep", "--json"]);
+    assert!(pending["deep_remote"]["missing"].as_u64().unwrap() > 0);
+    assert_eq!(pending["deep_remote"]["limited"], false);
+    assert_eq!(pending["deep_remote"]["publish_in_progress"], true);
+    assert_eq!(
+        pending["deep_remote"]["snapshot_id"],
+        pending["current_snapshot"]
+    );
+    assert!(object_issue(&pending, "remote-objects-pending").is_some());
+    run(command(&["sync"]));
+    let cached = health(&["health", "--json"]);
+    assert!(
+        cached["remote_head_status"]
+            .as_str()
+            .unwrap()
+            .starts_with("synced")
+    );
+    assert_eq!(cached["queued_uploads"], 0);
+    assert_eq!(cached["sync_lock_pid"], serde_json::Value::Null);
+    assert_eq!(
+        object_issue(&cached, "remote-objects-recheck-required").unwrap()["severity"],
+        "warning"
+    );
+    assert!(object_issue(&cached, "remote-objects-missing").is_none());
+
+    let complete = health(&["health", "--deep", "--json"]);
+    assert_eq!(complete["deep_remote"]["missing"], 0);
+    assert_eq!(complete["deep_remote"]["publish_in_progress"], false);
+    assert!(object_issue(&complete, "remote-objects-recheck-required").is_none());
+    let cache_path = state.join("runtime/deep-health.json");
+    let cache_before = fs::read(&cache_path).unwrap();
+    let limited = health(&["health", "--deep", "--sample", "1", "--json"]);
+    assert_eq!(limited["deep_remote"]["limited"], true);
+    assert!(object_issue(&limited, "remote-objects-check-limited").is_some());
+    assert_eq!(fs::read(&cache_path).unwrap(), cache_before);
+
+    // 一時remoteだけからcurrent treeの全別名を削除し、実欠損の重大警告を確認する。
+    let manifest = local_snapshot_manifest(&state, "asc");
+    let tree_key = manifest["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap();
+    for key in [tree_key.to_string(), canonical_object_key(tree_key)] {
+        fs::remove_file(remote.join(key)).unwrap();
+    }
+    let missing = health(&["health", "--deep", "--json"]);
+    assert!(missing["deep_remote"]["missing"].as_u64().unwrap() > 0);
+    assert_eq!(missing["deep_remote"]["publish_in_progress"], false);
+    assert_eq!(
+        object_issue(&missing, "remote-objects-missing").unwrap()["severity"],
+        "critical"
+    );
+    let cached_missing = health(&["health", "--json"]);
+    assert_eq!(
+        object_issue(&cached_missing, "remote-objects-missing").unwrap()["severity"],
+        "critical"
+    );
+}
+
+#[test]
 fn health_reports_tracked_paths_that_current_rules_exclude() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

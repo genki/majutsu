@@ -647,6 +647,12 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
     let remote_journal_stats = remote_event_journal_stats(paths)?;
     let daemon = daemon_health(paths)?;
     let mut deep_remote_error = None;
+    let publish_in_progress = deep_remote_publish_in_progress(
+        remote_head.synced,
+        upload_stats.total,
+        remote_journal_stats.pending,
+        process_lock_owner(&paths.sync_lock)?,
+    );
     let deep_remote = if args.deep && remote.configured {
         if let Some(error) = remote.open_error.as_deref() {
             deep_remote_error = Some(error.to_string());
@@ -663,7 +669,11 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
                     current.as_deref(),
                 ) {
                     Ok(summary) => {
-                        let report = deep_remote_health_from_summary(&summary);
+                        let report = deep_remote_health_from_summary(
+                            &summary,
+                            current.as_deref(),
+                            publish_in_progress,
+                        );
                         // sample／timeoutで全件確認できていない結果は、最後の完全検査を上書きしない。
                         if !report.limited {
                             write_deep_health_record(paths, &report)?;
@@ -811,6 +821,11 @@ struct HealthReport {
 struct DeepRemoteHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
+    // 旧形式のキャッシュは検査時の同期状態が不明なので、falseと区別する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publish_in_progress: Option<bool>,
     scope: String,
     local_objects: usize,
     checked: usize,
@@ -1135,45 +1150,17 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         });
     }
     if let Some(deep) = deep_remote {
-        if deep.missing > 0 {
-            let publish_in_progress = deep_remote_publish_in_progress(
+        if let Some(issue) = deep_remote_object_issue(
+            deep,
+            current,
+            deep_remote_publish_in_progress(
                 remote_head.synced,
                 upload_stats.total,
                 durable_journal_pending,
                 sync_lock_pid,
-            );
-            issues.push(HealthIssue {
-                severity: if publish_in_progress {
-                    HealthSeverity::Warning
-                } else {
-                    HealthSeverity::Critical
-                },
-                code: if publish_in_progress {
-                    "remote-objects-pending".into()
-                } else {
-                    "remote-objects-missing".into()
-                },
-                message: if publish_in_progress {
-                    format!(
-                        "deep remote check ({}) found {} object(s) not yet published while sync is in progress after checking {}/{} via {}",
-                        deep.scope, deep.missing, deep.checked, deep.local_objects, deep.source
-                    )
-                } else {
-                    format!(
-                        "deep remote check ({}) found {} missing object(s) after checking {}/{} via {}",
-                        deep.scope, deep.missing, deep.checked, deep.local_objects, deep.source
-                    )
-                },
-            });
-        } else if deep.limited {
-            issues.push(HealthIssue {
-                severity: HealthSeverity::Warning,
-                code: "remote-objects-check-limited".into(),
-                message: format!(
-                    "deep remote check ({}) was limited after checking {}/{} object(s)",
-                    deep.scope, deep.checked, deep.local_objects
-                ),
-            });
+            ),
+        ) {
+            issues.push(issue);
         }
         let stale_secs = std::env::var("MAJUTSU_DEEP_HEALTH_STALE_SECS")
             .ok()
@@ -1278,6 +1265,62 @@ fn deep_remote_publish_in_progress(
         || queued_uploads > 0
         || durable_journal_pending > 0
         || sync_lock_pid.is_some()
+}
+
+fn deep_remote_object_issue(
+    deep: &DeepRemoteHealth,
+    current: Option<&str>,
+    publish_in_progress: bool,
+) -> Option<HealthIssue> {
+    if deep.missing > 0 {
+        // 同期完了は過去の欠損検査を更新しない。未公開時・別snapshot・旧形式の
+        // 結果は、再検査するまで欠損確定にも正常にも昇格させない。
+        let needs_recheck = deep.publish_in_progress != Some(false)
+            || (deep.scope == "current" && deep.snapshot_id.as_deref() != current);
+        let (severity, code, context) = if publish_in_progress {
+            (
+                HealthSeverity::Warning,
+                "remote-objects-pending",
+                "同期中のため、未公開objectを含む可能性があります",
+            )
+        } else if needs_recheck {
+            (
+                HealthSeverity::Warning,
+                "remote-objects-recheck-required",
+                "検査時に同期中だったか、現在とは異なる・不明なsnapshotの結果です。同期完了後にmj health --deepで再検査してください",
+            )
+        } else {
+            (
+                HealthSeverity::Critical,
+                "remote-objects-missing",
+                "同期処理のない時点の検査で欠損を確認しました",
+            )
+        };
+        Some(HealthIssue {
+            severity,
+            code: code.into(),
+            message: format!(
+                "deep remote検査 ({}, snapshot={}) は{}/{}件を{}で確認し、{}件が未確認です。{context}",
+                deep.scope,
+                deep.snapshot_id.as_deref().unwrap_or("不明"),
+                deep.checked,
+                deep.local_objects,
+                deep.source,
+                deep.missing,
+            ),
+        })
+    } else if deep.limited {
+        Some(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "remote-objects-check-limited".into(),
+            message: format!(
+                "deep remote検査 ({}) は{}/{}件で打ち切られました",
+                deep.scope, deep.checked, deep.local_objects
+            ),
+        })
+    } else {
+        None
+    }
 }
 
 fn excluded_tracked_path_summary(
@@ -1429,9 +1472,15 @@ fn deep_health_path(paths: &Paths) -> std::path::PathBuf {
     paths.runtime.join("deep-health.json")
 }
 
-fn deep_remote_health_from_summary(summary: &SyncDeepHealthSummary) -> DeepRemoteHealth {
+fn deep_remote_health_from_summary(
+    summary: &SyncDeepHealthSummary,
+    snapshot_id: Option<&str>,
+    publish_in_progress: bool,
+) -> DeepRemoteHealth {
     DeepRemoteHealth {
         observed_at: Some(Utc::now().to_rfc3339()),
+        snapshot_id: snapshot_id.map(str::to_string),
+        publish_in_progress: Some(publish_in_progress),
         scope: summary.scope.to_string(),
         local_objects: summary.local_objects,
         checked: summary.checked,
@@ -1622,8 +1671,17 @@ fn print_health_report(report: &HealthReport, verbose: bool) {
     println!("encryption {}", report.encryption);
     if let Some(deep) = &report.deep_remote {
         println!(
-            "deep_remote scope={} checked={}/{} missing={} limited={} source={}",
-            deep.scope, deep.checked, deep.local_objects, deep.missing, deep.limited, deep.source
+            "deep_remote scope={} checked={}/{} missing={} limited={} source={} snapshot={} publish_in_progress={}",
+            deep.scope,
+            deep.checked,
+            deep.local_objects,
+            deep.missing,
+            deep.limited,
+            deep.source,
+            deep.snapshot_id.as_deref().unwrap_or("不明"),
+            deep.publish_in_progress
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "不明".into())
         );
     }
     for issue in &report.issues {
@@ -7400,9 +7458,10 @@ fn print_snapshot_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        LogProducerMessage, StateStreamMode, deep_remote_publish_in_progress,
-        effective_watch_backend, prefetch_state_lines_for_viewer, read_remote_root_acks,
-        should_page_status_with_tty, state_lines_need_viewer, truncate_for_terminal,
+        DeepRemoteHealth, HealthSeverity, LogProducerMessage, StateStreamMode,
+        deep_remote_object_issue, deep_remote_publish_in_progress, effective_watch_backend,
+        prefetch_state_lines_for_viewer, read_remote_root_acks, should_page_status_with_tty,
+        state_lines_need_viewer, truncate_for_terminal,
     };
     use crate::majutsu_db::EventJournalRecord;
     use chrono::{TimeZone, Utc};
@@ -7545,5 +7604,87 @@ mod tests {
         assert!(deep_remote_publish_in_progress(true, 0, 1, None));
         assert!(deep_remote_publish_in_progress(true, 0, 0, Some(42)));
         assert!(!deep_remote_publish_in_progress(true, 0, 0, None));
+    }
+
+    fn missing_deep_report() -> DeepRemoteHealth {
+        DeepRemoteHealth {
+            observed_at: Some(Utc::now().to_rfc3339()),
+            snapshot_id: Some("snap-current".into()),
+            publish_in_progress: Some(false),
+            scope: "current".into(),
+            local_objects: 10,
+            checked: 10,
+            missing: 2,
+            limited: false,
+            source: "master-local-list".into(),
+        }
+    }
+
+    #[test]
+    fn deep_remote_cached_pending_requires_recheck_after_sync_finishes() {
+        let mut report = missing_deep_report();
+        report.publish_in_progress = Some(true);
+        let pending = deep_remote_object_issue(&report, Some("snap-current"), true).unwrap();
+        assert_eq!(pending.severity, HealthSeverity::Warning);
+        assert_eq!(pending.code, "remote-objects-pending");
+        let finished = deep_remote_object_issue(&report, Some("snap-current"), false).unwrap();
+        assert_eq!(finished.severity, HealthSeverity::Warning);
+        assert_eq!(finished.code, "remote-objects-recheck-required");
+    }
+
+    #[test]
+    fn deep_remote_stable_current_missing_remains_critical() {
+        let report = missing_deep_report();
+        let issue = deep_remote_object_issue(&report, Some("snap-current"), false).unwrap();
+        assert_eq!(issue.severity, HealthSeverity::Critical);
+        assert_eq!(issue.code, "remote-objects-missing");
+    }
+
+    #[test]
+    fn deep_remote_old_snapshot_missing_requires_recheck() {
+        let report = missing_deep_report();
+        for current in [Some("snap-new"), None] {
+            let issue = deep_remote_object_issue(&report, current, false).unwrap();
+            assert_eq!(issue.severity, HealthSeverity::Warning);
+            assert_eq!(issue.code, "remote-objects-recheck-required");
+        }
+    }
+
+    #[test]
+    fn deep_remote_history_missing_is_not_hidden_by_new_current() {
+        let mut report = missing_deep_report();
+        report.scope = "history".into();
+        let issue = deep_remote_object_issue(&report, Some("snap-new"), false).unwrap();
+        assert_eq!(issue.severity, HealthSeverity::Critical);
+        assert_eq!(issue.code, "remote-objects-missing");
+    }
+
+    #[test]
+    fn deep_remote_legacy_missing_has_unknown_publication_state() {
+        let mut legacy = serde_json::to_value(missing_deep_report()).unwrap();
+        legacy.as_object_mut().unwrap().remove("snapshot_id");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("publish_in_progress");
+        let report: DeepRemoteHealth = serde_json::from_value(legacy).unwrap();
+        assert_eq!(report.snapshot_id, None);
+        assert_eq!(report.publish_in_progress, None);
+        let issue = deep_remote_object_issue(&report, Some("snap-current"), false).unwrap();
+        assert_eq!(issue.severity, HealthSeverity::Warning);
+        assert_eq!(issue.code, "remote-objects-recheck-required");
+    }
+
+    #[test]
+    fn deep_remote_limited_and_successful_results_keep_their_meaning() {
+        let mut report = missing_deep_report();
+        report.limited = true;
+        let missing = deep_remote_object_issue(&report, Some("snap-current"), false).unwrap();
+        assert_eq!(missing.severity, HealthSeverity::Critical);
+        report.missing = 0;
+        let limited = deep_remote_object_issue(&report, Some("snap-current"), false).unwrap();
+        assert_eq!(limited.code, "remote-objects-check-limited");
+        report.limited = false;
+        assert!(deep_remote_object_issue(&report, Some("snap-current"), false).is_none());
     }
 }
