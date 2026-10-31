@@ -270,11 +270,11 @@ fn shell_quote_path(path: &std::path::Path) -> String {
 fn snapshot_write_hook(path: &str, value: &str) -> String {
     #[cfg(windows)]
     {
-        format!(
-            "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{}','{}')\"",
+        powershell_hook(&format!(
+            "[IO.File]::WriteAllText('{}','{}')",
             path.replace('\'', "''"),
             value.replace('\'', "''")
-        )
+        ))
     }
     #[cfg(unix)]
     {
@@ -283,11 +283,24 @@ fn snapshot_write_hook(path: &str, value: &str) -> String {
 }
 
 #[cfg(windows)]
+fn powershell_hook(script: &str) -> String {
+    use base64::Engine;
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+#[cfg(windows)]
 fn snapshot_source_hook(path: &std::path::Path, name: &str) -> String {
     let path = path.display().to_string().replace('\'', "''");
-    format!(
-        "powershell.exe -NoProfile -NonInteractive -Command \"$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force '{path}' | Out-Null; Copy-Item 'live.txt' '{path}/live.txt'; [IO.File]::WriteAllText('{path}/{name}.txt','{name}')\""
-    )
+    powershell_hook(&format!(
+        "$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force '{path}' | Out-Null; Copy-Item 'live.txt' '{path}/live.txt'; [IO.File]::WriteAllText('{path}/{name}.txt','{name}')"
+    ))
 }
 
 fn set_watch_backend(state: &std::path::Path, backend: &str) {
@@ -22256,15 +22269,19 @@ fn watch_records_runtime_health_and_notices_unprotected_state() {
             .arg("--once")
             .env(
                 "MAJUTSU_HEALTH_NOTICE_CMD",
-                if cfg!(windows) {
-                    format!(
-                        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{}',($env:MAJUTSU_HEALTH_STATE+':'+$env:MAJUTSU_HEALTH_ISSUE_CODES))\"",
+                {
+                    #[cfg(windows)]
+                    let command = powershell_hook(&format!(
+                        "[IO.File]::WriteAllText('{}',($env:MAJUTSU_HEALTH_STATE+':'+$env:MAJUTSU_HEALTH_ISSUE_CODES))",
                         notice.display().to_string().replace('\'', "''")
-                    )
-                } else { format!(
+                    ));
+                    #[cfg(unix)]
+                    let command = format!(
                     "printf '%s' \"$MAJUTSU_HEALTH_STATE:$MAJUTSU_HEALTH_ISSUE_CODES\" > {}",
                     notice.display()
-                ) },
+                    );
+                    command
+                },
             );
         c
     });
@@ -24801,7 +24818,9 @@ fn transactional_snapshot_runs_application_plugin_phases() {
         c
     });
     #[cfg(windows)]
-    let plugin = "powershell.exe -NoProfile -NonInteractive -Command \"$ErrorActionPreference='Stop'; if ($env:MAJUTSU_PLUGIN_PHASE -eq 'pre') {New-Item -ItemType Directory -Force $env:MAJUTSU_SNAPSHOT_SOURCE | Out-Null; Copy-Item 'live.txt' ($env:MAJUTSU_SNAPSHOT_SOURCE+'/live.txt'); [IO.File]::WriteAllText(($env:MAJUTSU_SNAPSHOT_SOURCE+'/plugin.txt'),'plugin')} else {[IO.File]::WriteAllText('plugin-cleaned.txt','cleaned')}\"";
+    let plugin = powershell_hook(
+        "$ErrorActionPreference='Stop'; if ($env:MAJUTSU_PLUGIN_PHASE -eq 'pre') {New-Item -ItemType Directory -Force $env:MAJUTSU_SNAPSHOT_SOURCE | Out-Null; Copy-Item 'live.txt' ($env:MAJUTSU_SNAPSHOT_SOURCE+'/live.txt'); [IO.File]::WriteAllText(($env:MAJUTSU_SNAPSHOT_SOURCE+'/plugin.txt'),'plugin')} else {[IO.File]::WriteAllText('plugin-cleaned.txt','cleaned')}",
+    );
     #[cfg(unix)]
     let plugin = "if [ \"$MAJUTSU_PLUGIN_PHASE\" = pre ]; then \
          mkdir -p \"$MAJUTSU_SNAPSHOT_SOURCE\" && \
