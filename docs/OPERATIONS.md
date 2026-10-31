@@ -263,6 +263,13 @@ daemon は watch loop の起動時、periodic rescan 後、filesystem event snap
 `$MAJUTSU_HOME/runtime/health.json` を更新する。外部監視はこのファイルを読むことで、
 full fsck を回さずに直近の保護状態を確認できる。
 
+`health --json`の`state_volume`は、状態保存先と同じvolumeの総容量と一般ユーザーが
+利用できる空き容量（bytes）を示す。空き5GiB未満または5%未満は`state-storage-low`の
+警告、512MiB未満は`state-storage-exhausted`の重大警告とする。取得失敗も
+`state-storage-check-failed`として警告し、無条件に正常扱いしない。
+検査はOSの容量APIだけを使い、ディレクトリ全走査やremote API呼出しを追加しない。
+この判定対象は状態保存先であり、全rootのファイルシステムやGCS容量ではない。
+
 `mj health --deep` の完全検査は `runtime/deep-health.json` に保存する。JSONの
 `deep_remote.snapshot_id` は検査対象、`publish_in_progress` は検査開始時の同期状態を表す。
 同期中に見つかった未公開objectは `remote-objects-pending` とし、同期完了後も過去の結果を

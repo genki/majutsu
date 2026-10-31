@@ -696,7 +696,7 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
     } else {
         read_deep_health_record(paths)
     };
-    build_health_report(HealthInputs {
+    let mut report = build_health_report(HealthInputs {
         paths,
         config: &config,
         roots: &roots,
@@ -717,7 +717,61 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
         remote_manifest: remote_manifest.as_ref(),
         deep_remote: deep_remote.as_ref(),
         conn: &conn,
+    })?;
+    let storage_issue = match crate::platform_runtime::volume_space(&paths.home) {
+        Ok(space) => {
+            let issue = state_volume_issue(&space);
+            report.state_volume = Some(space);
+            issue
+        }
+        Err(_) => Some(HealthIssue {
+            severity: HealthSeverity::Warning,
+            code: "state-storage-check-failed".into(),
+            message: "状態保存先の空き容量を取得できませんでした".into(),
+        }),
+    };
+    if let Some(issue) = storage_issue {
+        report.issues.push(issue);
+        report.state = protection_state_for_issues(&report.issues);
+    }
+    Ok(report)
+}
+
+fn state_volume_issue(space: &crate::platform_runtime::VolumeSpace) -> Option<HealthIssue> {
+    let (severity, code) = if space.available_bytes < 512 * 1024 * 1024 {
+        (HealthSeverity::Critical, "state-storage-exhausted")
+    } else if space.available_bytes < 5 * 1024 * 1024 * 1024
+        || u128::from(space.available_bytes) * 100 < u128::from(space.total_bytes) * 5
+    {
+        (HealthSeverity::Warning, "state-storage-low")
+    } else {
+        return None;
+    };
+    Some(HealthIssue {
+        severity,
+        code: code.into(),
+        message: format!(
+            "状態保存先の空き容量が少なくなっています: 空き{} / 全体{}。snapshot・pack・journalの書込み余地を確保してください",
+            format_bytes(space.available_bytes),
+            format_bytes(space.total_bytes)
+        ),
     })
+}
+
+fn protection_state_for_issues(issues: &[HealthIssue]) -> ProtectionState {
+    if issues
+        .iter()
+        .any(|issue| issue.severity == HealthSeverity::Critical)
+    {
+        ProtectionState::Unprotected
+    } else if issues
+        .iter()
+        .any(|issue| issue.severity == HealthSeverity::Warning)
+    {
+        ProtectionState::Degraded
+    } else {
+        ProtectionState::Protected
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,6 +847,8 @@ struct RootChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HealthReport {
     state: ProtectionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_volume: Option<crate::platform_runtime::VolumeSpace>,
     current_snapshot: Option<String>,
     active_roots: usize,
     roots_total: usize,
@@ -1216,22 +1272,11 @@ fn build_health_report(input: HealthInputs<'_>) -> Result<HealthReport> {
         });
     }
 
-    let state = if issues
-        .iter()
-        .any(|issue| issue.severity == HealthSeverity::Critical)
-    {
-        ProtectionState::Unprotected
-    } else if issues
-        .iter()
-        .any(|issue| issue.severity == HealthSeverity::Warning)
-    {
-        ProtectionState::Degraded
-    } else {
-        ProtectionState::Protected
-    };
+    let state = protection_state_for_issues(&issues);
 
     Ok(HealthReport {
         state,
+        state_volume: None,
         current_snapshot: current.map(str::to_string),
         active_roots,
         roots_total: roots.len(),
@@ -7458,10 +7503,11 @@ fn print_snapshot_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeepRemoteHealth, HealthSeverity, LogProducerMessage, StateStreamMode,
+        DeepRemoteHealth, HealthSeverity, LogProducerMessage, ProtectionState, StateStreamMode,
         deep_remote_object_issue, deep_remote_publish_in_progress, effective_watch_backend,
-        prefetch_state_lines_for_viewer, read_remote_root_acks, should_page_status_with_tty,
-        state_lines_need_viewer, truncate_for_terminal,
+        prefetch_state_lines_for_viewer, protection_state_for_issues, read_remote_root_acks,
+        should_page_status_with_tty, state_lines_need_viewer, state_volume_issue,
+        truncate_for_terminal,
     };
     use crate::majutsu_db::EventJournalRecord;
     use chrono::{TimeZone, Utc};
@@ -7469,6 +7515,53 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn state_volume_warns_for_absolute_and_fractional_shortage() {
+        let gib = 1024_u64.pow(3);
+        for (total, available) in [(20 * gib, 4 * gib), (500 * gib, 10 * gib)] {
+            let issue = state_volume_issue(&crate::platform_runtime::VolumeSpace {
+                total_bytes: total,
+                available_bytes: available,
+            })
+            .unwrap();
+            assert_eq!(issue.code, "state-storage-low");
+            assert_eq!(issue.severity, HealthSeverity::Warning);
+        }
+        assert!(
+            state_volume_issue(&crate::platform_runtime::VolumeSpace {
+                total_bytes: 100 * gib,
+                available_bytes: 5 * gib,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn state_volume_critical_boundary_and_state_preserve_existing_critical() {
+        let mib = 1024_u64.pow(2);
+        let critical = state_volume_issue(&crate::platform_runtime::VolumeSpace {
+            total_bytes: 100 * 1024 * mib,
+            available_bytes: 511 * mib,
+        })
+        .unwrap();
+        assert_eq!(critical.code, "state-storage-exhausted");
+        assert_eq!(critical.severity, HealthSeverity::Critical);
+        let warning = state_volume_issue(&crate::platform_runtime::VolumeSpace {
+            total_bytes: 100 * 1024 * mib,
+            available_bytes: 512 * mib,
+        })
+        .unwrap();
+        assert_eq!(
+            protection_state_for_issues(std::slice::from_ref(&warning)),
+            ProtectionState::Degraded
+        );
+        assert_eq!(
+            protection_state_for_issues(&[critical, warning]),
+            ProtectionState::Unprotected
+        );
+        assert_eq!(protection_state_for_issues(&[]), ProtectionState::Protected);
+    }
 
     #[test]
     fn status_pager_decision_respects_tty_height_and_force() {

@@ -6,6 +6,57 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct VolumeSpace {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// 保存先と同じvolumeの、一般ユーザーが利用できる容量を取得する。
+pub(crate) fn volume_space(path: &Path) -> Result<VolumeSpace> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("保存先の空き容量を取得");
+        }
+        let stat = unsafe { stat.assume_init() };
+        let block_size = if stat.f_frsize == 0 {
+            stat.f_bsize
+        } else {
+            stat.f_frsize
+        } as u128;
+        Ok(VolumeSpace {
+            total_bytes: u64::try_from((stat.f_blocks as u128).saturating_mul(block_size))
+                .unwrap_or(u64::MAX),
+            available_bytes: u64::try_from((stat.f_bavail as u128).saturating_mul(block_size))
+                .unwrap_or(u64::MAX),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let path = std::fs::canonicalize(path)?;
+        let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if path.last() != Some(&92) {
+            path.push(92);
+        }
+        path.push(0);
+        let (mut available, mut total, mut free) = (0, 0, 0);
+        if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, &mut free) } == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("保存先の空き容量を取得");
+        }
+        Ok(VolumeSpace {
+            total_bytes: total,
+            available_bytes: available,
+        })
+    }
+}
+
 /// 通知hookの停止で保全workerを無期限に止めない。
 pub(crate) fn command_status_with_timeout(
     command: &mut Command,
@@ -664,6 +715,15 @@ mod windows_ipc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_space_reports_existing_directory_and_rejects_missing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let space = volume_space(temp.path()).unwrap();
+        assert!(space.total_bytes > 0);
+        assert!(space.available_bytes <= space.total_bytes);
+        assert!(volume_space(&temp.path().join("missing")).is_err());
+    }
 
     #[test]
     fn current_process_is_alive() {

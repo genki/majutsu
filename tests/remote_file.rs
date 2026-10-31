@@ -21501,6 +21501,28 @@ fn snapshot_compacts_covered_durable_journal_and_sync_prunes_remote_journal() {
 }
 
 #[test]
+fn health_reports_state_volume_for_unicode_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("状態領域");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    let value: serde_json::Value = serde_json::from_str(&output({
+        let mut c = mj();
+        c.arg("--home").arg(&state).args(["health", "--json"]);
+        c
+    }))
+    .unwrap();
+    let volume = &value["state_volume"];
+    let total = volume["total_bytes"].as_u64().unwrap();
+    let available = volume["available_bytes"].as_u64().unwrap();
+    assert!(total > 0);
+    assert!(available <= total);
+}
+
+#[test]
 fn health_reports_unprotected_when_active_root_has_no_daemon_or_remote() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
