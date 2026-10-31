@@ -40,7 +40,7 @@ cargo install majutsu
 This installs the `mj` binary. To install a specific released version:
 
 ```sh
-cargo install majutsu --version 0.8.0 --locked
+cargo install majutsu --version 0.8.4 --locked
 ```
 
 Use repository-local builds only for development or verification of unreleased

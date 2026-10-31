@@ -1,6 +1,6 @@
 [package]
 name = "majutsu"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 description = "Host-level multi-root snapshot history agent"
 license = "MIT"
@@ -30,6 +30,7 @@ include = [
     "/docs/releases/v0.8.1.md",
     "/docs/releases/v0.8.2.md",
     "/docs/releases/v0.8.3.md",
+    "/docs/releases/v0.8.4.md",
     "/docs/WINDOWS_EXTENDED_ATTRIBUTES.md",
     "/docs/assets/majutsu-logo.png",
     "/THIRD_PARTY_NOTICES.md",
