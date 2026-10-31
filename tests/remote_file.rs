@@ -201,6 +201,7 @@ use std::time::{Duration, Instant};
 fn mj() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
     command.env("MAJUTSU_AUTO_DAEMON", "0");
+    command.env("HOSTNAME", "vagrant");
     // 統合テストでは一時stateの破棄前に保守子プロセスを残さない。
     command.env("MAJUTSU_WATCH_PRUNE_ASYNC", "0");
     command
@@ -256,7 +257,7 @@ fn output_metric(output: &str, name: &str) -> usize {
         .unwrap_or_else(|| panic!("missing metric {name} in output:\n{output}"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -264,6 +265,29 @@ fn shell_quote(value: &str) -> String {
 #[cfg(target_os = "linux")]
 fn shell_quote_path(path: &std::path::Path) -> String {
     shell_quote(&path.to_string_lossy())
+}
+
+fn snapshot_write_hook(path: &str, value: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{}','{}')\"",
+            path.replace('\'', "''"),
+            value.replace('\'', "''")
+        )
+    }
+    #[cfg(unix)]
+    {
+        format!("printf %s {} > {}", shell_quote(value), shell_quote(path))
+    }
+}
+
+#[cfg(windows)]
+fn snapshot_source_hook(path: &std::path::Path, name: &str) -> String {
+    let path = path.display().to_string().replace('\'', "''");
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -Command \"$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force '{path}' | Out-Null; Copy-Item 'live.txt' '{path}/live.txt'; [IO.File]::WriteAllText('{path}/{name}.txt','{name}')\""
+    )
 }
 
 fn set_watch_backend(state: &std::path::Path, backend: &str) {
@@ -6615,8 +6639,8 @@ fn log_defaults_to_managed_file_changes_not_sync_operations() {
     });
     let mut config = fs::read_to_string(state.join("config.toml")).unwrap();
     config.push_str(&format!(
-        "\n[remote]\ntype = \"file\"\npath = \"{}\"\n",
-        remote.display()
+        "\n[remote]\ntype = \"file\"\npath = {}\n",
+        toml::Value::String(remote.display().to_string())
     ));
     fs::write(state.join("config.toml"), config).unwrap();
     fs::write(source.join("alpha.txt"), b"changed\n").unwrap();
@@ -7090,10 +7114,10 @@ fn split_remote_config_supports_file_and_s3_forms() {
             r#"{base}
 [remote]
 type = "file"
-path = "{}"
+path = {}
 
 [large]{large_and_after}"#,
-            remote.display()
+            toml::Value::String(remote.display().to_string())
         ),
     )
     .unwrap();
@@ -13898,7 +13922,8 @@ fn restore_prepare_resume_preserves_root_path_and_target_filters() {
     let job = fs::read_to_string(&job_path).unwrap();
     assert!(job.contains("\"root\": \"docs\""));
     assert!(job.contains("\"path\": \"keep.txt\""));
-    assert!(job.contains(&format!("\"target\": \"{}\"", restore.display())));
+    let job: serde_json::Value = serde_json::from_str(&job).unwrap();
+    assert_eq!(job["target"], restore.display().to_string());
 
     run({
         let mut c = mj();
@@ -14031,7 +14056,10 @@ fn xdg_config_can_select_state_home() {
     fs::create_dir_all(config_home.join("majutsu")).unwrap();
     fs::write(
         config_home.join("majutsu/config.toml"),
-        format!("[state]\nhome = \"{}\"\n", state.display()),
+        format!(
+            "[state]\nhome = {}\n",
+            toml::Value::String(state.display().to_string())
+        ),
     )
     .unwrap();
 
@@ -14055,7 +14083,10 @@ fn state_home_priority_prefers_cli_then_env_then_xdg_config() {
     fs::create_dir_all(config_home.join("majutsu")).unwrap();
     fs::write(
         config_home.join("majutsu/config.toml"),
-        format!("[state]\nhome = \"{}\"\n", xdg_state.display()),
+        format!(
+            "[state]\nhome = {}\n",
+            toml::Value::String(xdg_state.display().to_string())
+        ),
     )
     .unwrap();
 
@@ -17107,13 +17138,13 @@ fn config_roots_are_synced_into_runtime_state() {
         r#"
 [[roots]]
 id = "cfg"
-path = "{}"
+path = {}
 exclude = ["**/.git/**"]
 
 [roots.large]
 min_size = "1 KiB"
 "#,
-        source.display()
+        toml::Value::String(source.display().to_string())
     ));
     fs::write(&config_path, config).unwrap();
 
@@ -22225,10 +22256,15 @@ fn watch_records_runtime_health_and_notices_unprotected_state() {
             .arg("--once")
             .env(
                 "MAJUTSU_HEALTH_NOTICE_CMD",
-                format!(
+                if cfg!(windows) {
+                    format!(
+                        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{}',($env:MAJUTSU_HEALTH_STATE+':'+$env:MAJUTSU_HEALTH_ISSUE_CODES))\"",
+                        notice.display().to_string().replace('\'', "''")
+                    )
+                } else { format!(
                     "printf '%s' \"$MAJUTSU_HEALTH_STATE:$MAJUTSU_HEALTH_ISSUE_CODES\" > {}",
                     notice.display()
-                ),
+                ) },
             );
         c
     });
@@ -23215,6 +23251,7 @@ fn notify_watch_startup_syncs_local_current_without_pending_events() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn daemon_service_renders_systemd_and_launchd_configs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -23318,6 +23355,40 @@ fn watch_memory_guard_stops_before_host_oom() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(events.contains("watch-memory-limit"), "{events}");
+}
+
+#[cfg(windows)]
+#[test]
+fn daemon_service_renders_windows_task_for_user_and_system() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    run({
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg("init");
+        c
+    });
+    for (scope, principal, trigger) in [
+        ("user", "$env:USERNAME", "-AtLogOn"),
+        ("system", "'SYSTEM'", "-AtStartup"),
+    ] {
+        let script = output({
+            let mut c = mj();
+            c.arg("--home").arg(&state).args([
+                "daemon",
+                "service",
+                "--provider",
+                "windows-task",
+                "--scope",
+                scope,
+            ]);
+            c
+        });
+        assert!(script.contains("Register-ScheduledTask"), "{script}");
+        assert!(script.contains(principal), "{script}");
+        assert!(script.contains(trigger), "{script}");
+        assert!(script.contains(state.to_str().unwrap()), "{script}");
+        assert!(script.contains("watch"), "{script}");
+    }
 }
 
 #[cfg(unix)]
@@ -24450,9 +24521,9 @@ fn transactional_snapshot_runs_pre_and_post_hooks() {
             .arg("--snapshot-mode")
             .arg("transactional")
             .arg("--pre-snapshot")
-            .arg("printf pre > pre.txt")
+            .arg(snapshot_write_hook("pre.txt", "pre"))
             .arg("--post-snapshot")
-            .arg("printf post > post.txt");
+            .arg(snapshot_write_hook("post.txt", "post"));
         c
     });
     run({
@@ -24574,6 +24645,9 @@ fn transactional_snapshot_can_scan_snapshot_source() {
         c.arg("--home").arg(&state).arg("init");
         c
     });
+    #[cfg(windows)]
+    let pre = snapshot_source_hook(&snapshot_source, "dump");
+    #[cfg(unix)]
     let pre = format!(
         "mkdir -p '{}' && cp live.txt '{}/live.txt' && printf dump > '{}/dump.txt'",
         snapshot_source.display(),
@@ -24595,7 +24669,7 @@ fn transactional_snapshot_can_scan_snapshot_source() {
             .arg("--pre-snapshot")
             .arg(pre)
             .arg("--post-snapshot")
-            .arg("printf post > post.txt");
+            .arg(snapshot_write_hook("post.txt", "post"));
         c
     });
     run({
@@ -24643,6 +24717,9 @@ fn transactional_snapshot_source_sync_clone_restore_preserves_checkpoint() {
             .arg(format!("file://{}", remote.display()));
         c
     });
+    #[cfg(windows)]
+    let pre = snapshot_source_hook(&snapshot_source, "checkpoint");
+    #[cfg(unix)]
     let pre = format!(
         "rm -rf '{}' && mkdir -p '{}' && cp live.txt '{}/live.txt' && printf checkpoint > '{}/checkpoint.txt'",
         snapshot_source.display(),
@@ -24665,7 +24742,7 @@ fn transactional_snapshot_source_sync_clone_restore_preserves_checkpoint() {
             .arg("--pre-snapshot")
             .arg(pre)
             .arg("--post-snapshot")
-            .arg("printf post > post.txt");
+            .arg(snapshot_write_hook("post.txt", "post"));
         c
     });
     run({
@@ -24723,6 +24800,9 @@ fn transactional_snapshot_runs_application_plugin_phases() {
         c.arg("--home").arg(&state).arg("init");
         c
     });
+    #[cfg(windows)]
+    let plugin = "powershell.exe -NoProfile -NonInteractive -Command \"$ErrorActionPreference='Stop'; if ($env:MAJUTSU_PLUGIN_PHASE -eq 'pre') {New-Item -ItemType Directory -Force $env:MAJUTSU_SNAPSHOT_SOURCE | Out-Null; Copy-Item 'live.txt' ($env:MAJUTSU_SNAPSHOT_SOURCE+'/live.txt'); [IO.File]::WriteAllText(($env:MAJUTSU_SNAPSHOT_SOURCE+'/plugin.txt'),'plugin')} else {[IO.File]::WriteAllText('plugin-cleaned.txt','cleaned')}\"";
+    #[cfg(unix)]
     let plugin = "if [ \"$MAJUTSU_PLUGIN_PHASE\" = pre ]; then \
          mkdir -p \"$MAJUTSU_SNAPSHOT_SOURCE\" && \
          cp live.txt \"$MAJUTSU_SNAPSHOT_SOURCE/live.txt\" && \

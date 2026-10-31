@@ -2219,7 +2219,24 @@ fn self_process_rss_kib() -> Option<u64> {
     u64::try_from(bytes).ok().map(|value| value / 1024)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn self_process_rss_kib() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: size,
+        ..Default::default()
+    };
+    if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) } == 0 {
+        return None;
+    }
+    u64::try_from(counters.WorkingSetSize / 1024).ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn self_process_rss_kib() -> Option<u64> {
     None
 }

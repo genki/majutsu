@@ -3140,7 +3140,7 @@ fn resolve_state_scope(roots: &[RootConfig], args: &StateArgs) -> Result<StateSc
 }
 
 fn infer_current_root_with_prefix(roots: &[RootConfig]) -> Result<Option<(RootConfig, String)>> {
-    let cwd = std::env::current_dir()?;
+    let cwd = absolutize_existing_path(&std::env::current_dir()?)?;
     let mut matches = roots
         .iter()
         .filter(|root| root.status == "active")
@@ -3163,7 +3163,7 @@ fn infer_current_root_with_prefix(roots: &[RootConfig]) -> Result<Option<(RootCo
 }
 
 fn current_root_prefix(root: &RootConfig) -> Result<Option<String>> {
-    let cwd = std::env::current_dir()?;
+    let cwd = absolutize_existing_path(&std::env::current_dir()?)?;
     let root_path = absolutize_existing_path(&root.path)?;
     if cwd.starts_with(&root_path) {
         Ok(Some(normalize_pathspec(cwd.strip_prefix(&root_path)?)))
