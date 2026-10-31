@@ -1199,7 +1199,12 @@ fn find_file_ending(root: &std::path::Path, suffix: &str) -> std::path::PathBuf 
         .into_iter()
         .filter_map(Result::ok)
         .find(|entry| {
-            entry.file_type().is_file() && entry.path().to_string_lossy().ends_with(suffix)
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with(suffix)
         })
         .map(|entry| entry.path().to_path_buf())
         .unwrap_or_else(|| panic!("missing file ending with {suffix} under {}", root.display()))
@@ -1213,15 +1218,10 @@ fn host_metadata_export_path(remote: &std::path::Path) -> std::path::PathBuf {
         .filter_map(Result::ok)
         .find(|entry| {
             entry.file_type().is_file()
-                && entry
-                    .path()
-                    .strip_prefix(remote)
-                    .ok()
-                    .and_then(|path| path.to_str())
-                    .is_some_and(|path| {
-                        path.ends_with("/metadata/export.json")
-                            || path.ends_with("/metadata/export.json.zst")
-                    })
+                && entry.path().strip_prefix(remote).ok().is_some_and(|path| {
+                    path.ends_with("metadata/export.json")
+                        || path.ends_with("metadata/export.json.zst")
+                })
         })
         .map(|entry| entry.path().to_path_buf())
         .unwrap_or_else(|| panic!("missing host metadata export under {}", remote.display()))
@@ -1507,7 +1507,12 @@ fn count_files_ending(root: &std::path::Path, suffix: &str) -> usize {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| {
-            entry.file_type().is_file() && entry.path().to_string_lossy().ends_with(suffix)
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with(suffix)
         })
         .count()
 }
@@ -10600,8 +10605,7 @@ fn pack_gc_and_remote_clone_restore_packed_blobs() {
     });
     assert!(
         find_file_ending(&state.join("objects/packs/small"), ".mpack")
-            .to_string_lossy()
-            .contains("objects/packs/small/")
+            .starts_with(state.join("objects/packs/small"))
     );
     run({
         let mut c = mj();

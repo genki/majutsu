@@ -2834,8 +2834,50 @@ fn local_gc_path(state: &MasterServerState, key: &str) -> PathBuf {
     state.local_gc_dir.join(format!("{id}.json"))
 }
 
+fn read_catalog_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        read_catalog_file_with_retry(|| fs::read(path))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::read(path)
+    }
+}
+
+#[cfg(windows)]
+fn read_catalog_file_with_retry(
+    mut read: impl FnMut() -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+    let mut delays = [5, 10, 20, 40, 80, 160, 320].into_iter();
+    loop {
+        match read() {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                let retryable = error.raw_os_error().is_some_and(|code| {
+                    [
+                        ERROR_ACCESS_DENIED,
+                        ERROR_SHARING_VIOLATION,
+                        ERROR_LOCK_VIOLATION,
+                        ERROR_DELETE_PENDING,
+                    ]
+                    .contains(&(code as u32))
+                });
+                // atomic置換や削除中の共有違反だけを短く待つ。恒久的な拒否は隠さない。
+                let Some(delay) = delays.next().filter(|_| retryable) else {
+                    return Err(error);
+                };
+                thread::sleep(Duration::from_millis(delay));
+            }
+        }
+    }
+}
+
 fn read_local_gc_item_optional(path: &Path) -> Result<Option<LocalGcItem>> {
-    match fs::read(path) {
+    match read_catalog_file(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
             format!("decode cluster local GC item {}", path.display())
         })?)),
@@ -3086,7 +3128,7 @@ fn run_local_gc(state: &MasterServerState) -> Result<usize> {
 }
 
 fn read_backend_queue_item_optional(path: &Path) -> Result<Option<BackendQueueItem>> {
-    match fs::read(path) {
+    match read_catalog_file(path) {
         Ok(bytes) => {
             let mut item: BackendQueueItem = serde_json::from_slice(&bytes)
                 .with_context(|| format!("decode cluster backend queue item {}", path.display()))?;
@@ -4765,6 +4807,57 @@ mod tests {
         assert_eq!(backend_queue_stats(&state).unwrap().objects, 1);
         assert_eq!(drain_backend_queue(&state, true).unwrap(), 1);
         assert_eq!(state.backend.get(key).unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_read_recovers_after_windows_sharing_handle_closes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"catalog").unwrap();
+        let mut held = Some(file);
+        let mut attempts = 0;
+        let bytes = read_catalog_file_with_retry(|| {
+            attempts += 1;
+            let result = fs::read(&path);
+            if attempts == 1 {
+                assert!(result.is_err());
+                drop(held.take());
+            }
+            result
+        })
+        .unwrap();
+        assert!(attempts > 1);
+        assert_eq!(bytes, b"catalog");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_read_preserves_persistent_errors_and_does_not_retry_missing_files() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        let error = read_catalog_file_with_retry(|| {
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_ACCESS_DENIED as i32,
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        let mut attempts = 0;
+        let error = read_catalog_file_with_retry(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
     }
 
     #[test]

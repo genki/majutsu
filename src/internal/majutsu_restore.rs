@@ -218,7 +218,7 @@ where
 }
 
 pub fn validate_relative_filter_path(path: &Path, label: &str) -> Result<()> {
-    if path.as_os_str().is_empty() || path.is_absolute() {
+    if path.as_os_str().is_empty() || path.has_root() {
         bail!("{label} must be a relative path inside the selected root");
     }
     let mut has_component = false;
@@ -402,6 +402,20 @@ mod tests {
                 .to_string(),
             "restore --path must not contain '.', '..', prefixes, or root separators"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_filter_path_rejects_drive_relative_and_rooted_windows_paths() {
+        for value in [r"\tmp\out", r"C:\tmp\out", r"\\server\share\out"] {
+            assert_eq!(
+                validate_relative_filter_path(Path::new(value), "restore --path")
+                    .unwrap_err()
+                    .to_string(),
+                "restore --path must be a relative path inside the selected root"
+            );
+        }
+        assert!(validate_relative_filter_path(Path::new(r"C:tmp\out"), "restore --path").is_err());
     }
 
     #[test]
