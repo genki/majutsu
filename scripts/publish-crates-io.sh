@@ -86,12 +86,14 @@ publish_one() {
     echo "== cargo publish ${args[*]} =="
     local tmp
     tmp="$(mktemp)"
+    local status
     if cargo publish "${args[@]}" >"$tmp" 2>&1; then
       cat "$tmp"
       rm -f "$tmp"
       return 0
+    else
+      status="$?"
     fi
-    local status="$?"
     cat "$tmp"
     if [ "$execute" -eq 1 ] && grep -q "Too Many Requests" "$tmp"; then
       rm -f "$tmp"

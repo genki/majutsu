@@ -165,4 +165,5 @@ fi
 diff -u "$root/file.txt" "$restore/sample/file.txt"
 cmp "$root/large.bin" "$restore/sample/large.bin"
 cmp "$multipart_root/multipart-normal.bin" "$restore/multipart/multipart-normal.bin"
+MAJUTSU_ENCRYPTED_REMOTE=s3://majutsu/encrypted-recovery scripts/verify-encrypted-remote-recovery.sh
 echo "MinIO E2E が通過しました"
