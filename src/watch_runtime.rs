@@ -1081,6 +1081,7 @@ fn capture_snapshot_and_sync(paths: &Paths, args: SnapshotArgs) -> Result<bool> 
         };
         match sync_result {
             Ok(AutoSyncResult::Synced) => {
+                clear_cluster_failure(paths, false);
                 record_event(paths, "watch-sync", "synced current snapshot to remote")?;
                 auto_prune_after_sync(paths)?;
             }
@@ -1265,6 +1266,7 @@ fn sync_current_external(paths: &Paths, prune_after: bool, changed_roots: &[Stri
     let status = command.status()?;
     drop(slot);
     if status.success() {
+        clear_cluster_failure(paths, false);
         record_event(paths, "watch-sync", "external sync completed")?;
         if prune_after {
             auto_prune_after_sync(paths)?;

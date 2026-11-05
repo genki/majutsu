@@ -22665,6 +22665,8 @@ fn watch_skips_followup_sync_when_event_snapshot_is_noop() {
     let original_mtime = filetime::FileTime::from_last_modification_time(
         &fs::metadata(source.join("alpha.txt")).unwrap(),
     );
+    let failure_marker = state.join("runtime/cluster-sync-failure.json");
+    fs::write(&failure_marker, b"{}").unwrap();
     let mut child = mj()
         .arg("--home")
         .arg(&state)
@@ -22685,6 +22687,18 @@ fn watch_skips_followup_sync_when_event_snapshot_is_noop() {
     filetime::set_file_mtime(source.join("alpha.txt"), original_mtime).unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
+    assert!(
+        !failure_marker.exists(),
+        "watch同期成功後も失敗状態が残っています"
+    );
+    let audit: serde_json::Value = serde_json::from_slice(
+        &fs::read(state.join("runtime/cluster-notice-history.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        audit.as_array().unwrap().last().unwrap()["result"],
+        "recovered"
+    );
     assert_eq!(
         db_ref(&state, "current").as_deref(),
         Some(baseline.as_str())
