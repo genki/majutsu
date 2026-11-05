@@ -254,7 +254,7 @@ fn render_windows_task_script(config: &DaemonServiceConfig<'_>, args: Vec<String
         "$ErrorActionPreference = 'Stop'\n\
          $action = New-ScheduledTaskAction -Execute {execute} -Argument {arguments}\n\
          {trigger}\n\
-         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)\n\
+         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)\n\
          {principal}\n\
          Register-ScheduledTask -TaskName {task_name} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force\n",
         arguments = powershell_quote(&argument_line),
@@ -413,6 +413,31 @@ mod tests {
         assert!(service.contains("<string>/Users/alice/.majutsu&amp;prod</string>"));
         assert!(service.contains("<string>strict</string>"));
         assert!(service.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn windows_watch_has_restart_and_no_execution_deadline() {
+        let service = render_daemon_service(DaemonServiceConfig {
+            provider: "windows-task",
+            style: "foreground",
+            scope: DaemonServiceScope::User,
+            exe: Path::new("C:/mj.exe"),
+            home: Path::new("C:/state"),
+            backend: "notify",
+            mode: "default",
+            interval_secs: 60,
+            debounce_ms: 1500,
+            settle_ms: 500,
+            buffer_max_ms: 60000,
+            buffer_max_events: 1000,
+            periodic_rescan_secs: 0,
+            max_rss_mib: 2048,
+        })
+        .unwrap();
+        assert!(service.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
+        assert!(service.contains("-RestartCount 999 -RestartInterval"));
+        assert!(service.contains("New-ScheduledTaskTrigger -AtLogOn"));
+        assert!(service.contains("watch"));
     }
 
     #[test]
