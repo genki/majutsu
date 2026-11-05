@@ -138,6 +138,7 @@ mod fuse_mount {
     }
 }
 mod history_runtime;
+mod hydration_error;
 mod key_runtime;
 mod large_runtime;
 mod lifecycle_runtime;
@@ -160,6 +161,7 @@ mod snapshot_rules;
 mod snapshot_state;
 mod sync_runtime;
 mod util;
+mod watch_recovery;
 mod watch_runtime;
 
 use atomic_io::write_atomic_with;
@@ -2173,42 +2175,36 @@ pub(crate) fn download_local_object_from_remote(
     key: &str,
 ) -> Result<Vec<u8>> {
     crate::util::validate_local_object_key(key)?;
+    let fetch = |remote_key: &str| {
+        remote
+            .get_optional(remote_key)
+            .map_err(|error| hydration_error::remote_failure(key, error))
+    };
+    let decode = |bytes: Vec<u8>| {
+        canonical_remote_object_to_local_bytes(paths, key, &bytes)
+            .map_err(|_| hydration_error::failure(key, "decode"))
+    };
     if remote.is_s3_like() {
-        let config = read_config(paths)?;
-        let host_prefix = remote_host_label(&config.host.name);
-        if let Some(alias) = canonical_remote_alias(key)
-            && alias != key
-        {
-            let remote_alias = host_remote_key(&host_prefix, &alias);
-            let bytes = remote
-                .get(&remote_alias)
-                .with_context(|| format!("download {key} via canonical alias {remote_alias}"))?;
-            return canonical_remote_object_to_local_bytes(paths, key, &bytes);
-        }
-        let remote_key = host_remote_key(&host_prefix, key);
-        let bytes = remote
-            .get(&remote_key)
-            .with_context(|| format!("download {key} from {remote_key}"))?;
-        return Ok(bytes);
+        let config = read_config(paths).map_err(|_| hydration_error::failure(key, "config"))?;
+        let host = remote_host_label(&config.host.name);
+        let alias = canonical_remote_alias(key);
+        let remote_key = host_remote_key(&host, alias.as_deref().unwrap_or(key));
+        let bytes = fetch(&remote_key)?.ok_or_else(|| hydration_error::failure(key, "missing"))?;
+        return if alias.is_some() {
+            decode(bytes)
+        } else {
+            Ok(bytes)
+        };
     }
-    if let Some(bytes) = remote
-        .get_optional(key)
-        .with_context(|| format!("download {key} from {key}"))?
-    {
+    if let Some(bytes) = fetch(key)? {
         return Ok(bytes);
     }
     if let Some(alias) = canonical_remote_alias(key)
-        && alias != key
-        && let Some(bytes) = remote
-            .get_optional(&alias)
-            .with_context(|| format!("download {key} via canonical alias {alias}"))?
+        && let Some(bytes) = fetch(&alias)?
     {
-        return canonical_remote_object_to_local_bytes(paths, key, &bytes)
-            .with_context(|| format!("decode canonical alias {alias} for {key}"));
+        return decode(bytes);
     }
-    remote
-        .get(key)
-        .with_context(|| format!("download {key} from {key}"))
+    Err(hydration_error::failure(key, "missing"))
 }
 
 pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Result<bool> {
@@ -2217,17 +2213,12 @@ pub(crate) fn hydrate_local_object_from_remote(paths: &Paths, key: &str) -> Resu
     if dest.exists() {
         return Ok(true);
     }
-    let Ok(config) = read_config(paths) else {
-        return Ok(false);
-    };
+    let config = read_config(paths).map_err(|_| hydration_error::failure(key, "config"))?;
     let Some(remote_config) = config.remote.as_ref() else {
         return Ok(false);
     };
-    let remote = open_remote(remote_config)?;
-    let bytes = match download_local_object_from_remote(paths, &remote, key) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(false),
-    };
+    let remote = open_remote(remote_config).map_err(|e| hydration_error::remote_failure(key, e))?;
+    let bytes = download_local_object_from_remote(paths, &remote, key)?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -5064,9 +5055,8 @@ pub(crate) fn encode_object_with_master_key_hex(
 pub(crate) fn read_object_raw(paths: &Paths, key: &str) -> Result<Vec<u8>> {
     crate::util::validate_local_object_key(key)?;
     let path = paths.home.join(key);
-    if !path.exists() {
-        hydrate_local_object_from_remote(paths, key)
-            .with_context(|| format!("hydrate missing local object {key}"))?;
+    if !path.exists() && !hydrate_local_object_from_remote(paths, key)? {
+        return Err(hydration_error::failure(key, "missing"));
     }
     let bytes = fs::read(paths.home.join(key))?;
     decode_object(paths, &bytes)

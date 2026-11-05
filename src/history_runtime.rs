@@ -718,6 +718,22 @@ fn current_health_report(paths: &Paths, args: &HealthArgs) -> Result<HealthRepor
         deep_remote: deep_remote.as_ref(),
         conn: &conn,
     })?;
+    match crate::watch_recovery::issue_code(paths) {
+        Ok(None) => {}
+        result => {
+            report.issues.push(HealthIssue {
+                severity: HealthSeverity::Critical,
+                code: result
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "snapshot-retry-state-unreadable".into()),
+                message:
+                    "参照objectの再取得に失敗し、未処理の変更を保持してsnapshotを再試行しています"
+                        .into(),
+            });
+            report.state = protection_state_for_issues(&report.issues);
+        }
+    }
     let storage_issue = match crate::platform_runtime::volume_space(&paths.home) {
         Ok(space) => {
             let issue = state_volume_issue(&space);

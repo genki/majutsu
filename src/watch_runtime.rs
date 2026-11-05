@@ -49,7 +49,7 @@ use crate::snapshot_rules::{
 };
 use crate::snapshot_state::current_snapshot;
 use crate::sync_runtime::{AutoSyncResult, sync_current_if_remote};
-use crate::{ensure_ready, open_db, replay_pending_journal_events, snapshot};
+use crate::{ensure_ready, open_db, snapshot};
 
 // watchと再送schedulerが、子プロセスのsync lock取得前に競合するのを防ぐ。
 // clusterでは単発syncの終了だけを待ち、全journalのACK待機は追加しない。
@@ -218,7 +218,7 @@ fn watch_fanotify(
     )?;
     record_health(paths);
     enforce_watch_memory_guard(paths, args.max_rss_mib)?;
-    let replayed_journal = replay_pending_journal_events(paths)?;
+    let replayed_journal = crate::watch_recovery::replay(paths, args.once)?;
     sync_current_external(paths, true, &[])?;
     if replayed_journal {
         record_health(paths);
@@ -234,7 +234,11 @@ fn watch_fanotify(
     }
     loop {
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
-        let Some(event) = fanotify.recv(args.periodic_rescan_secs)? else {
+        let Some(event) = fanotify.recv(crate::watch_recovery::wait_secs(
+            paths,
+            args.periodic_rescan_secs,
+        )?)?
+        else {
             notify_stalled_pending_journal(paths)?;
             record_event(
                 paths,
@@ -248,6 +252,7 @@ fn watch_fanotify(
                     changed_roots: Vec::new(),
                     origin: fallback_watch_origin("watch:fanotify", Some("fanotify")),
                 },
+                args.once,
             )?;
             record_health(paths);
             enforce_watch_memory_guard(paths, args.max_rss_mib)?;
@@ -270,6 +275,7 @@ fn watch_fanotify(
                     changed_roots: changed_roots_vec(changed_roots),
                     origin,
                 },
+                args.once,
             )?;
             if args.once {
                 break;
@@ -305,6 +311,7 @@ fn watch_fanotify(
                 changed_roots: changed_roots_vec(outcome.changed_roots),
                 origin: outcome.origin,
             },
+            args.once,
         )?;
         record_health(paths);
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
@@ -353,13 +360,16 @@ fn watch_poll(paths: &Paths, args: &ResolvedWatchArgs) -> Result<()> {
                 changed_roots: Vec::new(),
                 origin: None,
             },
+            args.once,
         )?;
         record_health(paths);
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
         if args.once {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_secs(args.interval_secs.max(1)));
+        std::thread::sleep(std::time::Duration::from_secs(
+            crate::watch_recovery::wait_secs(paths, args.interval_secs.max(1))?,
+        ));
     }
     record_event(paths, "watch-stop", "foreground watch stopped")?;
     Ok(())
@@ -776,7 +786,7 @@ fn watch_notify_loop<W: Watcher>(
     }
     record_health(paths);
     enforce_watch_memory_guard(paths, args.max_rss_mib)?;
-    let replayed_journal = replay_pending_journal_events(paths)?;
+    let replayed_journal = crate::watch_recovery::replay(paths, args.once)?;
     sync_current_external(paths, true, &[])?;
     if replayed_journal {
         record_health(paths);
@@ -792,7 +802,10 @@ fn watch_notify_loop<W: Watcher>(
     }
     loop {
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
-        let event = match recv_watch_event(&rx, args.periodic_rescan_secs) {
+        let event = match recv_watch_event(
+            &rx,
+            crate::watch_recovery::wait_secs(paths, args.periodic_rescan_secs)?,
+        ) {
             Ok(Some(event)) => event,
             Ok(None) => {
                 notify_stalled_pending_journal(paths)?;
@@ -811,6 +824,7 @@ fn watch_notify_loop<W: Watcher>(
                             Some(backend_label),
                         ),
                     },
+                    args.once,
                 )?;
                 record_health(paths);
                 enforce_watch_memory_guard(paths, args.max_rss_mib)?;
@@ -843,6 +857,7 @@ fn watch_notify_loop<W: Watcher>(
                         Some(backend_label),
                     ),
                 },
+                args.once,
             )?;
             if args.once {
                 break;
@@ -882,6 +897,7 @@ fn watch_notify_loop<W: Watcher>(
                     Some(backend_label),
                 ),
             },
+            args.once,
         )?;
         record_health(paths);
         enforce_watch_memory_guard(paths, args.max_rss_mib)?;
@@ -1039,7 +1055,16 @@ fn watchable_directories(root: &RootConfig) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
+fn snapshot_and_maybe_sync(paths: &Paths, mut args: SnapshotArgs, once: bool) -> Result<()> {
+    crate::watch_recovery::run(paths, once, |full_rescan| {
+        if full_rescan {
+            args.changed_roots.clear();
+        }
+        capture_snapshot_and_sync(paths, args)
+    })
+}
+
+fn capture_snapshot_and_sync(paths: &Paths, args: SnapshotArgs) -> Result<bool> {
     let changed_roots = args.changed_roots.clone();
     sync_current_external(paths, false, &changed_roots)?;
     let before_snapshot = local_current_snapshot(paths)?;
@@ -1048,7 +1073,7 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         let after_snapshot = local_current_snapshot(paths)?;
         if before_snapshot == after_snapshot {
             record_watch_sync_skipped(paths, after_snapshot.as_deref())?;
-            return Ok(());
+            return Ok(true);
         }
         let sync_result = {
             let _slot = watch_sync_slot()?;
@@ -1074,7 +1099,7 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
             Ok(AutoSyncResult::NoRemote) => {}
             Err(err) => record_event(paths, "watch-sync-error", &format!("{err:#}"))?,
         }
-        return Ok(());
+        return Ok(true);
     }
 
     let origin = args
@@ -1113,17 +1138,17 @@ fn snapshot_and_maybe_sync(paths: &Paths, args: SnapshotArgs) -> Result<()> {
         run_snapshot_child_with_retry(paths, &mut command)?,
         SnapshotChildOutcome::Deferred
     ) {
-        return Ok(());
+        return Ok(false);
     }
     record_event(paths, "watch-snapshot-child", &message)?;
 
     let after_snapshot = local_current_snapshot(paths)?;
     if before_snapshot == after_snapshot {
         record_watch_sync_skipped(paths, after_snapshot.as_deref())?;
-        return Ok(());
+        return Ok(true);
     }
     sync_current_external(paths, true, &changed_roots)?;
-    Ok(())
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1273,7 +1298,9 @@ fn cluster_heartbeat_scheduler_loop(paths: Paths) {
     let heartbeat_interval = cluster_heartbeat_interval();
     loop {
         match cluster_slave_heartbeat(&paths) {
-            Ok(_) => {}
+            Ok(_) => {
+                clear_cluster_master_unavailable(&paths);
+            }
             Err(err) => {
                 eprintln!("cluster master heartbeat error: {err:#}");
                 let _ = record_cluster_master_unavailable(&paths, &err);
@@ -1320,12 +1347,13 @@ fn upload_retry_scheduler_loop(paths: Paths) {
                 match retry_queued_uploads_external(&paths) {
                     Err(err) => {
                         eprintln!("upload retry scheduler error: {err:#}");
-                        let _ = record_cluster_master_unavailable(&paths, &err);
+                        let _ = record_retry_sync_failure(&paths, &err);
                         Duration::from_secs(30)
                     }
                     Ok(RetrySyncOutcome::Deferred) => Duration::from_secs(5),
                     Ok(RetrySyncOutcome::Completed) => {
                         clear_cluster_master_unavailable(&paths);
+                        clear_cluster_failure(&paths, false);
                         let pending_after = upload_retry_scheduler_work(&paths)
                             .map(|work| work.pending_items())
                             .unwrap_or(pending_before);
@@ -1470,11 +1498,91 @@ fn cluster_unavailable_state_path(paths: &Paths) -> PathBuf {
     paths.runtime.join("cluster-master-unavailable.json")
 }
 
+static CLUSTER_NOTICE_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+fn cluster_failure_path(paths: &Paths, master: bool) -> PathBuf {
+    if master {
+        cluster_unavailable_state_path(paths)
+    } else {
+        paths.runtime.join("cluster-sync-failure.json")
+    }
+}
 fn record_cluster_master_unavailable(paths: &Paths, error: &anyhow::Error) -> Result<()> {
+    record_cluster_failure(paths, error, true)
+}
+fn record_retry_sync_failure(paths: &Paths, error: &anyhow::Error) -> Result<()> {
     if !configured_remote_is_cluster(paths) {
         return Ok(());
     }
-    let path = cluster_unavailable_state_path(paths);
+    // 同期失敗の内容だけからmaster停止と判断せず、独立した到達確認を行う。
+    match cluster_slave_heartbeat(paths) {
+        Ok(_) => {
+            clear_cluster_master_unavailable(paths);
+            record_cluster_failure(paths, error, false)
+        }
+        Err(unreachable) => record_cluster_master_unavailable(paths, &unreachable),
+    }
+}
+fn append_notice_audit(paths: &Paths, issue: &str, result: &str) -> Result<()> {
+    let path = paths.runtime.join("cluster-notice-history.json");
+    let mut history: Vec<serde_json::Value> = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("通知履歴の形式が不正です"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    history
+        .push(serde_json::json!({"observed_at":Utc::now(), "issue_code":issue, "result":result}));
+    if history.len() > 64 {
+        history.drain(..history.len() - 64);
+    }
+    fs::create_dir_all(&paths.runtime)?;
+    crate::atomic_io::write_atomic(&path, &serde_json::to_vec(&history)?)
+}
+fn clear_cluster_failure(paths: &Paths, master: bool) {
+    let Ok(_guard) = CLUSTER_NOTICE_STATE_LOCK.lock() else {
+        return;
+    };
+    let path = cluster_failure_path(paths, master);
+    if path.exists() {
+        if append_notice_audit(
+            paths,
+            if master {
+                "master-unavailable"
+            } else {
+                "sync-failed"
+            },
+            "recovered",
+        )
+        .is_err()
+        {
+            eprintln!("cluster notice recovery audit failed");
+        }
+        let _ = fs::remove_file(path);
+    }
+}
+fn clear_cluster_master_unavailable(paths: &Paths) {
+    clear_cluster_failure(paths, true);
+}
+fn cluster_failure_issue(error: &anyhow::Error, master: bool) -> String {
+    if master {
+        "master-unavailable".into()
+    } else {
+        crate::hydration_error::code(&format!("{error:#}")).map_or_else(
+            || "sync-failed".into(),
+            |code| format!("sync-object-fetch-{code}"),
+        )
+    }
+}
+
+fn record_cluster_failure(paths: &Paths, error: &anyhow::Error, master: bool) -> Result<()> {
+    let _guard = CLUSTER_NOTICE_STATE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("通知状態の排他が破損しています"))?;
+    if !configured_remote_is_cluster(paths) {
+        return Ok(());
+    }
+    let path = cluster_failure_path(paths, master);
     let now = Utc::now();
     let mut state = fs::read(&path)
         .ok()
@@ -1499,14 +1607,16 @@ fn record_cluster_master_unavailable(paths: &Paths, error: &anyhow::Error) -> Re
         .is_some_and(|last| now.signed_duration_since(last).num_seconds() < rate_limit);
     let should_notice =
         state.failures >= minimum_failures && outage_age >= minimum_age && !rate_limited;
+    let issue = cluster_failure_issue(error, master);
     if should_notice
         && let Some(command) = std::env::var("MAJUTSU_CLUSTER_NOTICE_CMD")
             .ok()
             .filter(|command| !command.trim().is_empty())
     {
-        let status = crate::platform_runtime::shell_command(&command)
+        let mut notice = crate::platform_runtime::shell_command(&command);
+        notice
             .env("MAJUTSU_HOME", &paths.home)
-            .env("MAJUTSU_CLUSTER_NOTICE_ISSUES", "master-unavailable")
+            .env("MAJUTSU_CLUSTER_NOTICE_ISSUES", &issue)
             .env(
                 "MAJUTSU_CLUSTER_UNAVAILABLE_FAILURES",
                 state.failures.to_string(),
@@ -1515,34 +1625,54 @@ fn record_cluster_master_unavailable(paths: &Paths, error: &anyhow::Error) -> Re
                 "MAJUTSU_CLUSTER_UNAVAILABLE_AGE_SECS",
                 outage_age.to_string(),
             )
-            .env("MAJUTSU_CLUSTER_LAST_ERROR", format!("{error:#}"))
-            .status();
+            .env("MAJUTSU_CLUSTER_LAST_ERROR", &issue);
+        let status = crate::platform_runtime::command_status_with_timeout(
+            &mut notice,
+            Duration::from_secs(10),
+        );
+        // 通知受理後の監査書込み失敗で再送を繰り返さない。
+        if status.as_ref().is_ok_and(|s| s.success()) {
+            state.last_notice_at = Some(now);
+            crate::atomic_io::write_atomic(&path, &serde_json::to_vec_pretty(&state)?)?;
+        }
+        if append_notice_audit(
+            paths,
+            &issue,
+            if status.as_ref().is_ok_and(|s| s.success()) {
+                "delivered"
+            } else {
+                "failed"
+            },
+        )
+        .is_err()
+        {
+            eprintln!("cluster notice audit failed");
+        }
         match status {
             Ok(status) if status.success() => {
                 state.last_notice_at = Some(now);
                 record_event(
                     paths,
-                    "cluster-master-unavailable-notice",
-                    &format!("failures={} age_secs={outage_age}", state.failures),
+                    "cluster-failure-notice",
+                    &format!(
+                        "issue={issue} failures={} age_secs={outage_age}",
+                        state.failures
+                    ),
                 )?;
             }
             Ok(status) => record_event(
                 paths,
-                "cluster-master-unavailable-notice-error",
+                "cluster-failure-notice-error",
                 &format!("notice command exited with status {status}"),
             )?,
             Err(err) => record_event(
                 paths,
-                "cluster-master-unavailable-notice-error",
+                "cluster-failure-notice-error",
                 &format!("notice command failed: {err}"),
             )?,
         }
     }
     crate::atomic_io::write_atomic(&path, &serde_json::to_vec_pretty(&state)?)
-}
-
-fn clear_cluster_master_unavailable(paths: &Paths) {
-    let _ = fs::remove_file(cluster_unavailable_state_path(paths));
 }
 
 fn auto_prune_after_sync(paths: &Paths) -> Result<()> {
@@ -2265,6 +2395,33 @@ mod tests {
     use notify::{Event, EventKind};
     use std::path::PathBuf;
     use std::thread;
+
+    #[test]
+    fn notice_classifies_fetch_failure_and_bounds_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = test_paths(tmp.path().join("home"));
+        let error = crate::hydration_error::failure("objects/trees/aa/bb", "missing");
+        assert_eq!(
+            cluster_failure_issue(&error, false),
+            "sync-object-fetch-missing"
+        );
+        assert_eq!(cluster_failure_issue(&error, true), "master-unavailable");
+        for _ in 0..70 {
+            append_notice_audit(&paths, "sync-object-fetch-missing", "failed").unwrap();
+        }
+        let path = paths.runtime.join("cluster-notice-history.json");
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(entries.len(), 64);
+        fs::write(cluster_failure_path(&paths, false), b"{}").unwrap();
+        clear_cluster_failure(&paths, false);
+        assert!(!cluster_failure_path(&paths, false).exists());
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(entries.len(), 64);
+        assert_eq!(entries.last().unwrap()["result"], "recovered");
+        assert!(entries.iter().all(|v| v.as_object().unwrap().len() == 3));
+    }
 
     #[test]
     fn formats_notify_event_kind_and_paths() {

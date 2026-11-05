@@ -724,3 +724,25 @@ metadata export を使う。詳細は `docs/REMOTE_METADATA_STORAGE.md` を参�
 S3/GCS 互換 remote では、最新 head 情報を `<host-prefix>/head.cbor.zst.enc`
 へ集約し、小変更時の canonical ref publish 数を削減する。詳細は
 `docs/PUBLISH_COMPACTION.md` を参照する。
+
+
+## watchの参照object再取得失敗
+
+参照metadataの再取得に失敗した常駐watchは、直前の有効snapshotと未処理journalを保持し、
+5秒から最大300秒のbackoffで再試行する。新しいファイル変更がなく、定期rescanが無効でも再試行する。
+`watch --once`は失敗を終了コードへ返す。未保全の変更がある間、`health --json`は
+`snapshot-object-fetch-{transport,missing,decode,config,remote}`をcriticalとして報告する。
+再試行状態は`runtime/watch-snapshot-retry.json`にあり、snapshot作成の成功後に解消する。
+欠損を隠す目的でこの状態やsnapshotを削除しない。
+
+clusterの同期再送失敗時はheartbeatで到達性を別途確認する。到達できる場合は
+`sync-object-fetch-*`または`sync-failed`として、到達確認も失敗した場合は
+`master-unavailable`として通知する。通知の成否と復旧は
+`runtime/cluster-notice-history.json`に直近64件を保持する。本文や認証値は記録しない。
+`delivered`は通知hookの正常終了を表し、端末での閲覧完了は表さない。
+master到達性と同期失敗には別々のrate limit状態を使う。
+
+Windows Task Schedulerの常駐taskには`ExecutionTimeLimit=PT0S`を設定する。
+生成するservice scriptもこの設定を含む。既存taskはバイナリ更新だけでは設定が変わらないため、
+同じprincipal・action・triggerを保持して設定を更新する。ユーザーtaskはログオンが必要であり、
+未ログオン時の起動を保証するSYSTEM taskとは区別する。

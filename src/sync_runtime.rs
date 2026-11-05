@@ -968,7 +968,21 @@ fn enqueue_and_drain_sync(
             {
                 continue;
             }
-            if !crate::hydrate_local_object_from_remote(paths, &key)? {
+            // 現行snapshot外の欠損を見送る既存動作は維持する。
+            // 通信・復号失敗まで見送ると保全成功と誤認するため伝播する。
+            let hydrated = match crate::hydrate_local_object_from_remote(paths, &key) {
+                Err(error)
+                    if current_snapshot_keys
+                        .as_ref()
+                        .is_some_and(|keys| !keys.contains(&key))
+                        && crate::hydration_error::code(&format!("{error:#}"))
+                            == Some("missing") =>
+                {
+                    false
+                }
+                result => result?,
+            };
+            if !hydrated {
                 if current_snapshot_keys
                     .as_ref()
                     .is_some_and(|keys| !keys.contains(&key))

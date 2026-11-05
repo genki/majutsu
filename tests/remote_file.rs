@@ -24876,3 +24876,123 @@ fn transactional_snapshot_runs_application_plugin_phases() {
     assert!(events.contains("application-plugin-pre"));
     assert!(events.contains("application-plugin-post"));
 }
+
+// remote切断とmetadata cache欠落が重なってもdaemonは未処理変更を保持する。
+#[cfg(unix)]
+#[test]
+fn watch_retries_missing_tree_without_new_event_and_restores_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let source = tmp.path().join("source");
+    let remote = tmp.path().join("remote");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("alpha.txt"), b"before\n").unwrap();
+    let mut c = mj();
+    c.arg("--home")
+        .arg(&state)
+        .args(["init", "--remote"])
+        .arg(format!("file://{}", remote.display()));
+    run(c);
+    let mut c = mj();
+    c.arg("--home")
+        .arg(&state)
+        .args(["root", "add", "sample"])
+        .arg(&source);
+    run(c);
+    for action in ["snapshot", "sync"] {
+        let mut c = mj();
+        c.arg("--home").arg(&state).arg(action);
+        run(c);
+    }
+    let baseline = db_ref(&state, "current").unwrap();
+    let tree = local_snapshot_manifest(&state, "desc")["root_trees"]["sample"]["tree_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut c = mj();
+    c.env("MAJUTSU_WATCH_AUTO_PRUNE", "0")
+        .arg("--home")
+        .arg(&state)
+        .args([
+            "daemon",
+            "start",
+            "--backend",
+            "notify",
+            "--debounce-ms",
+            "50",
+            "--settle-ms",
+            "50",
+            "--periodic-rescan-secs",
+            "0",
+        ]);
+    run(c);
+    struct Stop(std::path::PathBuf);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = mj()
+                .arg("--home")
+                .arg(&self.0)
+                .args(["daemon", "stop"])
+                .output();
+        }
+    }
+    let _stop = Stop(state.clone());
+    wait_for_watch_ready(&state);
+    // 切断前にsyncを完了し、参照metadataだけを隔離する。
+    thread::sleep(Duration::from_secs(1));
+    let offline = tmp.path().join("offline");
+    fs::rename(&remote, &offline).unwrap();
+    fs::remove_file(state.join(&tree)).unwrap();
+    fs::write(source.join("alpha.txt"), b"after recovery\n").unwrap();
+    let retry = state.join("runtime/watch-snapshot-retry.json");
+    for _ in 0..300 {
+        if retry.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(retry.exists(), "snapshot再試行状態が作成されませんでした");
+    assert_eq!(
+        db_ref(&state, "current").as_deref(),
+        Some(baseline.as_str())
+    );
+    let mut c = mj();
+    c.arg("--home").arg(&state).args(["health", "--json"]);
+    let h = c.output().unwrap();
+    let health = String::from_utf8_lossy(&h.stdout);
+    assert!(health.contains("snapshot-object-fetch-"), "{health}");
+    let _ = fs::remove_dir_all(&remote);
+    fs::rename(&offline, &remote).unwrap();
+    for _ in 0..600 {
+        if !retry.exists() && db_ref(&state, "current").as_deref() != Some(baseline.as_str()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!retry.exists(), "新規eventなしで自動復旧しませんでした");
+    assert_ne!(
+        db_ref(&state, "current").as_deref(),
+        Some(baseline.as_str())
+    );
+    let mut c = mj();
+    c.arg("--home").arg(&state).arg("sync");
+    run(c);
+    let clone = tmp.path().join("clone");
+    let restored = tmp.path().join("restored");
+    let mut c = mj();
+    c.arg("--home")
+        .arg(&clone)
+        .args(["clone", "--remote"])
+        .arg(format!("file://{}", remote.display()));
+    run(c);
+    let mut c = mj();
+    c.arg("--home")
+        .arg(&clone)
+        .args(["restore", "apply", "--to"])
+        .arg(&restored);
+    run(c);
+    assert_eq!(
+        fs::read(restored.join("sample/alpha.txt")).unwrap(),
+        b"after recovery\n"
+    );
+}
