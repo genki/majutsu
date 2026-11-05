@@ -2189,12 +2189,22 @@ pub(crate) fn download_local_object_from_remote(
         let host = remote_host_label(&config.host.name);
         let alias = canonical_remote_alias(key);
         let remote_key = host_remote_key(&host, alias.as_deref().unwrap_or(key));
-        let bytes = fetch(&remote_key)?.ok_or_else(|| hydration_error::failure(key, "missing"))?;
-        return if alias.is_some() {
-            decode(bytes)
-        } else {
-            Ok(bytes)
-        };
+        if let Some(bytes) = fetch(&remote_key)? {
+            return if alias.is_some() {
+                decode(bytes)
+            } else {
+                Ok(bytes)
+            };
+        }
+        // masterにlegacy形式だけが残る履歴も取得する。通常のcanonical成功時には
+        // 追加RPCを行わず、通信・復号エラーや削除済みkeyを欠損と混同しない。
+        if remote.is_master_proxy()
+            && alias.is_some()
+            && let Some(bytes) = fetch(&host_remote_key(&host, key))?
+        {
+            return Ok(bytes);
+        }
+        return Err(hydration_error::failure(key, "missing"));
     }
     if let Some(bytes) = fetch(key)? {
         return Ok(bytes);

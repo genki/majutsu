@@ -746,3 +746,7 @@ Windows Task Schedulerの常駐taskには`ExecutionTimeLimit=PT0S`を設定す�
 生成するservice scriptもこの設定を含む。既存taskはバイナリ更新だけでは設定が変わらないため、
 同じprincipal・action・triggerを保持して設定を更新する。ユーザーtaskはログオンが必要であり、
 未ログオン時の起動を保証するSYSTEM taskとは区別する。
+
+cluster masterにlegacy形式だけが残るobjectは、canonical形式の取得が欠損を返した場合に限り、
+同じhost prefixのlegacy keyから取得する。canonical成功時の追加RPCはなく、通信・復号エラーを
+fallbackで隠さない。masterが論理削除済みと判断したlegacy objectは取得しない。

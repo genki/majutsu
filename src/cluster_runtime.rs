@@ -5448,6 +5448,67 @@ mod tests {
     }
 
     #[test]
+    fn cluster_hydration_reads_legacy_only_and_honors_logical_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let backend_root = root.path().join("backend");
+        let state = Arc::new(test_master_state(root.path(), &backend_root));
+        let paths = crate::config::resolve_paths(Some(root.path().join("client"))).unwrap();
+        crate::init(
+            &paths,
+            crate::cli::InitArgs {
+                remote: None,
+                host_name: Some("test-host".into()),
+                encrypt: false,
+            },
+        )
+        .unwrap();
+        let key = "objects/large/chunks/fixed/aa/legacy";
+        let preferred = "objects/large/chunks/fixed/aa/preferred";
+        let deleted = "objects/large/chunks/fixed/aa/deleted";
+        for (key, bytes) in [
+            (key, b"legacy-bytes".as_slice()),
+            (preferred, b"wrong-legacy"),
+            (deleted, b"deleted"),
+        ] {
+            state.store.put(&format!("test-host/{key}"), bytes).unwrap();
+        }
+        let canonical = crate::majutsu_store::canonical_remote_alias(preferred).unwrap();
+        state
+            .store
+            .put(&format!("test-host/{canonical}"), b"canonical-bytes")
+            .unwrap();
+        durable_delete(&state, "test-host", &format!("test-host/{deleted}")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server_state = Arc::clone(&state);
+        let server = thread::spawn(move || {
+            // capability 1回、legacy-only 2回、canonical 1回、削除済み 2回。
+            for stream in listener.incoming().take(6) {
+                handle_connection(stream.unwrap(), Arc::clone(&server_state));
+            }
+        });
+        let proxy = RemoteStore::MasterProxy(ClusterRemote {
+            endpoint,
+            token: "test-token".into(),
+            host_id: "test-host".into(),
+        });
+        assert_eq!(
+            crate::download_local_object_from_remote(&paths, &proxy, key).unwrap(),
+            b"legacy-bytes"
+        );
+        assert_eq!(
+            crate::download_local_object_from_remote(&paths, &proxy, preferred).unwrap(),
+            b"canonical-bytes"
+        );
+        let error = crate::download_local_object_from_remote(&paths, &proxy, deleted).unwrap_err();
+        assert_eq!(
+            crate::hydration_error::code(&error.to_string()),
+            Some("missing")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn cluster_proxy_heartbeat_round_trip_records_explicit_liveness() {
         let root = tempfile::tempdir().unwrap();
         let backend_root = root.path().join("backend");
